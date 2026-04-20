@@ -35,7 +35,7 @@ CANARY_TYPES = [
 TRACEBIT_SOURCE = (os.environ.get("TRACEBIT_ENV_CANARY_SOURCE") or "flux").strip()
 TRACEBIT_SOURCE_TYPE = (os.environ.get("TRACEBIT_ENV_CANARY_SOURCE_TYPE") or "endpoint").strip()
 LOG_PATH = Path(os.environ.get("TRACEBIT_ENV_LOG_PATH") or "/var/log/honeypot/tracebit/env-canary.jsonl")
-TARPIT_ENABLED = (os.environ.get("TRACEBIT_ENV_TARPIT_ENABLED") or "").strip().lower() in {"1", "true", "yes", "on"}
+TARPIT_ENABLED = (os.environ.get("TRACEBIT_ENV_TARPIT_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
 TARPIT_SECONDS = max(int((os.environ.get("TRACEBIT_ENV_TARPIT_SECONDS") or "0").strip() or "0"), 0)
 TARPIT_CHUNK_BYTES = max(int((os.environ.get("TRACEBIT_ENV_TARPIT_CHUNK_BYTES") or "32").strip() or "32"), 1)
 TARPIT_INTERVAL_MS = max(int((os.environ.get("TRACEBIT_ENV_TARPIT_INTERVAL_MS") or "2000").strip() or "2000"), 100)
@@ -45,8 +45,16 @@ HEADER_VALUE_LOG_LIMIT = 512
 LOG_HEADER_NAMES = "Host,X-Forwarded-Host,X-Forwarded-For,X-Forwarded-Proto,True-Client-Ip,X-Real-Ip,X-Client-Ip,X-Azure-Clientip,X-Azure-Socketip,X-Originating-Ip,X-Host,Cf-Connecting-Ip,Content-Type,Content-Length".split(",")
 
 # --- Tarpit module configuration ---
-def _env_bool(name: str) -> bool:
-    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+# Defaults are ON — flux is a honeypot, the whole point is to fingerprint.
+# To disable an individual module, set its env var to "false" / "0".
+# DNS callback is a partial exception: enabled by default but a no-op
+# unless TARPIT_MOD_DNS_CALLBACK_DOMAIN is also set, since redirecting
+# to an empty domain produces garbage URLs.
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if raw == "":
+        return default
+    return raw in {"1", "true", "yes", "on"}
 
 MOD_DNS_CALLBACK_ENABLED = _env_bool("TARPIT_MOD_DNS_CALLBACK_ENABLED")
 MOD_DNS_CALLBACK_DOMAIN = (os.environ.get("TARPIT_MOD_DNS_CALLBACK_DOMAIN") or "").strip()
@@ -60,8 +68,31 @@ MOD_CONTENT_LENGTH_MISMATCH_ENABLED = _env_bool("TARPIT_MOD_CONTENT_LENGTH_MISMA
 MOD_CONTENT_LENGTH_CLAIMED_BYTES = max(int((os.environ.get("TARPIT_MOD_CONTENT_LENGTH_CLAIMED_BYTES") or "1048576").strip() or "1048576"), 1024)
 MOD_ETAG_PROBE_ENABLED = _env_bool("TARPIT_MOD_ETAG_PROBE_ENABLED")
 
+# --- Generic fingerprint paths ---
+# The fingerprinting modules (cookie, etag, dns-callback, redirect-chain,
+# drip, content-length-mismatch) were originally only invoked on `.env`
+# variants. Scanners that aren't hunting `.env` never tripped them. This
+# list routes the same module chain at a set of generic paths a scanner
+# typically hits on first contact.
+_FINGERPRINT_DEFAULT_PATHS = ",".join([
+    "/",
+    "/index.html",
+    "/index.php",
+    "/robots.txt",
+    "/sitemap.xml",
+    "/favicon.ico",
+])
+FINGERPRINT_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("FINGERPRINT_PATHS_CSV") or _FINGERPRINT_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+FINGERPRINT_PATHS_ENABLED = _env_bool("FINGERPRINT_PATHS_ENABLED")
+
 # --- Fake /.git/ tree configuration ---
-FAKE_GIT_ENABLED = _env_bool("FAKE_GIT_ENABLED")
+# Opt-in: it mints a fresh canary on every cache-miss, so you want to
+# know you turned it on before your Tracebit quota starts burning.
+FAKE_GIT_ENABLED = _env_bool("FAKE_GIT_ENABLED", default=False)
 FAKE_GIT_CACHE_TTL_SECONDS = max(int((os.environ.get("FAKE_GIT_CACHE_TTL_SECONDS") or "3600").strip() or "3600"), 60)
 FAKE_GIT_CACHE_MAX_ENTRIES = max(int((os.environ.get("FAKE_GIT_CACHE_MAX_ENTRIES") or "1024").strip() or "1024"), 16)
 FAKE_GIT_DRIP_BYTES = max(int((os.environ.get("FAKE_GIT_DRIP_BYTES") or "1024").strip() or "1024"), 32)
@@ -193,6 +224,21 @@ def is_tarpit_path(path: str) -> bool:
         return True
     leaf = stripped.rsplit("/", 1)[-1]
     return leaf.startswith(".env") and leaf != ".env"
+
+
+def is_fingerprint_path(path: str) -> bool:
+    """Generic paths that route into the tarpit + module chain for
+    fingerprinting. Separate from `.env` variants so they can be disabled
+    independently (they're much louder — they hit every first-contact scanner)."""
+    if not FINGERPRINT_PATHS_ENABLED:
+        return False
+    normalized = path.lower() or "/"
+    if normalized in FINGERPRINT_PATHS:
+        return True
+    # Allow "/" to match whether the caller passed "/" or "".
+    if normalized == "" and "/" in FINGERPRINT_PATHS:
+        return True
+    return False
 
 
 def is_webshell_path(path: str) -> bool:
@@ -1107,7 +1153,7 @@ class EnvHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if TARPIT_ENABLED and host_allowed and is_tarpit_path(path):
+        if TARPIT_ENABLED and host_allowed and (is_tarpit_path(path) or is_fingerprint_path(path)):
             self._send_tarpit(request_id=request_id, path=path, log_context=log_context, send_body=send_body, query=query_string)
             return
 

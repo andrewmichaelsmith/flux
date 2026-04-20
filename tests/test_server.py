@@ -315,3 +315,49 @@ def test_dispatch_without_tracebit_api_key_404s_env_and_git(monkeypatch, tmp_pat
         )
         h._handle(send_body=True)
         assert h.response_code == 404, f"expected 404 for {path} without API key, got {h.response_code}"
+
+
+# --- Fingerprint paths ---
+
+
+def test_is_fingerprint_path_defaults_match_generic_paths():
+    """Fingerprinting is on by default for the built-in generic paths."""
+    assert tbenv.FINGERPRINT_PATHS_ENABLED, (
+        "FINGERPRINT_PATHS_ENABLED should default to True — flux is a honeypot"
+    )
+    for path in ["/", "/index.html", "/index.php", "/robots.txt", "/sitemap.xml", "/favicon.ico"]:
+        assert tbenv.is_fingerprint_path(path), f"expected match: {path}"
+
+
+def test_is_fingerprint_path_respects_explicit_disable(monkeypatch):
+    monkeypatch.setattr(tbenv, "FINGERPRINT_PATHS_ENABLED", False)
+    assert not tbenv.is_fingerprint_path("/")
+    assert not tbenv.is_fingerprint_path("/index.html")
+
+
+def test_tarpit_modules_default_on():
+    """All fingerprint modules default to on. A user who explicitly disables
+    one via env var still wins; the defaults just mean a fresh sensor
+    already fingerprints without any extra env tuning."""
+    assert tbenv.MOD_COOKIE_ENABLED
+    assert tbenv.MOD_ETAG_PROBE_ENABLED
+    assert tbenv.MOD_REDIRECT_CHAIN_ENABLED
+    assert tbenv.MOD_VARIABLE_DRIP_ENABLED
+    assert tbenv.MOD_CONTENT_LENGTH_MISMATCH_ENABLED
+    # DNS callback is default-on but is a no-op unless the domain is set.
+    assert tbenv.MOD_DNS_CALLBACK_ENABLED
+
+
+def test_tarpit_enabled_by_default():
+    assert tbenv.TARPIT_ENABLED
+
+
+def test_is_fingerprint_path_case_insensitive(monkeypatch):
+    monkeypatch.setattr(tbenv, "FINGERPRINT_PATHS_ENABLED", True)
+    assert tbenv.is_fingerprint_path("/Index.HTML")
+
+
+def test_is_fingerprint_path_non_match(monkeypatch):
+    monkeypatch.setattr(tbenv, "FINGERPRINT_PATHS_ENABLED", True)
+    for path in ["/wp-login.php", "/api/v1/users", "/readme", "/.env"]:
+        assert not tbenv.is_fingerprint_path(path)
