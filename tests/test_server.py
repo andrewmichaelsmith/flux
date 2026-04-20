@@ -336,6 +336,15 @@ FAKE_TRACEBIT = {
     ("/.pypirc", b"username = deploybot42"),
     ("/api/v4/user", b'"username": "deploybot42"'),
     ("/users/sign_in", b"<title>Sign in"),
+    # AI credential config files — the "probably-doesn't-make-sense"
+    # caveat lives in server.py above render_openai_config_json. The
+    # AWS canary value still gets embedded and shipped; field names are
+    # OpenAI / Anthropic / Cursor-shaped so a grep-by-field scanner
+    # still harvests it, even though a prefix-filter (sk-...) would
+    # reject it.
+    ("/.openai/config.json", b'"api_key": "AKIAFAKEEXAMPLE01"'),
+    ("/.anthropic/config.json", b'"auth_token": "AKIAFAKEEXAMPLE01"'),
+    ("/.cursor/mcp.json", b'"GITHUB_PERSONAL_ACCESS_TOKEN": "AKIAFAKEEXAMPLE01"'),
 ])
 def test_canary_trap_renderers_embed_canary(path, needle):
     trap = tbenv._TRAP_BY_PATH[path]
@@ -424,6 +433,65 @@ async def test_dispatch_trap_serves_on_any_host(flux_client, monkeypatch):
         assert resp.status == 200, f"trap should fire for Host={host!r}"
         body = await resp.read()
         assert b"AWS_ACCESS_KEY_ID" in body
+
+
+async def test_dispatch_openai_config_embeds_aws_canary(flux_client, monkeypatch):
+    """Scanner hitting /.openai/config.json gets a JSON doc whose api_key is
+    the AWS canary value. Field names are OpenAI-flavored; the value is
+    AWS-flavored. This is the intentional mismatch documented at the top
+    of the AI-credential renderers."""
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/.openai/config.json",
+        headers={"X-Forwarded-For": "203.0.113.40"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["api_key"] == "AKIAFAKEEXAMPLE01"
+    assert body["default_model"].startswith("gpt-")
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "openai-config"
+
+
+async def test_dispatch_anthropic_config_embeds_aws_canary(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/.anthropic/config.json",
+        headers={"X-Forwarded-For": "203.0.113.41"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["auth_token"] == "AKIAFAKEEXAMPLE01"
+    assert body["default_model"].startswith("claude-")
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "anthropic-config"
+
+
+async def test_dispatch_cursor_mcp_embeds_canary_in_env_blocks(flux_client, monkeypatch):
+    """The Cursor MCP config shape is nested — canary lives inside
+    mcpServers[*].env. Scanners that flatten for secret-looking values
+    still pick it up."""
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/.cursor/mcp.json",
+        headers={"X-Forwarded-For": "203.0.113.42"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    servers = body["mcpServers"]
+    assert servers["github"]["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"] == "AKIAFAKEEXAMPLE01"
+    assert servers["internal-tools"]["env"]["API_KEY"]
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "cursor-mcp"
 
 
 async def test_dispatch_gitlab_sign_in_emits_set_cookie(flux_client, monkeypatch):

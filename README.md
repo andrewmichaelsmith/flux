@@ -104,10 +104,25 @@ case-insensitive exact matches.
 | .pypirc | `/.pypirc` | `gitlab-username-password` | `pypirc` |
 | GitLab API user | `/api/v4/user` | `gitlab-username-password` | `gitlab-api-user` |
 | GitLab sign-in | `/users/sign_in` | `gitlab-cookie` | `gitlab-sign-in` |
+| OpenAI config file | `/.openai/config.json` | `aws` (†) | `openai-config` |
+| Anthropic config file | `/.anthropic/config.json` | `aws` (†) | `anthropic-config` |
+| Cursor MCP config | `/.cursor/mcp.json` | `aws` (†) | `cursor-mcp` |
 
 `/users/sign_in` returns the cookie canary as `Set-Cookie:
 _gitlab_session=<value>`. `/api/v4/user` embeds the username/password
 canary as a plausible GitLab API user response.
+
+† **The three AI-credential-file traps probably don't make sense yet.**
+Tracebit Community doesn't expose an OpenAI / Anthropic / LLM canary
+type, so these traps dress an `aws` canary in OpenAI / Anthropic /
+Cursor-shaped JSON. A scanner that filters by key-format prefix
+(`sk-...`, `sk-ant-...`) will correctly decide the key is fake and
+drop it; a scanner that harvests by field name (`api_key`, `auth_token`,
+`GITHUB_PERSONAL_ACCESS_TOKEN`) will still serialize the value and ship
+it, and *that* side-channel trips the AWS canary if it's ever used as
+AWS credentials. Shipped anyway because the probe itself is what we
+want to log. Swap the renderers to real LLM canaries when Tracebit
+ships them.
 
 The four canary types (`aws`, `ssh`, `gitlab-username-password`,
 `gitlab-cookie`) are everything Tracebit Community currently exposes via

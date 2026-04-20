@@ -1550,6 +1550,86 @@ def render_gitlab_sign_in(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+# --- AI credential config files (/.openai/config.json, etc.) -------------
+#
+# Intel note (2026-04-18 → 2026-04-20 weekly-novelty): scanner fleets
+# started probing `/.openai/config.json`, `/.anthropic/config.json`, and
+# `/.cursor/mcp.json` — looking for harvestable LLM provider credentials.
+# By 2026-04-20 these had spread to 13 IPs and been absorbed into standard
+# env-hunter dictionaries.
+#
+# **This trap probably doesn't make sense yet, and we're shipping it
+# anyway.** Tracebit Community only exposes `aws`, `ssh`,
+# `gitlab-username-password`, and `gitlab-cookie` canary types today — no
+# OpenAI/Anthropic/LLM type. The renderers below therefore dress an AWS
+# canary in OpenAI/Anthropic/Cursor-shaped JSON. A grep-based scanner that
+# only cares about the field names (`api_key`, `auth_token`) will still
+# serialize the value and ship it to its exfil endpoint; a scanner that
+# filters by the `sk-...` / `sk-ant-...` key-format prefix will correctly
+# decide the key is fake and drop it. Either way we still log the probe,
+# which is the primary intel for now.
+#
+# When Tracebit ships LLM canary types (hinted at in their marketing), swap
+# the renderers below over and the trap becomes genuinely trippable.
+
+
+def render_openai_config_json(r: dict[str, object]) -> bytes:
+    # Official OpenAI clients don't actually use `~/.openai/config.json` —
+    # the path is a common misconfiguration / leaked-env-var convention,
+    # which is why scanners grep for it. We emit a shape that matches what
+    # several third-party OpenAI wrapper libs document.
+    aws = _aws(r)
+    return json.dumps({
+        "organization": "org-internal-tools",
+        "api_key": aws.get("awsAccessKeyId", ""),
+        "api_secret": aws.get("awsSecretAccessKey", ""),
+        "session_token": aws.get("awsSessionToken", ""),
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o-mini",
+    }, indent=2).encode("utf-8")
+
+
+def render_anthropic_config_json(r: dict[str, object]) -> bytes:
+    # Same caveat as render_openai_config_json: Anthropic's official SDK
+    # doesn't use a config.json, but scanner dictionaries include this path
+    # because leaked env files + third-party wrappers often do.
+    aws = _aws(r)
+    return json.dumps({
+        "auth_token": aws.get("awsAccessKeyId", ""),
+        "api_key": aws.get("awsSecretAccessKey", ""),
+        "session_token": aws.get("awsSessionToken", ""),
+        "base_url": "https://api.anthropic.com",
+        "default_model": "claude-3-5-sonnet-20241022",
+    }, indent=2).encode("utf-8")
+
+
+def render_cursor_mcp_json(r: dict[str, object]) -> bytes:
+    # Cursor's Model Context Protocol config — can contain API keys and
+    # tokens passed as env vars to spawned MCP servers. We embed the canary
+    # as the auth material on two plausible MCP server entries.
+    aws = _aws(r)
+    return json.dumps({
+        "mcpServers": {
+            "github": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": aws.get("awsAccessKeyId", ""),
+                },
+            },
+            "internal-tools": {
+                "command": "uvx",
+                "args": ["--from", "internal-tools-mcp", "serve"],
+                "env": {
+                    "API_KEY": aws.get("awsSecretAccessKey", ""),
+                    "SESSION_TOKEN": aws.get("awsSessionToken", ""),
+                    "BASE_URL": "https://tools.internal.lan",
+                },
+            },
+        },
+    }, indent=2).encode("utf-8")
+
+
 @dataclass(frozen=True)
 class CanaryTrap:
     name: str                      # log tag, e.g. "aws-credentials-file"
@@ -1721,6 +1801,31 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_gitlab_sign_in,
         "text/html; charset=utf-8",
         extra_headers=_gitlab_cookie_header,
+    ),
+    # AI credential config files. See the big comment above
+    # render_openai_config_json for the "this probably doesn't make sense
+    # yet" caveat — we're logging the probe now, and will swap in real LLM
+    # canaries when Tracebit ships them.
+    CanaryTrap(
+        "openai-config",
+        ("/.openai/config.json",),
+        ("aws",),
+        render_openai_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "anthropic-config",
+        ("/.anthropic/config.json",),
+        ("aws",),
+        render_anthropic_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "cursor-mcp",
+        ("/.cursor/mcp.json",),
+        ("aws",),
+        render_cursor_mcp_json,
+        "application/json; charset=utf-8",
     ),
 )
 
