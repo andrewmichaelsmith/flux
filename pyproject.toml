@@ -15,6 +15,15 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Topic :: Security",
 ]
+dependencies = [
+  "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-aiohttp>=1.0",
+]
 
 [project.scripts]
 flux = "flux.server:main"

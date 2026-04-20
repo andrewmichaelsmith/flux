@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import re
 import sys
-import threading
 import time
 import uuid
 import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, unquote
+
+import aiohttp
+from aiohttp import web
 
 
 API_BASE_URL = (os.environ.get("TRACEBIT_API_BASE_URL", "https://community.tracebit.com") or "https://community.tracebit.com").rstrip("/")
@@ -36,7 +36,7 @@ TARPIT_SECONDS = max(int((os.environ.get("TRACEBIT_ENV_TARPIT_SECONDS") or "0").
 TARPIT_CHUNK_BYTES = max(int((os.environ.get("TRACEBIT_ENV_TARPIT_CHUNK_BYTES") or "32").strip() or "32"), 1)
 TARPIT_INTERVAL_MS = max(int((os.environ.get("TRACEBIT_ENV_TARPIT_INTERVAL_MS") or "2000").strip() or "2000"), 100)
 TARPIT_MAX_CONNECTIONS = max(int((os.environ.get("TRACEBIT_ENV_TARPIT_MAX_CONNECTIONS") or "8").strip() or "8"), 1)
-TARPIT_SEMAPHORE = threading.BoundedSemaphore(TARPIT_MAX_CONNECTIONS)
+_active_slow_drips = 0  # tarpit + fake-git share this cap; bumped per event loop (single-threaded).
 HEADER_VALUE_LOG_LIMIT = 512
 LOG_HEADER_NAMES = "Host,X-Forwarded-Host,X-Forwarded-For,X-Forwarded-Proto,True-Client-Ip,X-Real-Ip,X-Client-Ip,X-Azure-Clientip,X-Azure-Socketip,X-Originating-Ip,X-Host,Cf-Connecting-Ip,Content-Type,Content-Length".split(",")
 
@@ -348,8 +348,9 @@ def _parse_chain_params(query: str) -> tuple[str, int]:
 class TarpitModule:
     """Base class. Subclass and add to TARPIT_MODULES to activate.
 
-    terminal=True  -> module sends the full HTTP response itself.
-    terminal=False -> module adds headers/metadata; caller streams.
+    terminal=True  -> module produces a full aiohttp Response (and logs).
+    terminal=False -> module returns (extra_headers, meta) for the caller
+                      to merge into the tarpit stream's headers.
     """
 
     name: str = ""
@@ -358,8 +359,13 @@ class TarpitModule:
     def should_run(self, ctx: dict[str, object]) -> bool:
         return False
 
-    def execute(self, handler: object, ctx: dict[str, object]) -> dict[str, object]:
-        return {}
+    async def run_terminal(self, request: "web.Request", ctx: dict[str, object]) -> "web.Response":
+        raise NotImplementedError
+
+    def augment(
+        self, request: "web.Request", ctx: dict[str, object]
+    ) -> tuple[dict[str, str], dict[str, object]]:
+        return {}, {}
 
 
 class DNSCallbackModule(TarpitModule):
@@ -371,17 +377,10 @@ class DNSCallbackModule(TarpitModule):
     def should_run(self, ctx):
         return MOD_DNS_CALLBACK_ENABLED and MOD_DNS_CALLBACK_DOMAIN
 
-    def execute(self, handler, ctx):
+    async def run_terminal(self, request, ctx):
         callback_id = str(uuid.uuid4())
         proto = ctx.get("protocol", "https")
         location = f"{proto}://{callback_id}.{MOD_DNS_CALLBACK_DOMAIN}{ctx['path']}"
-        handler.send_response(302)
-        handler.send_header("Location", location)
-        handler.send_header("Content-Type", "text/plain; charset=utf-8")
-        handler.send_header("Cache-Control", "no-store")
-        handler.end_headers()
-        if ctx.get("send_body", True):
-            handler.wfile.write(b"redirecting\n")
         append_log({
             **ctx["log_context"],
             "status": 302,
@@ -390,7 +389,15 @@ class DNSCallbackModule(TarpitModule):
             "callbackId": callback_id,
             "location": location,
         })
-        return {"terminal": True}
+        return web.Response(
+            status=302,
+            body=b"redirecting\n",
+            headers={
+                "Location": location,
+                "Content-Type": "text/plain; charset=utf-8",
+                "Cache-Control": "no-store",
+            },
+        )
 
 
 class CookieTrackingModule(TarpitModule):
@@ -402,8 +409,8 @@ class CookieTrackingModule(TarpitModule):
     def should_run(self, ctx):
         return MOD_COOKIE_ENABLED
 
-    def execute(self, handler, ctx):
-        cookie_header = handler.headers.get("Cookie", "")
+    def augment(self, request, ctx):
+        cookie_header = request.headers.get("Cookie", "")
         returned_tid = ""
         if "_hp_tid=" in cookie_header:
             for part in cookie_header.split(";"):
@@ -412,14 +419,11 @@ class CookieTrackingModule(TarpitModule):
                     returned_tid = part[8:]
                     break
         cookie_id = str(uuid.uuid4())
-        handler.send_header(
-            "Set-Cookie",
-            f"_hp_tid={cookie_id}; Path=/; HttpOnly; SameSite=Lax",
-        )
+        headers = {"Set-Cookie": f"_hp_tid={cookie_id}; Path=/; HttpOnly; SameSite=Lax"}
         meta: dict[str, object] = {"cookieId": cookie_id}
         if returned_tid:
             meta["cookieReturned"] = returned_tid
-        return meta
+        return headers, meta
 
 
 class RedirectChainModule(TarpitModule):
@@ -433,16 +437,9 @@ class RedirectChainModule(TarpitModule):
             return False
         return not ctx.get("query") or "_hp_chain" not in ctx["query"]
 
-    def execute(self, handler, ctx):
+    async def run_terminal(self, request, ctx):
         chain_id = str(uuid.uuid4())
         location = f"{ctx['path']}?_hp_chain={chain_id}&_hp_hop=1"
-        handler.send_response(302)
-        handler.send_header("Location", location)
-        handler.send_header("Content-Type", "text/plain; charset=utf-8")
-        handler.send_header("Cache-Control", "no-store")
-        handler.end_headers()
-        if ctx.get("send_body", True):
-            handler.wfile.write(b"redirecting\n")
         append_log({
             **ctx["log_context"],
             "status": 302,
@@ -451,7 +448,15 @@ class RedirectChainModule(TarpitModule):
             "chainId": chain_id,
             "hop": 0,
         })
-        return {"terminal": True}
+        return web.Response(
+            status=302,
+            body=b"redirecting\n",
+            headers={
+                "Location": location,
+                "Content-Type": "text/plain; charset=utf-8",
+                "Cache-Control": "no-store",
+            },
+        )
 
 
 class ContentLengthMismatchModule(TarpitModule):
@@ -463,9 +468,11 @@ class ContentLengthMismatchModule(TarpitModule):
     def should_run(self, ctx):
         return MOD_CONTENT_LENGTH_MISMATCH_ENABLED
 
-    def execute(self, handler, ctx):
-        handler.send_header("Content-Length", str(MOD_CONTENT_LENGTH_CLAIMED_BYTES))
-        return {"claimedBytes": MOD_CONTENT_LENGTH_CLAIMED_BYTES}
+    def augment(self, request, ctx):
+        return (
+            {"Content-Length": str(MOD_CONTENT_LENGTH_CLAIMED_BYTES)},
+            {"claimedBytes": MOD_CONTENT_LENGTH_CLAIMED_BYTES},
+        )
 
 
 class ETagProbeModule(TarpitModule):
@@ -477,21 +484,20 @@ class ETagProbeModule(TarpitModule):
     def should_run(self, ctx):
         return MOD_ETAG_PROBE_ENABLED
 
-    def execute(self, handler, ctx):
+    def augment(self, request, ctx):
         request_id = ctx.get("request_id", "")
         etag_value = f'"{request_id}"'
-        handler.send_header("ETag", etag_value)
-        handler.send_header("Last-Modified", "Mon, 01 Jan 2024 00:00:00 GMT")
+        headers = {"ETag": etag_value, "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT"}
         meta: dict[str, object] = {"etag": etag_value}
-        if_none_match = handler.headers.get("If-None-Match", "")
-        if_modified_since = handler.headers.get("If-Modified-Since", "")
+        if_none_match = request.headers.get("If-None-Match", "")
+        if_modified_since = request.headers.get("If-Modified-Since", "")
         if if_none_match:
             meta["conditionalRequest"] = True
             meta["ifNoneMatch"] = if_none_match[:256]
         if if_modified_since:
             meta["conditionalRequest"] = True
             meta["ifModifiedSince"] = if_modified_since[:256]
-        return meta
+        return headers, meta
 
 
 TARPIT_MODULES: list[TarpitModule] = []
@@ -516,7 +522,22 @@ def build_tarpit_chunk(request_id: str, path: str, chunk_index: int) -> bytes:
     return base + b"\n"
 
 
-def issue_credentials(
+# One aiohttp session per process, created on first use. Reusing the session
+# pools TCP+TLS connections to Tracebit so rapid cache-miss bursts don't each
+# pay the handshake cost.
+_http_session: aiohttp.ClientSession | None = None
+
+
+async def _get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
+    return _http_session
+
+
+async def issue_credentials(
     request_id: str,
     client_ip: str,
     host: str,
@@ -543,19 +564,17 @@ def issue_credentials(
             {"name": "user_agent", "value": (user_agent or "unknown")[:180]},
         ],
     }
-    body = json.dumps(payload).encode("utf-8")
-    req = Request(
+    session = await _get_http_session()
+    async with session.post(
         issue_url,
-        data=body,
+        json=payload,
         headers={
             "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
             "Accept": "application/json",
         },
-        method="POST",
-    )
-    with urlopen(req, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
+    ) as response:
+        response.raise_for_status()
+        return await response.json()
 
 
 def format_env_payload(tracebit_response: dict[str, object]) -> str:
@@ -611,8 +630,17 @@ def format_env_payload(tracebit_response: dict[str, object]) -> str:
 
 # --- Fake /.git/ tree builder ---
 
-_FAKE_GIT_LOCK = threading.Lock()
+_FAKE_GIT_LOCK: asyncio.Lock | None = None
 _FAKE_GIT_CACHE: dict[str, tuple[float, dict[str, bytes], dict[str, object]]] = {}
+
+
+def _get_fake_git_lock() -> asyncio.Lock:
+    # Must be created inside a running event loop; lazily initialize so the
+    # module can be imported outside an async context (tests, etc.).
+    global _FAKE_GIT_LOCK
+    if _FAKE_GIT_LOCK is None:
+        _FAKE_GIT_LOCK = asyncio.Lock()
+    return _FAKE_GIT_LOCK
 
 
 def _git_loose_object(obj_type: bytes, content: bytes) -> tuple[str, bytes]:
@@ -753,7 +781,7 @@ def _build_fake_repo(secrets_body: str) -> tuple[dict[str, bytes], dict[str, obj
     return files, meta
 
 
-def _fake_git_get_or_build(
+async def _fake_git_get_or_build(
     client_ip: str,
     request_id: str,
     host: str,
@@ -768,14 +796,17 @@ def _fake_git_get_or_build(
     """
     now = time.monotonic()
     cache_key = client_ip or f"_anon-{request_id}"
-    with _FAKE_GIT_LOCK:
+    lock = _get_fake_git_lock()
+    async with lock:
         entry = _FAKE_GIT_CACHE.get(cache_key)
         if entry and entry[0] > now:
             return entry[1], entry[2]
 
+    # Release the lock during the network call so a burst of different IPs
+    # can issue in parallel; the cache is only guarded for mutation.
     try:
-        tracebit_response = issue_credentials(request_id, client_ip, host, user_agent, path, proto)
-    except (HTTPError, URLError, TimeoutError, ValueError):
+        tracebit_response = await issue_credentials(request_id, client_ip, host, user_agent, path, proto)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
         return None
 
     secrets_body = _format_secrets_yaml(tracebit_response)
@@ -783,7 +814,7 @@ def _fake_git_get_or_build(
     meta["canaryTypes"] = [key for key, value in tracebit_response.items() if value]
 
     expiry = now + FAKE_GIT_CACHE_TTL_SECONDS
-    with _FAKE_GIT_LOCK:
+    async with lock:
         expired = [k for k, v in _FAKE_GIT_CACHE.items() if v[0] <= now]
         for k in expired:
             del _FAKE_GIT_CACHE[k]
@@ -801,7 +832,7 @@ def _fake_git_get_or_build(
 # (wp-config.php, .aws/credentials, a SQL dump, etc.). Per-IP cache keeps
 # repeated scanner fan-out from burning Tracebit quota.
 
-_CANARY_LOCK = threading.Lock()
+_CANARY_LOCK: asyncio.Lock | None = None
 _CANARY_CACHE: dict[tuple[str, tuple[str, ...]], tuple[float, dict[str, object]]] = {}
 CANARY_TRAP_CACHE_TTL_SECONDS = max(
     int((os.environ.get("CANARY_TRAP_CACHE_TTL_SECONDS") or "3600").strip() or "3600"), 60,
@@ -812,7 +843,14 @@ CANARY_TRAP_CACHE_MAX_ENTRIES = max(
 CANARY_TRAPS_ENABLED = _env_bool("CANARY_TRAPS_ENABLED")
 
 
-def _get_or_issue_canary(
+def _get_canary_lock() -> asyncio.Lock:
+    global _CANARY_LOCK
+    if _CANARY_LOCK is None:
+        _CANARY_LOCK = asyncio.Lock()
+    return _CANARY_LOCK
+
+
+async def _get_or_issue_canary(
     types: tuple[str, ...],
     client_ip: str,
     request_id: str,
@@ -828,16 +866,17 @@ def _get_or_issue_canary(
     """
     now = time.monotonic()
     cache_key = (client_ip or f"_anon-{request_id}", types)
-    with _CANARY_LOCK:
+    lock = _get_canary_lock()
+    async with lock:
         entry = _CANARY_CACHE.get(cache_key)
         if entry and entry[0] > now:
             return entry[1]
     try:
-        resp = issue_credentials(request_id, client_ip, host, user_agent, path, proto, types=types)
-    except (HTTPError, URLError, TimeoutError, ValueError):
+        resp = await issue_credentials(request_id, client_ip, host, user_agent, path, proto, types=types)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
         return None
     expiry = now + CANARY_TRAP_CACHE_TTL_SECONDS
-    with _CANARY_LOCK:
+    async with lock:
         expired = [k for k, v in _CANARY_CACHE.items() if v[0] <= now]
         for k in expired:
             del _CANARY_CACHE[k]
@@ -1368,483 +1407,463 @@ def find_canary_trap(path: str) -> "CanaryTrap | None":
     return _TRAP_BY_PATH.get(path.lower())
 
 
-class EnvHandler(BaseHTTPRequestHandler):
-    server_version = "flux/0.1"
 
-    def log_message(self, format: str, *args: object) -> None:
-        return
 
-    def do_HEAD(self) -> None:
-        self._handle(send_body=False)
 
-    def do_GET(self) -> None:
-        self._handle(send_body=True)
+# ============================================================================
+# Async HTTP handler — aiohttp
+# ============================================================================
 
-    def do_POST(self) -> None:
-        self._handle(send_body=True, read_body=True)
 
-    def _send_canary_trap(
-        self,
-        trap: "CanaryTrap",
-        *,
-        request_id: str,
-        path: str,
-        client_ip: str,
-        host: str,
-        user_agent: str,
-        proto: str,
-        log_context: dict[str, object],
-        send_body: bool,
-    ) -> None:
-        tracebit_response = _get_or_issue_canary(
-            trap.canary_types, client_ip, request_id, host, user_agent, path, proto,
+def _log_context_from_request(request: web.Request, request_id: str, body_bytes_read: int, body_sha256: str) -> dict[str, object]:
+    host = clean_host(request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or "")
+    client_ip = first_forwarded_ip(request.headers.get("X-Forwarded-For", ""))
+    user_agent = request.headers.get("User-Agent", "")
+    proto = (request.headers.get("X-Forwarded-Proto") or "http").strip().lower()
+    url = request.rel_url
+    raw_path = url.raw_path
+    query_string = url.raw_query_string
+    raw_target = raw_path + (("?" + query_string) if query_string else "")
+    path = normalize_path(raw_path)
+    return {
+        "timestamp": utc_now(),
+        "requestId": request_id,
+        "method": request.method,
+        "host": host,
+        "path": path,
+        "rawPath": raw_path,
+        "rawTarget": raw_target,
+        "query": query_string,
+        "clientIp": client_ip,
+        "userAgent": user_agent,
+        "protocol": proto,
+        "headers": header_subset(request.headers),
+        "bodyBytesRead": body_bytes_read,
+        "bodySha256": body_sha256,
+    }
+
+
+async def _handle_webshell(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    query_params = parse_qs(query_string, keep_blank_values=True) if query_string else {}
+    content_type = request.headers.get("Content-Type", "")
+    form_params = parse_form_body(request_body, content_type)
+    cookies = parse_cookies(request.headers.get("Cookie", ""))
+    command_source, command_key, command = extract_webshell_command(
+        query_params, form_params, cookies, request.headers,
+    )
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    output = simulate_command_output(command) if command else ""
+    payload = render_webshell_page(command=command, output=output)
+
+    log_entry = {
+        **log_context,
+        "status": 200,
+        "result": "webshell-command" if command else "webshell-probe",
+        "webshellPath": path,
+        "commandSource": command_source,
+        "commandKey": command_key,
+        "command": command,
+        "simulatedOutputBytes": len(output),
+        "cookieNames": sorted(cookies.keys()),
+        "queryParamNames": sorted(query_params.keys()),
+        "formParamNames": sorted(form_params.keys()),
+        "contentType": content_type[:120],
+    }
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview
+    append_log(log_entry)
+
+    return web.Response(
+        status=200, body=payload,
+        headers={
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+async def _send_canary_trap(
+    request: web.Request,
+    trap: "CanaryTrap",
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.Response:
+    tracebit_response = await _get_or_issue_canary(
+        trap.canary_types, client_ip, request_id, host, user_agent, path, proto,
+    )
+    if tracebit_response is None:
+        append_log({**log_context, "status": 502, "result": f"{trap.name}-error"})
+        return web.Response(
+            status=502, body=b"upstream credential issue failed\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
         )
-        if tracebit_response is None:
-            self.send_response(502)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            append_log({**log_context, "status": 502, "result": f"{trap.name}-error"})
-            if send_body:
-                self.wfile.write(b"upstream credential issue failed\n")
-            return
 
-        try:
-            body = trap.render(tracebit_response)
-        except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
-            self.send_response(502)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            append_log({
-                **log_context,
-                "status": 502,
-                "result": f"{trap.name}-render-error",
-                "error": str(exc)[:400],
-            })
-            if send_body:
-                self.wfile.write(b"render error\n")
-            return
+    try:
+        body = trap.render(tracebit_response)
+    except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
+        append_log({
+            **log_context, "status": 502, "result": f"{trap.name}-render-error",
+            "error": str(exc)[:400],
+        })
+        return web.Response(
+            status=502, body=b"render error\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
 
-        self.send_response(200)
-        self.send_header("Content-Type", trap.content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for header_name, header_value in trap.extra_headers(tracebit_response):
-            self.send_header(header_name, header_value)
-        self.end_headers()
+    response = web.Response(status=200, body=body)
+    response.headers["Content-Type"] = trap.content_type
+    response.headers["Cache-Control"] = "no-store"
+    for header_name, header_value in trap.extra_headers(tracebit_response):
+        response.headers[header_name] = header_value
+
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": trap.name,
+        "canaryTypes": [k for k, v in tracebit_response.items() if v],
+        "bytes": len(body),
+    })
+    return response
+
+
+async def _send_fake_git(
+    request: web.Request,
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.StreamResponse:
+    global _active_slow_drips
+    result = await _fake_git_get_or_build(client_ip, request_id, host, user_agent, path, proto)
+    if result is None:
+        append_log({**log_context, "status": 502, "result": "fake-git-error"})
+        return web.Response(
+            status=502, body=b"upstream credential issue failed\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    files, meta = result
+    content = files.get(path)
+    if content is None:
+        append_log({
+            **log_context, "status": 404, "result": "fake-git-miss",
+            "commitSha": meta.get("commitSha", ""),
+        })
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    if path.startswith("/.git/objects/") and "/info/" not in path:
+        content_type = "application/x-git-loose-object"
+    else:
+        content_type = "text/plain; charset=utf-8"
+
+    if _active_slow_drips >= TARPIT_MAX_CONNECTIONS:
+        append_log({**log_context, "status": 503, "result": "fake-git-capacity"})
+        return web.Response(
+            status=503, body=b"busy\n",
+            headers={
+                "Content-Type": "text/plain; charset=utf-8",
+                "Cache-Control": "no-store",
+            },
+        )
+    _active_slow_drips += 1
+    try:
+        response = web.StreamResponse(status=200, headers={
+            "Content-Type": content_type,
+            "Content-Length": str(len(content)),
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        })
+        await response.prepare(request)
         append_log({
             **log_context,
             "status": 200,
-            "result": trap.name,
-            "canaryTypes": [k for k, v in tracebit_response.items() if v],
-            "bytes": len(body),
+            "result": "fake-git",
+            "commitSha": meta.get("commitSha", ""),
+            "rootTreeSha": meta.get("rootTreeSha", ""),
+            "secretsBlobSha": meta.get("secretsBlobSha", ""),
+            "canaryTypes": meta.get("canaryTypes", []),
+            "fakeGitBytes": len(content),
+            "fakeGitDripBytes": FAKE_GIT_DRIP_BYTES,
+            "fakeGitDripIntervalMs": FAKE_GIT_DRIP_INTERVAL_MS,
         })
-        if send_body:
-            self.wfile.write(body)
+        if request.method == "HEAD":
+            return response
 
-    def _send_fake_git(
-        self,
-        *,
-        request_id: str,
-        path: str,
-        client_ip: str,
-        host: str,
-        user_agent: str,
-        proto: str,
-        log_context: dict[str, object],
-        send_body: bool,
-    ) -> None:
-        result = _fake_git_get_or_build(client_ip, request_id, host, user_agent, path, proto)
-        if result is None:
-            self.send_response(502)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            append_log({**log_context, "status": 502, "result": "fake-git-error"})
-            if send_body:
-                self.wfile.write(b"upstream credential issue failed\n")
-            return
-
-        files, meta = result
-        content = files.get(path)
-        if content is None:
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            append_log({
-                **log_context,
-                "status": 404,
-                "result": "fake-git-miss",
-                "commitSha": meta.get("commitSha", ""),
-            })
-            if send_body:
-                self.wfile.write(b"not found\n")
-            return
-
-        if path.startswith("/.git/objects/") and "/info/" not in path:
-            content_type = "application/x-git-loose-object"
-        else:
-            content_type = "text/plain; charset=utf-8"
-
-        # Share the tarpit semaphore: fake-git is another slow-response path.
-        acquired = TARPIT_SEMAPHORE.acquire(blocking=False)
-        if not acquired:
-            self.send_response(503)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            append_log({**log_context, "status": 503, "result": "fake-git-capacity"})
-            if send_body:
-                self.wfile.write(b"busy\n")
-            return
-
+        interval_s = FAKE_GIT_DRIP_INTERVAL_MS / 1000.0
         bytes_sent = 0
         try:
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(content)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "close")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            append_log({
-                **log_context,
-                "status": 200,
-                "result": "fake-git",
-                "commitSha": meta.get("commitSha", ""),
-                "rootTreeSha": meta.get("rootTreeSha", ""),
-                "secretsBlobSha": meta.get("secretsBlobSha", ""),
-                "canaryTypes": meta.get("canaryTypes", []),
-                "fakeGitBytes": len(content),
-                "fakeGitDripBytes": FAKE_GIT_DRIP_BYTES,
-                "fakeGitDripIntervalMs": FAKE_GIT_DRIP_INTERVAL_MS,
-            })
-            if not send_body:
-                return
-            interval_s = FAKE_GIT_DRIP_INTERVAL_MS / 1000.0
             for offset in range(0, len(content), FAKE_GIT_DRIP_BYTES):
                 chunk = content[offset:offset + FAKE_GIT_DRIP_BYTES]
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                await response.write(chunk)
                 bytes_sent += len(chunk)
                 if offset + FAKE_GIT_DRIP_BYTES < len(content):
-                    time.sleep(interval_s)
-        except (BrokenPipeError, ConnectionResetError):
+                    await asyncio.sleep(interval_s)
+        except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientConnectionError):
             append_log({
-                **log_context,
-                "status": 200,
-                "result": "fake-git-disconnect",
+                **log_context, "status": 200, "result": "fake-git-disconnect",
                 "fakeGitBytesSent": bytes_sent,
                 "commitSha": meta.get("commitSha", ""),
             })
-        finally:
-            TARPIT_SEMAPHORE.release()
+        return response
+    finally:
+        _active_slow_drips -= 1
 
-    def _send_tarpit(self, *, request_id: str, path: str, log_context: dict[str, object], send_body: bool, query: str = "") -> None:
-        module_ctx: dict[str, object] = {
-            "log_context": log_context,
-            "path": path,
-            "query": query,
-            "protocol": log_context.get("protocol", "https"),
-            "host": log_context.get("host", ""),
-            "send_body": send_body,
-            "request_id": request_id,
-        }
 
-        # --- Terminal modules (first match wins) ---
-        for mod in TARPIT_MODULES:
-            if mod.terminal and mod.should_run(module_ctx):
-                mod.execute(self, module_ctx)
-                return
+async def _send_tarpit(
+    request: web.Request,
+    request_id: str,
+    path: str,
+    log_context: dict[str, object],
+    query: str,
+) -> web.StreamResponse:
+    global _active_slow_drips
+    ctx: dict[str, object] = {
+        "log_context": log_context,
+        "path": path,
+        "query": query,
+        "protocol": log_context.get("protocol", "https"),
+        "host": log_context.get("host", ""),
+        "send_body": request.method != "HEAD",
+        "request_id": request_id,
+    }
 
-        # --- Redirect-chain continuation ---
-        if query:
-            chain_id, hop = _parse_chain_params(query)
-            if chain_id and MOD_REDIRECT_CHAIN_ENABLED:
-                if hop < MOD_REDIRECT_CHAIN_MAX_HOPS:
-                    location = f"{path}?_hp_chain={chain_id}&_hp_hop={hop + 1}"
-                    self.send_response(302)
-                    self.send_header("Location", location)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
-                    if send_body:
-                        self.wfile.write(b"redirecting\n")
-                    append_log({
-                        **log_context,
-                        "status": 302,
-                        "result": "tarpit-module",
-                        "module": "redirect-chain",
-                        "chainId": chain_id,
-                        "hop": hop,
-                    })
-                    return
-                # Chain exhausted — fall through to tarpit stream
+    # Terminal modules (first match wins).
+    for mod in TARPIT_MODULES:
+        if mod.terminal and mod.should_run(ctx):
+            return await mod.run_terminal(request, ctx)
 
-        # --- Semaphore gate ---
-        acquired = TARPIT_SEMAPHORE.acquire(blocking=False)
-        if not acquired:
-            self.send_response(503)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            append_log({**log_context, "status": 503, "result": "tarpit-capacity"})
-            if send_body:
-                self.wfile.write(b"busy\n")
-            return
+    # Redirect-chain continuation.
+    if query:
+        chain_id, hop = _parse_chain_params(query)
+        if chain_id and MOD_REDIRECT_CHAIN_ENABLED:
+            if hop < MOD_REDIRECT_CHAIN_MAX_HOPS:
+                location = f"{path}?_hp_chain={chain_id}&_hp_hop={hop + 1}"
+                append_log({
+                    **log_context,
+                    "status": 302,
+                    "result": "tarpit-module",
+                    "module": "redirect-chain",
+                    "chainId": chain_id,
+                    "hop": hop,
+                })
+                return web.Response(
+                    status=302, body=b"redirecting\n",
+                    headers={
+                        "Location": location,
+                        "Content-Type": "text/plain; charset=utf-8",
+                        "Cache-Control": "no-store",
+                    },
+                )
+            # Chain exhausted — fall through to drip.
 
-        chunks_sent = 0
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "close")
-            self.send_header("X-Accel-Buffering", "no")
-
-            # --- Augmenting modules (add headers / metadata) ---
-            aug_meta: dict[str, object] = {}
-            for mod in TARPIT_MODULES:
-                if not mod.terminal and mod.should_run(module_ctx):
-                    result = mod.execute(self, module_ctx)
-                    if result:
-                        aug_meta[mod.name] = result
-
-            self.end_headers()
-
-            log_entry: dict[str, object] = {
-                **log_context,
-                "status": 200,
-                "result": "tarpit",
-                "tarpitChunkBytes": TARPIT_CHUNK_BYTES,
-                "tarpitIntervalMs": TARPIT_INTERVAL_MS,
-                "tarpitSeconds": TARPIT_SECONDS,
-            }
-            if aug_meta:
-                log_entry["modules"] = aug_meta
-            append_log(log_entry)
-
-            if not send_body:
-                return
-
-            # --- Stream with optional variable drip ---
-            if MOD_VARIABLE_DRIP_ENABLED:
-                interval_ms = float(MOD_VARIABLE_DRIP_INITIAL_MS)
-            else:
-                interval_ms = float(TARPIT_INTERVAL_MS)
-
-            if TARPIT_SECONDS > 0:
-                deadline = time.monotonic() + TARPIT_SECONDS
-                keep_streaming = lambda: time.monotonic() < deadline
-            else:
-                keep_streaming = lambda: True
-
-            while keep_streaming():
-                self.wfile.write(build_tarpit_chunk(request_id, path, chunks_sent))
-                self.wfile.flush()
-                chunks_sent += 1
-                time.sleep(interval_ms / 1000.0)
-                if MOD_VARIABLE_DRIP_ENABLED:
-                    interval_ms = min(interval_ms * 1.5, float(MOD_VARIABLE_DRIP_MAX_MS))
-        except (BrokenPipeError, ConnectionResetError):
-            append_log({**log_context, "status": 200, "result": "tarpit-disconnect", "tarpitChunksSent": chunks_sent})
-        finally:
-            TARPIT_SEMAPHORE.release()
-
-    def _handle_webshell(
-        self,
-        *,
-        log_context: dict[str, object],
-        path: str,
-        query_string: str,
-        request_body: bytes,
-        send_body: bool,
-    ) -> None:
-        query_params = parse_qs(query_string, keep_blank_values=True) if query_string else {}
-        content_type = self.headers.get("Content-Type", "")
-        form_params = parse_form_body(request_body, content_type)
-        cookies = parse_cookies(self.headers.get("Cookie", ""))
-        command_source, command_key, command = extract_webshell_command(
-            query_params, form_params, cookies, self.headers,
+    # Concurrency gate (simple int counter — safe in single-threaded event loop).
+    if _active_slow_drips >= TARPIT_MAX_CONNECTIONS:
+        append_log({**log_context, "status": 503, "result": "tarpit-capacity"})
+        return web.Response(
+            status=503, body=b"busy\n",
+            headers={
+                "Content-Type": "text/plain; charset=utf-8",
+                "Cache-Control": "no-store",
+            },
         )
+    _active_slow_drips += 1
+    try:
+        # Augmenting modules contribute headers + log metadata.
+        aug_meta: dict[str, object] = {}
+        extra_headers: dict[str, str] = {}
+        for mod in TARPIT_MODULES:
+            if not mod.terminal and mod.should_run(ctx):
+                mod_headers, mod_meta = mod.augment(request, ctx)
+                extra_headers.update(mod_headers)
+                if mod_meta:
+                    aug_meta[mod.name] = mod_meta
 
-        body_preview = ""
-        if request_body:
-            try:
-                body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
-            except UnicodeDecodeError:
-                body_preview = ""
+        response = web.StreamResponse(status=200, headers={
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+            **extra_headers,
+        })
+        await response.prepare(request)
 
-        output = simulate_command_output(command) if command else ""
-        payload = render_webshell_page(command=command, output=output)
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        if send_body:
-            self.wfile.write(payload)
-
-        log_entry = {
+        log_entry: dict[str, object] = {
             **log_context,
             "status": 200,
-            "result": "webshell-command" if command else "webshell-probe",
-            "webshellPath": path,
-            "commandSource": command_source,
-            "commandKey": command_key,
-            "command": command,
-            "simulatedOutputBytes": len(output),
-            "cookieNames": sorted(cookies.keys()),
-            "queryParamNames": sorted(query_params.keys()),
-            "formParamNames": sorted(form_params.keys()),
-            "contentType": content_type[:120],
+            "result": "tarpit",
+            "tarpitChunkBytes": TARPIT_CHUNK_BYTES,
+            "tarpitIntervalMs": TARPIT_INTERVAL_MS,
+            "tarpitSeconds": TARPIT_SECONDS,
         }
-        if body_preview:
-            log_entry["bodyPreview"] = body_preview
+        if aug_meta:
+            log_entry["modules"] = aug_meta
         append_log(log_entry)
 
-    def _handle(self, *, send_body: bool, read_body: bool = False) -> None:
-        request_id = str(uuid.uuid4())
-        host = clean_host(self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "")
-        client_ip = first_forwarded_ip(self.headers.get("X-Forwarded-For", ""))
-        user_agent = self.headers.get("User-Agent", "")
-        proto = (self.headers.get("X-Forwarded-Proto") or "http").strip().lower()
-        raw_target = self.path or "/"
-        parsed_target = urlsplit(raw_target)
-        raw_path = parsed_target.path or "/"
-        path = normalize_path(raw_path)
-        query_string = parsed_target.query or ""
-        body_bytes_expected = None
-        body_bytes_read = 0
-        body_sha256 = ""
-        request_body = b""
-        if read_body:
-            content_length_value = (self.headers.get("Content-Length") or "").strip()
-            if content_length_value:
-                try:
-                    body_bytes_expected = max(int(content_length_value), 0)
-                except ValueError:
-                    body_bytes_expected = None
-            if body_bytes_expected is not None:
-                read_cap = min(body_bytes_expected, WEBSHELL_BODY_READ_LIMIT)
-                request_body = self.rfile.read(read_cap)
-                body_bytes_read = len(request_body)
-                body_sha256 = hashlib.sha256(request_body).hexdigest()
+        if request.method == "HEAD":
+            return response
 
-        log_context = {
-            "timestamp": utc_now(),
-            "requestId": request_id,
-            "method": self.command,
-            "host": host,
-            "path": path,
-            "rawPath": raw_path,
-            "rawTarget": raw_target,
-            "query": query_string,
-            "clientIp": client_ip,
-            "userAgent": user_agent,
-            "protocol": proto,
-            "headers": header_subset(self.headers),
-            "bodyBytesRead": body_bytes_read,
-            "bodySha256": body_sha256,
-        }
+        if MOD_VARIABLE_DRIP_ENABLED:
+            interval_ms = float(MOD_VARIABLE_DRIP_INITIAL_MS)
+        else:
+            interval_ms = float(TARPIT_INTERVAL_MS)
 
-        # All traps respond regardless of Host header. Scanners spoof Host
-        # routinely, and we want to catch them; there's no "control sensor"
-        # mode. If you don't want traps, don't run flux.
-        if is_webshell_path(path):
-            self._handle_webshell(
-                log_context=log_context,
-                path=path,
-                query_string=query_string,
-                request_body=request_body,
-                send_body=send_body,
-            )
-            return
-
-        if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
-            self._send_tarpit(request_id=request_id, path=path, log_context=log_context, send_body=send_body, query=query_string)
-            return
-
-        if FAKE_GIT_ENABLED and API_KEY and (path == "/.git" or path.startswith("/.git/")):
-            self._send_fake_git(
-                request_id=request_id,
-                path=path,
-                client_ip=client_ip,
-                host=host,
-                user_agent=user_agent,
-                proto=proto,
-                log_context=log_context,
-                send_body=send_body,
-            )
-            return
-
-        if API_KEY:
-            trap = find_canary_trap(path)
-            if trap is not None:
-                self._send_canary_trap(
-                    trap,
-                    request_id=request_id,
-                    path=path,
-                    client_ip=client_ip,
-                    host=host,
-                    user_agent=user_agent,
-                    proto=proto,
-                    log_context=log_context,
-                    send_body=send_body,
-                )
-                return
-
-        if path != "/.env" or not API_KEY:
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            append_log({**log_context, "status": 404, "result": "not-handled"})
-            if send_body:
-                self.wfile.write(b"not found\n")
-            return
-
+        deadline = (time.monotonic() + TARPIT_SECONDS) if TARPIT_SECONDS > 0 else None
+        chunks_sent = 0
         try:
-            tracebit_response = issue_credentials(request_id, client_ip, host, user_agent, path, proto)
-            payload = format_env_payload(tracebit_response).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            append_log(
-                {
-                    **log_context,
-                    "status": 200,
-                    "result": "issued",
-                    "types": [key for key, value in tracebit_response.items() if value],
-                }
+            while deadline is None or time.monotonic() < deadline:
+                await response.write(build_tarpit_chunk(request_id, path, chunks_sent))
+                chunks_sent += 1
+                await asyncio.sleep(interval_ms / 1000.0)
+                if MOD_VARIABLE_DRIP_ENABLED:
+                    interval_ms = min(interval_ms * 1.5, float(MOD_VARIABLE_DRIP_MAX_MS))
+        except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientConnectionError):
+            append_log({
+                **log_context,
+                "status": 200,
+                "result": "tarpit-disconnect",
+                "tarpitChunksSent": chunks_sent,
+            })
+        return response
+    finally:
+        _active_slow_drips -= 1
+
+
+async def _send_env(
+    request: web.Request,
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.Response:
+    try:
+        tracebit_response = await issue_credentials(request_id, client_ip, host, user_agent, path, proto)
+    except aiohttp.ClientResponseError as exc:
+        append_log({
+            **log_context,
+            "status": 502,
+            "result": "tracebit-http-error",
+            "tracebitStatus": exc.status,
+            "error": (exc.message or "")[:400],
+        })
+        return web.Response(
+            status=502, body=b"upstream credential issue failed\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        append_log({
+            **log_context, "status": 502, "result": "tracebit-error",
+            "error": str(exc)[:400],
+        })
+        return web.Response(
+            status=502, body=b"upstream credential issue failed\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    payload = format_env_payload(tracebit_response).encode("utf-8")
+    append_log({
+        **log_context, "status": 200, "result": "issued",
+        "types": [key for key, value in tracebit_response.items() if value],
+    })
+    return web.Response(
+        status=200, body=payload,
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+    )
+
+
+async def handle(request: web.Request) -> web.StreamResponse:
+    method = request.method
+    if method not in ("GET", "HEAD", "POST"):
+        return web.Response(status=405, body=b"method not allowed\n")
+
+    request_id = str(uuid.uuid4())
+    read_body = method == "POST"
+
+    body_bytes_read = 0
+    body_sha256 = ""
+    request_body = b""
+    if read_body:
+        # Cap body size off the wire. aiohttp returns exactly N bytes or fewer;
+        # the scanner's Content-Length is advisory only, not trusted.
+        request_body = await request.content.read(WEBSHELL_BODY_READ_LIMIT)
+        body_bytes_read = len(request_body)
+        body_sha256 = hashlib.sha256(request_body).hexdigest()
+
+    log_context = _log_context_from_request(request, request_id, body_bytes_read, body_sha256)
+    path = str(log_context["path"])
+    query_string = str(log_context["query"])
+    client_ip = str(log_context["clientIp"])
+    host = str(log_context["host"])
+    user_agent = str(log_context["userAgent"])
+    proto = str(log_context["protocol"])
+
+    if is_webshell_path(path):
+        return await _handle_webshell(request, log_context, path, query_string, request_body)
+
+    if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
+        return await _send_tarpit(request, request_id, path, log_context, query_string)
+
+    if FAKE_GIT_ENABLED and API_KEY and (path == "/.git" or path.startswith("/.git/")):
+        return await _send_fake_git(
+            request, request_id, path, client_ip, host, user_agent, proto, log_context,
+        )
+
+    if API_KEY:
+        trap = find_canary_trap(path)
+        if trap is not None:
+            return await _send_canary_trap(
+                request, trap, request_id, path, client_ip, host, user_agent, proto, log_context,
             )
-            if send_body:
-                self.wfile.write(payload)
-            return
-        except HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
-            append_log({**log_context, "status": 502, "result": "tracebit-http-error", "tracebitStatus": exc.code, "error": error_body[:400]})
-            self.send_response(502)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            if send_body:
-                self.wfile.write(b"upstream credential issue failed\n")
-            return
-        except (URLError, TimeoutError, ValueError) as exc:
-            append_log({**log_context, "status": 502, "result": "tracebit-error", "error": str(exc)[:400]})
-            self.send_response(502)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            if send_body:
-                self.wfile.write(b"upstream credential issue failed\n")
-            return
+
+    if path != "/.env" or not API_KEY:
+        append_log({**log_context, "status": 404, "result": "not-handled"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    return await _send_env(
+        request, request_id, path, client_ip, host, user_agent, proto, log_context,
+    )
 
 
-class ReusableThreadingHTTPServer(ThreadingHTTPServer):
-    allow_reuse_address = True
+async def _close_http_session(app: web.Application) -> None:
+    global _http_session
+    if _http_session is not None and not _http_session.closed:
+        await _http_session.close()
+    _http_session = None
+
+
+def create_app() -> web.Application:
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handle)
+    app.on_cleanup.append(_close_http_session)
+    return app
 
 
 def main() -> int:
-    # Single clear startup line about which traps are active. Scanners don't
-    # read this, humans reading journalctl do.
     active = []
     if API_KEY:
         active.append("env-canary")
@@ -1861,10 +1880,13 @@ def main() -> int:
         active.append("tarpit")
     if WEBSHELL_ENABLED:
         active.append("webshell")
-    print(f"flux: listening on 127.0.0.1:18081, active traps: {', '.join(active) or 'none'}", file=sys.stderr)
+    print(
+        f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
+        file=sys.stderr,
+    )
 
-    server = ReusableThreadingHTTPServer(("127.0.0.1", 18081), EnvHandler)
-    server.serve_forever()
+    app = create_app()
+    web.run_app(app, host="127.0.0.1", port=18081, print=None, access_log=None)
     return 0
 
 
