@@ -33,30 +33,44 @@ those traps mint per-request canaries at hit time.
 
 | Var | Default | Notes |
 | --- | --- | --- |
-| `TRACEBIT_ENV_TARPIT_ENABLED` | *(unset → off)* | Master switch for the `.env`-variant tarpit. |
+| `TRACEBIT_ENV_TARPIT_ENABLED` | **on** | Master switch for the tarpit + fingerprint modules. |
 | `TRACEBIT_ENV_TARPIT_SECONDS` | `0` | Max duration per response. `0` = stream until the client hangs up. |
 | `TRACEBIT_ENV_TARPIT_CHUNK_BYTES` | `32` | |
 | `TRACEBIT_ENV_TARPIT_INTERVAL_MS` | `2000` | |
 | `TRACEBIT_ENV_TARPIT_MAX_CONNECTIONS` | `8` | Concurrent tarpit responses per process. Shared with the fake-git drip. |
+
+### Fingerprint paths
+
+The tarpit originally only fired on `.env` variants; that missed scanners
+who weren't hunting for `.env` files. These paths route into the same
+tarpit + module chain for first-contact fingerprinting.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `FINGERPRINT_PATHS_ENABLED` | **on** | Route generic paths through the fingerprint chain. |
+| `FINGERPRINT_PATHS_CSV` | `/,/index.html,/index.php,/robots.txt,/sitemap.xml,/favicon.ico` | Case-insensitive exact-match. |
 
 ### Tarpit modules
 
 Each is independently toggleable. When multiple *terminal* modules are
 enabled, the first match wins in module-registration order.
 
+**All default to ON** — flux is a honeypot, the whole point is to
+fingerprint. Set any single var to `false` / `0` to disable just that one.
+
 | Var | Default | Notes |
 | --- | --- | --- |
-| `TARPIT_MOD_DNS_CALLBACK_ENABLED` | off | Redirect to `<uuid>.$TARPIT_MOD_DNS_CALLBACK_DOMAIN` to fingerprint DNS resolution. |
-| `TARPIT_MOD_DNS_CALLBACK_DOMAIN` | *(empty)* | Required if DNS-callback is enabled. Needs a wildcard record pointing back at a logging endpoint. |
-| `TARPIT_MOD_COOKIE_ENABLED` | off | Set `_hp_tid=<uuid>`; detect persistent cookie jars and cross-IP reuse. |
-| `TARPIT_MOD_REDIRECT_CHAIN_ENABLED` | off | Issue a chain of 302s up to N hops, then fall through to the tarpit stream. |
+| `TARPIT_MOD_DNS_CALLBACK_ENABLED` | on | Redirect to `<uuid>.$TARPIT_MOD_DNS_CALLBACK_DOMAIN` to fingerprint DNS resolution. **No-op unless `TARPIT_MOD_DNS_CALLBACK_DOMAIN` is also set.** |
+| `TARPIT_MOD_DNS_CALLBACK_DOMAIN` | *(empty)* | Needs a wildcard record pointing back at a logging endpoint. |
+| `TARPIT_MOD_COOKIE_ENABLED` | on | Set `_hp_tid=<uuid>`; detect persistent cookie jars and cross-IP reuse. |
+| `TARPIT_MOD_REDIRECT_CHAIN_ENABLED` | on | Issue a chain of 302s up to N hops, then fall through to the tarpit stream. |
 | `TARPIT_MOD_REDIRECT_CHAIN_MAX_HOPS` | `5` | |
-| `TARPIT_MOD_VARIABLE_DRIP_ENABLED` | off | Start fast (500ms) and exponentially slow down to `MAX_MS` to fingerprint client timeouts. |
+| `TARPIT_MOD_VARIABLE_DRIP_ENABLED` | on | Start fast (500ms) and exponentially slow down to `MAX_MS` to fingerprint client timeouts. |
 | `TARPIT_MOD_VARIABLE_DRIP_INITIAL_MS` | `500` | |
 | `TARPIT_MOD_VARIABLE_DRIP_MAX_MS` | `16000` | |
-| `TARPIT_MOD_CONTENT_LENGTH_MISMATCH_ENABLED` | off | Claim `Content-Length: 1048576` then drip slowly. |
+| `TARPIT_MOD_CONTENT_LENGTH_MISMATCH_ENABLED` | on | Claim `Content-Length: 1048576` then drip slowly. |
 | `TARPIT_MOD_CONTENT_LENGTH_CLAIMED_BYTES` | `1048576` | |
-| `TARPIT_MOD_ETAG_PROBE_ENABLED` | off | Set `ETag` / `Last-Modified`; log conditional requests on repeat visits. |
+| `TARPIT_MOD_ETAG_PROBE_ENABLED` | on | Set `ETag` / `Last-Modified`; log conditional requests on repeat visits. |
 
 ## Fake `/.git/*` tree
 

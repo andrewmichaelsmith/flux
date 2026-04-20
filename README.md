@@ -3,6 +3,14 @@
 A small, single-binary HTTP honeypot intended to run behind nginx on a public
 sensor. Pure stdlib Python (3.11+), no external dependencies at runtime.
 
+> **Heads up: this is a pure vibe-coded app.** Every line was written by an
+> LLM working off natural-language prompts from a human operator, then smoke-
+> tested against a live sensor. It has not been audited by a human who read
+> every line. If you're planning to deploy it anywhere that matters, please
+> read [`flux/server.py`](./flux/server.py) end-to-end first, run the test
+> suite, and think about what `HONEYPOT_WEBSHELL_PATHS_CSV` or `FAKE_GIT_*`
+> hitting a real webroot would do. No warranties.
+
 Four layered traps, each independently toggleable via env var:
 
 1. **Fake `/.env` canary issuer** — on a hit, mints a per-request Tracebit
@@ -17,14 +25,21 @@ Four layered traps, each independently toggleable via env var:
    short-named `*.php` shells) and returns a plausible File Manager-ish
    page that invites follow-up commands. Simulates output for `id`,
    `whoami`, `uname -a`, `cat /etc/passwd`, etc. No Tracebit key required.
-4. **Modular tarpit** — on `.env` variants (`.env.bak`, `*/.env.prod`,
-   etc.), streams a slow-drip response. Pluggable modules:
-   - DNS callback (redirect to `<uuid>.<your-domain>` to fingerprint DNS)
+4. **Modular tarpit + fingerprinting** — streams a slow-drip response with
+   a chain of pluggable fingerprinting modules, triggered on either:
+   - `.env` variants (`.env.bak`, `*/.env.prod`, etc.), or
+   - generic first-contact paths (`/`, `/index.html`, `/index.php`,
+     `/robots.txt`, `/sitemap.xml`, `/favicon.ico`) — configurable via
+     `FINGERPRINT_PATHS_CSV`.
+
+   Modules (all default-on):
    - Cookie tracking (detects persistent cookie jars / cross-IP reuse)
+   - ETag / conditional-request probe
    - Redirect chain (measure follow-depth)
    - Variable drip rate (fingerprint client timeout resolution)
    - Content-Length mismatch (claim large CL, drip slowly)
-   - ETag / conditional-request probe
+   - DNS callback (redirect to `<uuid>.<your-domain>` — default-on but
+     a no-op until you set `TARPIT_MOD_DNS_CALLBACK_DOMAIN`)
 
    No Tracebit key required.
 
@@ -57,6 +72,8 @@ python -m flux
 ```
 
 See [`CONFIG.md`](./CONFIG.md) for the full env var list.
+See [`ROADMAP.md`](./ROADMAP.md) for proposed new trap surfaces (where
+else we could deploy the existing Tracebit Community canary types).
 
 ## Tests
 
