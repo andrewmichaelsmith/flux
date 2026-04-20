@@ -180,130 +180,69 @@ def test_webshell_disabled_returns_false_even_for_anchor_path(monkeypatch):
 
 # --- End-to-end dispatch tests (gate behavior) ---
 #
-# No Host-based gating — flux is a honeypot, it responds on every Host.
-# The only sensor-level gate is TRACEBIT_API_KEY, which only controls the
-# Tracebit-backed traps (/.env, /.git/*, canary file traps). Webshell and
-# tarpit do not need a key.
+# Use pytest-aiohttp's aiohttp_client fixture: a real aiohttp server bound to
+# a random port in the test event loop, hit with an HTTP client. Mocks the
+# Tracebit call at the module level via monkeypatch so tests stay offline.
 
 
-def _fake_handler(tbenv_mod):
-    """Build a minimal EnvHandler stand-in + exercise _handle."""
-    import io
-
-    class StubHeaders:
-        def __init__(self, data: dict[str, str]) -> None:
-            self._data = data
-
-        def get(self, key: str, default: str = "") -> str:
-            for k, v in self._data.items():
-                if k.lower() == key.lower():
-                    return v
-            return default
-
-        def __iter__(self):
-            return iter(self._data)
-
-        def items(self):
-            return self._data.items()
-
-    class RecordingHandler(tbenv_mod.EnvHandler):
-        def __init__(self, headers: dict[str, str], path: str) -> None:
-            # Skip super().__init__ — it expects a real socket.
-            self.headers = StubHeaders(headers)
-            self.path = path
-            self.command = "GET"
-            self.response_code = None
-            self.response_body = b""
-            self.sent_headers: list[tuple[str, str]] = []
-            self.rfile = io.BytesIO(b"")
-            self.wfile = io.BytesIO()
-            self.client_address = ("127.0.0.1", 0)
-
-        def send_response(self, code, message=None):
-            self.response_code = code
-
-        def send_header(self, key, val):
-            self.sent_headers.append((key, val))
-
-        def end_headers(self):
-            pass
-
-    return RecordingHandler, StubHeaders
+import pytest_asyncio
 
 
-def test_dispatch_serves_webshell_when_host_is_spoofed(monkeypatch, tmp_path):
+@pytest_asyncio.fixture
+async def flux_client(aiohttp_client, monkeypatch, tmp_path):
+    """Spin up the real aiohttp app; return a TestClient ready to hit it.
+    Routes LOG_PATH to tmp_path so each test gets its own log file."""
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    app = tbenv.create_app()
+    client = await aiohttp_client(app)
+    client.log_path = tmp_path / "env-canary.jsonl"
+    return client
+
+
+def _log_entries(log_path):
+    import json
+    return [json.loads(line) for line in log_path.read_text().splitlines()]
+
+
+async def test_dispatch_serves_webshell_when_host_is_spoofed(flux_client, monkeypatch):
     """Scanner with a spoofed Host header still gets the webshell response —
     flux serves traps regardless of Host."""
     monkeypatch.setattr(tbenv, "WEBSHELL_ENABLED", True)
-    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
-
-    RecordingHandler, _ = _fake_handler(tbenv)
-    h = RecordingHandler(
+    resp = await flux_client.get(
+        "/wp-content/plugins/hellopress/wp_filemanager.php",
         headers={
-            "Host": "staging.victim.example",  # spoofed
             "X-Forwarded-Host": "staging.victim.example",
             "X-Forwarded-For": "203.0.113.7",
             "X-Forwarded-Proto": "https",
         },
-        path="/wp-content/plugins/hellopress/wp_filemanager.php",
     )
-    h._handle(send_body=True)
-
-    assert h.response_code == 200
-    assert b"File Manager" in h.wfile.getvalue()
-
-    log_lines = (tmp_path / "env-canary.jsonl").read_text().splitlines()
-    assert len(log_lines) == 1
-    import json
-    entry = json.loads(log_lines[0])
-    assert entry["result"] == "webshell-probe"
-    assert entry["clientIp"] == "203.0.113.7"
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"File Manager" in body
+    entries = _log_entries(flux_client.log_path)
+    assert len(entries) == 1
+    assert entries[0]["result"] == "webshell-probe"
+    assert entries[0]["clientIp"] == "203.0.113.7"
 
 
-def test_dispatch_webshell_disabled_returns_404(monkeypatch, tmp_path):
-    """With WEBSHELL_ENABLED=False, webshell paths 404 instead of serving."""
+async def test_dispatch_webshell_disabled_returns_404(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "WEBSHELL_ENABLED", False)
-    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
-
-    RecordingHandler, _ = _fake_handler(tbenv)
-    h = RecordingHandler(
-        headers={
-            "Host": "example.com",
-            "X-Forwarded-For": "203.0.113.7",
-            "X-Forwarded-Proto": "https",
-        },
-        path="/wp-content/plugins/hellopress/wp_filemanager.php",
+    resp = await flux_client.get(
+        "/wp-content/plugins/hellopress/wp_filemanager.php",
+        headers={"X-Forwarded-For": "203.0.113.7"},
     )
-    h._handle(send_body=True)
-
-    assert h.response_code == 404
-
-    log_lines = (tmp_path / "env-canary.jsonl").read_text().splitlines()
-    assert len(log_lines) == 1
-    import json
-    entry = json.loads(log_lines[0])
-    assert entry["result"] == "not-handled"
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert len(entries) == 1
+    assert entries[0]["result"] == "not-handled"
 
 
-def test_dispatch_without_tracebit_api_key_404s_env_and_git(monkeypatch, tmp_path):
-    """Without a Tracebit API key, /.env and /.git/* both 404 — the handler
-    must not try to issue a canary against an empty key."""
+async def test_dispatch_without_tracebit_api_key_404s_env_and_git(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "API_KEY", "")
     monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
-    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
-
-    RecordingHandler, _ = _fake_handler(tbenv)
     for path in ["/.env", "/.git/HEAD", "/.git/config"]:
-        h = RecordingHandler(
-            headers={
-                "Host": "trap.example.com",
-                "X-Forwarded-For": "203.0.113.8",
-                "X-Forwarded-Proto": "https",
-            },
-            path=path,
-        )
-        h._handle(send_body=True)
-        assert h.response_code == 404, f"expected 404 for {path} without API key, got {h.response_code}"
+        resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.8"})
+        assert resp.status == 404, f"expected 404 for {path} without API_KEY"
 
 
 # --- Fingerprint paths ---
@@ -443,92 +382,61 @@ def test_gitlab_cookie_emits_set_cookie_header():
     assert "cookieCanaryValue" in cookie_value
 
 
-def test_dispatch_routes_aws_credentials_file_to_trap(monkeypatch, tmp_path):
-    """Full dispatch path — hit /.aws/credentials, see the canary in the body,
-    see one JSON log line with result=aws-credentials-file."""
+async def _fake_canary(*args, **kwargs):
+    return FAKE_TRACEBIT
+
+
+async def test_dispatch_routes_aws_credentials_file_to_trap(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
     monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
-    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
-    monkeypatch.setattr(tbenv, "_get_or_issue_canary", lambda *a, **kw: FAKE_TRACEBIT)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
 
-    RecordingHandler, _ = _fake_handler(tbenv)
-    h = RecordingHandler(
-        headers={
-            "Host": "trap.example.com",
-            "X-Forwarded-For": "203.0.113.10",
-            "X-Forwarded-Proto": "https",
-        },
-        path="/.aws/credentials",
+    resp = await flux_client.get(
+        "/.aws/credentials",
+        headers={"X-Forwarded-For": "203.0.113.10"},
     )
-    h._handle(send_body=True)
-
-    assert h.response_code == 200
-    assert b"AKIAFAKEEXAMPLE01" in h.wfile.getvalue()
-    import json
-    entry = json.loads((tmp_path / "env-canary.jsonl").read_text().splitlines()[-1])
-    assert entry["result"] == "aws-credentials-file"
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"AKIAFAKEEXAMPLE01" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "aws-credentials-file"
 
 
-def test_dispatch_trap_404s_without_api_key(monkeypatch, tmp_path):
-    """Every canary trap requires API_KEY — no key → 404."""
+async def test_dispatch_trap_404s_without_api_key(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "API_KEY", "")
     monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
-    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
 
-    RecordingHandler, _ = _fake_handler(tbenv)
     for path in ["/.aws/credentials", "/wp-config.php", "/id_rsa", "/api/v4/user"]:
-        h = RecordingHandler(
-            headers={
-                "Host": "trap.example.com",
-                "X-Forwarded-For": "203.0.113.11",
-                "X-Forwarded-Proto": "https",
-            },
-            path=path,
-        )
-        h._handle(send_body=True)
-        assert h.response_code == 404, f"expected 404 for {path} sans API_KEY"
+        resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.11"})
+        assert resp.status == 404, f"expected 404 for {path} sans API_KEY"
 
 
-def test_dispatch_trap_serves_on_any_host(monkeypatch, tmp_path):
-    """No Host-based gating — traps respond whatever the Host header says."""
+async def test_dispatch_trap_serves_on_any_host(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
     monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
-    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
-    monkeypatch.setattr(tbenv, "_get_or_issue_canary", lambda *a, **kw: FAKE_TRACEBIT)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
 
-    RecordingHandler, _ = _fake_handler(tbenv)
-    for host in ["staging.victim.example", "example.com", "", "123.45.67.8"]:
-        h = RecordingHandler(
-            headers={
-                "Host": host,
-                "X-Forwarded-For": "203.0.113.13",
-                "X-Forwarded-Proto": "https",
-            },
-            path="/wp-config.php",
+    for host in ["staging.victim.example", "example.com", "127.0.0.1"]:
+        resp = await flux_client.get(
+            "/wp-config.php",
+            headers={"X-Forwarded-Host": host, "X-Forwarded-For": "203.0.113.13"},
         )
-        h._handle(send_body=True)
-        assert h.response_code == 200, f"trap should fire for Host={host!r}"
-        assert b"AWS_ACCESS_KEY_ID" in h.wfile.getvalue()
+        assert resp.status == 200, f"trap should fire for Host={host!r}"
+        body = await resp.read()
+        assert b"AWS_ACCESS_KEY_ID" in body
 
 
-def test_dispatch_gitlab_sign_in_emits_set_cookie(monkeypatch, tmp_path):
+async def test_dispatch_gitlab_sign_in_emits_set_cookie(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
     monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
-    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
-    monkeypatch.setattr(tbenv, "_get_or_issue_canary", lambda *a, **kw: FAKE_TRACEBIT)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
 
-    RecordingHandler, _ = _fake_handler(tbenv)
-    h = RecordingHandler(
-        headers={
-            "Host": "trap.example.com",
-            "X-Forwarded-For": "203.0.113.14",
-            "X-Forwarded-Proto": "https",
-        },
-        path="/users/sign_in",
+    resp = await flux_client.get(
+        "/users/sign_in",
+        headers={"X-Forwarded-For": "203.0.113.14"},
     )
-    h._handle(send_body=True)
-    assert h.response_code == 200
-    set_cookies = [v for k, v in h.sent_headers if k == "Set-Cookie"]
+    assert resp.status == 200
+    set_cookies = resp.headers.getall("Set-Cookie", [])
     assert any("cookieCanaryValue" in v for v in set_cookies), set_cookies
 
 

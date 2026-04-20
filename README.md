@@ -1,7 +1,10 @@
 # flux
 
-A small, single-binary HTTP honeypot intended to run behind nginx on a public
-sensor. Pure stdlib Python (3.11+), no external dependencies at runtime.
+A small async HTTP honeypot intended to run behind nginx on a public sensor.
+Python 3.11+; one runtime dep — [aiohttp](https://docs.aiohttp.org/).
+
+Async so the tarpit and fake-git drip paths can hold thousands of concurrent
+slow-drip connections at ~8 KB each instead of one OS thread each.
 
 > **Heads up: this is a pure vibe-coded app.** Every line was written by an
 > LLM working off natural-language prompts from a human operator, then smoke-
@@ -52,9 +55,10 @@ for tailing into a log shipper.
 pip install .
 ```
 
-Or run in place:
+Or in place (needs `aiohttp` on the path):
 
 ```bash
+pip install aiohttp
 python -m flux
 ```
 
@@ -78,8 +82,17 @@ else we could deploy the existing Tracebit Community canary types).
 ## Tests
 
 ```bash
+pip install -e '.[dev]'
 python -m pytest
 ```
+
+Two test files:
+
+- `tests/test_server.py` — pure-function tests (renderers, path matchers,
+  parsers) + dispatch tests via aiohttp's in-process `TestClient`.
+- `tests/test_integration.py` — binds flux to a random port on 127.0.0.1
+  and hits it with a real HTTP client over the kernel loopback. Catches
+  anything that only breaks on a real socket.
 
 ## Why a fake webshell on a sensor that never had a real shell?
 

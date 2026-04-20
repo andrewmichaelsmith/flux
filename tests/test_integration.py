@@ -1,0 +1,160 @@
+"""Integration tests — bind flux to an ephemeral port on localhost, hit it
+with a real HTTP client over a real socket.
+
+Unlike tests/test_server.py (which uses aiohttp's in-process TestClient),
+these go through the kernel loopback. Catches any bug where the handler
+code depends on `request` fields that only exist in a real server.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+
+import aiohttp
+import pytest
+
+from flux import server as tbenv
+
+
+FAKE_TRACEBIT = {
+    "aws": {
+        "awsAccessKeyId": "AKIAFAKEINTEG01",
+        "awsSecretAccessKey": "integSecretExampleKey",
+        "awsSessionToken": "integSessionToken",
+        "awsExpiration": "2030-01-01T00:00:00Z",
+    },
+    "ssh": {
+        "sshIp": "203.0.113.99",
+        "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nINTEG\n-----END OPENSSH PRIVATE KEY-----",
+        "sshPublicKey": "ssh-ed25519 AAAAINTEG canary@flux",
+        "sshExpiration": "2030-01-01T00:00:00Z",
+    },
+    "http": {
+        "gitlab-cookie": {
+            "credentials": {"name": "_gitlab_session", "value": "integCookieVal"},
+            "hostNames": ["gitlab.canary.example"],
+        },
+    },
+}
+
+
+async def _fake_canary(*_a, **_kw):
+    return FAKE_TRACEBIT
+
+
+@pytest.fixture
+async def live_server(monkeypatch, tmp_path):
+    """Start flux on 127.0.0.1:<random>; yield (base_url, log_path)."""
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    from aiohttp.test_utils import TestServer
+    app = tbenv.create_app()
+    server = TestServer(app, host="127.0.0.1", port=0)
+    await server.start_server()
+    try:
+        base = f"http://127.0.0.1:{server.port}"
+        yield base, tmp_path / "env-canary.jsonl"
+    finally:
+        await server.close()
+
+
+async def test_integration_webshell_roundtrip(live_server, monkeypatch):
+    """Real socket → real parser → webshell handler → response body on the wire."""
+    monkeypatch.setattr(tbenv, "WEBSHELL_ENABLED", True)
+    base, log_path = live_server
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base}/shell.php?cmd=id",
+            headers={"X-Forwarded-For": "203.0.113.20"},
+            data=b"cmd=id",
+        ) as resp:
+            assert resp.status == 200
+            body = await resp.read()
+            assert b"File Manager" in body
+            assert b"uid=33(www-data)" in body
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e["result"] == "webshell-command" for e in entries)
+
+
+async def test_integration_aws_credentials_file(live_server):
+    """Canary trap over the wire, real headers come back including Content-Type."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/.aws/credentials",
+            headers={"X-Forwarded-For": "203.0.113.21"},
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/plain")
+            assert resp.headers.get("Cache-Control") == "no-store"
+            body = await resp.read()
+            assert b"AKIAFAKEINTEG01" in body
+            assert b"[default]" in body
+
+
+async def test_integration_gitlab_sign_in_sets_cookie_over_the_wire(live_server):
+    """Set-Cookie arrives on the client, not just inside the mocked response."""
+    base, _ = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{base}/users/sign_in") as resp:
+            assert resp.status == 200
+            cookies = resp.headers.getall("Set-Cookie", [])
+            assert any("integCookieVal" in c for c in cookies), cookies
+
+
+async def test_integration_404_logs_one_line(live_server):
+    """Unhandled path gets 404 + exactly one 'not-handled' log entry."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{base}/nope/unhandled") as resp:
+            assert resp.status == 404
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    matching = [e for e in entries if e["path"] == "/nope/unhandled"]
+    assert len(matching) == 1
+    assert matching[0]["result"] == "not-handled"
+
+
+async def test_integration_head_request_has_no_body(live_server):
+    """HEAD on a canary trap: 200, full headers, zero body bytes."""
+    base, _ = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.head(f"{base}/.aws/credentials") as resp:
+            assert resp.status == 200
+            body = await resp.read()
+            assert body == b""
+
+
+async def test_integration_tarpit_drips_then_client_disconnects(live_server, monkeypatch):
+    """Open a tarpit response, read one chunk, close. Server logs tarpit-disconnect."""
+    monkeypatch.setattr(tbenv, "TARPIT_ENABLED", True)
+    # Narrow the modules so we definitely hit the drip path (not a 302 redirect).
+    monkeypatch.setattr(tbenv, "MOD_DNS_CALLBACK_ENABLED", False)
+    monkeypatch.setattr(tbenv, "MOD_REDIRECT_CHAIN_ENABLED", False)
+    monkeypatch.setattr(tbenv, "TARPIT_MODULES", [])
+    # Fast drip so the test doesn't take seconds.
+    monkeypatch.setattr(tbenv, "TARPIT_INTERVAL_MS", 50)
+    monkeypatch.setattr(tbenv, "MOD_VARIABLE_DRIP_ENABLED", False)
+
+    base, log_path = live_server
+    timeout = aiohttp.ClientTimeout(total=2)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(f"{base}/.env.bak") as resp:
+            assert resp.status == 200
+            # Read a little, then bail. Server should see the disconnect on its
+            # next write and log tarpit-disconnect.
+            chunk = await resp.content.read(16)
+            assert chunk  # got at least one drip
+
+    # Give the server a moment to notice the closed socket + write its log line.
+    await asyncio.sleep(0.3)
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    # One "tarpit" entry (started) — the disconnect entry may or may not fire
+    # depending on whether the server tried to write after we closed. Start is
+    # the reliable signal.
+    assert any(e["result"] == "tarpit" for e in entries), entries

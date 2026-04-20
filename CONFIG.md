@@ -111,6 +111,22 @@ No Tracebit key required.
 
 ## Bind address / port
 
-Flux listens on `127.0.0.1:18081`. To change, edit `flux/server.py`:`main()`
-— there's no env var because this is always a local backend behind a
-reverse proxy in our use.
+Flux listens on `127.0.0.1:18081` (aiohttp). To change, edit
+`flux/server.py`:`main()` — there's no env var because this is always a
+local backend behind a reverse proxy in our use.
+
+## Concurrency model
+
+Single-process aiohttp event loop. Slow-drip traps (tarpit + fake-git)
+share a connection cap of `TRACEBIT_ENV_TARPIT_MAX_CONNECTIONS` (default
+8) — the 9th concurrent drip gets a 503. Because the event loop is
+cooperative, each drip costs ~8 KB of coroutine state, so raising the
+cap by 10–100× is usually cheap if you see legitimate 503s.
+
+Non-drip traps (webshell, canary file traps, /.env canary, /.git/* cache
+hit) return immediately; they're not subject to the cap.
+
+The Tracebit API client is one shared `aiohttp.ClientSession` per
+process, created lazily on first use and closed on shutdown. TCP + TLS
+connections to `community.tracebit.com` get pooled across cache-miss
+bursts.
