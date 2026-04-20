@@ -66,8 +66,7 @@ nginx in front and proxies a set of trap paths (e.g. `/.env`, `/.git/*`,
 all non-trap routing.
 
 ```bash
-export TRACEBIT_ENV_HOSTS_CSV=trap-sensor.example.com   # which Host headers are "trap sensors"
-export TRACEBIT_API_KEY=...                             # optional — enables /.env and /.git/
+export TRACEBIT_API_KEY=...  # optional — enables canary-backed traps (/.env, /.git/*, etc)
 python -m flux
 ```
 

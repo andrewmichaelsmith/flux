@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -24,11 +23,6 @@ from urllib.request import Request, urlopen
 API_BASE_URL = (os.environ.get("TRACEBIT_API_BASE_URL", "https://community.tracebit.com") or "https://community.tracebit.com").rstrip("/")
 API_KEY = (os.environ.get("TRACEBIT_API_KEY") or "").strip()
 SENSOR_ID = (os.environ.get("SENSOR_ID") or "").strip()
-ALLOWED_HOSTS = {
-    value.strip().lower()
-    for value in (os.environ.get("TRACEBIT_ENV_HOSTS_CSV") or "").split(",")
-    if value.strip()
-}
 CANARY_TYPES = [
     value.strip()
     for value in (os.environ.get("TRACEBIT_ENV_CANARY_TYPES_CSV") or "aws").split(",")
@@ -177,18 +171,6 @@ def clean_host(header_value: str) -> str:
     return value
 
 
-def discover_local_ip_hosts() -> set[str]:
-    hosts = {"127.0.0.1", "::1"}
-    try:
-        hosts.update(subprocess.check_output(["hostname", "-I"], text=True, stderr=subprocess.DEVNULL).strip().lower().split())
-    except (OSError, subprocess.SubprocessError):
-        return hosts
-    return hosts
-
-
-LOCAL_IP_HOSTS = discover_local_ip_hosts()
-
-
 def header_subset(headers: object) -> dict[str, str]:
     values: dict[str, str] = {}
     for name in LOG_HEADER_NAMES:
@@ -196,18 +178,6 @@ def header_subset(headers: object) -> dict[str, str]:
         if value:
             values[name] = value[:HEADER_VALUE_LOG_LIMIT]
     return values
-
-
-def host_allow_reason(host: str) -> str:
-    if not ALLOWED_HOSTS:
-        return ""
-    if host in ALLOWED_HOSTS:
-        return "configured-host"
-    if host in LOCAL_IP_HOSTS:
-        return "local-ip"
-    if host == "localhost":
-        return "localhost"
-    return ""
 
 
 def normalize_path(raw_path: str) -> str:
@@ -1742,8 +1712,6 @@ class EnvHandler(BaseHTTPRequestHandler):
         raw_path = parsed_target.path or "/"
         path = normalize_path(raw_path)
         query_string = parsed_target.query or ""
-        host_allow = host_allow_reason(host)
-        host_allowed = bool(host_allow)
         body_bytes_expected = None
         body_bytes_read = 0
         body_sha256 = ""
@@ -1766,7 +1734,6 @@ class EnvHandler(BaseHTTPRequestHandler):
             "requestId": request_id,
             "method": self.command,
             "host": host,
-            "hostAllowReason": host_allow or "not-allowed",
             "path": path,
             "rawPath": raw_path,
             "rawTarget": raw_target,
@@ -1779,13 +1746,10 @@ class EnvHandler(BaseHTTPRequestHandler):
             "bodySha256": body_sha256,
         }
 
-        # Gate webshell on "is this a trap sensor" (ALLOWED_HOSTS non-empty),
-        # NOT on host_allowed(this specific request). Scanners routinely send
-        # arbitrary/spoofed Host headers (2026-04-20: 172.213.224.85 sent 104
-        # probes with Host=staging.porsche.nocadis.com); gating on Host match
-        # 404s exactly the actors we want to catch. Control sensors with no
-        # ALLOWED_HOSTS still stay clean because the whole check short-circuits.
-        if ALLOWED_HOSTS and is_webshell_path(path):
+        # All traps respond regardless of Host header. Scanners spoof Host
+        # routinely, and we want to catch them; there's no "control sensor"
+        # mode. If you don't want traps, don't run flux.
+        if is_webshell_path(path):
             self._handle_webshell(
                 log_context=log_context,
                 path=path,
@@ -1795,11 +1759,11 @@ class EnvHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if TARPIT_ENABLED and host_allowed and (is_tarpit_path(path) or is_fingerprint_path(path)):
+        if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
             self._send_tarpit(request_id=request_id, path=path, log_context=log_context, send_body=send_body, query=query_string)
             return
 
-        if FAKE_GIT_ENABLED and host_allowed and API_KEY and (path == "/.git" or path.startswith("/.git/")):
+        if FAKE_GIT_ENABLED and API_KEY and (path == "/.git" or path.startswith("/.git/")):
             self._send_fake_git(
                 request_id=request_id,
                 path=path,
@@ -1812,10 +1776,7 @@ class EnvHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Canary file traps — gated like the webshell on ALLOWED_HOSTS
-        # (trap sensor, not per-request Host match) because scanners
-        # routinely spoof Host and we still want to catch them.
-        if ALLOWED_HOSTS and API_KEY:
+        if API_KEY:
             trap = find_canary_trap(path)
             if trap is not None:
                 self._send_canary_trap(
@@ -1831,7 +1792,7 @@ class EnvHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-        if path != "/.env" or not API_KEY or not host_allowed:
+        if path != "/.env" or not API_KEY:
             self.send_response(404)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
@@ -1889,14 +1850,17 @@ def main() -> int:
         active.append("env-canary")
         if FAKE_GIT_ENABLED:
             active.append("fake-git")
+        if CANARY_TRAPS_ENABLED:
+            active.append("canary-file-traps")
     else:
-        print("flux: TRACEBIT_API_KEY unset — /.env and /.git/* disabled (both 404)", file=sys.stderr)
+        print(
+            "flux: TRACEBIT_API_KEY unset — /.env, /.git/*, and canary file traps disabled (all 404)",
+            file=sys.stderr,
+        )
     if TARPIT_ENABLED:
         active.append("tarpit")
     if WEBSHELL_ENABLED:
         active.append("webshell")
-    if not ALLOWED_HOSTS:
-        print("flux: TRACEBIT_ENV_HOSTS_CSV empty — running as control sensor, traps 404", file=sys.stderr)
     print(f"flux: listening on 127.0.0.1:18081, active traps: {', '.join(active) or 'none'}", file=sys.stderr)
 
     server = ReusableThreadingHTTPServer(("127.0.0.1", 18081), EnvHandler)

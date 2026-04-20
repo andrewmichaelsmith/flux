@@ -180,16 +180,13 @@ def test_webshell_disabled_returns_false_even_for_anchor_path(monkeypatch):
 
 # --- End-to-end dispatch tests (gate behavior) ---
 #
-# Context: April 2026 observed a scanner (Azure WP Webshell Checker variant)
-# sending ~100 probes to our env-trap host with Host=staging.<victim>.<tld>
-# — a fully spoofed Host. The original host_allowed gate (inherited from
-# /.env canary handling) 404'd every probe because the spoofed Host didn't
-# match ALLOWED_HOSTS. The dispatch now gates webshell routing on "is this a
-# trap sensor at all" (ALLOWED_HOSTS non-empty), not "does this specific
-# request's Host match".
+# No Host-based gating — flux is a honeypot, it responds on every Host.
+# The only sensor-level gate is TRACEBIT_API_KEY, which only controls the
+# Tracebit-backed traps (/.env, /.git/*, canary file traps). Webshell and
+# tarpit do not need a key.
 
 
-def _fake_handler(tbenv_mod, allowed_hosts: set[str]):
+def _fake_handler(tbenv_mod):
     """Build a minimal EnvHandler stand-in + exercise _handle."""
     import io
 
@@ -235,13 +232,12 @@ def _fake_handler(tbenv_mod, allowed_hosts: set[str]):
 
 
 def test_dispatch_serves_webshell_when_host_is_spoofed(monkeypatch, tmp_path):
-    """Scanner with a spoofed Host header should still get the webshell
-    response on a trap sensor (ALLOWED_HOSTS non-empty)."""
-    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", {"trap.example.com"})
+    """Scanner with a spoofed Host header still gets the webshell response —
+    flux serves traps regardless of Host."""
     monkeypatch.setattr(tbenv, "WEBSHELL_ENABLED", True)
     monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
 
-    RecordingHandler, _ = _fake_handler(tbenv, tbenv.ALLOWED_HOSTS)
+    RecordingHandler, _ = _fake_handler(tbenv)
     h = RecordingHandler(
         headers={
             "Host": "staging.victim.example",  # spoofed
@@ -264,20 +260,15 @@ def test_dispatch_serves_webshell_when_host_is_spoofed(monkeypatch, tmp_path):
     assert entry["clientIp"] == "203.0.113.7"
 
 
-def test_dispatch_control_sensor_with_empty_allowed_hosts_still_404s_webshell(
-    monkeypatch, tmp_path,
-):
-    """Control sensor (no TRACEBIT_ENV_HOSTS_CSV → empty ALLOWED_HOSTS) must
-    still return 404 for webshell paths even with a matching path."""
-    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", set())
-    monkeypatch.setattr(tbenv, "WEBSHELL_ENABLED", True)
+def test_dispatch_webshell_disabled_returns_404(monkeypatch, tmp_path):
+    """With WEBSHELL_ENABLED=False, webshell paths 404 instead of serving."""
+    monkeypatch.setattr(tbenv, "WEBSHELL_ENABLED", False)
     monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
 
-    RecordingHandler, _ = _fake_handler(tbenv, set())
+    RecordingHandler, _ = _fake_handler(tbenv)
     h = RecordingHandler(
         headers={
             "Host": "example.com",
-            "X-Forwarded-Host": "example.com",
             "X-Forwarded-For": "203.0.113.7",
             "X-Forwarded-Proto": "https",
         },
@@ -297,17 +288,15 @@ def test_dispatch_control_sensor_with_empty_allowed_hosts_still_404s_webshell(
 def test_dispatch_without_tracebit_api_key_404s_env_and_git(monkeypatch, tmp_path):
     """Without a Tracebit API key, /.env and /.git/* both 404 — the handler
     must not try to issue a canary against an empty key."""
-    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", {"trap.example.com"})
     monkeypatch.setattr(tbenv, "API_KEY", "")
     monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
     monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
 
-    RecordingHandler, _ = _fake_handler(tbenv, tbenv.ALLOWED_HOSTS)
+    RecordingHandler, _ = _fake_handler(tbenv)
     for path in ["/.env", "/.git/HEAD", "/.git/config"]:
         h = RecordingHandler(
             headers={
                 "Host": "trap.example.com",
-                "X-Forwarded-Host": "trap.example.com",
                 "X-Forwarded-For": "203.0.113.8",
                 "X-Forwarded-Proto": "https",
             },
@@ -457,17 +446,15 @@ def test_gitlab_cookie_emits_set_cookie_header():
 def test_dispatch_routes_aws_credentials_file_to_trap(monkeypatch, tmp_path):
     """Full dispatch path — hit /.aws/credentials, see the canary in the body,
     see one JSON log line with result=aws-credentials-file."""
-    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", {"trap.example.com"})
     monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
     monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
     monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
     monkeypatch.setattr(tbenv, "_get_or_issue_canary", lambda *a, **kw: FAKE_TRACEBIT)
 
-    RecordingHandler, _ = _fake_handler(tbenv, tbenv.ALLOWED_HOSTS)
+    RecordingHandler, _ = _fake_handler(tbenv)
     h = RecordingHandler(
         headers={
             "Host": "trap.example.com",
-            "X-Forwarded-Host": "trap.example.com",
             "X-Forwarded-For": "203.0.113.10",
             "X-Forwarded-Proto": "https",
         },
@@ -483,13 +470,12 @@ def test_dispatch_routes_aws_credentials_file_to_trap(monkeypatch, tmp_path):
 
 
 def test_dispatch_trap_404s_without_api_key(monkeypatch, tmp_path):
-    """Every canary trap must require API_KEY — no key → 404."""
-    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", {"trap.example.com"})
+    """Every canary trap requires API_KEY — no key → 404."""
     monkeypatch.setattr(tbenv, "API_KEY", "")
     monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
     monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
 
-    RecordingHandler, _ = _fake_handler(tbenv, tbenv.ALLOWED_HOSTS)
+    RecordingHandler, _ = _fake_handler(tbenv)
     for path in ["/.aws/credentials", "/wp-config.php", "/id_rsa", "/api/v4/user"]:
         h = RecordingHandler(
             headers={
@@ -503,59 +489,35 @@ def test_dispatch_trap_404s_without_api_key(monkeypatch, tmp_path):
         assert h.response_code == 404, f"expected 404 for {path} sans API_KEY"
 
 
-def test_dispatch_trap_404s_on_control_sensor(monkeypatch, tmp_path):
-    """Empty ALLOWED_HOSTS (control sensor) must 404 every canary trap."""
-    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", set())
+def test_dispatch_trap_serves_on_any_host(monkeypatch, tmp_path):
+    """No Host-based gating — traps respond whatever the Host header says."""
     monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
     monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
     monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
     monkeypatch.setattr(tbenv, "_get_or_issue_canary", lambda *a, **kw: FAKE_TRACEBIT)
 
-    RecordingHandler, _ = _fake_handler(tbenv, set())
-    h = RecordingHandler(
-        headers={
-            "Host": "example.com",
-            "X-Forwarded-For": "203.0.113.12",
-            "X-Forwarded-Proto": "https",
-        },
-        path="/wp-config.php",
-    )
-    h._handle(send_body=True)
-    assert h.response_code == 404
-
-
-def test_dispatch_trap_serves_even_with_spoofed_host(monkeypatch, tmp_path):
-    """Webshell-style gating: Host can be anything, as long as ALLOWED_HOSTS is set
-    (= this is a trap sensor). Matches the April 2026 lesson."""
-    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", {"trap.example.com"})
-    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
-    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
-    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
-    monkeypatch.setattr(tbenv, "_get_or_issue_canary", lambda *a, **kw: FAKE_TRACEBIT)
-
-    RecordingHandler, _ = _fake_handler(tbenv, tbenv.ALLOWED_HOSTS)
-    h = RecordingHandler(
-        headers={
-            "Host": "staging.victim.example",  # spoofed
-            "X-Forwarded-Host": "staging.victim.example",
-            "X-Forwarded-For": "203.0.113.13",
-            "X-Forwarded-Proto": "https",
-        },
-        path="/wp-config.php",
-    )
-    h._handle(send_body=True)
-    assert h.response_code == 200
-    assert b"AWS_ACCESS_KEY_ID" in h.wfile.getvalue()
+    RecordingHandler, _ = _fake_handler(tbenv)
+    for host in ["staging.victim.example", "example.com", "", "123.45.67.8"]:
+        h = RecordingHandler(
+            headers={
+                "Host": host,
+                "X-Forwarded-For": "203.0.113.13",
+                "X-Forwarded-Proto": "https",
+            },
+            path="/wp-config.php",
+        )
+        h._handle(send_body=True)
+        assert h.response_code == 200, f"trap should fire for Host={host!r}"
+        assert b"AWS_ACCESS_KEY_ID" in h.wfile.getvalue()
 
 
 def test_dispatch_gitlab_sign_in_emits_set_cookie(monkeypatch, tmp_path):
-    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", {"trap.example.com"})
     monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
     monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
     monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
     monkeypatch.setattr(tbenv, "_get_or_issue_canary", lambda *a, **kw: FAKE_TRACEBIT)
 
-    RecordingHandler, _ = _fake_handler(tbenv, tbenv.ALLOWED_HOSTS)
+    RecordingHandler, _ = _fake_handler(tbenv)
     h = RecordingHandler(
         headers={
             "Host": "trap.example.com",

@@ -13,8 +13,7 @@ Every line includes these — they're built in `_handle()` before dispatch.
 | `timestamp` | string | UTC, ISO 8601, `Z` suffix. |
 | `requestId` | string | UUID4 minted on each request. |
 | `method` | string | `GET` / `HEAD` / `POST`. |
-| `host` | string | `X-Forwarded-Host` or `Host`, lowercased, port stripped. |
-| `hostAllowReason` | string | `configured-host` / `local-ip` / `localhost` / `not-allowed`. |
+| `host` | string | `X-Forwarded-Host` or `Host`, lowercased, port stripped. Logged as-is; flux never gates on it. |
 | `path` | string | Percent-decoded, duplicate-slash collapsed. |
 | `rawPath` | string | Pre-decode path from the request line. |
 | `rawTarget` | string | Full request target (path + query). |

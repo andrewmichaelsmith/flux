@@ -2,21 +2,19 @@
 
 Every knob is an environment variable. Flux has no config file.
 
-## Required (or near-required)
-
-| Var | Default | Notes |
-| --- | --- | --- |
-| `TRACEBIT_ENV_HOSTS_CSV` | *(empty)* | Comma-separated list of `Host` header values to treat as "trap sensors". Leave empty on a control sensor — flux will 404 every trap path. |
+Flux does **not** gate on the `Host` header. Every trap responds on every
+host the sensor receives. If you don't want traps, don't run flux.
 
 ## Tracebit Community integration (optional)
 
 If `TRACEBIT_API_KEY` is unset, flux still works: the tarpit and webshell
-traps do not need it. Only `/.env` and `/.git/*` require a key, because
-those traps mint per-request canaries at hit time.
+traps do not need it. Only the canary-backed traps (`/.env`, `/.git/*`,
+and the canary file trap table) need a key, because those mint per-request
+canaries at hit time.
 
 | Var | Default | Notes |
 | --- | --- | --- |
-| `TRACEBIT_API_KEY` | *(empty)* | Bearer token. **When unset, `/.env` and `/.git/*` are disabled and return 404.** |
+| `TRACEBIT_API_KEY` | *(empty)* | Bearer token. **When unset, canary-backed traps are disabled and return 404.** |
 | `TRACEBIT_API_BASE_URL` | `https://community.tracebit.com` | |
 | `TRACEBIT_ENV_CANARY_TYPES_CSV` | `aws` | Any of `aws`, `ssh`, `gitlab-cookie`, `gitlab-username-password`. |
 | `TRACEBIT_ENV_CANARY_SOURCE` | `flux` | `source` label on issued canaries. |
@@ -76,9 +74,8 @@ fingerprint. Set any single var to `false` / `0` to disable just that one.
 
 A table of paths that serve a plausible file format with a freshly-minted
 Tracebit canary embedded. See [`ROADMAP.md`](./ROADMAP.md) for the current
-list. Gated on `ALLOWED_HOSTS` being non-empty (trap sensor) **and**
-`TRACEBIT_API_KEY` being set. Per-IP cache keeps scanner fan-out from
-burning quota.
+list. Gated on `TRACEBIT_API_KEY` being set. Per-IP cache keeps scanner
+fan-out from burning quota.
 
 | Var | Default | Notes |
 | --- | --- | --- |

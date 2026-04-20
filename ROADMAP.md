@@ -27,9 +27,10 @@ Flux today only serves `aws` and `ssh` (inside `/.env` and `/.git/*`).
 
 ## Implemented trap surfaces
 
-The table below is the live set of file traps. All gated on `ALLOWED_HOSTS`
-+ `TRACEBIT_API_KEY`, with per-IP TTL caching to protect quota. Toggle with
-`CANARY_TRAPS_ENABLED`. Paths are case-insensitive exact matches.
+The table below is the live set of file traps. All gated on
+`TRACEBIT_API_KEY`, with per-IP TTL caching to protect quota. Toggle with
+`CANARY_TRAPS_ENABLED`. Paths are case-insensitive exact matches. No Host
+filter — scanners spoof Host and we still want to catch them.
 
 | Trap | Paths | Canary type | Log tag |
 | --- | --- | --- | --- |
@@ -75,13 +76,11 @@ them yet. When / if they're added to `issue-credentials`:
 Whatever we ship next should:
 
 1. **Require `TRACEBIT_API_KEY`**; 404 when unset.
-2. **Gate on `ALLOWED_HOSTS` being non-empty** (trap sensors only). We
-   intentionally do **not** gate on per-request Host matching, because
-   scanners routinely spoof Host and we still want to catch them. See
-   `test_dispatch_trap_serves_even_with_spoofed_host`.
+2. **Do not gate on Host** — scanners spoof it; flux serves traps on any
+   Host the request arrived with.
 3. **Mint one canary per cache-miss**, not per request — reuse the
-   same per-IP TTL cache we already have for `/.git/*`.
-4. **Log a distinct `result` tag** (`aws-credentials-file`, `gitlab-login-page`,
+   per-IP TTL cache.
+4. **Log a distinct `result` tag** (`aws-credentials-file`, `gitlab-sign-in`,
    etc.) so the downstream analysis can tell which trap fired.
 5. **Stream behind `TARPIT_SEMAPHORE`** when the response is slow-dripped,
    to protect against a scanner opening many connections.
