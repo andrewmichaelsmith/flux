@@ -100,6 +100,39 @@ Webshell extras (both variants):
 | `contentType` | string | First 120 chars of `Content-Type`. |
 | `bodyPreview` | string | Up to `HONEYPOT_WEBSHELL_BODY_DECODE_LIMIT` chars; omitted if empty. |
 
+### Fake LLM-API endpoint
+
+One log line per hit. `result` identifies which family was served.
+
+| `result` | `status` | Meaning |
+| --- | --- | --- |
+| `llm-endpoint-models-list` | 200 | `GET /v1/models` (OpenAI-compatible list) |
+| `llm-endpoint-anthropic-models-list` | 200 | `GET /anthropic/v1/models` (the `scanner/1.0` target) |
+| `llm-endpoint-ollama-tags` | 200 | `GET /api/tags` |
+| `llm-endpoint-ollama-version` | 200 | `GET /api/version` |
+| `llm-endpoint-ollama-ps` | 200 | `GET /api/ps` |
+| `llm-endpoint-ollama-show` | 200 | `POST /api/show` |
+| `llm-endpoint-ollama-chat` | 200 | `POST /api/chat` |
+| `llm-endpoint-ollama-generate` | 200 | `POST /api/generate` |
+| `llm-endpoint-openai-chat` | 200 | `POST /v1/chat/completions` |
+| `llm-endpoint-openai-completion` | 200 | `POST /v1/completions` |
+| `llm-endpoint-openai-embedding` | 200 | `POST /v1/embeddings` |
+| `llm-endpoint-anthropic-message` | 200 | `POST /v1/messages` or `POST /anthropic/v1/messages` |
+| `llm-endpoint-miss` | 404 | Matched the path set but no renderer (shouldn't occur; defensive) |
+
+Extras on every `llm-endpoint-*` line:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `llmPath` | string | The path that matched. |
+| `llmAction` | string | One of `models-list`, `version`, `running-models`, `show-model`, `chat`, `completion`, `embedding`. Filled from the JSON body when present, otherwise inferred from the path. |
+| `llmModel` | string | `model` field pulled from a JSON body; `""` on GETs or malformed bodies. Truncated to 120 chars. |
+| `llmHasAuth` | bool | `true` if `Authorization` or `x-api-key` header was present — the strongest signal that the scanner already has a harvested key. |
+| `llmAuthScheme` | string | Lowercased first token of `Authorization` (`bearer`, `basic`, …); `""` otherwise. |
+| `llmMethod` | string | Request method (`GET` / `POST` / `HEAD`). |
+| `bytes` | int | Size of the JSON body returned. |
+| `llmPromptPreview` | string | Prefix of the extracted prompt, truncated to `HONEYPOT_LLM_BODY_DECODE_LIMIT`. Omitted if empty. |
+
 ### Canary-backed file traps
 
 One log line per hit. All entries share the same shape:

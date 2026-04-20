@@ -14,7 +14,7 @@ slow-drip connections at ~8 KB each instead of one OS thread each.
 > suite, and think about what `HONEYPOT_WEBSHELL_PATHS_CSV` or `FAKE_GIT_*`
 > hitting a real webroot would do. No warranties.
 
-Five trap families, each independently toggleable via env var:
+Six trap families, each independently toggleable via env var:
 
 1. **Fake `/.env` canary issuer** — mints a per-request Tracebit Community
    canary and returns it as a `.env`-style payload. Requires `TRACEBIT_API_KEY`.
@@ -38,6 +38,12 @@ Five trap families, each independently toggleable via env var:
    configurable set of first-contact paths (default: `/`, `/index.html`,
    `/index.php`, `/robots.txt`, `/sitemap.xml`, `/favicon.ico`). No
    Tracebit key required.
+6. **Fake LLM-API endpoint** — serves plausible Ollama / OpenAI /
+   Anthropic-proxy responses on common AI-probe paths (`/v1/models`,
+   `/anthropic/v1/models`, `/api/version`, `/api/chat`, `/v1/chat/completions`,
+   …). Logs the model requested, any `Authorization: Bearer` or `x-api-key`
+   header, and a prefix of the POSTed prompt body. No Tracebit key required.
+   See [below](#fake-llm-api-endpoint) for why this exists.
 
 All traps log one JSON line per event to the configured log path. See
 [`LOGS.md`](./LOGS.md) for the schema.
@@ -123,6 +129,53 @@ Two test files:
 - `tests/test_integration.py` — binds flux to a random port on 127.0.0.1
   and hits it with a real HTTP client over the kernel loopback. Catches
   anything that only breaks on a real socket.
+
+## Fake LLM-API endpoint
+
+Scanners started hunting for exposed AI inference servers in April 2026.
+The trap matches these paths (exact, case-insensitive; configurable via
+`HONEYPOT_LLM_ENDPOINT_PATHS_CSV`):
+
+| Family | Paths | Response |
+| --- | --- | --- |
+| Ollama | `/v1/models`, `/api/tags`, `/api/version`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate` | Ollama-native JSON with a fixed list of plausible model IDs |
+| OpenAI | `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | OpenAI-compatible JSON |
+| Anthropic | `/v1/messages`, `/anthropic/v1/models`, `/anthropic/v1/messages` | Anthropic Messages-API JSON |
+
+On any POST the trap parses `model` and a prompt-ish field out of the JSON
+body (handles OpenAI/Ollama/Anthropic content shapes), then logs them along
+with the scanner's auth header, UA, and IP. Chat responses are a
+deterministic canned reply — bland enough to look boring, not real enough
+to be abusable.
+
+### Why this exists
+
+The 2026-04-20 weekly-novelty run caught a new scanner — `scanner/1.0`
+from `203.0.113.10` — sending 26 requests to `/anthropic/v1/models` in
+one day. Three other IPs (`203.0.113.11`, `203.0.113.12`,
+`203.0.113.13`) hit `/v1/models`. Earlier, on Apr 18, the lab sensor
+saw the Ollama signature (`/v1/models` + `/api/version` from
+`203.0.113.14`).
+
+These scanners are looking for:
+
+- **Exposed self-hosted Ollama / llama.cpp servers** — unauthenticated by
+  default, so a `200 OK` on `/api/tags` with a real model list is an
+  immediate prompt-execution primitive.
+- **Internal AI-proxy gateways** (`/anthropic/v1/models`) — corporate
+  relays that hold an upstream API key, which a scanner can then use from
+  the proxy without needing the key itself.
+- **Harvested API keys in the wild** — the scanner already has a
+  `Bearer sk-...` or `x-api-key` from a credential dump and is probing
+  who'll honor it.
+
+The intel we want: the model a scanner targets, the prompt they send on
+their first successful POST, the auth header they present, and the
+follow-up sequence when they believe the endpoint is live. None of that
+is visible from a bare 404.
+
+See `LOGS.md` for the `llm-endpoint-*` result tags and the `llmModel` /
+`llmPromptPreview` / `llmHasAuth` fields.
 
 ## Why a fake webshell on a sensor that never had a real shell?
 

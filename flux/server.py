@@ -140,6 +140,48 @@ WEBSHELL_COMMAND_KEYS = (
 )
 WEBSHELL_COMMAND_HEADERS = ("X-Cmd", "X-Exec", "X-Command")
 
+# --- Fake LLM-API endpoint (Ollama / OpenAI / Anthropic-proxy shape) ---
+# Motivated by the 2026-04-20 weekly-novelty run: `scanner/1.0` scanner
+# probing `/anthropic/v1/models` (first ever scanner specifically targeting
+# an Anthropic proxy endpoint), plus corroborating `/v1/models` + `/api/version`
+# Ollama-endpoint probes from three other IPs the prior week. The intel we
+# want is what comes next — model name requested, prompt body, whether a
+# bearer token is presented, UA rotation on a follow-up.
+#
+# Default-on like the webshell: the trap is cheap, logs are cheap, and a
+# plausible response is what makes the scanner send its next command.
+LLM_ENDPOINT_ENABLED = _env_bool("HONEYPOT_LLM_ENDPOINT_ENABLED")
+# Paths served. All exact lowercase matches — same model as WEBSHELL_PATHS.
+_LLM_ENDPOINT_DEFAULT_PATHS = ",".join([
+    # Ollama + OpenAI-compatible listings
+    "/v1/models",
+    "/api/tags",
+    "/api/version",
+    "/api/ps",
+    # Ollama POST endpoints
+    "/api/chat",
+    "/api/generate",
+    "/api/show",
+    # OpenAI POST
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    # Anthropic Messages API + the scanner/1.0 proxy target
+    "/v1/messages",
+    "/anthropic/v1/models",
+    "/anthropic/v1/messages",
+])
+LLM_ENDPOINT_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_LLM_ENDPOINT_PATHS_CSV") or _LLM_ENDPOINT_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# Cap how much of the prompt body we decode into the log line. Scanners that
+# find the endpoint may POST large system prompts or tool definitions; we want
+# the first chunk (enough to see intent + model + a prompt prefix) without
+# bloating the log file.
+LLM_BODY_DECODE_LIMIT = max(int((os.environ.get("HONEYPOT_LLM_BODY_DECODE_LIMIT") or "4096").strip() or "4096"), 512)
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -220,6 +262,290 @@ def is_webshell_path(path: str) -> bool:
     if not WEBSHELL_ENABLED:
         return False
     return path.lower() in WEBSHELL_PATHS
+
+
+def is_llm_endpoint_path(path: str) -> bool:
+    if not LLM_ENDPOINT_ENABLED:
+        return False
+    return path.lower() in LLM_ENDPOINT_PATHS
+
+
+# Models advertised by the listings. Chosen to mix Ollama-native names
+# (`llama3.2:latest`) with OpenAI- and Anthropic-branded ids so every scanner
+# that filters by model name sees at least one plausible match.
+_LLM_MODEL_NAMES: tuple[str, ...] = (
+    "llama3.2:latest",
+    "llama3.1:8b",
+    "qwen2.5-coder:7b",
+    "mistral:7b",
+    "deepseek-r1:7b",
+    "gemma2:9b",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku-20241022",
+)
+
+
+def extract_llm_prompt(body: bytes, content_type: str) -> tuple[str, str, str, bool]:
+    """Best-effort pull of (model, prompt, action, has_auth_hint) from a JSON body.
+
+    Handles the three wire formats we see probes against:
+    - Ollama:         {"model": "...", "prompt": "..."}               /api/generate
+                      {"model": "...", "messages": [{"role","content"}]}  /api/chat
+                      {"model": "..."}                                 /api/show
+    - OpenAI:         {"model": "...", "messages": [{"role","content"}]}  /v1/chat/completions
+                      {"model": "...", "prompt": "..."}                /v1/completions
+                      {"model": "...", "input": "..."|[..]}            /v1/embeddings
+    - Anthropic:      {"model": "...", "messages": [{"role","content"}]}  /v1/messages
+
+    Returns `(model, prompt_prefix, action, has_auth_hint)`. Unknown shape
+    returns all-empty. `has_auth_hint` is always False at this layer; the
+    caller fills it from the request headers. Prompt is truncated to
+    LLM_BODY_DECODE_LIMIT chars.
+    """
+    if not body:
+        return "", "", "", False
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    # Ollama and OpenAI clients usually send application/json; some scanners
+    # send no Content-Type at all but still use JSON, so be lenient.
+    if ct not in {"application/json", ""}:
+        return "", "", "", False
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+    except (ValueError, UnicodeDecodeError):
+        return "", "", "", False
+    if not isinstance(payload, dict):
+        return "", "", "", False
+
+    model = ""
+    raw_model = payload.get("model")
+    if isinstance(raw_model, str):
+        model = raw_model[:120]
+
+    # Prefer a chat `messages` list if present, then `prompt`, then `input`.
+    prompt = ""
+    action = ""
+    messages = payload.get("messages")
+    if isinstance(messages, list) and messages:
+        action = "chat"
+        pieces: list[str] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", ""))[:32]
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Anthropic content-block form: [{"type":"text","text":"..."}]
+                text_pieces = []
+                for block in content:
+                    if isinstance(block, dict):
+                        t = block.get("text") or block.get("content") or ""
+                        if isinstance(t, str):
+                            text_pieces.append(t)
+                content = " ".join(text_pieces)
+            if not isinstance(content, str):
+                content = str(content)
+            pieces.append(f"{role}: {content}" if role else content)
+        prompt = "\n".join(pieces)
+    elif isinstance(payload.get("prompt"), str):
+        action = "completion"
+        prompt = payload["prompt"]
+    elif "input" in payload:
+        action = "embedding"
+        val = payload["input"]
+        if isinstance(val, list):
+            prompt = " ".join(str(x) for x in val if isinstance(x, (str, int, float)))
+        else:
+            prompt = str(val)
+
+    if len(prompt) > LLM_BODY_DECODE_LIMIT:
+        prompt = prompt[:LLM_BODY_DECODE_LIMIT]
+    return model, prompt, action, False
+
+
+# --- LLM renderers --------------------------------------------------------
+# Shapes match the wire format the scanner expects well enough that it sends
+# its next command. Content is deterministic — we don't need a real LLM.
+
+
+def render_ollama_version() -> bytes:
+    return json.dumps({"version": "0.4.7"}).encode("utf-8")
+
+
+def render_ollama_tags() -> bytes:
+    modified = "2026-01-15T12:00:00.000000000Z"
+    payload = {
+        "models": [
+            {
+                "name": name,
+                "model": name,
+                "modified_at": modified,
+                "size": 4_661_211_808,
+                "digest": hashlib.sha256(name.encode("utf-8")).hexdigest(),
+                "details": {
+                    "parent_model": "",
+                    "format": "gguf",
+                    "family": name.split(":", 1)[0].split("-", 1)[0],
+                    "families": None,
+                    "parameter_size": "7B",
+                    "quantization_level": "Q4_0",
+                },
+            }
+            for name in _LLM_MODEL_NAMES
+        ]
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_ollama_ps() -> bytes:
+    # "No models currently loaded" — looks like a fresh, idle server.
+    return json.dumps({"models": []}).encode("utf-8")
+
+
+def render_openai_models() -> bytes:
+    payload = {
+        "object": "list",
+        "data": [
+            {"id": name, "object": "model", "created": 1_735_689_600, "owned_by": "library"}
+            for name in _LLM_MODEL_NAMES
+        ],
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_anthropic_models() -> bytes:
+    # Anthropic's /v1/models response shape: {"data":[{"type":"model","id":..}],
+    # "has_more": false, "first_id": "...", "last_id": "..."}.
+    anthropic_ids = [m for m in _LLM_MODEL_NAMES if m.startswith("claude-")] or [
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+    ]
+    data = [
+        {
+            "type": "model",
+            "id": mid,
+            "display_name": mid.replace("-", " ").title(),
+            "created_at": "2024-10-22T00:00:00Z",
+        }
+        for mid in anthropic_ids
+    ]
+    payload = {
+        "data": data,
+        "has_more": False,
+        "first_id": data[0]["id"],
+        "last_id": data[-1]["id"],
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_ollama_show(model: str) -> bytes:
+    model = model or "llama3.2:latest"
+    payload = {
+        "modelfile": f"FROM {model}\nPARAMETER temperature 0.7\n",
+        "parameters": "temperature 0.7",
+        "template": "{{ .Prompt }}",
+        "details": {
+            "parent_model": "",
+            "format": "gguf",
+            "family": "llama",
+            "families": ["llama"],
+            "parameter_size": "8B",
+            "quantization_level": "Q4_0",
+        },
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+# Canned assistant reply used for any chat/completion POST. Deliberately
+# bland: "plausible but boring" keeps the scanner moving to its next
+# command without us having to host a real model.
+_LLM_CANNED_REPLY = (
+    "I can help with that. Could you share more detail about what you're "
+    "trying to accomplish?"
+)
+
+
+def render_ollama_chat(model: str) -> bytes:
+    payload = {
+        "model": model or "llama3.2:latest",
+        "created_at": utc_now(),
+        "message": {"role": "assistant", "content": _LLM_CANNED_REPLY},
+        "done": True,
+        "done_reason": "stop",
+        "total_duration": 1_234_567_890,
+        "load_duration": 12_345_678,
+        "prompt_eval_count": 24,
+        "prompt_eval_duration": 123_456_789,
+        "eval_count": 32,
+        "eval_duration": 987_654_321,
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_ollama_generate(model: str) -> bytes:
+    payload = {
+        "model": model or "llama3.2:latest",
+        "created_at": utc_now(),
+        "response": _LLM_CANNED_REPLY,
+        "done": True,
+        "done_reason": "stop",
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_openai_chat(model: str) -> bytes:
+    payload = {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model or "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": _LLM_CANNED_REPLY},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 24, "completion_tokens": 32, "total_tokens": 56},
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_openai_completion(model: str) -> bytes:
+    payload = {
+        "id": f"cmpl-{uuid.uuid4().hex[:24]}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": model or "gpt-4o-mini",
+        "choices": [{"text": _LLM_CANNED_REPLY, "index": 0, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 16, "completion_tokens": 24, "total_tokens": 40},
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_openai_embedding(model: str) -> bytes:
+    # 8 floats — tiny; scanners that care about dim are probing, not using.
+    vec = [0.01, -0.02, 0.03, -0.04, 0.05, -0.06, 0.07, -0.08]
+    payload = {
+        "object": "list",
+        "data": [{"object": "embedding", "index": 0, "embedding": vec}],
+        "model": model or "text-embedding-3-small",
+        "usage": {"prompt_tokens": 4, "total_tokens": 4},
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_anthropic_message(model: str) -> bytes:
+    payload = {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": model or "claude-3-5-sonnet-20241022",
+        "content": [{"type": "text", "text": _LLM_CANNED_REPLY}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 24, "output_tokens": 32},
+    }
+    return json.dumps(payload).encode("utf-8")
 
 
 def parse_cookies(cookie_header: str) -> dict[str, str]:
@@ -1446,6 +1772,105 @@ def _log_context_from_request(request: web.Request, request_id: str, body_bytes_
     }
 
 
+async def _handle_llm_endpoint(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Dispatch a fake LLM-API response by path. Always 200 + JSON; the
+    whole point is to look live enough that the scanner keeps going."""
+    lpath = path.lower()
+    method = request.method
+    content_type_req = request.headers.get("Content-Type", "")
+    auth_header = request.headers.get("Authorization", "")
+    api_key_header = request.headers.get("x-api-key", "") or request.headers.get("X-Api-Key", "")
+    has_auth = bool(auth_header) or bool(api_key_header)
+
+    model, prompt, action, _ = extract_llm_prompt(request_body, content_type_req)
+
+    # Route to a renderer.
+    if lpath in {"/v1/models"}:
+        result_tag = "llm-endpoint-models-list"
+        body = render_openai_models()
+        if not action:
+            action = "models-list"
+    elif lpath == "/anthropic/v1/models":
+        result_tag = "llm-endpoint-anthropic-models-list"
+        body = render_anthropic_models()
+        if not action:
+            action = "models-list"
+    elif lpath == "/api/tags":
+        result_tag = "llm-endpoint-ollama-tags"
+        body = render_ollama_tags()
+        if not action:
+            action = "models-list"
+    elif lpath == "/api/version":
+        result_tag = "llm-endpoint-ollama-version"
+        body = render_ollama_version()
+        if not action:
+            action = "version"
+    elif lpath == "/api/ps":
+        result_tag = "llm-endpoint-ollama-ps"
+        body = render_ollama_ps()
+        if not action:
+            action = "running-models"
+    elif lpath == "/api/show":
+        result_tag = "llm-endpoint-ollama-show"
+        body = render_ollama_show(model)
+        if not action:
+            action = "show-model"
+    elif lpath == "/api/chat":
+        result_tag = "llm-endpoint-ollama-chat"
+        body = render_ollama_chat(model)
+    elif lpath == "/api/generate":
+        result_tag = "llm-endpoint-ollama-generate"
+        body = render_ollama_generate(model)
+    elif lpath == "/v1/chat/completions":
+        result_tag = "llm-endpoint-openai-chat"
+        body = render_openai_chat(model)
+    elif lpath == "/v1/completions":
+        result_tag = "llm-endpoint-openai-completion"
+        body = render_openai_completion(model)
+    elif lpath == "/v1/embeddings":
+        result_tag = "llm-endpoint-openai-embedding"
+        body = render_openai_embedding(model)
+    elif lpath in {"/v1/messages", "/anthropic/v1/messages"}:
+        result_tag = "llm-endpoint-anthropic-message"
+        body = render_anthropic_message(model)
+    else:
+        # Path matched the set but no renderer — shouldn't happen; defensive 404.
+        append_log({**log_context, "status": 404, "result": "llm-endpoint-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    log_entry = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "llmPath": path,
+        "llmAction": action,
+        "llmModel": model,
+        "llmHasAuth": has_auth,
+        "llmAuthScheme": auth_header.split(" ", 1)[0].lower() if auth_header else "",
+        "llmMethod": method,
+        "bytes": len(body),
+    }
+    if prompt:
+        log_entry["llmPromptPreview"] = prompt
+    append_log(log_entry)
+
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_webshell(
     request: web.Request,
     log_context: dict[str, object],
@@ -1825,6 +2250,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_webshell_path(path):
         return await _handle_webshell(request, log_context, path, query_string, request_body)
 
+    if is_llm_endpoint_path(path):
+        return await _handle_llm_endpoint(request, log_context, path, request_body)
+
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)
 
@@ -1883,6 +2311,8 @@ def main() -> int:
         active.append("tarpit")
     if WEBSHELL_ENABLED:
         active.append("webshell")
+    if LLM_ENDPOINT_ENABLED:
+        active.append("llm-endpoint")
     print(
         f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
         file=sys.stderr,

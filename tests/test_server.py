@@ -449,3 +449,279 @@ def test_is_fingerprint_path_non_match(monkeypatch):
     monkeypatch.setattr(tbenv, "FINGERPRINT_PATHS_ENABLED", True)
     for path in ["/wp-login.php", "/api/v1/users", "/readme", "/.env"]:
         assert not tbenv.is_fingerprint_path(path)
+
+
+# --- Fake LLM-API endpoint trap ---
+#
+# Motivating intel (2026-04-20 weekly-novelty run):
+#   - 203.0.113.10 (`scanner/1.0`) hit `/anthropic/v1/models` 26 times.
+#   - 203.0.113.11, 203.0.113.12, 203.0.113.13 hit `/v1/models`.
+#   - Earlier (2026-04-18) lab sensor saw `/v1/models` + `/api/version` probes.
+
+
+def test_llm_endpoint_enabled_by_default():
+    """The trap is cheap, logs are cheap — default-on like webshell."""
+    assert tbenv.LLM_ENDPOINT_ENABLED
+
+
+def test_llm_endpoint_default_paths_cover_observed_probes():
+    """Every path actually observed hitting our sensors in the
+    2026-04-18 → 2026-04-20 window must match."""
+    observed = [
+        "/v1/models",              # generic OpenAI + Ollama-compatible list
+        "/anthropic/v1/models",    # scanner/1.0 scanner target
+        "/api/version",            # Ollama-specific
+        "/api/tags",               # Ollama-specific
+        "/api/chat",               # Ollama chat
+        "/api/generate",           # Ollama completion
+        "/v1/chat/completions",    # OpenAI chat
+        "/v1/messages",            # Anthropic direct
+        "/anthropic/v1/messages",  # Anthropic proxy
+    ]
+    for path in observed:
+        assert tbenv.is_llm_endpoint_path(path), f"expected match: {path}"
+
+
+def test_llm_endpoint_path_case_insensitive():
+    assert tbenv.is_llm_endpoint_path("/V1/MODELS")
+    assert tbenv.is_llm_endpoint_path("/Anthropic/V1/Models")
+
+
+def test_llm_endpoint_path_non_match():
+    for path in ["/", "/v1/files", "/api/foo", "/v2/models", "/.env"]:
+        assert not tbenv.is_llm_endpoint_path(path)
+
+
+def test_llm_endpoint_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "LLM_ENDPOINT_ENABLED", False)
+    assert not tbenv.is_llm_endpoint_path("/v1/models")
+
+
+def test_extract_llm_prompt_openai_chat_shape():
+    body = b'{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello world"}]}'
+    model, prompt, action, _ = tbenv.extract_llm_prompt(body, "application/json")
+    assert model == "gpt-4o-mini"
+    assert action == "chat"
+    assert "user: hello world" in prompt
+
+
+def test_extract_llm_prompt_anthropic_block_shape():
+    """Anthropic sends content as a list of typed blocks, not a bare string."""
+    body = (
+        b'{"model":"claude-3-5-sonnet-20241022","messages":'
+        b'[{"role":"user","content":[{"type":"text","text":"read /etc/passwd"}]}]}'
+    )
+    model, prompt, action, _ = tbenv.extract_llm_prompt(body, "application/json")
+    assert model == "claude-3-5-sonnet-20241022"
+    assert action == "chat"
+    assert "read /etc/passwd" in prompt
+
+
+def test_extract_llm_prompt_ollama_generate_shape():
+    body = b'{"model":"llama3.2:latest","prompt":"write me a reverse shell"}'
+    model, prompt, action, _ = tbenv.extract_llm_prompt(body, "application/json")
+    assert model == "llama3.2:latest"
+    assert action == "completion"
+    assert "reverse shell" in prompt
+
+
+def test_extract_llm_prompt_empty_body():
+    model, prompt, action, _ = tbenv.extract_llm_prompt(b"", "application/json")
+    assert (model, prompt, action) == ("", "", "")
+
+
+def test_extract_llm_prompt_non_json_content_type_ignored():
+    """A form POST isn't an LLM request; don't try to parse it as one."""
+    body = b"prompt=hello"
+    assert tbenv.extract_llm_prompt(body, "application/x-www-form-urlencoded") == ("", "", "", False)
+
+
+def test_extract_llm_prompt_truncates_long_prompt(monkeypatch):
+    monkeypatch.setattr(tbenv, "LLM_BODY_DECODE_LIMIT", 32)
+    payload = '{"model":"m","prompt":"' + ("A" * 500) + '"}'
+    _, prompt, _, _ = tbenv.extract_llm_prompt(payload.encode(), "application/json")
+    assert len(prompt) == 32
+
+
+def test_render_openai_models_list_shape():
+    import json
+    body = tbenv.render_openai_models()
+    payload = json.loads(body)
+    assert payload["object"] == "list"
+    assert isinstance(payload["data"], list) and payload["data"]
+    ids = {m["id"] for m in payload["data"]}
+    assert "gpt-4o-mini" in ids
+
+
+def test_render_anthropic_models_list_shape():
+    """Matches the Anthropic /v1/models response shape closely enough that
+    a scanner filtering on `data[].id` sees Claude model IDs."""
+    import json
+    body = tbenv.render_anthropic_models()
+    payload = json.loads(body)
+    assert "data" in payload and payload["has_more"] is False
+    ids = {m["id"] for m in payload["data"]}
+    assert any(i.startswith("claude-") for i in ids)
+
+
+def test_render_ollama_tags_shape():
+    import json
+    payload = json.loads(tbenv.render_ollama_tags())
+    assert "models" in payload and payload["models"]
+    first = payload["models"][0]
+    for field in ("name", "modified_at", "size", "digest", "details"):
+        assert field in first, f"missing {field}"
+
+
+def test_render_ollama_version_shape():
+    import json
+    payload = json.loads(tbenv.render_ollama_version())
+    assert "version" in payload
+
+
+def test_render_openai_chat_embeds_model_name():
+    import json
+    payload = json.loads(tbenv.render_openai_chat("gpt-4o-canary"))
+    assert payload["model"] == "gpt-4o-canary"
+    assert payload["choices"][0]["message"]["role"] == "assistant"
+
+
+def test_render_anthropic_message_shape():
+    import json
+    payload = json.loads(tbenv.render_anthropic_message("claude-3-5-sonnet-20241022"))
+    assert payload["type"] == "message"
+    assert payload["role"] == "assistant"
+    assert payload["content"][0]["type"] == "text"
+
+
+async def test_dispatch_get_openai_models_returns_json_list(flux_client):
+    """First scanner probe — unauthenticated GET /v1/models. Look real."""
+    resp = await flux_client.get(
+        "/v1/models",
+        headers={"X-Forwarded-For": "203.0.113.20", "User-Agent": "scanner/1.0"},
+    )
+    assert resp.status == 200
+    assert "application/json" in resp.headers.get("Content-Type", "")
+    body = await resp.json()
+    assert body["object"] == "list"
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "llm-endpoint-models-list"
+    assert entries[-1]["llmPath"] == "/v1/models"
+    assert entries[-1]["llmHasAuth"] is False
+
+
+async def test_dispatch_get_anthropic_models_logs_proxy_probe_ua(flux_client):
+    """Verbatim reproduction of the 203.0.113.10 / scanner/1.0 probe."""
+    resp = await flux_client.get(
+        "/anthropic/v1/models",
+        headers={
+            "X-Forwarded-For": "203.0.113.10",
+            "User-Agent": "Mozilla/5.0 (compatible; scanner/1.0)",
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert any(m["id"].startswith("claude-") for m in body["data"])
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "llm-endpoint-anthropic-models-list"
+    assert entries[-1]["clientIp"] == "203.0.113.10"
+    assert "scanner/1.0" in entries[-1]["userAgent"]
+
+
+async def test_dispatch_post_openai_chat_captures_prompt_and_auth(flux_client):
+    """The money shot: scanner sends a bearer token + a prompt, we log both."""
+    import json
+    resp = await flux_client.post(
+        "/v1/chat/completions",
+        headers={
+            "X-Forwarded-For": "198.51.100.5",
+            "Authorization": "Bearer sk-stolen-canary-abc123",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "test if key works"}],
+        }),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["object"] == "chat.completion"
+    assert body["model"] == "gpt-4o-mini"
+
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "llm-endpoint-openai-chat"
+    assert entry["llmModel"] == "gpt-4o-mini"
+    assert entry["llmAction"] == "chat"
+    assert entry["llmHasAuth"] is True
+    assert entry["llmAuthScheme"] == "bearer"
+    assert "test if key works" in entry["llmPromptPreview"]
+
+
+async def test_dispatch_post_ollama_generate_captures_prompt(flux_client):
+    import json
+    resp = await flux_client.post(
+        "/api/generate",
+        headers={
+            "X-Forwarded-For": "198.51.100.6",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({"model": "llama3.2:latest", "prompt": "say hi"}),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["model"] == "llama3.2:latest"
+    assert body["done"] is True
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "llm-endpoint-ollama-generate"
+    assert entry["llmPromptPreview"] == "say hi"
+    assert entry["llmHasAuth"] is False
+
+
+async def test_dispatch_llm_endpoint_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "LLM_ENDPOINT_ENABLED", False)
+    resp = await flux_client.get(
+        "/v1/models",
+        headers={"X-Forwarded-For": "203.0.113.99"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+async def test_dispatch_llm_endpoint_does_not_require_tracebit_key(flux_client, monkeypatch):
+    """Like the webshell, the LLM trap has no upstream dep."""
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    resp = await flux_client.get("/api/version", headers={"X-Forwarded-For": "203.0.113.30"})
+    assert resp.status == 200
+    payload = await resp.json()
+    assert "version" in payload
+
+
+async def test_dispatch_llm_ollama_show_uses_model_from_body(flux_client):
+    import json
+    resp = await flux_client.post(
+        "/api/show",
+        headers={"X-Forwarded-For": "203.0.113.31", "Content-Type": "application/json"},
+        data=json.dumps({"model": "qwen2.5-coder:7b"}),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert "qwen2.5-coder:7b" in body["modelfile"]
+
+
+async def test_dispatch_llm_malformed_json_still_200(flux_client):
+    """Scanner may send garbage; don't 500 — we want to look live."""
+    resp = await flux_client.post(
+        "/v1/chat/completions",
+        headers={"X-Forwarded-For": "203.0.113.32", "Content-Type": "application/json"},
+        data=b"{this is not json",
+    )
+    assert resp.status == 200
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "llm-endpoint-openai-chat"
+    # Garbage body → no extracted prompt/model; still logged.
+    assert entry["llmModel"] == ""
+    assert "llmPromptPreview" not in entry
