@@ -72,6 +72,20 @@ fingerprint. Set any single var to `false` / `0` to disable just that one.
 | `TARPIT_MOD_CONTENT_LENGTH_CLAIMED_BYTES` | `1048576` | |
 | `TARPIT_MOD_ETAG_PROBE_ENABLED` | on | Set `ETag` / `Last-Modified`; log conditional requests on repeat visits. |
 
+## Canary-backed file traps
+
+A table of paths that serve a plausible file format with a freshly-minted
+Tracebit canary embedded. See [`ROADMAP.md`](./ROADMAP.md) for the current
+list. Gated on `ALLOWED_HOSTS` being non-empty (trap sensor) **and**
+`TRACEBIT_API_KEY` being set. Per-IP cache keeps scanner fan-out from
+burning quota.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `CANARY_TRAPS_ENABLED` | **on** | Master switch. |
+| `CANARY_TRAP_CACHE_TTL_SECONDS` | `3600` | Per-(IP, canary types) TTL. |
+| `CANARY_TRAP_CACHE_MAX_ENTRIES` | `1024` | |
+
 ## Fake `/.git/*` tree
 
 Requires `TRACEBIT_API_KEY`.
