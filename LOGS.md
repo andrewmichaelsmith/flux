@@ -110,29 +110,8 @@ One log line per hit. All entries share the same shape:
 | `<trap-name>-error` | 502 | — (upstream canary issuance failed) |
 | `<trap-name>-render-error` | 502 | `error: str<=400` (renderer raised) |
 
-Where `<trap-name>` is one of:
-
-| Tag | Paths | Canary type |
-| --- | --- | --- |
-| `aws-credentials-file` | `/.aws/credentials` | `aws` |
-| `wp-config` | `/wp-config.php` (+`.bak`/`.old`/`.txt`) | `aws` |
-| `sql-dump` | `/backup.sql`, `/db.sql`, `/dump.sql`, `/database.sql`, `/backup/db.sql`, `/sql/backup.sql` | `aws` |
-| `config-json` | `/config.json`, `/settings.json`, `/credentials.json`, `/secrets.json` | `aws` |
-| `firebase-json` | `/firebase.json`, `/google-services.json`, `/serviceaccount.json`, `/service-account.json` | `aws` |
-| `docker-config` | `/.docker/config.json`, `/docker/config.json` | `aws` |
-| `docker-compose` | `/docker-compose.yml`, `/docker-compose.yaml`, `/compose.yml`, `/compose.yaml` | `aws` |
-| `application-properties` | `/application.properties` | `aws` |
-| `application-yml` | `/application.yml`, `/application.yaml` | `aws` |
-| `env-production` | `/.env.production`, `/.env.prod`, `/.env.live` | `aws` |
-| `phpinfo` | `/phpinfo.php`, `/info.php`, `/php.php`, `/test.php` | `aws` |
-| `ssh-private-key` | `/id_rsa`, `/.ssh/id_rsa`, `/ssh/id_rsa`, `/ssh/id_rsa.key`, `/keys/id_rsa`, `/private.key`, `/deploy_key`, `/deploy.key` | `ssh` |
-| `ssh-public-key` | `/id_rsa.pub`, `/.ssh/id_rsa.pub` | `ssh` |
-| `authorized-keys` | `/authorized_keys`, `/.ssh/authorized_keys` | `ssh` |
-| `netrc` | `/.netrc`, `/_netrc` | `gitlab-username-password` |
-| `npmrc` | `/.npmrc` | `gitlab-username-password` |
-| `pypirc` | `/.pypirc` | `gitlab-username-password` |
-| `gitlab-api-user` | `/api/v4/user` | `gitlab-username-password` |
-| `gitlab-sign-in` | `/users/sign_in` | `gitlab-cookie` |
+See the [canary file trap table in the README](./README.md#canary-file-trap-table)
+for the full list of `<trap-name>` values and the paths each one matches.
 
 ## Caveats
 

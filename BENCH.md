@@ -13,53 +13,61 @@ python scripts/bench.py --tarpit-only       # concurrent-drip saturation only
 python scripts/bench.py --throughput-only   # skip the tarpit saturation test
 ```
 
-## Results
+All latency columns are wall-clock ms measured per request via
+`time.monotonic()`. `req/s` is the completed-request count divided by
+wall-clock elapsed seconds of the run.
 
 Run in the Claude Code web sandbox (Linux, x86_64, 16 logical cores,
-Python 3.11.15, aiohttp 3.13.5), 32 concurrent clients, 3 s per case:
+Python 3.11.15, aiohttp 3.13.5), 32 concurrent clients, 3 s per case,
+Tracebit canary issuance mocked (emulates the always-cached path — real
+Tracebit round-trips would dominate the first hit per IP):
 
 | Path                                         | req/s  | p50 (ms) | p95 (ms) | p99 (ms) |
 | -------------------------------------------- | -----: | -------: | -------: | -------: |
-| `/nope/does-not-exist` (404)                 |  1,847 |    16.97 |    20.17 |    24.04 |
-| `/shell.php?cmd=id` (webshell)               |  3,483 |     9.01 |    10.96 |    12.31 |
-| `/wp-content/plugins/hellopress/…` (webshell)|  3,422 |     9.12 |    10.98 |    12.09 |
-| `/.aws/credentials` (aws INI)                |  3,626 |     8.63 |    10.28 |    11.07 |
-| `/wp-config.php` (aws PHP)                   |  3,542 |     8.83 |    10.58 |    11.92 |
-| `/backup.sql` (aws SQL)                      |  3,473 |     9.02 |    10.56 |    12.67 |
-| `/config.json` (aws JSON)                    |  3,134 |     9.77 |    12.55 |    20.20 |
-| `/id_rsa` (ssh PEM)                          |  3,454 |     8.97 |    11.46 |    13.59 |
-| `/api/v4/user` (gitlab JSON)                 |  3,103 |     9.95 |    12.46 |    20.00 |
-| `/users/sign_in` (gitlab HTML + Set-Cookie)  |  3,230 |     9.68 |    11.88 |    13.42 |
+| `/nope/does-not-exist` (404)                 |  1,173 |    26.72 |    32.40 |    38.08 |
+| `/shell.php?cmd=id` (webshell)               |  1,888 |    16.65 |    23.64 |    27.15 |
+| `/wp-content/plugins/hellopress/…` (webshell)|  1,996 |    15.45 |    22.35 |    27.10 |
+| `/.aws/credentials` (aws INI)                |  2,421 |    13.20 |    16.72 |    18.75 |
+| `/wp-config.php` (aws PHP)                   |  2,044 |    15.23 |    21.59 |    26.71 |
+| `/backup.sql` (aws SQL)                      |  1,997 |    15.90 |    21.54 |    23.39 |
+| `/config.json` (aws JSON)                    |  1,672 |    19.36 |    24.81 |    31.25 |
+| `/id_rsa` (ssh PEM)                          |  1,965 |    16.06 |    21.28 |    24.85 |
+| `/api/v4/user` (gitlab JSON)                 |  1,691 |    18.58 |    25.20 |    29.58 |
+| `/users/sign_in` (gitlab HTML + Set-Cookie)  |  1,706 |    18.95 |    24.79 |    30.43 |
 
-~3k req/s on fast-path traps, single-threaded Python. That's CPU-bound
-on the aiohttp parse+serialize path, not renderer-bound (the renderer
-functions are small string ops). The 404 case is noticeably slower in
-aiohttp by design — its 404 path allocates a fresh response object and
-doesn't benefit from the route match that the other cases follow.
+~2k req/s on fast-path traps in this shared sandbox; another run on the
+same config returned 3.0–3.6k req/s for the same cases, so expect ±50%
+run-to-run noise here. A dedicated single-core VM without noisy
+neighbours should sit near the high end. CPU is spent on aiohttp
+parse+serialize, not the renderers (small string ops).
 
-Caching model: the per-`(IP, canary-type)` TTL cache means a scanner
-fanning out against the same trap sees one canary mint + 1 h of cheap
-re-serves. Real Tracebit round-trips would dominate the first request
-per (IP, types) pair and cap real-world throughput at whatever
-`community.tracebit.com` returns in — typically 50–200 ms per request.
+Real production throughput is bounded by Tracebit on cache miss —
+typically 50–200 ms per issuance at `community.tracebit.com`. The
+per-`(IP, canary-type)` TTL cache means a scanner session fanning out
+over one trap pays for one canary mint, not one per request.
+
+To simulate real Tracebit latency:
+
+```bash
+python scripts/bench.py --simulate-tracebit-latency-ms 100
+```
 
 ## Tarpit saturation
 
-`TARPIT_MAX_CONNECTIONS` default is 8. With the cap in place:
+`TARPIT_MAX_CONNECTIONS` default is 256 (sized for an async event loop,
+not a thread pool). With the cap in place:
 
-| Concurrent `/.env.bak` clients | 200 | 503 |
-| -----------------------------: | --: | --: |
-| 4                              |   4 |   0 |
-| 8                              |   8 |   0 |
-| 16                             |   8 |   8 |
-| 32                             |   8 |  24 |
-| 64                             |   8 |  56 |
+| Concurrent `/.env.bak` clients | 200 | 503 | wall  |
+| -----------------------------: | --: | --: | ----: |
+| 64                             |  64 |   0 | 0.08s |
+| 128                            | 128 |   0 | 0.16s |
+| 256                            | 256 |   0 | 1.20s |
+| 512                            | 418 |  94 | 1.52s |
+| 1,024                          | 493 | 531 | 3.31s |
 
-Exactly at the cap, as expected. The cap's there to bound memory, not
-CPU — each async drip costs ~8 KB of coroutine state, so raising the
-cap 10×–100× is usually fine if you're hitting the limit on a live
-sensor. Set `TRACEBIT_ENV_TARPIT_MAX_CONNECTIONS=256` (or higher) in
-that case.
+Each held drip is ~8 KB of coroutine state (not a thread), so raising
+`TRACEBIT_ENV_TARPIT_MAX_CONNECTIONS` another 10× is cheap if a real
+burst trips the 256 default.
 
 ## What the benchmark doesn't cover
 

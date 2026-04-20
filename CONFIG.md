@@ -35,7 +35,7 @@ canaries at hit time.
 | `TRACEBIT_ENV_TARPIT_SECONDS` | `0` | Max duration per response. `0` = stream until the client hangs up. |
 | `TRACEBIT_ENV_TARPIT_CHUNK_BYTES` | `32` | |
 | `TRACEBIT_ENV_TARPIT_INTERVAL_MS` | `2000` | |
-| `TRACEBIT_ENV_TARPIT_MAX_CONNECTIONS` | `8` | Concurrent tarpit responses per process. Shared with the fake-git drip. |
+| `TRACEBIT_ENV_TARPIT_MAX_CONNECTIONS` | `256` | Concurrent tarpit responses per process. Shared with the fake-git drip. Each held drip is ~8 KB of coroutine state (not a thread). |
 
 ### Fingerprint paths
 
@@ -73,9 +73,10 @@ fingerprint. Set any single var to `false` / `0` to disable just that one.
 ## Canary-backed file traps
 
 A table of paths that serve a plausible file format with a freshly-minted
-Tracebit canary embedded. See [`ROADMAP.md`](./ROADMAP.md) for the current
-list. Gated on `TRACEBIT_API_KEY` being set. Per-IP cache keeps scanner
-fan-out from burning quota.
+Tracebit canary embedded. See [README](./README.md#canary-file-trap-table)
+for the full list of paths and per-trap canary types. Gated on
+`TRACEBIT_API_KEY` being set. Per-IP cache keeps scanner fan-out from
+burning quota.
 
 | Var | Default | Notes |
 | --- | --- | --- |
@@ -119,9 +120,9 @@ local backend behind a reverse proxy in our use.
 
 Single-process aiohttp event loop. Slow-drip traps (tarpit + fake-git)
 share a connection cap of `TRACEBIT_ENV_TARPIT_MAX_CONNECTIONS` (default
-8) — the 9th concurrent drip gets a 503. Because the event loop is
-cooperative, each drip costs ~8 KB of coroutine state, so raising the
-cap by 10–100× is usually cheap if you see legitimate 503s.
+256) — the 257th concurrent drip gets a 503. Because the event loop is
+cooperative, each drip costs ~8 KB of coroutine state, not an OS thread,
+so raising the cap another 10× is usually cheap if a real burst trips it.
 
 Non-drip traps (webshell, canary file traps, /.env canary, /.git/* cache
 hit) return immediately; they're not subject to the cap.
