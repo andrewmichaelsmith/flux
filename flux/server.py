@@ -11,9 +11,11 @@ import threading
 import time
 import uuid
 import zlib
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import Request, urlopen
@@ -544,13 +546,21 @@ def build_tarpit_chunk(request_id: str, path: str, chunk_index: int) -> bytes:
     return base + b"\n"
 
 
-def issue_credentials(request_id: str, client_ip: str, host: str, user_agent: str, path: str, proto: str) -> dict[str, object]:
+def issue_credentials(
+    request_id: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    path: str,
+    proto: str,
+    types: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, object]:
     issue_url = f"{API_BASE_URL}/api/v1/credentials/issue-credentials"
     safe_host = re.sub(r"[^0-9a-z._-]+", "-", host or "unknown").strip("-") or "unknown"
     request_name = f"{SENSOR_ID or 'sensor'}-{safe_host}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{request_id[:8]}"
     payload = {
         "name": request_name,
-        "types": CANARY_TYPES,
+        "types": list(types) if types else CANARY_TYPES,
         "source": TRACEBIT_SOURCE,
         "sourceType": TRACEBIT_SOURCE_TYPE,
         "labels": [
@@ -814,6 +824,580 @@ def _fake_git_get_or_build(
     return files, meta
 
 
+# --- Canary-backed file traps ---
+#
+# Each entry routes a set of exact paths to a render function that embeds
+# a freshly-minted Tracebit canary credential into a plausible file format
+# (wp-config.php, .aws/credentials, a SQL dump, etc.). Per-IP cache keeps
+# repeated scanner fan-out from burning Tracebit quota.
+
+_CANARY_LOCK = threading.Lock()
+_CANARY_CACHE: dict[tuple[str, tuple[str, ...]], tuple[float, dict[str, object]]] = {}
+CANARY_TRAP_CACHE_TTL_SECONDS = max(
+    int((os.environ.get("CANARY_TRAP_CACHE_TTL_SECONDS") or "3600").strip() or "3600"), 60,
+)
+CANARY_TRAP_CACHE_MAX_ENTRIES = max(
+    int((os.environ.get("CANARY_TRAP_CACHE_MAX_ENTRIES") or "1024").strip() or "1024"), 16,
+)
+CANARY_TRAPS_ENABLED = _env_bool("CANARY_TRAPS_ENABLED")
+
+
+def _get_or_issue_canary(
+    types: tuple[str, ...],
+    client_ip: str,
+    request_id: str,
+    host: str,
+    user_agent: str,
+    path: str,
+    proto: str,
+) -> dict[str, object] | None:
+    """Per-(IP, types) TTL-cached canary issuance.
+
+    A scanner that fans out on the same trap (or different traps needing the
+    same canary types) within the TTL gets one canary, not N.
+    """
+    now = time.monotonic()
+    cache_key = (client_ip or f"_anon-{request_id}", types)
+    with _CANARY_LOCK:
+        entry = _CANARY_CACHE.get(cache_key)
+        if entry and entry[0] > now:
+            return entry[1]
+    try:
+        resp = issue_credentials(request_id, client_ip, host, user_agent, path, proto, types=types)
+    except (HTTPError, URLError, TimeoutError, ValueError):
+        return None
+    expiry = now + CANARY_TRAP_CACHE_TTL_SECONDS
+    with _CANARY_LOCK:
+        expired = [k for k, v in _CANARY_CACHE.items() if v[0] <= now]
+        for k in expired:
+            del _CANARY_CACHE[k]
+        if len(_CANARY_CACHE) >= CANARY_TRAP_CACHE_MAX_ENTRIES:
+            oldest_key = min(_CANARY_CACHE, key=lambda k: _CANARY_CACHE[k][0])
+            del _CANARY_CACHE[oldest_key]
+        _CANARY_CACHE[cache_key] = (expiry, resp)
+    return resp
+
+
+# --- Render functions: (tracebit_response) -> bytes ---
+
+def _aws(r: dict[str, object]) -> dict[str, str]:
+    aws = r.get("aws") if isinstance(r, dict) else None
+    return aws if isinstance(aws, dict) else {}
+
+
+def _gitlab_creds(r: dict[str, object], canary_type: str) -> dict[str, object]:
+    http = r.get("http") if isinstance(r, dict) else None
+    if not isinstance(http, dict):
+        return {}
+    details = http.get(canary_type)
+    if not isinstance(details, dict):
+        return {}
+    return details
+
+
+def render_aws_credentials_ini(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "[default]\n"
+        f"aws_access_key_id = {aws.get('awsAccessKeyId', '')}\n"
+        f"aws_secret_access_key = {aws.get('awsSecretAccessKey', '')}\n"
+        f"aws_session_token = {aws.get('awsSessionToken', '')}\n"
+        "region = us-east-1\n"
+    ).encode("utf-8")
+
+
+def render_wp_config_php(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "<?php\n"
+        "/** MySQL settings */\n"
+        "define('DB_NAME', 'wordpress');\n"
+        "define('DB_USER', 'wp_prod');\n"
+        "define('DB_PASSWORD', 'h6T!9pq2Wz@LmRnV');\n"
+        "define('DB_HOST', 'db.internal:3306');\n"
+        "define('DB_CHARSET', 'utf8mb4');\n"
+        "\n"
+        "/** AWS settings for media uploads + nightly backups */\n"
+        f"define('AWS_ACCESS_KEY_ID', '{aws.get('awsAccessKeyId', '')}');\n"
+        f"define('AWS_SECRET_ACCESS_KEY', '{aws.get('awsSecretAccessKey', '')}');\n"
+        f"define('AWS_SESSION_TOKEN', '{aws.get('awsSessionToken', '')}');\n"
+        "define('AWS_DEFAULT_REGION', 'us-east-1');\n"
+        "define('S3_UPLOADS_BUCKET', 'wp-uploads-prod');\n"
+        "\n"
+        "$table_prefix = 'wp_';\n"
+        "define('WP_DEBUG', false);\n"
+        "if (!defined('ABSPATH')) { define('ABSPATH', __DIR__ . '/'); }\n"
+        "require_once ABSPATH . 'wp-settings.php';\n"
+    ).encode("utf-8")
+
+
+def render_sql_dump(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        "-- MySQL dump 10.13  Distrib 8.0.35\n"
+        f"-- Host: db.internal    Database: wp_prod\n"
+        f"-- Dumped at: {ts}\n"
+        "--\n"
+        "-- S3 backup credentials (rotate via Vault; see INFRA-412):\n"
+        f"--   AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"--   AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"--   AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "--\n"
+        "\n"
+        "LOCK TABLES `wp_options` WRITE;\n"
+        "INSERT INTO `wp_options` VALUES (1,'siteurl','https://shop.internal-tools.lan','yes');\n"
+        "INSERT INTO `wp_options` VALUES (2,'blogname','Internal Tools','yes');\n"
+        "INSERT INTO `wp_options` VALUES (3,'admin_email','ops@internal-tools.lan','yes');\n"
+        "INSERT INTO `wp_options` VALUES (4,'s3_backup_bucket','wp-backups-prod','yes');\n"
+        f"INSERT INTO `wp_options` VALUES (5,'s3_access_key','{aws.get('awsAccessKeyId', '')}','no');\n"
+        f"INSERT INTO `wp_options` VALUES (6,'s3_secret_key','{aws.get('awsSecretAccessKey', '')}','no');\n"
+        "UNLOCK TABLES;\n"
+    ).encode("utf-8")
+
+
+def render_config_json(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return json.dumps({
+        "app": "internal-tools",
+        "env": "production",
+        "aws": {
+            "access_key_id": aws.get("awsAccessKeyId", ""),
+            "secret_access_key": aws.get("awsSecretAccessKey", ""),
+            "session_token": aws.get("awsSessionToken", ""),
+            "region": "us-east-1",
+        },
+        "features": {"s3_uploads": True, "dynamodb_sessions": True},
+    }, indent=2).encode("utf-8")
+
+
+def render_firebase_json(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    # We only have AWS canaries from Tracebit Community today. Shape this
+    # like a service-account file but label keys in a way that still looks
+    # plausible to a grep-based scanner.
+    return json.dumps({
+        "type": "service_account",
+        "project_id": "internal-tools-prod",
+        "private_key_id": aws.get("awsAccessKeyId", ""),
+        "private_key": f"-----BEGIN PRIVATE KEY-----\n{aws.get('awsSecretAccessKey', '')}\n-----END PRIVATE KEY-----\n",
+        "client_email": "deployer@internal-tools-prod.iam.gserviceaccount.com",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "aws_session_token": aws.get("awsSessionToken", ""),
+    }, indent=2).encode("utf-8")
+
+
+def render_docker_config(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    import base64
+    auth = base64.b64encode(
+        f"AWS:{aws.get('awsSecretAccessKey', '')}".encode("utf-8"),
+    ).decode("ascii")
+    return json.dumps({
+        "auths": {
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com": {
+                "auth": auth,
+                "identitytoken": aws.get("awsSessionToken", ""),
+            },
+        },
+        "credsStore": "ecr-login",
+        "HttpHeaders": {"User-Agent": "Docker-Client/24.0.7 (linux)"},
+    }, indent=2).encode("utf-8")
+
+
+def render_docker_compose_yml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "version: '3.9'\n"
+        "services:\n"
+        "  web:\n"
+        "    image: internal/tools:prod\n"
+        "    environment:\n"
+        f"      AWS_ACCESS_KEY_ID: {aws.get('awsAccessKeyId', '')}\n"
+        f"      AWS_SECRET_ACCESS_KEY: {aws.get('awsSecretAccessKey', '')}\n"
+        f"      AWS_SESSION_TOKEN: {aws.get('awsSessionToken', '')}\n"
+        "      AWS_DEFAULT_REGION: us-east-1\n"
+        "    ports:\n"
+        "      - '8080:8080'\n"
+    ).encode("utf-8")
+
+
+def render_application_properties(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "# Spring Boot production config\n"
+        "spring.application.name=internal-tools\n"
+        "server.port=8080\n"
+        "\n"
+        "spring.datasource.url=jdbc:postgresql://db.internal:5432/prod\n"
+        "spring.datasource.username=prod_rw\n"
+        "spring.datasource.password=h6T!9pq2Wz@LmRnV\n"
+        "\n"
+        f"aws.access.key.id={aws.get('awsAccessKeyId', '')}\n"
+        f"aws.access.key.secret={aws.get('awsSecretAccessKey', '')}\n"
+        f"aws.session.token={aws.get('awsSessionToken', '')}\n"
+        "aws.region=us-east-1\n"
+    ).encode("utf-8")
+
+
+def render_application_yml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "spring:\n"
+        "  application:\n"
+        "    name: internal-tools\n"
+        "  datasource:\n"
+        "    url: jdbc:postgresql://db.internal:5432/prod\n"
+        "    username: prod_rw\n"
+        "    password: h6T!9pq2Wz@LmRnV\n"
+        "aws:\n"
+        f"  access-key-id: {aws.get('awsAccessKeyId', '')}\n"
+        f"  access-key-secret: {aws.get('awsSecretAccessKey', '')}\n"
+        f"  session-token: {aws.get('awsSessionToken', '')}\n"
+        "  region: us-east-1\n"
+    ).encode("utf-8")
+
+
+def render_env_production(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "# production .env — rotate quarterly (INFRA-218)\n"
+        "NODE_ENV=production\n"
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "AWS_REGION=us-east-1\n"
+        "DATABASE_URL=postgresql://prod_rw:h6T!9pq2Wz@LmRnV@db.internal:5432/prod\n"
+    ).encode("utf-8")
+
+
+def render_phpinfo(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    return (
+        "<!DOCTYPE html>\n"
+        "<html><head><title>phpinfo()</title>\n"
+        "<style>body{background:#fff;color:#000;font-family:sans-serif}"
+        "table{border-collapse:collapse;width:80%;margin:1em auto}"
+        "th,td{border:1px solid #000;padding:4px 8px}"
+        "h1{background:#9999cc;text-align:center}"
+        "h2{background:#ccccff;margin-top:2em}</style></head><body>\n"
+        "<h1>PHP Version 8.2.15</h1>\n"
+        "<h2>Environment</h2>\n"
+        "<table>\n"
+        "<tr><th>Variable</th><th>Value</th></tr>\n"
+        f"<tr><td>AWS_ACCESS_KEY_ID</td><td>{ak}</td></tr>\n"
+        f"<tr><td>AWS_SECRET_ACCESS_KEY</td><td>{sk}</td></tr>\n"
+        f"<tr><td>AWS_SESSION_TOKEN</td><td>{st}</td></tr>\n"
+        "<tr><td>AWS_DEFAULT_REGION</td><td>us-east-1</td></tr>\n"
+        "<tr><td>DB_HOST</td><td>db.internal</td></tr>\n"
+        "<tr><td>DB_USER</td><td>prod_rw</td></tr>\n"
+        "<tr><td>DB_PASSWORD</td><td>h6T!9pq2Wz@LmRnV</td></tr>\n"
+        "</table>\n"
+        "<h2>Loaded Modules</h2>\n"
+        "<p>core, date, libxml, openssl, pcre, sqlite3, zlib, ctype, curl, "
+        "dom, fileinfo, filter, hash, iconv, json, mbstring, SPL, session, "
+        "pdo_mysql, mysqlnd, ftp</p>\n"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
+def render_ssh_private_key(r: dict[str, object]) -> bytes:
+    ssh = r.get("ssh") if isinstance(r, dict) else None
+    if not isinstance(ssh, dict):
+        return b""
+    pk = ssh.get("sshPrivateKey", "") or ""
+    # Tracebit returns the PEM as-is; ensure it ends with a newline.
+    return (pk if pk.endswith("\n") else pk + "\n").encode("utf-8")
+
+
+def render_ssh_public_key(r: dict[str, object]) -> bytes:
+    ssh = r.get("ssh") if isinstance(r, dict) else None
+    if not isinstance(ssh, dict):
+        return b""
+    pub = ssh.get("sshPublicKey", "") or ""
+    return (pub if pub.endswith("\n") else pub + "\n").encode("utf-8")
+
+
+def render_authorized_keys(r: dict[str, object]) -> bytes:
+    ssh = r.get("ssh") if isinstance(r, dict) else None
+    if not isinstance(ssh, dict):
+        return b""
+    pub = (ssh.get("sshPublicKey", "") or "").strip()
+    return (
+        f"# production deploy keys — rotate via scripts/rotate-keys.sh\n"
+        f"{pub}\n"
+    ).encode("utf-8")
+
+
+def render_netrc(r: dict[str, object]) -> bytes:
+    creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    username = str(creds.get("username", "") or "deploy")
+    password = str(creds.get("password", "") or "")
+    host_names = _gitlab_creds(r, "gitlab-username-password").get("hostNames") or []
+    host = str(host_names[0]) if host_names else "gitlab.internal-tools.lan"
+    return (
+        f"machine {host}\n"
+        f"  login {username}\n"
+        f"  password {password}\n"
+    ).encode("utf-8")
+
+
+def render_npmrc(r: dict[str, object]) -> bytes:
+    creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    password = str(creds.get("password", "") or "")
+    return (
+        "registry=https://npm.internal-tools.lan/\n"
+        f"//npm.internal-tools.lan/:_authToken={password}\n"
+        "always-auth=true\n"
+    ).encode("utf-8")
+
+
+def render_pypirc(r: dict[str, object]) -> bytes:
+    creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    username = str(creds.get("username", "") or "deploy")
+    password = str(creds.get("password", "") or "")
+    return (
+        "[distutils]\n"
+        "index-servers = internal\n"
+        "\n"
+        "[internal]\n"
+        "repository = https://pypi.internal-tools.lan/\n"
+        f"username = {username}\n"
+        f"password = {password}\n"
+    ).encode("utf-8")
+
+
+def render_gitlab_api_user(r: dict[str, object]) -> bytes:
+    creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    username = str(creds.get("username", "") or "deploy")
+    return json.dumps({
+        "id": 42,
+        "username": username,
+        "name": "Deploy Bot",
+        "state": "active",
+        "email": f"{username}@internal-tools.lan",
+        "web_url": f"https://gitlab.internal-tools.lan/{username}",
+        "is_admin": False,
+        "two_factor_enabled": False,
+    }, indent=2).encode("utf-8")
+
+
+def render_gitlab_sign_in(r: dict[str, object]) -> bytes:
+    # Body doesn't need the canary; just a plausible login page. The canary
+    # goes out as Set-Cookie when we dispatch this trap (see _send_canary_trap).
+    return (
+        "<!DOCTYPE html>\n"
+        "<html><head><title>Sign in &middot; GitLab</title></head>\n"
+        "<body>\n"
+        "<h1>GitLab</h1>\n"
+        "<form method='POST' action='/users/sign_in'>\n"
+        "<input name='authenticity_token' type='hidden' value='xxx' />\n"
+        "<label>Username or email <input name='user[login]' /></label>\n"
+        "<label>Password <input name='user[password]' type='password' /></label>\n"
+        "<button type='submit'>Sign in</button>\n"
+        "</form>\n"
+        "<p><a href='/users/password/new'>Forgot your password?</a></p>\n"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
+@dataclass(frozen=True)
+class CanaryTrap:
+    name: str                      # log tag, e.g. "aws-credentials-file"
+    paths: tuple[str, ...]          # exact lowercase matches
+    canary_types: tuple[str, ...]   # Tracebit types to request
+    render: "Callable[[dict[str, object]], bytes]"
+    content_type: str
+    # Optional: extra response headers to emit (e.g. Set-Cookie for gitlab-cookie).
+    extra_headers: "Callable[[dict[str, object]], tuple[tuple[str, str], ...]]" = field(
+        default=lambda _r: ()
+    )
+
+
+def _gitlab_cookie_header(r: dict[str, object]) -> tuple[tuple[str, str], ...]:
+    creds = _gitlab_creds(r, "gitlab-cookie").get("credentials")
+    if not isinstance(creds, dict):
+        return ()
+    cookie_name = str(creds.get("name") or creds.get("cookie_name") or "_gitlab_session")
+    cookie_value = str(
+        creds.get("value") or creds.get("cookie_value") or creds.get("password") or "",
+    )
+    if not cookie_value:
+        return ()
+    return (
+        ("Set-Cookie", f"{cookie_name}={cookie_value}; Path=/; HttpOnly; SameSite=Lax"),
+    )
+
+
+CANARY_TRAPS: tuple[CanaryTrap, ...] = (
+    CanaryTrap(
+        "aws-credentials-file",
+        ("/.aws/credentials",),
+        ("aws",),
+        render_aws_credentials_ini,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "wp-config",
+        ("/wp-config.php", "/wp-config.php.bak", "/wp-config.old", "/wp-config.txt"),
+        ("aws",),
+        render_wp_config_php,
+        "application/x-php; charset=utf-8",
+    ),
+    CanaryTrap(
+        "sql-dump",
+        ("/backup.sql", "/db.sql", "/dump.sql", "/database.sql", "/backup/db.sql", "/sql/backup.sql"),
+        ("aws",),
+        render_sql_dump,
+        "application/sql; charset=utf-8",
+    ),
+    CanaryTrap(
+        "config-json",
+        ("/config.json", "/settings.json", "/credentials.json", "/secrets.json"),
+        ("aws",),
+        render_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "firebase-json",
+        ("/firebase.json", "/google-services.json", "/serviceaccount.json", "/service-account.json"),
+        ("aws",),
+        render_firebase_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "docker-config",
+        ("/.docker/config.json", "/docker/config.json"),
+        ("aws",),
+        render_docker_config,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "docker-compose",
+        ("/docker-compose.yml", "/docker-compose.yaml", "/compose.yml", "/compose.yaml"),
+        ("aws",),
+        render_docker_compose_yml,
+        "application/yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "application-properties",
+        ("/application.properties",),
+        ("aws",),
+        render_application_properties,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "application-yml",
+        ("/application.yml", "/application.yaml"),
+        ("aws",),
+        render_application_yml,
+        "application/yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "env-production",
+        ("/.env.production", "/.env.prod", "/.env.live"),
+        ("aws",),
+        render_env_production,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "phpinfo",
+        ("/phpinfo.php", "/info.php", "/php.php", "/test.php"),
+        ("aws",),
+        render_phpinfo,
+        "text/html; charset=utf-8",
+    ),
+    CanaryTrap(
+        "ssh-private-key",
+        (
+            "/id_rsa",
+            "/.ssh/id_rsa",
+            "/ssh/id_rsa",
+            "/ssh/id_rsa.key",
+            "/keys/id_rsa",
+            "/private.key",
+            "/deploy_key",
+            "/deploy.key",
+        ),
+        ("ssh",),
+        render_ssh_private_key,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "ssh-public-key",
+        ("/id_rsa.pub", "/.ssh/id_rsa.pub"),
+        ("ssh",),
+        render_ssh_public_key,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "authorized-keys",
+        ("/authorized_keys", "/.ssh/authorized_keys"),
+        ("ssh",),
+        render_authorized_keys,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "netrc",
+        ("/.netrc", "/_netrc"),
+        ("gitlab-username-password",),
+        render_netrc,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "npmrc",
+        ("/.npmrc",),
+        ("gitlab-username-password",),
+        render_npmrc,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "pypirc",
+        ("/.pypirc",),
+        ("gitlab-username-password",),
+        render_pypirc,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "gitlab-api-user",
+        ("/api/v4/user",),
+        ("gitlab-username-password",),
+        render_gitlab_api_user,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "gitlab-sign-in",
+        ("/users/sign_in",),
+        ("gitlab-cookie",),
+        render_gitlab_sign_in,
+        "text/html; charset=utf-8",
+        extra_headers=_gitlab_cookie_header,
+    ),
+)
+
+_TRAP_BY_PATH: dict[str, CanaryTrap] = {}
+for _trap in CANARY_TRAPS:
+    for _p in _trap.paths:
+        _TRAP_BY_PATH[_p.lower()] = _trap
+
+
+def find_canary_trap(path: str) -> "CanaryTrap | None":
+    if not CANARY_TRAPS_ENABLED:
+        return None
+    return _TRAP_BY_PATH.get(path.lower())
+
+
 class EnvHandler(BaseHTTPRequestHandler):
     server_version = "flux/0.1"
 
@@ -828,6 +1412,64 @@ class EnvHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self._handle(send_body=True, read_body=True)
+
+    def _send_canary_trap(
+        self,
+        trap: "CanaryTrap",
+        *,
+        request_id: str,
+        path: str,
+        client_ip: str,
+        host: str,
+        user_agent: str,
+        proto: str,
+        log_context: dict[str, object],
+        send_body: bool,
+    ) -> None:
+        tracebit_response = _get_or_issue_canary(
+            trap.canary_types, client_ip, request_id, host, user_agent, path, proto,
+        )
+        if tracebit_response is None:
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            append_log({**log_context, "status": 502, "result": f"{trap.name}-error"})
+            if send_body:
+                self.wfile.write(b"upstream credential issue failed\n")
+            return
+
+        try:
+            body = trap.render(tracebit_response)
+        except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            append_log({
+                **log_context,
+                "status": 502,
+                "result": f"{trap.name}-render-error",
+                "error": str(exc)[:400],
+            })
+            if send_body:
+                self.wfile.write(b"render error\n")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", trap.content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for header_name, header_value in trap.extra_headers(tracebit_response):
+            self.send_header(header_name, header_value)
+        self.end_headers()
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": trap.name,
+            "canaryTypes": [k for k, v in tracebit_response.items() if v],
+            "bytes": len(body),
+        })
+        if send_body:
+            self.wfile.write(body)
 
     def _send_fake_git(
         self,
@@ -1169,6 +1811,25 @@ class EnvHandler(BaseHTTPRequestHandler):
                 send_body=send_body,
             )
             return
+
+        # Canary file traps — gated like the webshell on ALLOWED_HOSTS
+        # (trap sensor, not per-request Host match) because scanners
+        # routinely spoof Host and we still want to catch them.
+        if ALLOWED_HOSTS and API_KEY:
+            trap = find_canary_trap(path)
+            if trap is not None:
+                self._send_canary_trap(
+                    trap,
+                    request_id=request_id,
+                    path=path,
+                    client_ip=client_ip,
+                    host=host,
+                    user_agent=user_agent,
+                    proto=proto,
+                    log_context=log_context,
+                    send_body=send_body,
+                )
+                return
 
         if path != "/.env" or not API_KEY or not host_allowed:
             self.send_response(404)
