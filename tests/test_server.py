@@ -352,6 +352,224 @@ def test_tarpit_enabled_by_default():
     assert tbenv.TARPIT_ENABLED
 
 
+# --- Canary-backed file traps ---
+
+FAKE_TRACEBIT = {
+    "aws": {
+        "awsAccessKeyId": "AKIAFAKEEXAMPLE01",
+        "awsSecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "awsSessionToken": "FwoGZXIvYXdzEXAMPLEFAKE=",
+        "awsExpiration": "2030-01-01T00:00:00Z",
+        "awsConfirmationId": "conf-aws-1",
+    },
+    "ssh": {
+        "sshIp": "203.0.113.99",
+        "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKEKEY\n-----END OPENSSH PRIVATE KEY-----",
+        "sshPublicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE canary@flux",
+        "sshExpiration": "2030-01-01T00:00:00Z",
+        "sshConfirmationId": "conf-ssh-1",
+    },
+    "http": {
+        "gitlab-username-password": {
+            "credentials": {"username": "deploybot42", "password": "p@ssCanaryValue"},
+            "hostNames": ["gitlab.canary.example"],
+            "expiresAt": "2030-01-01T00:00:00Z",
+            "browserDeploymentId": "bd-gup-1",
+            "confirmationId": "conf-gup-1",
+        },
+        "gitlab-cookie": {
+            "credentials": {"name": "_gitlab_session", "value": "cookieCanaryValue"},
+            "hostNames": ["gitlab.canary.example"],
+            "expiresAt": "2030-01-01T00:00:00Z",
+            "browserDeploymentId": "bd-gc-1",
+            "confirmationId": "conf-gc-1",
+        },
+    },
+}
+
+
+@pytest.mark.parametrize("path,needle", [
+    ("/.aws/credentials", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    ("/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/backup.sql", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/config.json", b'"access_key_id": "AKIAFAKEEXAMPLE01"'),
+    ("/firebase.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
+    ("/.docker/config.json", b'"auths"'),
+    ("/docker-compose.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
+    ("/application.properties", b"aws.access.key.id=AKIAFAKEEXAMPLE01"),
+    ("/application.yml", b"access-key-id: AKIAFAKEEXAMPLE01"),
+    ("/.env.production", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/phpinfo.php", b"AKIAFAKEEXAMPLE01"),
+    ("/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/authorized_keys", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
+    ("/.netrc", b"login deploybot42"),
+    ("/.npmrc", b"p@ssCanaryValue"),
+    ("/.pypirc", b"username = deploybot42"),
+    ("/api/v4/user", b'"username": "deploybot42"'),
+    ("/users/sign_in", b"<title>Sign in"),
+])
+def test_canary_trap_renderers_embed_canary(path, needle):
+    trap = tbenv._TRAP_BY_PATH[path]
+    body = trap.render(FAKE_TRACEBIT)
+    assert needle in body, f"expected {needle!r} in rendered {path}; got {body[:200]!r}"
+
+
+def test_find_canary_trap_returns_none_when_disabled(monkeypatch):
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", False)
+    assert tbenv.find_canary_trap("/.aws/credentials") is None
+
+
+def test_find_canary_trap_matches_case_insensitively(monkeypatch):
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    assert tbenv.find_canary_trap("/WP-Config.PHP") is not None
+    assert tbenv.find_canary_trap("/.AWS/Credentials") is not None
+
+
+def test_find_canary_trap_misses_non_trap_paths(monkeypatch):
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    for p in ["/", "/index.html", "/api/v4/projects", "/.env"]:
+        assert tbenv.find_canary_trap(p) is None, f"unexpected match for {p}"
+
+
+def test_every_trap_has_distinct_paths():
+    """Catch accidental duplicates across traps (which one wins would be undefined)."""
+    seen: dict[str, str] = {}
+    for trap in tbenv.CANARY_TRAPS:
+        for p in trap.paths:
+            lp = p.lower()
+            assert lp not in seen, f"{lp} claimed by both {seen[lp]} and {trap.name}"
+            seen[lp] = trap.name
+
+
+def test_gitlab_cookie_emits_set_cookie_header():
+    """The gitlab-sign-in trap returns the gitlab-cookie canary as Set-Cookie,
+    not in the body. That's how the scanner picks it up."""
+    trap = tbenv._TRAP_BY_PATH["/users/sign_in"]
+    headers = trap.extra_headers(FAKE_TRACEBIT)
+    assert headers, "expected at least one extra header"
+    names = {h[0] for h in headers}
+    assert "Set-Cookie" in names
+    cookie_value = next(v for k, v in headers if k == "Set-Cookie")
+    assert "cookieCanaryValue" in cookie_value
+
+
+def test_dispatch_routes_aws_credentials_file_to_trap(monkeypatch, tmp_path):
+    """Full dispatch path — hit /.aws/credentials, see the canary in the body,
+    see one JSON log line with result=aws-credentials-file."""
+    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", {"trap.example.com"})
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", lambda *a, **kw: FAKE_TRACEBIT)
+
+    RecordingHandler, _ = _fake_handler(tbenv, tbenv.ALLOWED_HOSTS)
+    h = RecordingHandler(
+        headers={
+            "Host": "trap.example.com",
+            "X-Forwarded-Host": "trap.example.com",
+            "X-Forwarded-For": "203.0.113.10",
+            "X-Forwarded-Proto": "https",
+        },
+        path="/.aws/credentials",
+    )
+    h._handle(send_body=True)
+
+    assert h.response_code == 200
+    assert b"AKIAFAKEEXAMPLE01" in h.wfile.getvalue()
+    import json
+    entry = json.loads((tmp_path / "env-canary.jsonl").read_text().splitlines()[-1])
+    assert entry["result"] == "aws-credentials-file"
+
+
+def test_dispatch_trap_404s_without_api_key(monkeypatch, tmp_path):
+    """Every canary trap must require API_KEY — no key → 404."""
+    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", {"trap.example.com"})
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+
+    RecordingHandler, _ = _fake_handler(tbenv, tbenv.ALLOWED_HOSTS)
+    for path in ["/.aws/credentials", "/wp-config.php", "/id_rsa", "/api/v4/user"]:
+        h = RecordingHandler(
+            headers={
+                "Host": "trap.example.com",
+                "X-Forwarded-For": "203.0.113.11",
+                "X-Forwarded-Proto": "https",
+            },
+            path=path,
+        )
+        h._handle(send_body=True)
+        assert h.response_code == 404, f"expected 404 for {path} sans API_KEY"
+
+
+def test_dispatch_trap_404s_on_control_sensor(monkeypatch, tmp_path):
+    """Empty ALLOWED_HOSTS (control sensor) must 404 every canary trap."""
+    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", set())
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", lambda *a, **kw: FAKE_TRACEBIT)
+
+    RecordingHandler, _ = _fake_handler(tbenv, set())
+    h = RecordingHandler(
+        headers={
+            "Host": "example.com",
+            "X-Forwarded-For": "203.0.113.12",
+            "X-Forwarded-Proto": "https",
+        },
+        path="/wp-config.php",
+    )
+    h._handle(send_body=True)
+    assert h.response_code == 404
+
+
+def test_dispatch_trap_serves_even_with_spoofed_host(monkeypatch, tmp_path):
+    """Webshell-style gating: Host can be anything, as long as ALLOWED_HOSTS is set
+    (= this is a trap sensor). Matches the April 2026 lesson."""
+    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", {"trap.example.com"})
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", lambda *a, **kw: FAKE_TRACEBIT)
+
+    RecordingHandler, _ = _fake_handler(tbenv, tbenv.ALLOWED_HOSTS)
+    h = RecordingHandler(
+        headers={
+            "Host": "staging.victim.example",  # spoofed
+            "X-Forwarded-Host": "staging.victim.example",
+            "X-Forwarded-For": "203.0.113.13",
+            "X-Forwarded-Proto": "https",
+        },
+        path="/wp-config.php",
+    )
+    h._handle(send_body=True)
+    assert h.response_code == 200
+    assert b"AWS_ACCESS_KEY_ID" in h.wfile.getvalue()
+
+
+def test_dispatch_gitlab_sign_in_emits_set_cookie(monkeypatch, tmp_path):
+    monkeypatch.setattr(tbenv, "ALLOWED_HOSTS", {"trap.example.com"})
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", lambda *a, **kw: FAKE_TRACEBIT)
+
+    RecordingHandler, _ = _fake_handler(tbenv, tbenv.ALLOWED_HOSTS)
+    h = RecordingHandler(
+        headers={
+            "Host": "trap.example.com",
+            "X-Forwarded-For": "203.0.113.14",
+            "X-Forwarded-Proto": "https",
+        },
+        path="/users/sign_in",
+    )
+    h._handle(send_body=True)
+    assert h.response_code == 200
+    set_cookies = [v for k, v in h.sent_headers if k == "Set-Cookie"]
+    assert any("cookieCanaryValue" in v for v in set_cookies), set_cookies
+
+
 def test_is_fingerprint_path_case_insensitive(monkeypatch):
     monkeypatch.setattr(tbenv, "FINGERPRINT_PATHS_ENABLED", True)
     assert tbenv.is_fingerprint_path("/Index.HTML")
