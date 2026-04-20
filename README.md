@@ -72,6 +72,7 @@ python -m flux
 ```
 
 See [`CONFIG.md`](./CONFIG.md) for the full env var list.
+See [`LOGS.md`](./LOGS.md) for the JSONL log schema (fields + every `result` tag).
 See [`ROADMAP.md`](./ROADMAP.md) for proposed new trap surfaces (where
 else we could deploy the existing Tracebit Community canary types).
 
