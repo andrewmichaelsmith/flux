@@ -1,55 +1,45 @@
 # flux
 
-A small async HTTP honeypot intended to run behind nginx on a public sensor.
-Python 3.11+; one runtime dep — [aiohttp](https://docs.aiohttp.org/).
+An evolving HTTP honeypot, actively maintained by an LLM working off
+observations from a live honeypot sensor network. Fresh scanner
+behaviour in the corpus drives new traps; existing traps get tuned or
+retired as the logs show what's eliciting follow-up and what's being
+ignored. New trap families land in days, not quarters — the table
+below has a release date per family, and it's usually recent.
 
-Async so the tarpit and fake-git drip paths can hold thousands of concurrent
-slow-drip connections at ~8 KB each instead of one OS thread each.
+Small async Python behind nginx. Python 3.11+; one runtime dep —
+[aiohttp](https://docs.aiohttp.org/). Async so the tarpit and
+fake-git drip paths can hold thousands of concurrent slow-drip
+connections at ~8 KB each instead of one OS thread each.
 
-> **Heads up: this is a pure vibe-coded app.** Every line was written by an
-> LLM working off natural-language prompts from a human operator, then smoke-
-> tested against a live sensor. It has not been audited by a human who read
-> every line. If you're planning to deploy it anywhere that matters, please
-> read [`flux/server.py`](./flux/server.py) end-to-end first, run the test
-> suite, and think about what `HONEYPOT_WEBSHELL_PATHS_CSV` or `FAKE_GIT_*`
-> hitting a real webroot would do. No warranties.
+> **Experimental — no guarantees about safety or value.** Every line
+> was written by an LLM from natural-language prompts, smoke-tested
+> against a live sensor, and continuously reshaped by the same loop.
+> It has not been audited line-by-line by a human. The author makes
+> no claim that flux is safe to run, produces useful intel, or won't
+> do something surprising under load. Before deploying anywhere that
+> matters, read [`flux/server.py`](./flux/server.py) end-to-end, run
+> the test suite, and think hard about what
+> `HONEYPOT_WEBSHELL_PATHS_CSV` or `FAKE_GIT_*` hitting a real webroot
+> would do. No warranties.
 
-Seven trap families, each independently toggleable via env var:
+## Traps
 
-1. **Fake `/.env` canary issuer** — mints a per-request Tracebit Community
-   canary and returns it as a `.env`-style payload. Requires `TRACEBIT_API_KEY`.
-2. **Fake `/.git/` repository** — serves a loose-object git tree whose
-   `config/secrets.yml` embeds a canary. Per-IP cached so `git-dumper`-style
-   scanners see a consistent tree across their fan-out. Requires `TRACEBIT_API_KEY`.
-3. **Canary file traps** — 19 plausible paths (`/.aws/credentials`,
-   `/wp-config.php`, `/backup.sql`, `/id_rsa`, `/api/v4/user`,
-   `/users/sign_in`, …) each render a canary in the file format a scanner
-   expects. See [the table below](#canary-file-trap-table). Requires
-   `TRACEBIT_API_KEY`.
-4. **Fake webshell** — matches known webshell probe paths
-   (`/wp-content/plugins/hellopress/wp_filemanager.php`, `/shell.php`,
-   short-named `*.php` shells) and returns a plausible File Manager page
-   that invites follow-up commands. Simulates `id` / `whoami` / `uname -a` /
-   `cat /etc/passwd`. No Tracebit key required.
-5. **Modular tarpit + fingerprinting** — streams a slow-drip response
-   with a chain of fingerprinting modules (cookie, ETag, redirect chain,
-   variable drip, Content-Length mismatch, DNS callback — all default-on).
-   Triggered on `.env` variants (`.env.bak`, `*/.env.prod`) or on a
-   configurable set of first-contact paths (default: `/`, `/index.html`,
-   `/index.php`, `/robots.txt`, `/sitemap.xml`, `/favicon.ico`). No
-   Tracebit key required.
-6. **Fake LLM-API endpoint** — serves plausible Ollama / OpenAI /
-   Anthropic-proxy responses on common AI-probe paths (`/v1/models`,
-   `/anthropic/v1/models`, `/api/version`, `/api/chat`, `/v1/chat/completions`,
-   …). Logs the model requested, any `Authorization: Bearer` or `x-api-key`
-   header, and a prefix of the POSTed prompt body. No Tracebit key required.
-   See [below](#fake-llm-api-endpoint) for why this exists.
-7. **Fake SonicWall SSL VPN** — serves plausible SonicOS 7 JSON responses
-   on the three paths in the CVE-2024-53704 auth-bypass chain
-   (`/api/sonicos/is-sslvpn-enabled`, `/api/sonicos/auth`, `/api/sonicos/tfa`).
-   Logs any username submitted, the full body sha + preview, and whether
-   the scanner replayed a harvested SonicOS session cookie. No Tracebit
-   key required. See [below](#fake-sonicwall-ssl-vpn-endpoint).
+Each family is independently toggleable via env var; all default to
+on (see [`CONFIG.md`](./CONFIG.md)). Keyless deployments still 404
+the canary-backed rows — dispatch requires `TRACEBIT_API_KEY` on top
+of the master switch.
+
+| Trap | What it does | Released | Key |
+| --- | --- | --- | --- |
+| Fake `/.env` canary issuer | Mints a per-request Tracebit Community canary and returns it as a `.env`-style payload | 2026-04-20 | yes |
+| Fake `/.git/` repository | Serves a loose-object git tree whose `config/secrets.yml` embeds a canary; per-IP cached so `git-dumper`-style fan-out sees a consistent tree | 2026-04-20 | yes |
+| Canary file traps (19 paths) | Plausible file-format responses for `/wp-config.php`, `/backup.sql`, `/id_rsa`, `/.aws/credentials`, `/api/v4/user`, `/users/sign_in`, … — full table [below](#canary-file-trap-table) | 2026-04-20 | yes |
+| AI-credential-file canaries | `/.openai/config.json`, `/.anthropic/config.json`, `/.cursor/mcp.json` — listed in the same table; broken out in the footnote because Tracebit has no LLM canary type yet | 2026-04-20 | yes |
+| Fake webshell | Plausible File Manager on known `*.php` shell probe paths; simulates `id` / `whoami` / `uname -a` / `cat /etc/passwd` on follow-up commands | 2026-04-20 | no |
+| Modular tarpit + fingerprinting | Slow-drip response plus six fingerprinting modules (cookie, ETag, redirect chain, variable drip, Content-Length mismatch, DNS callback); fires on `.env` variants and on configurable first-contact paths (`/`, `/index.html`, `/robots.txt`, …) | 2026-04-20 | no |
+| Fake LLM-API endpoint | Ollama / OpenAI / Anthropic-proxy JSON on `/v1/models`, `/v1/chat/completions`, `/anthropic/v1/messages`, `/api/chat`, … ; logs model + auth header + prompt prefix — see [below](#fake-llm-api-endpoint) | 2026-04-20 | no |
+| Fake SonicWall SSL VPN | SonicOS 7 JSON responses on the three paths in the CVE-2024-53704 auth-bypass chain; logs submitted username, body sha + preview, and replayed session cookies — see [below](#fake-sonicwall-ssl-vpn-endpoint) | 2026-04-21 | no |
 
 All traps log one JSON line per event to the configured log path. See
 [`LOGS.md`](./LOGS.md) for the schema.
@@ -171,12 +161,13 @@ to be abusable.
 
 ### Why this exists
 
-The 2026-04-20 weekly-novelty run caught a new scanner — `scanner/1.0`
-from `203.0.113.10` — sending 26 requests to `/anthropic/v1/models` in
-one day. Three other IPs (`203.0.113.11`, `203.0.113.12`,
-`203.0.113.13`) hit `/v1/models`. Earlier, on Apr 18, the lab sensor
-saw the Ollama signature (`/v1/models` + `/api/version` from
-`203.0.113.14`).
+Multiple distinct scanner fleets started probing exposed AI-inference
+endpoints on our sensors in April 2026 — Ollama-native paths
+(`/v1/models` + `/api/version` + `/api/tags`), OpenAI-compatible paths
+(`/v1/chat/completions`), and corporate AI-proxy paths
+(`/anthropic/v1/models`). The trap shipped the day after the
+behaviour was confirmed across more than one source, spread across
+several ASNs with non-overlapping HTTP-client fingerprints.
 
 These scanners are looking for:
 
@@ -219,31 +210,32 @@ session token.
 
 ### Why this exists
 
-The 2026-04-20 and 2026-04-21 weekly-novelty runs caught two overlapping
-fleets probing SonicWall SSL VPN:
+Two overlapping behaviour patterns appeared on our sensors in
+mid-April 2026:
 
-- A dedicated SonicWall probe fleet (JA4 `JA4_REDACTED_A`, ~10 IPs) hitting
-  `/api/sonicos/is-sslvpn-enabled` — the CVE-2024-53704 precondition check.
-- The enterprise-multi-scanner (JA4 `JA4_REDACTED_B`)
-  added `/api/sonicos/tfa` + `/api/sonicos/auth` to its dictionary on
-  2026-04-16, ahead of the dedicated fleet. Active today from Linode
-  (203.0.113.20, 203.0.113.21) running the full three-step sequence:
-  `is-sslvpn-enabled` → `auth` → `tfa`.
+- A dedicated SonicWall-precondition fleet hitting
+  `/api/sonicos/is-sslvpn-enabled` on its own — the CVE-2024-53704
+  precondition check, stopping at the first 404.
+- A broader enterprise-appliance probe that added
+  `/api/sonicos/tfa` + `/api/sonicos/auth` to its dictionary and
+  runs the full three-step sequence
+  (`is-sslvpn-enabled` → `auth` → `tfa`) on every target.
 
-These paths are SonicWall-specific — no legitimate scanner hits them.
-The intel we want from a bare 404 is zero; from a plausible 200 the
-scanner moves on to its next payload, which is the actual exploit try.
-That payload is what `bodyPreview` + `bodySha256` capture on each hit,
-and what future rev-eng of CVE-2024-53704 payload variants will read.
+These paths are SonicWall-specific — no legitimate client hits them.
+The intel a bare 404 yields is zero; a plausible 200 gets the scanner
+to send its next payload, which is the actual exploit try. That
+payload is what `bodyPreview` + `bodySha256` capture on each hit,
+and what future analysis of CVE-2024-53704 variants will read from
+the log.
 
 ## Why a fake webshell on a sensor that never had a real shell?
 
-Because post-compromise scanners — e.g. the Azure WP Webshell Checker family
-observed probing our sensors in April 2026 — walk a list of PHP shell paths
-looking for "is my planted shell still here". They don't care whether your
-site ever ran WordPress. A plausible response makes them send their *next*
-command, which is the actual intel we want: the argument they pass, their
-cookie jar, their user-agent rotation, whether they escalate.
+Because post-compromise scanners walk a list of PHP shell paths
+looking for "is my planted shell still here". They don't care whether
+your site ever ran WordPress. A plausible response makes them send
+their *next* command, which is the actual intel we want: the argument
+they pass, their cookie jar, their user-agent rotation, whether they
+escalate.
 
 The simulated command outputs are deliberately boring (`www-data`, a stock
 `/etc/passwd`, a Linux 5.15 `uname`) and the form reflects whatever the
