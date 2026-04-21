@@ -86,11 +86,12 @@ burning quota.
 
 ## Fake `/.git/*` tree
 
-Requires `TRACEBIT_API_KEY`.
+Requires `TRACEBIT_API_KEY`. Default-on, but still 404s on every hit
+when `TRACEBIT_API_KEY` is unset — the dispatch requires both.
 
 | Var | Default | Notes |
 | --- | --- | --- |
-| `FAKE_GIT_ENABLED` | off | Master switch. |
+| `FAKE_GIT_ENABLED` | **on** | Master switch. |
 | `FAKE_GIT_CACHE_TTL_SECONDS` | `3600` | Per-IP cache TTL — keeps object SHAs consistent across a scanner's fan-out. |
 | `FAKE_GIT_CACHE_MAX_ENTRIES` | `1024` | |
 | `FAKE_GIT_DRIP_BYTES` | `1024` | |

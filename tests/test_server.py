@@ -276,6 +276,23 @@ def test_tarpit_modules_default_on():
     assert tbenv.MOD_DNS_CALLBACK_ENABLED
 
 
+def test_all_trap_families_default_on():
+    """Every trap master-switch defaults to on — flux is a honeypot, the
+    whole point is to run every trap that's cheap to run. Deployments that
+    lack TRACEBIT_API_KEY still 404 the canary-backed traps (/.env,
+    /.git/*, canary file table) at dispatch time."""
+    assert tbenv.TARPIT_ENABLED
+    assert tbenv.FINGERPRINT_PATHS_ENABLED
+    assert tbenv.CANARY_TRAPS_ENABLED
+    assert tbenv.FAKE_GIT_ENABLED, (
+        "FAKE_GIT_ENABLED should default to True — the per-IP cache bounds "
+        "quota burn and the dispatch still requires TRACEBIT_API_KEY."
+    )
+    assert tbenv.WEBSHELL_ENABLED
+    assert tbenv.LLM_ENDPOINT_ENABLED
+    assert tbenv.SONICWALL_ENABLED
+
+
 def test_tarpit_enabled_by_default():
     assert tbenv.TARPIT_ENABLED
 

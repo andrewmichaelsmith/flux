@@ -89,9 +89,12 @@ FINGERPRINT_PATHS = {
 FINGERPRINT_PATHS_ENABLED = _env_bool("FINGERPRINT_PATHS_ENABLED")
 
 # --- Fake /.git/ tree configuration ---
-# Opt-in: it mints a fresh canary on every cache-miss, so you want to
-# know you turned it on before your Tracebit quota starts burning.
-FAKE_GIT_ENABLED = _env_bool("FAKE_GIT_ENABLED", default=False)
+# Default-on: flux is a honeypot, and the /.git/ tree is one of the most
+# valuable traps we have. The per-IP cache (FAKE_GIT_CACHE_TTL_SECONDS)
+# keeps scanner fan-out from burning Tracebit quota, and the dispatch
+# still requires TRACEBIT_API_KEY to be set (see server.py:2559) — so
+# deployments without a key stay 404 regardless of this default.
+FAKE_GIT_ENABLED = _env_bool("FAKE_GIT_ENABLED")
 FAKE_GIT_CACHE_TTL_SECONDS = max(int((os.environ.get("FAKE_GIT_CACHE_TTL_SECONDS") or "3600").strip() or "3600"), 60)
 FAKE_GIT_CACHE_MAX_ENTRIES = max(int((os.environ.get("FAKE_GIT_CACHE_MAX_ENTRIES") or "1024").strip() or "1024"), 16)
 FAKE_GIT_DRIP_BYTES = max(int((os.environ.get("FAKE_GIT_DRIP_BYTES") or "1024").strip() or "1024"), 32)
