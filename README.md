@@ -28,7 +28,8 @@ connections at ~8 KB each instead of one OS thread each.
 Each family is independently toggleable via env var; all default to
 on (see [`CONFIG.md`](./CONFIG.md)). Keyless deployments still 404
 the canary-backed rows — dispatch requires `TRACEBIT_API_KEY` on top
-of the master switch.
+of the master switch. We use [Tracebit Community](https://community.tracebit.com)
+for the canaries: free tier, sign up and drop the key in the env var.
 
 | Trap | What it does | Released | Key |
 | --- | --- | --- | --- |
