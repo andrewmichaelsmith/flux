@@ -36,10 +36,10 @@ of the master switch.
 | Fake `/.git/` repository | Serves a loose-object git tree whose `config/secrets.yml` embeds a canary; per-IP cached so `git-dumper`-style fan-out sees a consistent tree | 2026-04-20 | yes |
 | Canary file traps (19 paths) | Plausible file-format responses for `/wp-config.php`, `/backup.sql`, `/id_rsa`, `/.aws/credentials`, `/api/v4/user`, `/users/sign_in`, … — full table [below](#canary-file-trap-table) | 2026-04-20 | yes |
 | AI-credential-file canaries | `/.openai/config.json`, `/.anthropic/config.json`, `/.cursor/mcp.json` — listed in the same table; broken out in the footnote because Tracebit has no LLM canary type yet | 2026-04-20 | yes |
-| Fake webshell | Plausible File Manager on known `*.php` shell probe paths; simulates `id` / `whoami` / `uname -a` / `cat /etc/passwd` on follow-up commands | 2026-04-20 | no |
+| Fake webshell | Plausible File Manager on known `*.php` shell probe paths; simulates `id` / `whoami` / `uname -a` / `cat /etc/passwd` on follow-up commands — [docs](./docs/fake-webshell.md) | 2026-04-20 | no |
 | Modular tarpit + fingerprinting | Slow-drip response plus six fingerprinting modules (cookie, ETag, redirect chain, variable drip, Content-Length mismatch, DNS callback); fires on `.env` variants and on configurable first-contact paths (`/`, `/index.html`, `/robots.txt`, …) | 2026-04-20 | no |
-| Fake LLM-API endpoint | Ollama / OpenAI / Anthropic-proxy JSON on `/v1/models`, `/v1/chat/completions`, `/anthropic/v1/messages`, `/api/chat`, … ; logs model + auth header + prompt prefix — see [below](#fake-llm-api-endpoint) | 2026-04-20 | no |
-| Fake SonicWall SSL VPN | SonicOS 7 JSON responses on the three paths in the CVE-2024-53704 auth-bypass chain; logs submitted username, body sha + preview, and replayed session cookies — see [below](#fake-sonicwall-ssl-vpn-endpoint) | 2026-04-21 | no |
+| Fake LLM-API endpoint | Ollama / OpenAI / Anthropic-proxy JSON on `/v1/models`, `/v1/chat/completions`, `/anthropic/v1/messages`, `/api/chat`, … ; logs model + auth header + prompt prefix — [docs](./docs/fake-llm-api.md) | 2026-04-20 | no |
+| Fake SonicWall SSL VPN | SonicOS 7 JSON responses on the three paths in the CVE-2024-53704 auth-bypass chain; logs submitted username, body sha + preview, and replayed session cookies — [docs](./docs/fake-sonicwall.md) | 2026-04-21 | no |
 
 All traps log one JSON line per event to the configured log path. See
 [`LOGS.md`](./LOGS.md) for the schema.
@@ -141,107 +141,18 @@ Two test files:
   and hits it with a real HTTP client over the kernel loopback. Catches
   anything that only breaks on a real socket.
 
-## Fake LLM-API endpoint
+## Per-trap docs
 
-Scanners started hunting for exposed AI inference servers in April 2026.
-The trap matches these paths (exact, case-insensitive; configurable via
-`HONEYPOT_LLM_ENDPOINT_PATHS_CSV`):
+Response shape, parsed fields, and rationale for the novel traps live
+under [`docs/`](./docs/):
 
-| Family | Paths | Response |
-| --- | --- | --- |
-| Ollama | `/v1/models`, `/api/tags`, `/api/version`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate` | Ollama-native JSON with a fixed list of plausible model IDs |
-| OpenAI | `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | OpenAI-compatible JSON |
-| Anthropic | `/v1/messages`, `/anthropic/v1/models`, `/anthropic/v1/messages` | Anthropic Messages-API JSON |
+- [Fake LLM-API endpoint](./docs/fake-llm-api.md)
+- [Fake SonicWall SSL VPN endpoint](./docs/fake-sonicwall.md)
+- [Fake webshell](./docs/fake-webshell.md)
 
-On any POST the trap parses `model` and a prompt-ish field out of the JSON
-body (handles OpenAI/Ollama/Anthropic content shapes), then logs them along
-with the scanner's auth header, UA, and IP. Chat responses are a
-deterministic canned reply — bland enough to look boring, not real enough
-to be abusable.
-
-### Why this exists
-
-Multiple distinct scanner fleets started probing exposed AI-inference
-endpoints on our sensors in April 2026 — Ollama-native paths
-(`/v1/models` + `/api/version` + `/api/tags`), OpenAI-compatible paths
-(`/v1/chat/completions`), and corporate AI-proxy paths
-(`/anthropic/v1/models`). The trap shipped the day after the
-behaviour was confirmed across more than one source, spread across
-several ASNs with non-overlapping HTTP-client fingerprints.
-
-These scanners are looking for:
-
-- **Exposed self-hosted Ollama / llama.cpp servers** — unauthenticated by
-  default, so a `200 OK` on `/api/tags` with a real model list is an
-  immediate prompt-execution primitive.
-- **Internal AI-proxy gateways** (`/anthropic/v1/models`) — corporate
-  relays that hold an upstream API key, which a scanner can then use from
-  the proxy without needing the key itself.
-- **Harvested API keys in the wild** — the scanner already has a
-  `Bearer sk-...` or `x-api-key` from a credential dump and is probing
-  who'll honor it.
-
-The intel we want: the model a scanner targets, the prompt they send on
-their first successful POST, the auth header they present, and the
-follow-up sequence when they believe the endpoint is live. None of that
-is visible from a bare 404.
-
-See `LOGS.md` for the `llm-endpoint-*` result tags and the `llmModel` /
-`llmPromptPreview` / `llmHasAuth` fields.
-
-## Fake SonicWall SSL VPN endpoint
-
-Scanners started hammering SonicWall SSL VPN auth-bypass paths in mid-April
-2026. The trap matches three paths (exact, case-insensitive; configurable
-via `HONEYPOT_SONICWALL_PATHS_CSV`):
-
-| Path | Method | Response |
-| --- | --- | --- |
-| `/api/sonicos/is-sslvpn-enabled` | GET | `{"is_ssl_vpn_enabled": true, "status": {...}}` |
-| `/api/sonicos/auth` | POST | SonicOS auth-success envelope with a per-request `session_id` and `tfa_required: true` |
-| `/api/sonicos/tfa` | POST | SonicOS TFA-accepted envelope (same session_id shape, `tfa_required: false`) |
-
-On each POST the trap extracts `user` / `username` / `login` from the JSON
-or form body and logs it along with the full body sha + a preview. The
-`Cookie` header is sniffed for `swap_session=` / `SonicOS-Session=` —
-presence of either is surfaced via `sonicwallHasAuth: true`, which is a
-stronger-than-baseline signal that the scanner already has a harvested
-session token.
-
-### Why this exists
-
-Two overlapping behaviour patterns appeared on our sensors in
-mid-April 2026:
-
-- A dedicated SonicWall-precondition fleet hitting
-  `/api/sonicos/is-sslvpn-enabled` on its own — the CVE-2024-53704
-  precondition check, stopping at the first 404.
-- A broader enterprise-appliance probe that added
-  `/api/sonicos/tfa` + `/api/sonicos/auth` to its dictionary and
-  runs the full three-step sequence
-  (`is-sslvpn-enabled` → `auth` → `tfa`) on every target.
-
-These paths are SonicWall-specific — no legitimate client hits them.
-The intel a bare 404 yields is zero; a plausible 200 gets the scanner
-to send its next payload, which is the actual exploit try. That
-payload is what `bodyPreview` + `bodySha256` capture on each hit,
-and what future analysis of CVE-2024-53704 variants will read from
-the log.
-
-## Why a fake webshell on a sensor that never had a real shell?
-
-Because post-compromise scanners walk a list of PHP shell paths
-looking for "is my planted shell still here". They don't care whether
-your site ever ran WordPress. A plausible response makes them send
-their *next* command, which is the actual intel we want: the argument
-they pass, their cookie jar, their user-agent rotation, whether they
-escalate.
-
-The simulated command outputs are deliberately boring (`www-data`, a stock
-`/etc/passwd`, a Linux 5.15 `uname`) and the form reflects whatever the
-scanner submits. Unknown commands return empty output — the same thing a
-real shell would produce for `cd foo` or a variable assignment — rather
-than a canned "command not found" that outs the trap on the first probe.
+The other traps (`.env`, `/.git/`, canary file traps, tarpit +
+fingerprinting) are documented in [`CONFIG.md`](./CONFIG.md) and the
+canary table above.
 
 ## License
 
