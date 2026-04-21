@@ -107,7 +107,7 @@ One log line per hit. `result` identifies which family was served.
 | `result` | `status` | Meaning |
 | --- | --- | --- |
 | `llm-endpoint-models-list` | 200 | `GET /v1/models` (OpenAI-compatible list) |
-| `llm-endpoint-anthropic-models-list` | 200 | `GET /anthropic/v1/models` (the `scanner/1.0` target) |
+| `llm-endpoint-anthropic-models-list` | 200 | `GET /anthropic/v1/models` (corporate AI-proxy probe target) |
 | `llm-endpoint-ollama-tags` | 200 | `GET /api/tags` |
 | `llm-endpoint-ollama-version` | 200 | `GET /api/version` |
 | `llm-endpoint-ollama-ps` | 200 | `GET /api/ps` |

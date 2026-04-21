@@ -144,12 +144,12 @@ WEBSHELL_COMMAND_KEYS = (
 WEBSHELL_COMMAND_HEADERS = ("X-Cmd", "X-Exec", "X-Command")
 
 # --- Fake LLM-API endpoint (Ollama / OpenAI / Anthropic-proxy shape) ---
-# Motivated by the 2026-04-20 weekly-novelty run: `scanner/1.0` scanner
-# probing `/anthropic/v1/models` (first ever scanner specifically targeting
-# an Anthropic proxy endpoint), plus corroborating `/v1/models` + `/api/version`
-# Ollama-endpoint probes from three other IPs the prior week. The intel we
-# want is what comes next — model name requested, prompt body, whether a
-# bearer token is presented, UA rotation on a follow-up.
+# Motivated by scanner fleets observed probing AI-inference endpoints
+# in April 2026 — Ollama-native paths, OpenAI-compatible paths, and
+# corporate AI-proxy paths (`/anthropic/v1/models`) with non-overlapping
+# HTTP-client fingerprints. The intel we want is what comes next —
+# model name requested, prompt body, whether a bearer token is
+# presented, UA rotation on a follow-up.
 #
 # Default-on like the webshell: the trap is cheap, logs are cheap, and a
 # plausible response is what makes the scanner send its next command.
@@ -169,7 +169,7 @@ _LLM_ENDPOINT_DEFAULT_PATHS = ",".join([
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",
-    # Anthropic Messages API + the scanner/1.0 proxy target
+    # Anthropic Messages API + corporate AI-proxy paths
     "/v1/messages",
     "/anthropic/v1/models",
     "/anthropic/v1/messages",
@@ -186,14 +186,11 @@ LLM_ENDPOINT_PATHS = {
 LLM_BODY_DECODE_LIMIT = max(int((os.environ.get("HONEYPOT_LLM_BODY_DECODE_LIMIT") or "4096").strip() or "4096"), 512)
 
 # --- Fake SonicWall SSL VPN (CVE-2024-53704 bait chain) ------------------
-# Motivating intel (weekly-novelty 2026-04-20 and 2026-04-21):
-#   - A dedicated SonicWall probe fleet (JA4 JA4_REDACTED_A, ~10 IPs) hitting
+# Two overlapping behaviour patterns observed in mid-April 2026:
+#   - A dedicated SonicWall-precondition fleet hitting only
 #     `/api/sonicos/is-sslvpn-enabled` — the CVE precondition check.
-#   - The enterprise-multi-scanner (JA4 JA4_REDACTED_B)
-#     added `/api/sonicos/tfa` and `/api/sonicos/auth` to its dictionary on
-#     2026-04-16, ahead of the dedicated fleet. Active today from Linode
-#     (203.0.113.20, 203.0.113.21, etc.) running the full three-step
-#     sequence: is-sslvpn-enabled → auth → tfa.
+#   - A broader enterprise-appliance probe running the full three-step
+#     sequence `is-sslvpn-enabled` → `auth` → `tfa` on every target.
 #
 # These paths are SonicWall-specific — no legitimate scanner hits them.
 # The trap looks live enough (200 + plausible JSON) that the scanner

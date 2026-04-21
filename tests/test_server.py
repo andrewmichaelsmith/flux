@@ -538,10 +538,8 @@ def test_is_fingerprint_path_non_match(monkeypatch):
 
 # --- Fake LLM-API endpoint trap ---
 #
-# Motivating intel (2026-04-20 weekly-novelty run):
-#   - 203.0.113.10 (`scanner/1.0`) hit `/anthropic/v1/models` 26 times.
-#   - 203.0.113.11, 203.0.113.12, 203.0.113.13 hit `/v1/models`.
-#   - Earlier (2026-04-18) lab sensor saw `/v1/models` + `/api/version` probes.
+# Covers the path set scanner fleets were observed probing in April 2026
+# across Ollama-native, OpenAI-compatible, and corporate AI-proxy shapes.
 
 
 def test_llm_endpoint_enabled_by_default():
@@ -550,11 +548,11 @@ def test_llm_endpoint_enabled_by_default():
 
 
 def test_llm_endpoint_default_paths_cover_observed_probes():
-    """Every path actually observed hitting our sensors in the
-    2026-04-18 → 2026-04-20 window must match."""
+    """Every path observed hitting our sensors in the April 2026
+    AI-endpoint-probe window must match."""
     observed = [
         "/v1/models",              # generic OpenAI + Ollama-compatible list
-        "/anthropic/v1/models",    # scanner/1.0 scanner target
+        "/anthropic/v1/models",    # corporate AI-proxy target
         "/api/version",            # Ollama-specific
         "/api/tags",               # Ollama-specific
         "/api/chat",               # Ollama chat
@@ -695,8 +693,9 @@ async def test_dispatch_get_openai_models_returns_json_list(flux_client):
     assert entries[-1]["llmHasAuth"] is False
 
 
-async def test_dispatch_get_anthropic_models_logs_proxy_probe_ua(flux_client):
-    """Verbatim reproduction of the 203.0.113.10 / scanner/1.0 probe."""
+async def test_dispatch_get_anthropic_models_logs_proxy_probe(flux_client):
+    """GET /anthropic/v1/models from a scanner UA — the corporate AI-proxy
+    probe shape. Logs the client IP and UA so follow-up probes can be linked."""
     resp = await flux_client.get(
         "/anthropic/v1/models",
         headers={
@@ -814,12 +813,11 @@ async def test_dispatch_llm_malformed_json_still_200(flux_client):
 
 # --- Fake SonicWall SSL VPN trap ---
 #
-# Motivating intel (weekly-novelty 2026-04-20 + 2026-04-21):
-#   - Dedicated SonicWall probe fleet (JA4 JA4_REDACTED_A, ~10 IPs) hitting
+# Two overlapping behaviour patterns observed in mid-April 2026:
+#   - A dedicated SonicWall-precondition fleet hitting only
 #     `/api/sonicos/is-sslvpn-enabled`.
-#   - Enterprise-multi-scanner (JA4 JA4_REDACTED_B)
-#     added `/api/sonicos/tfa` + `/api/sonicos/auth` on 2026-04-16. Active
-#     today (203.0.113.20, 203.0.113.21) running the full chain.
+#   - A broader enterprise-appliance probe running the full chain
+#     `is-sslvpn-enabled` → `auth` → `tfa` on every target.
 
 
 def test_sonicwall_enabled_by_default():
