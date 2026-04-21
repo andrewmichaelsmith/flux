@@ -14,7 +14,7 @@ slow-drip connections at ~8 KB each instead of one OS thread each.
 > suite, and think about what `HONEYPOT_WEBSHELL_PATHS_CSV` or `FAKE_GIT_*`
 > hitting a real webroot would do. No warranties.
 
-Six trap families, each independently toggleable via env var:
+Seven trap families, each independently toggleable via env var:
 
 1. **Fake `/.env` canary issuer** — mints a per-request Tracebit Community
    canary and returns it as a `.env`-style payload. Requires `TRACEBIT_API_KEY`.
@@ -44,6 +44,12 @@ Six trap families, each independently toggleable via env var:
    …). Logs the model requested, any `Authorization: Bearer` or `x-api-key`
    header, and a prefix of the POSTed prompt body. No Tracebit key required.
    See [below](#fake-llm-api-endpoint) for why this exists.
+7. **Fake SonicWall SSL VPN** — serves plausible SonicOS 7 JSON responses
+   on the three paths in the CVE-2024-53704 auth-bypass chain
+   (`/api/sonicos/is-sslvpn-enabled`, `/api/sonicos/auth`, `/api/sonicos/tfa`).
+   Logs any username submitted, the full body sha + preview, and whether
+   the scanner replayed a harvested SonicOS session cookie. No Tracebit
+   key required. See [below](#fake-sonicwall-ssl-vpn-endpoint).
 
 All traps log one JSON line per event to the configured log path. See
 [`LOGS.md`](./LOGS.md) for the schema.
@@ -191,6 +197,44 @@ is visible from a bare 404.
 
 See `LOGS.md` for the `llm-endpoint-*` result tags and the `llmModel` /
 `llmPromptPreview` / `llmHasAuth` fields.
+
+## Fake SonicWall SSL VPN endpoint
+
+Scanners started hammering SonicWall SSL VPN auth-bypass paths in mid-April
+2026. The trap matches three paths (exact, case-insensitive; configurable
+via `HONEYPOT_SONICWALL_PATHS_CSV`):
+
+| Path | Method | Response |
+| --- | --- | --- |
+| `/api/sonicos/is-sslvpn-enabled` | GET | `{"is_ssl_vpn_enabled": true, "status": {...}}` |
+| `/api/sonicos/auth` | POST | SonicOS auth-success envelope with a per-request `session_id` and `tfa_required: true` |
+| `/api/sonicos/tfa` | POST | SonicOS TFA-accepted envelope (same session_id shape, `tfa_required: false`) |
+
+On each POST the trap extracts `user` / `username` / `login` from the JSON
+or form body and logs it along with the full body sha + a preview. The
+`Cookie` header is sniffed for `swap_session=` / `SonicOS-Session=` —
+presence of either is surfaced via `sonicwallHasAuth: true`, which is a
+stronger-than-baseline signal that the scanner already has a harvested
+session token.
+
+### Why this exists
+
+The 2026-04-20 and 2026-04-21 weekly-novelty runs caught two overlapping
+fleets probing SonicWall SSL VPN:
+
+- A dedicated SonicWall probe fleet (JA4 `JA4_REDACTED_A`, ~10 IPs) hitting
+  `/api/sonicos/is-sslvpn-enabled` — the CVE-2024-53704 precondition check.
+- The enterprise-multi-scanner (JA4 `JA4_REDACTED_B`)
+  added `/api/sonicos/tfa` + `/api/sonicos/auth` to its dictionary on
+  2026-04-16, ahead of the dedicated fleet. Active today from Linode
+  (203.0.113.20, 203.0.113.21) running the full three-step sequence:
+  `is-sslvpn-enabled` → `auth` → `tfa`.
+
+These paths are SonicWall-specific — no legitimate scanner hits them.
+The intel we want from a bare 404 is zero; from a plausible 200 the
+scanner moves on to its next payload, which is the actual exploit try.
+That payload is what `bodyPreview` + `bodySha256` capture on each hit,
+and what future rev-eng of CVE-2024-53704 payload variants will read.
 
 ## Why a fake webshell on a sensor that never had a real shell?
 

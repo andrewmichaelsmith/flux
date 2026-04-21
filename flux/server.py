@@ -182,6 +182,33 @@ LLM_ENDPOINT_PATHS = {
 # bloating the log file.
 LLM_BODY_DECODE_LIMIT = max(int((os.environ.get("HONEYPOT_LLM_BODY_DECODE_LIMIT") or "4096").strip() or "4096"), 512)
 
+# --- Fake SonicWall SSL VPN (CVE-2024-53704 bait chain) ------------------
+# Motivating intel (weekly-novelty 2026-04-20 and 2026-04-21):
+#   - A dedicated SonicWall probe fleet (JA4 JA4_REDACTED_A, ~10 IPs) hitting
+#     `/api/sonicos/is-sslvpn-enabled` — the CVE precondition check.
+#   - The enterprise-multi-scanner (JA4 JA4_REDACTED_B)
+#     added `/api/sonicos/tfa` and `/api/sonicos/auth` to its dictionary on
+#     2026-04-16, ahead of the dedicated fleet. Active today from Linode
+#     (203.0.113.20, 203.0.113.21, etc.) running the full three-step
+#     sequence: is-sslvpn-enabled → auth → tfa.
+#
+# These paths are SonicWall-specific — no legitimate scanner hits them.
+# The trap looks live enough (200 + plausible JSON) that the scanner
+# sends its next step, which is where the actual intel is: what usernames
+# they try, whether they present harvested session cookies, whether the
+# TFA payload carries an exploit.
+SONICWALL_ENABLED = _env_bool("HONEYPOT_SONICWALL_ENABLED")
+_SONICWALL_DEFAULT_PATHS = ",".join([
+    "/api/sonicos/is-sslvpn-enabled",
+    "/api/sonicos/auth",
+    "/api/sonicos/tfa",
+])
+SONICWALL_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_SONICWALL_PATHS_CSV") or _SONICWALL_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -268,6 +295,42 @@ def is_llm_endpoint_path(path: str) -> bool:
     if not LLM_ENDPOINT_ENABLED:
         return False
     return path.lower() in LLM_ENDPOINT_PATHS
+
+
+def is_sonicwall_path(path: str) -> bool:
+    if not SONICWALL_ENABLED:
+        return False
+    return path.lower() in SONICWALL_PATHS
+
+
+def extract_sonicwall_username(body: bytes, content_type: str) -> str:
+    """Pull `user`/`username` out of a SonicOS auth body. SonicOS accepts
+    both JSON and form-encoded auth POSTs in the wild; try both. Returns
+    "" if neither shape matches or the field is absent.
+    """
+    if not body:
+        return ""
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct in {"application/json", ""}:
+        try:
+            payload = json.loads(body.decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            for key in ("user", "username", "login"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    return value[:120]
+    if ct in {"application/x-www-form-urlencoded", ""}:
+        try:
+            form = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+        except (UnicodeDecodeError, ValueError):
+            form = {}
+        for key in ("user", "username", "login"):
+            values = form.get(key) or form.get(key.upper())
+            if values and values[0]:
+                return values[0][:120]
+    return ""
 
 
 # Models advertised by the listings. Chosen to mix Ollama-native names
@@ -544,6 +607,66 @@ def render_anthropic_message(model: str) -> bytes:
         "stop_reason": "end_turn",
         "stop_sequence": None,
         "usage": {"input_tokens": 24, "output_tokens": 32},
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+# --- SonicWall SSL VPN renderers -----------------------------------------
+# Shapes match SonicOS 7.x API responses closely enough that a CVE-2024-53704
+# exploit client moves from the precondition check into the auth POST.
+# We don't need to mint a real session — the scanner's next payload is the
+# intel we want, and SonicOS's success envelope is simple enough to fake.
+
+
+def render_sonicwall_is_sslvpn_enabled() -> bytes:
+    # SonicOS 7 returns a status envelope alongside the boolean. Field names
+    # match the documented shape; values are the defaults a live appliance
+    # with SSL VPN turned on would emit.
+    payload = {
+        "is_ssl_vpn_enabled": True,
+        "status": {
+            "success": True,
+            "cli_msg": "",
+            "info": [{"level": "info", "code": "E_OK", "message": ""}],
+        },
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_sonicwall_auth_success(session_id: str) -> bytes:
+    # Minimum-plausible SonicOS auth success: a status envelope, a session
+    # token echoed back (so the scanner thinks it has a live session), and a
+    # nonce field the CVE-2024-53704 exploit chain reads.
+    payload = {
+        "status": {
+            "success": True,
+            "cli_msg": "Login succeeded",
+            "info": [{"level": "info", "code": "E_OK", "message": "authenticated"}],
+        },
+        "auth": {
+            "session_id": session_id,
+            "user_name": "admin",
+            "tfa_required": True,
+            "tfa_method": "totp",
+        },
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_sonicwall_tfa_success(session_id: str) -> bytes:
+    # Mirror the auth response shape; TFA success collapses the `tfa_required`
+    # flag to false so the exploit moves on to whatever it does post-auth.
+    payload = {
+        "status": {
+            "success": True,
+            "cli_msg": "TFA accepted",
+            "info": [{"level": "info", "code": "E_OK", "message": "tfa-accepted"}],
+        },
+        "auth": {
+            "session_id": session_id,
+            "user_name": "admin",
+            "tfa_required": False,
+        },
     }
     return json.dumps(payload).encode("utf-8")
 
@@ -1976,6 +2099,75 @@ async def _handle_llm_endpoint(
     )
 
 
+async def _handle_sonicwall(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Dispatch a fake SonicOS SSL VPN response by path. All 200 + JSON; the
+    whole point is to look live enough that the exploit chain proceeds."""
+    lpath = path.lower()
+    method = request.method
+    content_type_req = request.headers.get("Content-Type", "")
+    auth_header = request.headers.get("Authorization", "")
+    cookie_header = request.headers.get("Cookie", "")
+    # SonicOS clients sometimes present a prior session as a `swap_session`
+    # or `SonicOS-Session` cookie; we don't validate, just log that it exists.
+    has_auth = bool(auth_header) or "swap_session" in cookie_header.lower() or "sonicos-session" in cookie_header.lower()
+
+    username = extract_sonicwall_username(request_body, content_type_req) if method == "POST" else ""
+
+    # Deterministic but per-request session_id so the scanner gets a consistent
+    # value to replay in the follow-on step.
+    session_id = uuid.uuid4().hex
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    if lpath == "/api/sonicos/is-sslvpn-enabled":
+        result_tag = "sonicwall-is-sslvpn-enabled"
+        body = render_sonicwall_is_sslvpn_enabled()
+    elif lpath == "/api/sonicos/auth":
+        result_tag = "sonicwall-auth"
+        body = render_sonicwall_auth_success(session_id)
+    elif lpath == "/api/sonicos/tfa":
+        result_tag = "sonicwall-tfa"
+        body = render_sonicwall_tfa_success(session_id)
+    else:
+        # Path matched the set but no renderer — shouldn't happen; defensive 404.
+        append_log({**log_context, "status": 404, "result": "sonicwall-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    log_entry = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "sonicwallPath": path,
+        "sonicwallMethod": method,
+        "sonicwallHasAuth": has_auth,
+        "sonicwallUsername": username,
+        "sonicwallSessionId": session_id,
+        "bytes": len(body),
+        "contentType": content_type_req[:120],
+    }
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview
+    append_log(log_entry)
+
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_webshell(
     request: web.Request,
     log_context: dict[str, object],
@@ -2358,6 +2550,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_llm_endpoint_path(path):
         return await _handle_llm_endpoint(request, log_context, path, request_body)
 
+    if is_sonicwall_path(path):
+        return await _handle_sonicwall(request, log_context, path, request_body)
+
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)
 
@@ -2418,6 +2613,8 @@ def main() -> int:
         active.append("webshell")
     if LLM_ENDPOINT_ENABLED:
         active.append("llm-endpoint")
+    if SONICWALL_ENABLED:
+        active.append("sonicwall-ssl-vpn")
     print(
         f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
         file=sys.stderr,

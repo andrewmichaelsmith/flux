@@ -793,3 +793,219 @@ async def test_dispatch_llm_malformed_json_still_200(flux_client):
     # Garbage body → no extracted prompt/model; still logged.
     assert entry["llmModel"] == ""
     assert "llmPromptPreview" not in entry
+
+
+# --- Fake SonicWall SSL VPN trap ---
+#
+# Motivating intel (weekly-novelty 2026-04-20 + 2026-04-21):
+#   - Dedicated SonicWall probe fleet (JA4 JA4_REDACTED_A, ~10 IPs) hitting
+#     `/api/sonicos/is-sslvpn-enabled`.
+#   - Enterprise-multi-scanner (JA4 JA4_REDACTED_B)
+#     added `/api/sonicos/tfa` + `/api/sonicos/auth` on 2026-04-16. Active
+#     today (203.0.113.20, 203.0.113.21) running the full chain.
+
+
+def test_sonicwall_enabled_by_default():
+    assert tbenv.SONICWALL_ENABLED
+
+
+def test_sonicwall_default_paths_cover_cve_2024_53704_chain():
+    """Every path in the observed CVE-2024-53704 bait sequence must match."""
+    for path in (
+        "/api/sonicos/is-sslvpn-enabled",
+        "/api/sonicos/auth",
+        "/api/sonicos/tfa",
+    ):
+        assert tbenv.is_sonicwall_path(path), f"expected match: {path}"
+
+
+def test_sonicwall_path_is_case_insensitive():
+    assert tbenv.is_sonicwall_path("/API/SonicOS/Auth")
+
+
+def test_sonicwall_path_non_match():
+    for path in ["/", "/api/sonicos", "/api/sonicos/other", "/.env", "/sonicos/auth"]:
+        assert not tbenv.is_sonicwall_path(path)
+
+
+def test_sonicwall_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "SONICWALL_ENABLED", False)
+    assert not tbenv.is_sonicwall_path("/api/sonicos/is-sslvpn-enabled")
+
+
+def test_extract_sonicwall_username_json():
+    body = b'{"user":"admin","password":"guess"}'
+    assert tbenv.extract_sonicwall_username(body, "application/json") == "admin"
+
+
+def test_extract_sonicwall_username_form():
+    body = b"user=root&password=guess"
+    assert tbenv.extract_sonicwall_username(body, "application/x-www-form-urlencoded") == "root"
+
+
+def test_extract_sonicwall_username_alternate_keys():
+    assert tbenv.extract_sonicwall_username(b'{"username":"u1"}', "application/json") == "u1"
+    assert tbenv.extract_sonicwall_username(b'{"login":"u2"}', "application/json") == "u2"
+
+
+def test_extract_sonicwall_username_empty_body():
+    assert tbenv.extract_sonicwall_username(b"", "application/json") == ""
+
+
+def test_extract_sonicwall_username_malformed_json():
+    assert tbenv.extract_sonicwall_username(b"{not json", "application/json") == ""
+
+
+def test_render_sonicwall_is_sslvpn_enabled_shape():
+    import json
+    payload = json.loads(tbenv.render_sonicwall_is_sslvpn_enabled())
+    assert payload["is_ssl_vpn_enabled"] is True
+    assert payload["status"]["success"] is True
+
+
+def test_render_sonicwall_auth_success_embeds_session_id():
+    import json
+    payload = json.loads(tbenv.render_sonicwall_auth_success("sess-abc"))
+    assert payload["auth"]["session_id"] == "sess-abc"
+    assert payload["auth"]["tfa_required"] is True
+    assert payload["status"]["success"] is True
+
+
+def test_render_sonicwall_tfa_success_clears_tfa_required():
+    import json
+    payload = json.loads(tbenv.render_sonicwall_tfa_success("sess-xyz"))
+    assert payload["auth"]["session_id"] == "sess-xyz"
+    assert payload["auth"]["tfa_required"] is False
+
+
+async def test_dispatch_sonicwall_is_sslvpn_enabled_returns_true(flux_client):
+    """CVE-2024-53704 step 1: the precondition check. Scanner wants a 200 +
+    boolean true to proceed to the auth POST."""
+    resp = await flux_client.get(
+        "/api/sonicos/is-sslvpn-enabled",
+        headers={"X-Forwarded-For": "203.0.113.20", "User-Agent": "scanner/1.0"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["is_ssl_vpn_enabled"] is True
+
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "sonicwall-is-sslvpn-enabled"
+    assert entry["sonicwallPath"] == "/api/sonicos/is-sslvpn-enabled"
+    assert entry["sonicwallMethod"] == "GET"
+    assert entry["clientIp"] == "203.0.113.20"
+
+
+async def test_dispatch_sonicwall_auth_post_captures_username_and_body(flux_client):
+    """The money shot: scanner POSTs credentials, we log the username and
+    the full body hash for post-hoc replay analysis."""
+    import json
+    resp = await flux_client.post(
+        "/api/sonicos/auth",
+        headers={
+            "X-Forwarded-For": "203.0.113.21",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({"user": "admin", "password": "admin"}),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["status"]["success"] is True
+    assert body["auth"]["tfa_required"] is True
+    assert body["auth"]["session_id"]
+
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "sonicwall-auth"
+    assert entry["sonicwallUsername"] == "admin"
+    assert entry["sonicwallMethod"] == "POST"
+    assert entry["bodySha256"]
+    assert "admin" in entry["bodyPreview"]
+    assert "password" in entry["bodyPreview"]
+
+
+async def test_dispatch_sonicwall_tfa_post_captures_payload(flux_client):
+    """Step 3 of the chain: TFA bypass. Log whatever the scanner sends."""
+    import json
+    resp = await flux_client.post(
+        "/api/sonicos/tfa",
+        headers={
+            "X-Forwarded-For": "203.0.113.21",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({"code": "000000", "session_id": "replayed"}),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["auth"]["tfa_required"] is False
+
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "sonicwall-tfa"
+    assert "000000" in entry["bodyPreview"]
+
+
+async def test_dispatch_sonicwall_form_body_username(flux_client):
+    """Some SonicOS clients send x-www-form-urlencoded instead of JSON."""
+    resp = await flux_client.post(
+        "/api/sonicos/auth",
+        headers={
+            "X-Forwarded-For": "203.0.113.40",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data="user=root&password=abc",
+    )
+    assert resp.status == 200
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["sonicwallUsername"] == "root"
+
+
+async def test_dispatch_sonicwall_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "SONICWALL_ENABLED", False)
+    resp = await flux_client.get(
+        "/api/sonicos/is-sslvpn-enabled",
+        headers={"X-Forwarded-For": "203.0.113.41"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+async def test_dispatch_sonicwall_does_not_require_tracebit_key(flux_client, monkeypatch):
+    """Like webshell/LLM, no upstream dep — the intel is the probe itself."""
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    resp = await flux_client.get(
+        "/api/sonicos/is-sslvpn-enabled",
+        headers={"X-Forwarded-For": "203.0.113.42"},
+    )
+    assert resp.status == 200
+
+
+async def test_dispatch_sonicwall_detects_session_cookie(flux_client):
+    """If a scanner replays a harvested SonicOS session cookie, flag it —
+    that's a stronger compromise signal than a cold probe."""
+    resp = await flux_client.get(
+        "/api/sonicos/is-sslvpn-enabled",
+        headers={
+            "X-Forwarded-For": "203.0.113.43",
+            "Cookie": "swap_session=stolen-abc; other=x",
+        },
+    )
+    assert resp.status == 200
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["sonicwallHasAuth"] is True
+
+
+async def test_dispatch_sonicwall_malformed_json_still_200(flux_client):
+    """Scanner may send garbage; don't 500."""
+    resp = await flux_client.post(
+        "/api/sonicos/auth",
+        headers={"X-Forwarded-For": "203.0.113.44", "Content-Type": "application/json"},
+        data=b"{broken",
+    )
+    assert resp.status == 200
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "sonicwall-auth"
+    assert entry["sonicwallUsername"] == ""

@@ -120,6 +120,20 @@ No Tracebit key required.
 | `HONEYPOT_LLM_ENDPOINT_PATHS_CSV` | *(built-in — `/v1/models`, `/anthropic/v1/models`, `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages`, `/anthropic/v1/messages`)* | Exact, case-insensitive. Override to add/remove without a code change. |
 | `HONEYPOT_LLM_BODY_DECODE_LIMIT` | `4096` | Max chars of the extracted `llmPromptPreview` written to the log. The raw body is still capped by `HONEYPOT_WEBSHELL_BODY_READ_LIMIT` (shared cap, default 64 KiB off the wire). |
 
+## Fake SonicWall SSL VPN
+
+No Tracebit key required.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_SONICWALL_ENABLED` | on | Master switch. |
+| `HONEYPOT_SONICWALL_PATHS_CSV` | *(built-in — `/api/sonicos/is-sslvpn-enabled`, `/api/sonicos/auth`, `/api/sonicos/tfa`)* | Exact, case-insensitive. Override to add/remove without a code change. |
+
+The POST body read cap is shared with the webshell trap
+(`HONEYPOT_WEBSHELL_BODY_READ_LIMIT`, default 64 KiB off the wire) and
+the decoded preview written to the log is capped by
+`HONEYPOT_WEBSHELL_BODY_DECODE_LIMIT` (default 8 KiB).
+
 ## Bind address / port
 
 Flux listens on `127.0.0.1:18081` (aiohttp). To change, edit

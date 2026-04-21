@@ -133,6 +133,30 @@ Extras on every `llm-endpoint-*` line:
 | `bytes` | int | Size of the JSON body returned. |
 | `llmPromptPreview` | string | Prefix of the extracted prompt, truncated to `HONEYPOT_LLM_BODY_DECODE_LIMIT`. Omitted if empty. |
 
+### Fake SonicWall SSL VPN
+
+One log line per hit.
+
+| `result` | `status` | Meaning |
+| --- | --- | --- |
+| `sonicwall-is-sslvpn-enabled` | 200 | `GET /api/sonicos/is-sslvpn-enabled` (CVE-2024-53704 step 1) |
+| `sonicwall-auth` | 200 | `POST /api/sonicos/auth` (CVE-2024-53704 step 2) |
+| `sonicwall-tfa` | 200 | `POST /api/sonicos/tfa` (CVE-2024-53704 step 3) |
+| `sonicwall-miss` | 404 | Matched the path set but no renderer (shouldn't occur; defensive) |
+
+Extras on every `sonicwall-*` line:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `sonicwallPath` | string | The path that matched. |
+| `sonicwallMethod` | string | `GET` / `POST` / `HEAD`. |
+| `sonicwallUsername` | string | `user` / `username` / `login` pulled from a JSON or form body; `""` on GETs or missing field. Truncated to 120 chars. |
+| `sonicwallHasAuth` | bool | `true` if `Authorization` header OR a `swap_session=` / `sonicos-session=` cookie was present — stronger signal that the scanner is replaying a harvested session. |
+| `sonicwallSessionId` | string | Per-request hex UUID minted for the fake response. Lets you correlate a scanner's follow-on replays back to the exact response they got from us. |
+| `contentType` | string | First 120 chars of `Content-Type`. |
+| `bytes` | int | Size of the JSON body returned. |
+| `bodyPreview` | string | Up to `HONEYPOT_WEBSHELL_BODY_DECODE_LIMIT` chars of the request body; omitted on GETs / empty bodies. |
+
 ### Canary-backed file traps
 
 One log line per hit. All entries share the same shape:
