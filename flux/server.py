@@ -1675,11 +1675,10 @@ def render_gitlab_sign_in(r: dict[str, object]) -> bytes:
 
 # --- AI credential config files (/.openai/config.json, etc.) -------------
 #
-# Intel note (2026-04-18 → 2026-04-20 weekly-novelty): scanner fleets
-# started probing `/.openai/config.json`, `/.anthropic/config.json`, and
-# `/.cursor/mcp.json` — looking for harvestable LLM provider credentials.
-# By 2026-04-20 these had spread to 13 IPs and been absorbed into standard
-# env-hunter dictionaries.
+# Scanner fleets were observed probing `/.openai/config.json`,
+# `/.anthropic/config.json`, and `/.cursor/mcp.json` in mid-April 2026 —
+# looking for harvestable LLM provider credentials — and appeared to be
+# absorbed into standard env-hunter dictionaries shortly after debut.
 #
 # **This trap probably doesn't make sense yet, and we're shipping it
 # anyway.** Tracebit Community only exposes `aws`, `ssh`,
