@@ -1024,3 +1024,418 @@ async def test_dispatch_sonicwall_malformed_json_still_200(flux_client):
     entry = entries[-1]
     assert entry["result"] == "sonicwall-auth"
     assert entry["sonicwallUsername"] == ""
+
+
+# --- _env_bool: explicit env var parsing ---
+
+
+def test_env_bool_reads_truthy_string(monkeypatch):
+    """Explicit env values are honored; defaults are overridden."""
+    monkeypatch.setenv("FLUX_TEST_BOOL", "YES")
+    assert tbenv._env_bool("FLUX_TEST_BOOL", default=False) is True
+    monkeypatch.setenv("FLUX_TEST_BOOL", "nope")
+    assert tbenv._env_bool("FLUX_TEST_BOOL", default=True) is False
+    monkeypatch.delenv("FLUX_TEST_BOOL", raising=False)
+    assert tbenv._env_bool("FLUX_TEST_BOOL", default=True) is True
+
+
+# --- Pure LLM renderers ---
+
+
+def test_render_ollama_chat_shape():
+    import json
+    payload = json.loads(tbenv.render_ollama_chat("llama3.1:8b"))
+    assert payload["model"] == "llama3.1:8b"
+    assert payload["done"] is True
+    assert payload["message"]["role"] == "assistant"
+    assert payload["message"]["content"]
+
+
+def test_render_ollama_chat_defaults_model():
+    import json
+    payload = json.loads(tbenv.render_ollama_chat(""))
+    assert payload["model"]  # non-empty default
+
+
+def test_render_ollama_generate_shape():
+    import json
+    payload = json.loads(tbenv.render_ollama_generate("mistral:7b"))
+    assert payload["model"] == "mistral:7b"
+    assert payload["done"] is True
+    assert payload["response"]
+
+
+def test_render_openai_completion_shape():
+    import json
+    payload = json.loads(tbenv.render_openai_completion("gpt-4o"))
+    assert payload["object"] == "text_completion"
+    assert payload["model"] == "gpt-4o"
+    assert payload["choices"][0]["text"]
+    assert payload["choices"][0]["finish_reason"] == "stop"
+
+
+def test_render_openai_embedding_shape():
+    import json
+    payload = json.loads(tbenv.render_openai_embedding(""))
+    assert payload["object"] == "list"
+    assert payload["model"]  # default populated
+    assert isinstance(payload["data"][0]["embedding"], list)
+    assert all(isinstance(v, (int, float)) for v in payload["data"][0]["embedding"])
+
+
+def test_render_ollama_ps_shape():
+    import json
+    payload = json.loads(tbenv.render_ollama_ps())
+    assert payload == {"models": []}
+
+
+# --- extract_llm_prompt: edge shapes ---
+
+
+def test_extract_llm_prompt_embedding_list_input():
+    model, prompt, action, has_auth = tbenv.extract_llm_prompt(
+        b'{"model":"text-embedding-3-small","input":["hello","world"]}',
+        "application/json",
+    )
+    assert model == "text-embedding-3-small"
+    assert action == "embedding"
+    assert "hello" in prompt and "world" in prompt
+    assert has_auth is False
+
+
+def test_extract_llm_prompt_embedding_scalar_input():
+    _, prompt, action, _ = tbenv.extract_llm_prompt(
+        b'{"model":"text-embedding-3-small","input":42}',
+        "application/json",
+    )
+    assert action == "embedding"
+    assert prompt == "42"
+
+
+def test_extract_llm_prompt_messages_skips_non_dict_entries():
+    _, prompt, action, _ = tbenv.extract_llm_prompt(
+        b'{"model":"gpt-4o","messages":[null,{"role":"user","content":"hi"}]}',
+        "application/json",
+    )
+    assert action == "chat"
+    assert "hi" in prompt
+
+
+def test_extract_llm_prompt_messages_coerces_non_string_content():
+    _, prompt, action, _ = tbenv.extract_llm_prompt(
+        b'{"model":"gpt-4o","messages":[{"role":"user","content":7}]}',
+        "application/json",
+    )
+    assert action == "chat"
+    assert "7" in prompt
+
+
+# --- simulate_command_output: remaining branches ---
+
+
+def test_simulate_command_output_hostname():
+    assert tbenv.simulate_command_output("hostname") == "web-01\n"
+
+
+def test_simulate_command_output_pwd():
+    assert tbenv.simulate_command_output("pwd").startswith("/var/www/html")
+
+
+def test_simulate_command_output_ls():
+    assert "wp_filemanager.php" in tbenv.simulate_command_output("ls")
+
+
+def test_simulate_command_output_w_who():
+    assert tbenv.simulate_command_output("who") == "\n"
+
+
+# --- parse_cookies: malformed parts ---
+
+
+def test_parse_cookies_skips_malformed_parts():
+    result = tbenv.parse_cookies("; good=1; bad; another=2")
+    assert result == {"good": "1", "another": "2"}
+
+
+# --- _parse_chain_params ---
+
+
+def test_parse_chain_params_extracts_both():
+    assert tbenv._parse_chain_params("_hp_chain=abc&_hp_hop=3") == ("abc", 3)
+
+
+def test_parse_chain_params_empty():
+    assert tbenv._parse_chain_params("") == ("", 0)
+
+
+def test_parse_chain_params_non_integer_hop_silently_zero():
+    # Malformed hop must not raise — scanners send junk.
+    assert tbenv._parse_chain_params("_hp_chain=abc&_hp_hop=xyz") == ("abc", 0)
+
+
+def test_parse_chain_params_ignores_unrelated_and_keyless_parts():
+    assert tbenv._parse_chain_params("foo=bar&keyless&_hp_chain=cid") == ("cid", 0)
+
+
+# --- Tarpit modules (pure classes) ---
+
+
+class _Ctx:
+    """Minimal stand-in for a tarpit ctx dict in augment-only tests."""
+
+
+def _log_ctx():
+    return {"clientIp": "203.0.113.5", "path": "/", "host": "", "query": ""}
+
+
+def test_cookie_tracking_augment_sets_cookie_and_records_returned_tid():
+    mod = tbenv.CookieTrackingModule()
+
+    class FakeReq:
+        headers = {"Cookie": "_hp_tid=prev-id; foo=bar"}
+
+    headers, meta = mod.augment(FakeReq(), {"log_context": _log_ctx(), "path": "/"})
+    assert "_hp_tid=" in headers["Set-Cookie"]
+    assert "HttpOnly" in headers["Set-Cookie"]
+    assert meta["cookieReturned"] == "prev-id"
+    assert meta["cookieId"]  # fresh per-request id
+
+
+def test_cookie_tracking_augment_first_visit_has_no_returned_tid():
+    mod = tbenv.CookieTrackingModule()
+
+    class FakeReq:
+        headers = {"Cookie": ""}
+
+    _, meta = mod.augment(FakeReq(), {})
+    assert "cookieReturned" not in meta
+    assert meta["cookieId"]
+
+
+def test_etag_probe_augment_no_conditional_headers():
+    mod = tbenv.ETagProbeModule()
+
+    class FakeReq:
+        headers = {}
+
+    headers, meta = mod.augment(FakeReq(), {"request_id": "req-abc"})
+    assert headers["ETag"] == '"req-abc"'
+    assert headers["Last-Modified"]
+    assert meta["etag"] == '"req-abc"'
+    assert "conditionalRequest" not in meta
+
+
+def test_etag_probe_augment_records_if_none_match_and_if_modified_since():
+    mod = tbenv.ETagProbeModule()
+
+    class FakeReq:
+        headers = {
+            "If-None-Match": '"prev"',
+            "If-Modified-Since": "Mon, 01 Jan 2024 00:00:00 GMT",
+        }
+
+    _, meta = mod.augment(FakeReq(), {"request_id": "x"})
+    assert meta["conditionalRequest"] is True
+    assert meta["ifNoneMatch"] == '"prev"'
+    assert meta["ifModifiedSince"].startswith("Mon,")
+
+
+def test_content_length_mismatch_augment_returns_claimed_bytes(monkeypatch):
+    monkeypatch.setattr(tbenv, "MOD_CONTENT_LENGTH_CLAIMED_BYTES", 1_000_000_000)
+    mod = tbenv.ContentLengthMismatchModule()
+    headers, meta = mod.augment(None, {})
+    assert headers["Content-Length"] == "1000000000"
+    assert meta["claimedBytes"] == 1_000_000_000
+
+
+def test_redirect_chain_should_run_false_when_chain_already_set(monkeypatch):
+    monkeypatch.setattr(tbenv, "MOD_REDIRECT_CHAIN_ENABLED", True)
+    mod = tbenv.RedirectChainModule()
+    assert not mod.should_run({"query": "_hp_chain=existing"})
+    # And true for the initial request (no chain param yet).
+    assert mod.should_run({"query": "other=1"})
+    assert mod.should_run({"query": ""})
+
+
+def test_dns_callback_should_run_requires_domain(monkeypatch):
+    monkeypatch.setattr(tbenv, "MOD_DNS_CALLBACK_ENABLED", True)
+    monkeypatch.setattr(tbenv, "MOD_DNS_CALLBACK_DOMAIN", "")
+    assert not tbenv.DNSCallbackModule().should_run({})
+    monkeypatch.setattr(tbenv, "MOD_DNS_CALLBACK_DOMAIN", "track.example")
+    assert tbenv.DNSCallbackModule().should_run({})
+
+
+def test_tarpit_module_base_defaults():
+    """Base class is a no-op. Subclasses opt in by overriding."""
+    base = tbenv.TarpitModule()
+    assert base.should_run({}) is False
+    headers, meta = base.augment(None, {})
+    assert headers == {} and meta == {}
+
+
+# --- build_tarpit_chunk ---
+
+
+def test_build_tarpit_chunk_pads_to_chunk_bytes_plus_newline(monkeypatch):
+    monkeypatch.setattr(tbenv, "TARPIT_CHUNK_BYTES", 64)
+    chunk = tbenv.build_tarpit_chunk("abcdef1234567890-req", "/short", 1)
+    assert len(chunk) == 65  # TARPIT_CHUNK_BYTES + trailing newline
+    assert chunk.endswith(b"\n")
+    assert b"TRACEBIT_TARPIT_" in chunk
+    assert b"/short" in chunk
+
+
+def test_build_tarpit_chunk_truncates_long_payload(monkeypatch):
+    monkeypatch.setattr(tbenv, "TARPIT_CHUNK_BYTES", 8)
+    long_path = "/" + ("verylongpath" * 20)
+    chunk = tbenv.build_tarpit_chunk("req", long_path, 7)
+    assert len(chunk) == 9  # 8 + newline
+    assert chunk.endswith(b"\n")
+
+
+# --- format_env_payload ---
+
+
+def test_format_env_payload_includes_aws_ssh_and_http_blocks():
+    response = {
+        "aws": {
+            "awsAccessKeyId": "AKIAEXAMPLE",
+            "awsSecretAccessKey": "supersecret",
+            "awsSessionToken": "token123",
+            "awsExpiration": "2030-01-01T00:00:00Z",
+        },
+        "ssh": {
+            "sshIp": "198.51.100.5",
+            "sshPrivateKey": "PRIV",
+            "sshPublicKey": "PUB",
+            "sshExpiration": "2030-01-01T00:00:00Z",
+        },
+        "http": {
+            "gitlab-cookie": {
+                "credentials": {"name": "_gitlab_session", "value": "v"},
+                "hostNames": ["gitlab.example"],
+                "expiresAt": "2030-01-01T00:00:00Z",
+            },
+        },
+    }
+    payload = tbenv.format_env_payload(response)
+    assert "AWS_ACCESS_KEY_ID=AKIAEXAMPLE" in payload
+    assert "SSH_CANARY_IP=198.51.100.5" in payload
+    # http blocks upper-case + underscore the canary type
+    assert "GITLAB_COOKIE_HOSTNAMES=gitlab.example" in payload
+    assert "GITLAB_COOKIE_EXPIRATION=2030-01-01T00:00:00Z" in payload
+    # credentials are JSON-encoded inline
+    assert '"_gitlab_session"' in payload
+
+
+def test_format_env_payload_empty_response_records_error():
+    payload = tbenv.format_env_payload({})
+    assert "TRACEBIT_CANARY_ERROR=empty-response" in payload
+
+
+def test_format_env_payload_ignores_non_dict_entries():
+    # Defensive: upstream must not crash flux.
+    payload = tbenv.format_env_payload({"aws": "not a dict", "http": "also not", "ssh": None})
+    assert "TRACEBIT_CANARY_ERROR=empty-response" in payload
+
+
+# --- Fake git primitives ---
+
+
+def test_git_loose_object_is_valid_for_blob():
+    import zlib
+    content = b"hello, git\n"
+    sha, blob_bytes = tbenv._git_loose_object(b"blob", content)
+    raw = zlib.decompress(blob_bytes)
+    # Git loose-object header: "blob <len>\x00" + content
+    header, _, body = raw.partition(b"\x00")
+    assert header == b"blob 11"
+    assert body == content
+    # Canonical git sha = sha1(header\x00 + content)
+    import hashlib
+    assert sha == hashlib.sha1(raw).hexdigest()
+
+
+def test_git_tree_entry_packs_mode_name_and_binary_sha():
+    entry = tbenv._git_tree_entry("100644", "README.md", "1" * 40)
+    assert entry.startswith(b"100644 README.md\x00")
+    assert entry[-20:] == bytes.fromhex("1" * 40)
+
+
+def test_format_secrets_yaml_embeds_aws_canary():
+    body = tbenv._format_secrets_yaml({"aws": {
+        "awsAccessKeyId": "AKIAFAKEYAML01",
+        "awsSecretAccessKey": "yamlSecret",
+        "awsSessionToken": "yamlTok",
+        "awsExpiration": "2030-01-01T00:00:00Z",
+    }})
+    assert "access_key_id: AKIAFAKEYAML01" in body
+    assert "session_token: yamlTok" in body
+    assert body.startswith("# config/secrets.yml")
+
+
+def test_format_secrets_yaml_tolerates_missing_aws():
+    # Not expected in practice, but the function must not crash.
+    body = tbenv._format_secrets_yaml({})
+    assert "access_key_id:" in body  # placeholder line still present
+
+
+def test_build_fake_repo_produces_expected_layout_and_sha_linkage():
+    import zlib
+    secrets_body = tbenv._format_secrets_yaml({"aws": {
+        "awsAccessKeyId": "AKIATESTREPO",
+        "awsSecretAccessKey": "x", "awsSessionToken": "y", "awsExpiration": "z",
+    }})
+    files, meta = tbenv._build_fake_repo(secrets_body)
+
+    # The minimum surface a git-dumper walks.
+    for required in ("/.git/HEAD", "/.git/config", "/.git/refs/heads/main",
+                     "/.git/packed-refs", "/.git/info/refs", "/.git/logs/HEAD"):
+        assert required in files, required
+
+    # refs/heads/main + packed-refs both reference the commit SHA.
+    assert meta["commitSha"] in files["/.git/refs/heads/main"].decode()
+    assert meta["commitSha"] in files["/.git/packed-refs"].decode()
+
+    # The secrets blob object exists at its hashed path and decompresses
+    # to a body that still carries the canary.
+    secrets_path = f"/.git/objects/{meta['secretsBlobSha'][:2]}/{meta['secretsBlobSha'][2:]}"
+    assert secrets_path in files
+    raw = zlib.decompress(files[secrets_path])
+    assert raw.startswith(b"blob ")
+    assert b"AKIATESTREPO" in raw
+
+    # Commit object references the root tree sha.
+    commit_path = f"/.git/objects/{meta['commitSha'][:2]}/{meta['commitSha'][2:]}"
+    commit_raw = zlib.decompress(files[commit_path])
+    assert commit_raw.startswith(b"commit ")
+    assert f"tree {meta['rootTreeSha']}".encode() in commit_raw
+
+
+# --- _close_http_session lifecycle ---
+
+
+async def test_close_http_session_closes_lazy_session():
+    # Prime a session, then verify cleanup hook closes it and clears the global.
+    session = await tbenv._get_http_session()
+    assert not session.closed
+    await tbenv._close_http_session(None)
+    assert session.closed
+    assert tbenv._http_session is None
+
+
+async def test_close_http_session_is_safe_when_nothing_opened():
+    # Reset, then call cleanup with no prior session — must not raise.
+    tbenv._http_session = None
+    await tbenv._close_http_session(None)
+    assert tbenv._http_session is None
+
+
+# --- Method handling ---
+
+
+async def test_dispatch_rejects_unsupported_methods(flux_client):
+    """PUT / DELETE / etc. short-circuit to 405. Prevents confused logging
+    downstream and stops tarpit/canary logic from running on odd verbs."""
+    resp = await flux_client.put("/anything", data=b"x")
+    assert resp.status == 405

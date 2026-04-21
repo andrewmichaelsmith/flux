@@ -130,6 +130,162 @@ async def test_integration_head_request_has_no_body(live_server):
             assert body == b""
 
 
+async def test_integration_env_serves_canary_payload(live_server, monkeypatch):
+    """GET /.env — mocks Tracebit issuance, verifies the payload surfaces the
+    canary fields the consumer contract expects."""
+    async def fake_issue(*_a, **_kw):
+        return FAKE_TRACEBIT
+
+    monkeypatch.setattr(tbenv, "issue_credentials", fake_issue)
+    base, log_path = live_server
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/.env", headers={"X-Forwarded-For": "203.0.113.30"},
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/plain")
+            body = await resp.read()
+
+    assert b"AWS_ACCESS_KEY_ID=AKIAFAKEINTEG01" in body
+    assert b"SSH_CANARY_IP=203.0.113.99" in body
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    issued = [e for e in entries if e.get("result") == "issued"]
+    assert issued and "aws" in issued[-1]["types"]
+
+
+async def test_integration_env_502s_when_tracebit_raises(live_server, monkeypatch):
+    """Upstream Tracebit failures must return 502 + logged error, not 500."""
+    async def boom(*_a, **_kw):
+        raise aiohttp.ClientConnectionError("connection refused")
+
+    monkeypatch.setattr(tbenv, "issue_credentials", boom)
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/.env", headers={"X-Forwarded-For": "203.0.113.31"},
+        ) as resp:
+            assert resp.status == 502
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e["result"] == "tracebit-error" for e in entries)
+
+
+async def test_integration_env_502s_on_tracebit_http_error(live_server, monkeypatch):
+    """ClientResponseError is logged with the upstream status code."""
+    from yarl import URL
+    from multidict import CIMultiDict, CIMultiDictProxy
+
+    async def upstream_500(*_a, **_kw):
+        info = aiohttp.RequestInfo(
+            url=URL("http://tracebit.test"),
+            method="POST",
+            headers=CIMultiDictProxy(CIMultiDict()),
+            real_url=URL("http://tracebit.test"),
+        )
+        raise aiohttp.ClientResponseError(info, (), status=500, message="boom")
+
+    monkeypatch.setattr(tbenv, "issue_credentials", upstream_500)
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/.env", headers={"X-Forwarded-For": "203.0.113.32"},
+        ) as resp:
+            assert resp.status == 502
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    http_errs = [e for e in entries if e.get("result") == "tracebit-http-error"]
+    assert http_errs and http_errs[-1]["tracebitStatus"] == 500
+
+
+async def test_integration_fake_git_serves_head_and_objects(live_server, monkeypatch):
+    """/.git/HEAD + a loose object round-trip. Exercises _build_fake_repo and
+    the streaming git handler end-to-end."""
+    import zlib
+
+    async def fake_issue(*_a, **_kw):
+        return FAKE_TRACEBIT
+
+    monkeypatch.setattr(tbenv, "issue_credentials", fake_issue)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_DRIP_INTERVAL_MS", 0)
+    # Fresh cache so this IP mints its own repo.
+    tbenv._FAKE_GIT_CACHE.clear()
+
+    base, log_path = live_server
+    headers = {"X-Forwarded-For": "203.0.113.40"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{base}/.git/HEAD", headers=headers) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/plain")
+            head = await resp.read()
+            assert head.strip() == b"ref: refs/heads/main"
+
+        # Discover the commit sha from refs/heads/main, then fetch that loose
+        # object and verify it decompresses to a git commit.
+        async with session.get(f"{base}/.git/refs/heads/main", headers=headers) as resp:
+            commit_sha = (await resp.read()).decode().strip()
+            assert len(commit_sha) == 40
+
+        obj_url = f"{base}/.git/objects/{commit_sha[:2]}/{commit_sha[2:]}"
+        async with session.get(obj_url, headers=headers) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"] == "application/x-git-loose-object"
+            raw = zlib.decompress(await resp.read())
+            assert raw.startswith(b"commit ")
+
+        # Unknown path under /.git returns 404 from the cached repo, not 502.
+        async with session.get(f"{base}/.git/nope", headers=headers) as resp:
+            assert resp.status == 404
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e["result"] == "fake-git" for e in entries)
+    assert any(e["result"] == "fake-git-miss" for e in entries)
+
+
+async def test_integration_fake_git_502s_when_tracebit_fails(live_server, monkeypatch):
+    async def boom(*_a, **_kw):
+        raise aiohttp.ClientConnectionError("nope")
+
+    monkeypatch.setattr(tbenv, "issue_credentials", boom)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    tbenv._FAKE_GIT_CACHE.clear()
+
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/.git/HEAD", headers={"X-Forwarded-For": "203.0.113.41"},
+        ) as resp:
+            assert resp.status == 502
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e["result"] == "fake-git-error" for e in entries)
+
+
+async def test_integration_tarpit_redirect_chain_increments_hop(live_server, monkeypatch):
+    """A request carrying an existing _hp_chain continues the chain (302 with
+    incremented hop) up to MOD_REDIRECT_CHAIN_MAX_HOPS."""
+    monkeypatch.setattr(tbenv, "TARPIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "MOD_REDIRECT_CHAIN_ENABLED", True)
+    # Remove terminal modules so the chain-continuation branch inside
+    # _send_tarpit runs (not the module's own initial-redirect branch).
+    monkeypatch.setattr(tbenv, "TARPIT_MODULES", [])
+
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/?_hp_chain=abc&_hp_hop=1",
+            allow_redirects=False,
+        ) as resp:
+            assert resp.status == 302
+            location = resp.headers["Location"]
+            assert "_hp_chain=abc" in location
+            assert "_hp_hop=2" in location
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e.get("module") == "redirect-chain" for e in entries)
+
+
 async def test_integration_tarpit_drips_then_client_disconnects(live_server, monkeypatch):
     """Open a tarpit response, read one chunk, close. Server logs tarpit-disconnect."""
     monkeypatch.setattr(tbenv, "TARPIT_ENABLED", True)
