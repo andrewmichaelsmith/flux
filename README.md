@@ -36,7 +36,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | Fake `/.env` canary issuer | Mints a per-request Tracebit Community canary and returns it as a `.env`-style payload | 2026-04-20 | yes |
 | Fake `/.git/` repository | Serves a loose-object git tree whose `config/secrets.yml` embeds a canary; per-IP cached so `git-dumper`-style fan-out sees a consistent tree | 2026-04-20 | yes |
 | Canary file traps (19 paths) | Plausible file-format responses for `/wp-config.php`, `/backup.sql`, `/id_rsa`, `/.aws/credentials`, `/api/v4/user`, `/users/sign_in`, … — full table [below](#canary-file-trap-table) | 2026-04-20 | yes |
-| AI-credential-file canaries | `/.openai/config.json`, `/.anthropic/config.json`, `/.cursor/mcp.json` — listed in the same table; broken out in the footnote because Tracebit has no LLM canary type yet | 2026-04-20 | yes |
+| AI-credential-file canaries | `/.openai/config.json`, `/.anthropic/config.json`, `/.cursor/mcp.json`, `/.claude/.credentials.json` — listed in the same table; broken out in the footnote because Tracebit has no LLM canary type yet | 2026-04-20 | yes |
 | Fake webshell | Plausible File Manager on known `*.php` shell probe paths; simulates `id` / `whoami` / `uname -a` / `cat /etc/passwd` on follow-up commands — [docs](./docs/fake-webshell.md) | 2026-04-20 | no |
 | Modular tarpit + fingerprinting | Slow-drip response plus six fingerprinting modules (cookie, ETag, redirect chain, variable drip, Content-Length mismatch, DNS callback); fires on `.env` variants and on configurable first-contact paths (`/`, `/index.html`, `/robots.txt`, …) | 2026-04-20 | no |
 | Fake LLM-API endpoint | Ollama / OpenAI / Anthropic-proxy JSON on `/v1/models`, `/v1/chat/completions`, `/anthropic/v1/messages`, `/api/chat`, … ; logs model + auth header + prompt prefix — [docs](./docs/fake-llm-api.md) | 2026-04-20 | no |
@@ -83,6 +83,8 @@ case-insensitive exact matches.
 | Trap | Paths | Canary type | Log tag |
 | --- | --- | --- | --- |
 | AWS credentials file (INI) | `/.aws/credentials` | `aws` | `aws-credentials-file` |
+| AWS SDK config (INI) | `/.aws/config` | `aws` | `aws-config-file` |
+| Postgres pgpass | `/.pgpass` | `gitlab-username-password` | `pgpass` |
 | WordPress config | `/wp-config.php` (+`.bak`/`.old`/`.txt`) | `aws` | `wp-config` |
 | SQL dump | `/backup.sql`, `/db.sql`, `/dump.sql`, `/database.sql`, `/backup/db.sql`, `/sql/backup.sql` | `aws` | `sql-dump` |
 | Generic JSON config | `/config.json`, `/settings.json`, `/credentials.json`, `/secrets.json` | `aws` | `config-json` |
@@ -104,22 +106,23 @@ case-insensitive exact matches.
 | OpenAI config file | `/.openai/config.json` | `aws` (†) | `openai-config` |
 | Anthropic config file | `/.anthropic/config.json` | `aws` (†) | `anthropic-config` |
 | Cursor MCP config | `/.cursor/mcp.json` | `aws` (†) | `cursor-mcp` |
+| Claude Code credentials | `/.claude/.credentials.json` | `aws` (†) | `claude-credentials` |
 
 `/users/sign_in` returns the cookie canary as `Set-Cookie:
 _gitlab_session=<value>`. `/api/v4/user` embeds the username/password
 canary as a plausible GitLab API user response.
 
-† **The three AI-credential-file traps probably don't make sense yet.**
+† **The AI-credential-file traps probably don't make sense yet.**
 Tracebit Community doesn't expose an OpenAI / Anthropic / LLM canary
 type, so these traps dress an `aws` canary in OpenAI / Anthropic /
-Cursor-shaped JSON. A scanner that filters by key-format prefix
+Cursor / Claude-shaped JSON. A scanner that filters by key-format prefix
 (`sk-...`, `sk-ant-...`) will correctly decide the key is fake and
 drop it; a scanner that harvests by field name (`api_key`, `auth_token`,
-`GITHUB_PERSONAL_ACCESS_TOKEN`) will still serialize the value and ship
-it, and *that* side-channel trips the AWS canary if it's ever used as
-AWS credentials. Shipped anyway because the probe itself is what we
-want to log. Swap the renderers to real LLM canaries when Tracebit
-ships them.
+`accessToken`, `GITHUB_PERSONAL_ACCESS_TOKEN`) will still serialize the
+value and ship it, and *that* side-channel trips the AWS canary if it's
+ever used as AWS credentials. Shipped anyway because the probe itself
+is what we want to log. Swap the renderers to real LLM canaries when
+Tracebit ships them.
 
 The four canary types (`aws`, `ssh`, `gitlab-username-password`,
 `gitlab-cookie`) are everything Tracebit Community currently exposes via

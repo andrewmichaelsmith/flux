@@ -38,6 +38,61 @@ def test_non_webshell_path_does_not_match():
         assert not tbenv.is_webshell_path(path)
 
 
+def test_webshell_path_regexes_match_well_known_php_shells():
+    """The /.well-known/<name>.php pattern is used as a shell-drop directory
+    (writable by the certbot user on many LAMP boxes). Scanners probe a rotating
+    set of filenames there."""
+    for path in [
+        "/.well-known/rk2.php",
+        "/.well-known/gecko-litespeed.php",
+        "/.well-known/admin.php",
+        "/.well-known/error.php",
+        "/.well-known/index.php",
+        "/.WELL-KNOWN/RK2.PHP",
+    ]:
+        assert tbenv.is_webshell_path(path), f"expected match: {path}"
+
+
+def test_webshell_regex_excludes_well_known_acme_challenge():
+    """nginx routes /.well-known/acme-challenge/ to the LE webroot, not flux,
+    but even if it did hit flux we shouldn't trap on it — legit cert renewals
+    would fire the shell dispatch path. The regex only matches <name>.php, not
+    subdirectory tokens."""
+    assert not tbenv.is_webshell_path("/.well-known/acme-challenge/")
+    assert not tbenv.is_webshell_path("/.well-known/acme-challenge/abc123")
+
+
+def test_webshell_regex_matches_numbered_trash_directories():
+    """Numbered /.trash<N>/ and /.tmb/ staging paths are a specific malware
+    family's shell-drop convention."""
+    for path in [
+        "/.trash7206/index.php",
+        "/.trash7309/f/",
+        "/.trash99/",
+        "/.tmb/shell.php",
+        "/.tresh/index.php",
+        "/.dj/index.php",
+        "/.alf/index.php",
+        "/.mopj.php",
+        "/.info.php",
+    ]:
+        assert tbenv.is_webshell_path(path), f"expected match: {path}"
+
+
+def test_webshell_regex_rejects_benign_hidden_dirs():
+    """Dot-directories we do NOT want to snag (other canary traps own some of
+    these, and legitimate framework paths use others)."""
+    for path in [
+        "/.env",
+        "/.git/HEAD",
+        "/.ssh/authorized_keys",
+        "/.aws/credentials",
+        "/.well-known/openid-configuration",   # standards-defined non-.php
+        "/.trash",                              # bare name, no numbered dir
+    ]:
+        assert not tbenv.is_webshell_path(path), f"unexpected match: {path}"
+
+
 def test_parse_cookies_basic():
     result = tbenv.parse_cookies("sid=abc; cmd=id; _hp_tid=xyz")
     assert result == {"sid": "abc", "cmd": "id", "_hp_tid": "xyz"}
@@ -335,6 +390,9 @@ FAKE_TRACEBIT = {
 
 @pytest.mark.parametrize("path,needle", [
     ("/.aws/credentials", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    ("/.aws/config", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    ("/.pgpass", b":deploybot42:p@ssCanaryValue"),
+    ("/.claude/.credentials.json", b'"accessToken": "AKIAFAKEEXAMPLE01"'),
     ("/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/backup.sql", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/config.json", b'"access_key_id": "AKIAFAKEEXAMPLE01"'),

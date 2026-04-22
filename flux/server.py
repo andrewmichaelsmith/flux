@@ -107,9 +107,10 @@ FAKE_GIT_REMOTE_URL = (os.environ.get("FAKE_GIT_REMOTE_URL") or "git@github.com:
 # Default-enabled: the trap is cheap, logs are cheap, and we want to see what
 # commands the checker follows up with on a positive hit.
 WEBSHELL_ENABLED = (os.environ.get("HONEYPOT_WEBSHELL_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
-# Paths known to be probed by the Azure WP Webshell Checker and similar
-# post-compromise "is my shell still here" scanners. Overridable via env for
-# quick additions without a republish.
+# Paths known to be probed by scanners looking for pre-existing PHP shells to
+# take over — the "shell jacking" pattern (probe candidate paths someone else
+# dropped, inherit their persistence) as well as the Azure WP Webshell Checker
+# lineage. Overridable via env for quick additions without a republish.
 _WEBSHELL_DEFAULT_PATHS = ",".join([
     # Anchor: the hellopress / wp-file-manager planted shell (CVE-2020-25213 lineage)
     "/wp-content/plugins/hellopress/wp_filemanager.php",
@@ -121,12 +122,47 @@ _WEBSHELL_DEFAULT_PATHS = ",".join([
     "/kma.php", "/ssh3ll.php", "/new4.php", "/sf.php",
     # Common generic PHP webshell names
     "/shell.php", "/cmd.php", "/c.php", "/up.php", "/upload.php",
+    # Named-shell filenames seen as follow-on probes from the same
+    # post-compromise fleet (webshell-jacking intel). Grouped by shape:
+    #   - single-digit / short numeric names
+    "/0.php", "/0x.php", "/1.php", "/7.php", "/12.php", "/222.php", "/404.php",
+    "/a.php", "/a1.php",
+    #   - generic-shell-looking filenames observed as 404s across sensors
+    "/aa.php", "/abcd.php", "/about.php", "/aboute.php", "/adminfuns.php",
+    "/as.php", "/autoload_classmap.php", "/av.php", "/chosen.php",
+    "/classwithtostring.php", "/dass.php", "/db.php", "/dx.php", "/edit.php",
+    "/eetu.php", "/f35.php", "/fs.php", "/gifclass.php", "/lib.php",
+    "/ms-edit.php", "/press.php", "/rip.php", "/sid3.php", "/sql.php",
+    "/themes.php", "/y.php",
+    #   - "ws<N>" numbered series (already had ws80; fleet probes ~50-99)
+    "/ws57.php", "/ws66.php", "/ws81.php", "/ws82.php",
+    #   - wp-themed backdoor filenames (not real WP core files)
+    "/wp-block.php", "/wp-good.php", "/wp-kikikoko.php",
+    #   - non-.php backdoors ("dr0v" is a specific observed marker name)
+    "/dr0v",
 ])
 WEBSHELL_PATHS = {
     value.strip().lower()
     for value in (os.environ.get("HONEYPOT_WEBSHELL_PATHS_CSV") or _WEBSHELL_DEFAULT_PATHS).split(",")
     if value.strip()
 }
+# Regex families for webshell paths that are parameterized and therefore can't
+# be enumerated as literal strings. Two observed shapes:
+#   - `/.well-known/<name>.php` — attackers abuse the writable acme-challenge
+#     area as a shell-drop directory (certbot can create files there as root).
+#     Names seen in the wild: rk2.php (r57 lineage), gecko-litespeed.php,
+#     admin.php, error.php, index.php. The legitimate `/.well-known/acme-challenge/*`
+#     path is excluded by nginx routing (see cloud-init-sensor template), so
+#     we don't need to special-case it here.
+#   - `/.trash<N>/` and `/.tmb/` — numbered "trash" directories and tmb/ staging
+#     paths used by specific malware families as shell-drop locations.
+#     `/.tresh/` (typo'd variant) is included via literal list only if seen.
+_WEBSHELL_PATH_REGEXES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^/\.well-known/[^/]+\.php$", re.IGNORECASE),
+    re.compile(r"^/\.trash\d+/", re.IGNORECASE),
+    re.compile(r"^/\.tmb/[^/]+\.php$", re.IGNORECASE),
+    re.compile(r"^/\.(tresh|dj|alf|mopj|info)(/|\.php$)", re.IGNORECASE),
+)
 # Bound the body we decode+log. Scanners can POST large payloads; we still
 # want body_sha256 for everything but only need a prefix of decoded content
 # to see command strings.
@@ -288,7 +324,13 @@ def is_fingerprint_path(path: str) -> bool:
 def is_webshell_path(path: str) -> bool:
     if not WEBSHELL_ENABLED:
         return False
-    return path.lower() in WEBSHELL_PATHS
+    lowered = path.lower()
+    if lowered in WEBSHELL_PATHS:
+        return True
+    for pattern in _WEBSHELL_PATH_REGEXES:
+        if pattern.match(lowered):
+            return True
+    return False
 
 
 def is_llm_endpoint_path(path: str) -> bool:
@@ -1367,6 +1409,63 @@ def render_aws_credentials_ini(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_aws_config_ini(r: dict[str, object]) -> bytes:
+    # `~/.aws/config` is the sibling of `~/.aws/credentials`: region / output
+    # format / profile definitions. Some SDK setups stash the access key here
+    # too (in-profile `aws_access_key_id`), so embedding the canary is valid.
+    aws = _aws(r)
+    return (
+        "[default]\n"
+        "region = us-east-1\n"
+        "output = json\n"
+        f"aws_access_key_id = {aws.get('awsAccessKeyId', '')}\n"
+        f"aws_secret_access_key = {aws.get('awsSecretAccessKey', '')}\n"
+        "\n"
+        "[profile prod]\n"
+        "region = us-east-1\n"
+        "output = json\n"
+        f"aws_session_token = {aws.get('awsSessionToken', '')}\n"
+    ).encode("utf-8")
+
+
+def render_pgpass(r: dict[str, object]) -> bytes:
+    # Postgres `.pgpass` format: one line per entry, colon-separated
+    # hostname:port:database:username:password. libpq reads this file if it
+    # exists and mode 0600. Harvesters typically grep the whole file, so
+    # a single plausible line is enough to elicit a follow-up.
+    creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    username = str(creds.get("username", "") or "deploy")
+    password = str(creds.get("password", "") or "")
+    return (
+        f"db.internal:5432:app_prod:{username}:{password}\n"
+        f"db-replica.internal:5432:*:{username}:{password}\n"
+    ).encode("utf-8")
+
+
+def render_claude_credentials_json(r: dict[str, object]) -> bytes:
+    # Claude Code stores its OAuth tokens at `~/.claude/.credentials.json`.
+    # Scanner dictionaries added this path in April 2026 shortly after
+    # Claude Code's rollout — tracker-kits follow new developer tooling.
+    # Same caveat as the other AI-credential traps: Tracebit Community has
+    # no LLM canary type yet, so we embed an AWS canary under
+    # Anthropic-shaped field names. A grep-by-field harvester will still
+    # serialize the value; a prefix-filter scanner (`sk-ant-...`) will
+    # correctly decide the key is fake and drop it. Either way, the probe
+    # itself is the intel we want.
+    aws = _aws(r)
+    return json.dumps({
+        "claudeAiOauth": {
+            "accessToken": aws.get("awsAccessKeyId", ""),
+            "refreshToken": aws.get("awsSecretAccessKey", ""),
+            "expiresAt": aws.get("awsExpiration", ""),
+            "scopes": ["user:inference", "user:profile"],
+            "subscriptionType": "max",
+        },
+    }, indent=2).encode("utf-8")
+
+
 def render_wp_config_php(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     return (
@@ -1789,6 +1888,20 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(
+        "aws-config-file",
+        ("/.aws/config",),
+        ("aws",),
+        render_aws_config_ini,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "pgpass",
+        ("/.pgpass",),
+        ("gitlab-username-password",),
+        render_pgpass,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
         "wp-config",
         ("/wp-config.php", "/wp-config.php.bak", "/wp-config.old", "/wp-config.txt"),
         ("aws",),
@@ -1947,6 +2060,13 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("/.cursor/mcp.json",),
         ("aws",),
         render_cursor_mcp_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "claude-credentials",
+        ("/.claude/.credentials.json",),
+        ("aws",),
+        render_claude_credentials_json,
         "application/json; charset=utf-8",
     ),
 )
