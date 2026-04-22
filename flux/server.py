@@ -1072,9 +1072,11 @@ async def issue_credentials(
 
 
 def format_env_payload(tracebit_response: dict[str, object]) -> str:
-    lines = [
-        f"# issued_at={utc_now()}",
-    ]
+    # Rendered body is served verbatim on /.env; every string here is
+    # visible to the attacker. No headers, no "canary"/"tracebit" tells,
+    # no error sentinels — an empty upstream response becomes an empty
+    # body, which is indistinguishable from an unremarkable empty .env.
+    lines: list[str] = []
 
     aws = tracebit_response.get("aws")
     if isinstance(aws, dict):
@@ -1091,10 +1093,10 @@ def format_env_payload(tracebit_response: dict[str, object]) -> str:
     if isinstance(ssh, dict):
         lines.extend(
             [
-                f"SSH_CANARY_IP={ssh.get('sshIp', '')}",
-                f"SSH_CANARY_PRIVATE_KEY_B64={ssh.get('sshPrivateKey', '')}",
-                f"SSH_CANARY_PUBLIC_KEY_B64={ssh.get('sshPublicKey', '')}",
-                f"SSH_CANARY_EXPIRATION={ssh.get('sshExpiration', '')}",
+                f"SSH_HOST={ssh.get('sshIp', '')}",
+                f"SSH_PRIVATE_KEY_B64={ssh.get('sshPrivateKey', '')}",
+                f"SSH_PUBLIC_KEY_B64={ssh.get('sshPublicKey', '')}",
+                f"SSH_KEY_EXPIRATION={ssh.get('sshExpiration', '')}",
             ]
         )
 
@@ -1114,9 +1116,8 @@ def format_env_payload(tracebit_response: dict[str, object]) -> str:
             if expires_at:
                 lines.append(f"{env_key}_EXPIRATION={expires_at}")
 
-    if len(lines) <= 1:
-        lines.append("TRACEBIT_CANARY_ERROR=empty-response")
-
+    if not lines:
+        return ""
     lines.append("")
     return "\n".join(lines)
 

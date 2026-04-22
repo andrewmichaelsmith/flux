@@ -148,7 +148,7 @@ async def test_integration_env_serves_canary_payload(live_server, monkeypatch):
             body = await resp.read()
 
     assert b"AWS_ACCESS_KEY_ID=AKIAFAKEINTEG01" in body
-    assert b"SSH_CANARY_IP=203.0.113.99" in body
+    assert b"SSH_HOST=203.0.113.99" in body
     entries = [json.loads(line) for line in log_path.read_text().splitlines()]
     issued = [e for e in entries if e.get("result") == "issued"]
     assert issued and "aws" in issued[-1]["types"]
