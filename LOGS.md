@@ -36,7 +36,7 @@ Every line has a `result` identifying what the handler did, and a
 | --- | --- | --- | --- |
 | `not-handled` | 404 | — | Path didn't match any trap; fell through to 404. |
 
-### `/.env` canary (existing)
+### `/.env` canary
 
 | `result` | `status` | Extras | Meaning |
 | --- | --- | --- | --- |
