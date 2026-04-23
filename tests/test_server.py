@@ -407,6 +407,7 @@ FAKE_TRACEBIT = {
     ("/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/authorized_keys", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
     ("/.netrc", b"login deploybot42"),
+    ("/.git-credentials", b"https://deploybot42:"),
     ("/.npmrc", b"p@ssCanaryValue"),
     ("/.pypirc", b"username = deploybot42"),
     ("/api/v4/user", b'"username": "deploybot42"'),
@@ -1482,9 +1483,11 @@ def test_build_fake_repo_produces_expected_layout_and_sha_linkage():
     }})
     files, meta = tbenv._build_fake_repo(secrets_body)
 
-    # The minimum surface a git-dumper walks.
-    for required in ("/.git/HEAD", "/.git/config", "/.git/refs/heads/main",
-                     "/.git/packed-refs", "/.git/info/refs", "/.git/logs/HEAD"):
+    # The minimum surface a git-dumper walks. Keys are lowercased so
+    # lookups via extract_git_path() (which returns a lowercase key) match
+    # regardless of the case a scanner uses on the wire.
+    for required in ("/.git/head", "/.git/config", "/.git/refs/heads/main",
+                     "/.git/packed-refs", "/.git/info/refs", "/.git/logs/head"):
         assert required in files, required
 
     # refs/heads/main + packed-refs both reference the commit SHA.
@@ -1504,6 +1507,106 @@ def test_build_fake_repo_produces_expected_layout_and_sha_linkage():
     commit_raw = zlib.decompress(files[commit_path])
     assert commit_raw.startswith(b"commit ")
     assert f"tree {meta['rootTreeSha']}".encode() in commit_raw
+
+
+# --- /.git/config URL embeds Tracebit canary (git-config-canary) ---
+
+
+def test_fake_git_config_url_embeds_canary_credential(monkeypatch):
+    # With no operator override, the URL userinfo is the Tracebit AWS key
+    # pair — so a scraper that only reads /.git/config still walks away
+    # with a live canary.
+    monkeypatch.setattr(tbenv, "FAKE_GIT_REMOTE_URL", "")
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, _meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    config = files["/.git/config"].decode()
+    assert "url = https://AKIAFAKEEXAMPLE01:" in config
+    # '/' '+' '=' in the secret are percent-encoded so downstream URL
+    # parsers don't choke.
+    assert "wJalrXUtnFEMI%2FK7MDENG%2FbPxRfiCYEXAMPLEKEY" in config
+    assert "@github.com/internal/tools.git" in config
+
+
+def test_fake_git_config_url_respects_operator_override(monkeypatch):
+    # If the operator pins FAKE_GIT_REMOTE_URL, it's used verbatim.
+    monkeypatch.setattr(tbenv, "FAKE_GIT_REMOTE_URL", "git@corp.example:myrepo.git")
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, _meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    config = files["/.git/config"].decode()
+    assert "url = git@corp.example:myrepo.git" in config
+    # No canary leaked in the URL when an override is set.
+    assert "AKIAFAKEEXAMPLE01" not in config
+
+
+def test_fake_git_config_url_falls_back_when_canary_missing(monkeypatch):
+    # If Tracebit returns a response without AWS creds, we must not emit
+    # a malformed URL — fall back to a static SSH URL.
+    monkeypatch.setattr(tbenv, "FAKE_GIT_REMOTE_URL", "")
+    secrets_body = tbenv._format_secrets_yaml({})
+    files, _meta = tbenv._build_fake_repo(secrets_body, {})
+    config = files["/.git/config"].decode()
+    assert "url = git@github.com:internal/tools.git" in config
+
+
+# --- extract_git_path: prefix + case-insensitive coverage ---
+
+
+@pytest.mark.parametrize("path,expected", [
+    # Direct /.git/ access
+    ("/.git/config", "/.git/config"),
+    ("/.git/HEAD", "/.git/head"),
+    ("/.git/refs/heads/main", "/.git/refs/heads/main"),
+    # Root pointers
+    ("/.git", "/.git/"),
+    ("/.git/", "/.git/"),
+    # Case variants
+    ("/.GIT/CONFIG", "/.git/config"),
+    ("/.Git/Config", "/.git/config"),
+    ("/.gIt/cOnFiG", "/.git/config"),
+    # Prefixed-app variants (app deployed at subpath)
+    ("/login/.git/config", "/.git/config"),
+    ("/project/.git/HEAD", "/.git/head"),
+    ("/api/.git/index", "/.git/index"),
+    ("/backend/.git/refs/heads/main", "/.git/refs/heads/main"),
+    # Nested prefix
+    ("/a/b/c/.git/config", "/.git/config"),
+    # Case-variant inside a prefix
+    ("/Login/.GiT/CoNfIg", "/.git/config"),
+])
+def test_extract_git_path_recognises_git_requests(path, expected):
+    assert tbenv.extract_git_path(path) == expected
+
+
+@pytest.mark.parametrize("path", [
+    "/",
+    "/.env",
+    "/.gitignore",
+    "/.gitconfig",
+    "/.git-credentials",
+    "/gitconfig",
+    "/foo/bar",
+    "",
+    # `.git` as part of a filename segment, not a directory
+    "/.gitlab-ci.yml",
+    # Decoy — must require actual `/.git/` substring
+    "/gitrepo/config",
+])
+def test_extract_git_path_ignores_non_git_requests(path):
+    assert tbenv.extract_git_path(path) is None
+
+
+# --- /.git/index placeholder ---
+
+
+def test_fake_git_index_is_valid_dirc_header():
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, _meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    index = files["/.git/index"]
+    # Signature + version 2 + entry count 0 + 20 zero bytes (trailer slot).
+    assert index.startswith(b"DIRC")
+    assert index[4:8] == b"\x00\x00\x00\x02"
+    assert index[8:12] == b"\x00\x00\x00\x00"
+    assert len(index) == 32
 
 
 # --- _close_http_session lifecycle ---

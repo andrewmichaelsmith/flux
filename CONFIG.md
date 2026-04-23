@@ -98,7 +98,9 @@ when `TRACEBIT_API_KEY` is unset — the dispatch requires both.
 | `FAKE_GIT_DRIP_INTERVAL_MS` | `3000` | |
 | `FAKE_GIT_AUTHOR` | `ops <ops@internal-tools.lan>` | Appears in the synthetic commit. |
 | `FAKE_GIT_COMMIT_MESSAGE` | `Initial import of internal-tools` | |
-| `FAKE_GIT_REMOTE_URL` | `git@github.com:internal/tools.git` | |
+| `FAKE_GIT_REMOTE_URL` | *unset* | Operator override for the `[remote "origin"] url` line. When unset (default), the URL is built per-request from the Tracebit canary so that scrapers who only fetch `.git/config` still leak a canary in the URL userinfo. Set this to a static string to suppress that embedding (e.g. in staging where you don't want canary burn on every hit). |
+| `FAKE_GIT_REMOTE_HOST` | `github.com` | Host portion of the generated canary URL. |
+| `FAKE_GIT_REMOTE_PATH` | `internal/tools.git` | Path portion of the generated canary URL. |
 
 ## Fake webshell
 

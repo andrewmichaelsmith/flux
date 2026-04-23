@@ -34,6 +34,10 @@ FAKE_TRACEBIT = {
             "credentials": {"name": "_gitlab_session", "value": "integCookieVal"},
             "hostNames": ["gitlab.canary.example"],
         },
+        "gitlab-username-password": {
+            "credentials": {"username": "integbot", "password": "integPassVal"},
+            "hostNames": ["gitlab.canary.example"],
+        },
     },
 }
 
@@ -241,6 +245,69 @@ async def test_integration_fake_git_serves_head_and_objects(live_server, monkeyp
     entries = [json.loads(line) for line in log_path.read_text().splitlines()]
     assert any(e["result"] == "fake-git" for e in entries)
     assert any(e["result"] == "fake-git-miss" for e in entries)
+
+
+async def test_integration_fake_git_serves_prefixed_and_case_variant_paths(live_server, monkeypatch):
+    """Scanners probing `/<prefix>/.git/config` and mixed-case variants
+    must reach the same fake-repo response as `/.git/config`."""
+    async def fake_issue(*_a, **_kw):
+        return FAKE_TRACEBIT
+
+    monkeypatch.setattr(tbenv, "issue_credentials", fake_issue)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_DRIP_INTERVAL_MS", 0)
+    tbenv._FAKE_GIT_CACHE.clear()
+
+    base, log_path = live_server
+    headers = {"X-Forwarded-For": "203.0.113.50"}
+    async with aiohttp.ClientSession() as session:
+        for path in (
+            "/login/.git/config",
+            "/project/.git/config",
+            "/.GIT/CONFIG",
+            "/Login/.GiT/CoNfIg",
+        ):
+            async with session.get(f"{base}{path}", headers=headers) as resp:
+                assert resp.status == 200, f"{path} → {resp.status}"
+                body = (await resp.read()).decode()
+                assert "[core]" in body
+                assert "[remote \"origin\"]" in body
+                # The canary AWS key is embedded in the URL userinfo.
+                assert "AKIAFAKEINTEG01" in body
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    fake_git_entries = [e for e in entries if e.get("result") == "fake-git"]
+    # One per requested path; log rows preserve the raw wire path for
+    # post-hoc analysis of which prefix/case variants scanners use.
+    paths_logged = {e.get("path") for e in fake_git_entries}
+    assert "/login/.git/config" in paths_logged
+    assert "/project/.git/config" in paths_logged
+    assert "/.GIT/CONFIG" in paths_logged
+
+
+async def test_integration_git_credentials_canary_trap(live_server, monkeypatch):
+    """/.git-credentials is a canary-file trap: the response body is a
+    credential-store-format line with an embedded gitlab-username-password
+    canary."""
+    async def fake_canary(*_a, **_kw):
+        return FAKE_TRACEBIT
+
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", fake_canary)
+
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/.git-credentials",
+            headers={"X-Forwarded-For": "203.0.113.51"},
+        ) as resp:
+            assert resp.status == 200
+            body = (await resp.read()).decode()
+            # https://user:pass@host format
+            assert body.startswith("https://integbot:")
+            assert "@gitlab.canary.example" in body
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e.get("result") == "git-credentials" for e in entries)
 
 
 async def test_integration_fake_git_502s_when_tracebit_fails(live_server, monkeypatch):

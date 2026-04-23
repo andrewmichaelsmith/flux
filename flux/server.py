@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs, quote, unquote
 
 import aiohttp
 from aiohttp import web
@@ -101,7 +101,18 @@ FAKE_GIT_DRIP_BYTES = max(int((os.environ.get("FAKE_GIT_DRIP_BYTES") or "1024").
 FAKE_GIT_DRIP_INTERVAL_MS = max(int((os.environ.get("FAKE_GIT_DRIP_INTERVAL_MS") or "3000").strip() or "3000"), 100)
 FAKE_GIT_AUTHOR = (os.environ.get("FAKE_GIT_AUTHOR") or "ops <ops@internal-tools.lan>").strip()
 FAKE_GIT_COMMIT_MESSAGE = (os.environ.get("FAKE_GIT_COMMIT_MESSAGE") or "Initial import of internal-tools").strip()
-FAKE_GIT_REMOTE_URL = (os.environ.get("FAKE_GIT_REMOTE_URL") or "git@github.com:internal/tools.git").strip()
+# If FAKE_GIT_REMOTE_URL is set, it's used verbatim (operator override).
+# If unset, the URL is built per-request from the Tracebit canary creds
+# issued for this fake repo, so that scrapers who just grep `.git/config`
+# (without running `git clone`) still leak a canary credential — the URL
+# userinfo is a real Tracebit access key, and any attempt to use it as AWS
+# credentials triggers a Tracebit callback. This is a distinct tripwire
+# from the `git clone`-then-read-secrets.yml path the rest of the trap
+# already covers: some scanning fleets observed in the wild fetch
+# `.git/config` in isolation and never progress to a full clone.
+FAKE_GIT_REMOTE_URL = (os.environ.get("FAKE_GIT_REMOTE_URL") or "").strip()
+FAKE_GIT_REMOTE_HOST = (os.environ.get("FAKE_GIT_REMOTE_HOST") or "github.com").strip()
+FAKE_GIT_REMOTE_PATH = (os.environ.get("FAKE_GIT_REMOTE_PATH") or "internal/tools.git").strip().lstrip("/")
 
 # --- Fake webshell configuration (Azure WP Webshell Checker intel, 2026-04-20) ---
 # Default-enabled: the trap is cheap, logs are cheap, and we want to see what
@@ -294,6 +305,34 @@ def normalize_path(raw_path: str) -> str:
     decoded = unquote(raw_path)
     collapsed = re.sub(r"/+", "/", decoded)
     return collapsed if collapsed.startswith("/") else f"/{collapsed}"
+
+
+def extract_git_path(path: str) -> str | None:
+    """Return the canonical `/.git/...` lookup key, or None if `path` isn't
+    a request for a /.git tree file.
+
+    Accepts:
+      - exact `/.git` (root) and `/.git/` (directory-ish)
+      - `/.git/<anything>`
+      - `/<any prefix>/.git/<anything>` — scanners enumerate apps deployed
+        at subpaths, e.g. `/login/.git/config`, `/project/.git/HEAD`,
+        `/api/.git/index`
+      - case-insensitive (`/.GiT/CoNfIg` → `/.git/config`)
+
+    Lowercases the result for case-insensitive lookup against the
+    canonical `files` map keys (which are all lowercase).
+    """
+    if not path:
+        return None
+    lower = path.lower()
+    if lower == "/.git" or lower == "/.git/":
+        return "/.git/"
+    if lower.startswith("/.git/"):
+        return lower
+    idx = lower.find("/.git/")
+    if idx > 0:
+        return lower[idx:]
+    return None
 
 
 def is_tarpit_path(path: str) -> bool:
@@ -1168,11 +1207,42 @@ def _format_secrets_yaml(tracebit_response: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-def _build_fake_repo(secrets_body: str) -> tuple[dict[str, bytes], dict[str, object]]:
+def _build_fake_git_remote_url(tracebit_response: dict[str, object]) -> str:
+    """Build the `url = …` line for the fake /.git/config [remote].
+
+    If FAKE_GIT_REMOTE_URL is set (operator override), use it verbatim.
+    Otherwise embed the Tracebit AWS canary as HTTPS Basic userinfo, so a
+    scraper that only reads `.git/config` (no clone) still walks away with
+    a live canary key. An attacker who extracts the URL and tries the
+    access-key/secret as AWS credentials trips the canary; an attacker who
+    actually runs `git clone` against the URL fails (the host is not ours)
+    but we still catch them via the rest of the fake-git tree.
+    """
+    if FAKE_GIT_REMOTE_URL:
+        return FAKE_GIT_REMOTE_URL
+    aws = _aws(tracebit_response)
+    access_key = str(aws.get("awsAccessKeyId") or "").strip()
+    secret = str(aws.get("awsSecretAccessKey") or "").strip()
+    if not access_key or not secret:
+        # Canary mint failed or was incomplete; fall back to a static SSH
+        # URL (no secret material) rather than emitting a malformed URL.
+        return f"git@{FAKE_GIT_REMOTE_HOST}:{FAKE_GIT_REMOTE_PATH}"
+    # Percent-encode the secret — base64 can contain '+' / '/' which break
+    # URL parsing by downstream tools. quote() with an empty safe set is
+    # RFC 3986 userinfo-safe.
+    encoded_secret = quote(secret, safe="")
+    return f"https://{access_key}:{encoded_secret}@{FAKE_GIT_REMOTE_HOST}/{FAKE_GIT_REMOTE_PATH}"
+
+
+def _build_fake_repo(
+    secrets_body: str,
+    tracebit_response: dict[str, object] | None = None,
+) -> tuple[dict[str, bytes], dict[str, object]]:
     """Build a loose-object git repo as a path->bytes map.
 
     Layout: root/{.env.example, README.md, config/secrets.yml}. One commit.
-    The canary creds live inside the secrets.yml blob.
+    The canary creds live inside the secrets.yml blob AND (when the Tracebit
+    response is provided) inside the `.git/config` remote-origin URL.
     """
     secrets_sha, secrets_blob = _git_loose_object(b"blob", secrets_body.encode("utf-8"))
 
@@ -1221,6 +1291,7 @@ def _build_fake_repo(secrets_body: str) -> tuple[dict[str, bytes], dict[str, obj
     def obj_path(sha: str) -> str:
         return f"/.git/objects/{sha[:2]}/{sha[2:]}"
 
+    remote_url = _build_fake_git_remote_url(tracebit_response or {})
     config_text = (
         "[core]\n"
         "\trepositoryformatversion = 0\n"
@@ -1228,7 +1299,7 @@ def _build_fake_repo(secrets_body: str) -> tuple[dict[str, bytes], dict[str, obj
         "\tbare = false\n"
         "\tlogallrefupdates = true\n"
         "[remote \"origin\"]\n"
-        f"\turl = {FAKE_GIT_REMOTE_URL}\n"
+        f"\turl = {remote_url}\n"
         "\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
         "[branch \"main\"]\n"
         "\tremote = origin\n"
@@ -1240,9 +1311,22 @@ def _build_fake_repo(secrets_body: str) -> tuple[dict[str, bytes], dict[str, obj
         f"{FAKE_GIT_AUTHOR} {commit_ts} +0000\tcommit (initial): {FAKE_GIT_COMMIT_MESSAGE}\n"
     )
 
+    # A minimal valid .git/index header: signature "DIRC" + version 2 +
+    # entry count 0. Real scanners (git-dumper, gitdumper.sh, etc.) request
+    # /.git/index on first contact and treat a 404 there as evidence of a
+    # fake repo. Returning zero entries is cheap and convincing: `git
+    # ls-files` against the tree just prints nothing.
+    git_index_body = b"DIRC" + (2).to_bytes(4, "big") + (0).to_bytes(4, "big") + b"\x00" * 20
+    # Keys are lowercased so lookups from extract_git_path() (which returns
+    # a lowercased key) match regardless of the case a scanner used on the
+    # wire. `/.git/HEAD` on the wire and `/.git/head` on the wire both land
+    # on the same response. Real git uses mixed-case filenames on disk, but
+    # the on-wire paths are what matter for a dumb-HTTP clone — and no
+    # harvester relies on HTTP paths being case-sensitive.
     files: dict[str, bytes] = {
-        "/.git/HEAD": b"ref: refs/heads/main\n",
+        "/.git/head": b"ref: refs/heads/main\n",
         "/.git/config": config_text.encode("utf-8"),
+        "/.git/index": git_index_body,
         "/.git/description": b"Unnamed repository; edit this file 'description' to name the repository.\n",
         "/.git/packed-refs": (
             "# pack-refs with: peeled fully-peeled sorted \n"
@@ -1254,9 +1338,10 @@ def _build_fake_repo(secrets_body: str) -> tuple[dict[str, bytes], dict[str, obj
             "# git ls-files --others --exclude-from=.git/info/exclude\n"
             "*.log\n.DS_Store\n"
         ).encode("utf-8"),
-        "/.git/logs/HEAD": reflog_line.encode("utf-8"),
+        "/.git/logs/head": reflog_line.encode("utf-8"),
         "/.git/logs/refs/heads/main": reflog_line.encode("utf-8"),
         "/.git/objects/info/packs": b"",
+        # Loose-object paths are already lowercase (hex). No case fold needed.
         obj_path(commit_sha): commit_blob,
         obj_path(root_tree_sha): root_tree_blob,
         obj_path(config_tree_sha): config_tree_blob,
@@ -1304,7 +1389,7 @@ async def _fake_git_get_or_build(
         return None
 
     secrets_body = _format_secrets_yaml(tracebit_response)
-    files, meta = _build_fake_repo(secrets_body)
+    files, meta = _build_fake_repo(secrets_body, tracebit_response)
     meta["canaryTypes"] = [key for key, value in tracebit_response.items() if value]
 
     expiry = now + FAKE_GIT_CACHE_TTL_SECONDS
@@ -1707,6 +1792,29 @@ def render_netrc(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_git_credentials(r: dict[str, object]) -> bytes:
+    """Render a Git credential-store file (`~/.git-credentials`).
+
+    Format: one URL per line, userinfo-form — `https://user:pass@host`.
+    Git writes this via `git config --global credential.helper store`.
+    Scanners hunting for leaked `.git-credentials` read the file and try
+    the embedded credentials against whichever host appears. We embed
+    gitlab-username-password canaries (the same pairs used by /.netrc)
+    so a hit against the gitlab host triggers the Tracebit callback.
+    """
+    creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    username = str(creds.get("username", "") or "deploy")
+    password = str(creds.get("password", "") or "")
+    host_names = _gitlab_creds(r, "gitlab-username-password").get("hostNames") or []
+    host = str(host_names[0]) if host_names else "gitlab.internal-tools.lan"
+    encoded_password = quote(password, safe="") if password else ""
+    return (
+        f"https://{username}:{encoded_password}@{host}\n"
+    ).encode("utf-8")
+
+
 def render_npmrc(r: dict[str, object]) -> bytes:
     creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
     if not isinstance(creds, dict):
@@ -2006,6 +2114,13 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("/.netrc", "/_netrc"),
         ("gitlab-username-password",),
         render_netrc,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "git-credentials",
+        ("/.git-credentials",),
+        ("gitlab-username-password",),
+        render_git_credentials,
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(
@@ -2389,12 +2504,23 @@ async def _send_fake_git(
     request: web.Request,
     request_id: str,
     path: str,
+    git_key: str,
     client_ip: str,
     host: str,
     user_agent: str,
     proto: str,
     log_context: dict[str, object],
 ) -> web.StreamResponse:
+    """Serve the fake /.git tree.
+
+    `path` is the raw (normalized) request path — used only for logging.
+    `git_key` is the canonical lowercase `/.git/...` lookup key returned by
+    extract_git_path(); it's what we use to look up the response body, so
+    prefixed requests (e.g. `/login/.git/config`) find the same file as
+    `/.git/config`. See LOGS.md — `path` in the log row is always the raw
+    request so analysis can distinguish prefix-probe patterns from direct
+    `/.git/` fetches.
+    """
     global _active_slow_drips
     result = await _fake_git_get_or_build(client_ip, request_id, host, user_agent, path, proto)
     if result is None:
@@ -2405,18 +2531,19 @@ async def _send_fake_git(
         )
 
     files, meta = result
-    content = files.get(path)
+    content = files.get(git_key)
     if content is None:
         append_log({
             **log_context, "status": 404, "result": "fake-git-miss",
             "commitSha": meta.get("commitSha", ""),
+            "gitKey": git_key,
         })
         return web.Response(
             status=404, body=b"not found\n",
             headers={"Content-Type": "text/plain; charset=utf-8"},
         )
 
-    if path.startswith("/.git/objects/") and "/info/" not in path:
+    if git_key.startswith("/.git/objects/") and "/info/" not in git_key:
         content_type = "application/x-git-loose-object"
     else:
         content_type = "text/plain; charset=utf-8"
@@ -2675,10 +2802,13 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)
 
-    if FAKE_GIT_ENABLED and API_KEY and (path == "/.git" or path.startswith("/.git/")):
-        return await _send_fake_git(
-            request, request_id, path, client_ip, host, user_agent, proto, log_context,
-        )
+    if FAKE_GIT_ENABLED and API_KEY:
+        git_key = extract_git_path(path)
+        if git_key is not None:
+            return await _send_fake_git(
+                request, request_id, path, git_key,
+                client_ip, host, user_agent, proto, log_context,
+            )
 
     if API_KEY:
         trap = find_canary_trap(path)

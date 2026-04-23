@@ -34,7 +34,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | Trap | What it does | Released | Key |
 | --- | --- | --- | --- |
 | Fake `/.env` canary issuer | Mints a per-request Tracebit Community canary and returns it as a `.env`-style payload | 2026-04-20 | yes |
-| Fake `/.git/` repository | Serves a loose-object git tree whose `config/secrets.yml` embeds a canary; per-IP cached so `git-dumper`-style fan-out sees a consistent tree | 2026-04-20 | yes |
+| Fake `/.git/` repository | Serves a loose-object git tree whose `config/secrets.yml` embeds a canary AND whose `.git/config` `[remote "origin"] url` embeds the same canary as HTTP Basic userinfo — so scrapers that only fetch `.git/config` (without cloning) still walk away with a live canary. Matches `<prefix>/.git/*` (apps deployed at subpaths) and is case-insensitive on the `.git` segment. Per-IP cached so `git-dumper`-style fan-out sees a consistent tree | 2026-04-20 | yes |
 | Canary file traps (19 paths) | Plausible file-format responses for `/wp-config.php`, `/backup.sql`, `/id_rsa`, `/.aws/credentials`, `/api/v4/user`, `/users/sign_in`, … — full table [below](#canary-file-trap-table) | 2026-04-20 | yes |
 | AI-credential-file canaries | `/.openai/config.json`, `/.anthropic/config.json`, `/.cursor/mcp.json`, `/.claude/.credentials.json` — listed in the same table; broken out in the footnote because Tracebit has no LLM canary type yet | 2026-04-20 | yes |
 | Fake webshell | Plausible File Manager on known `*.php` shell probe paths; simulates `id` / `whoami` / `uname -a` / `cat /etc/passwd` on follow-up commands — [docs](./docs/fake-webshell.md) | 2026-04-20 | no |
@@ -99,6 +99,7 @@ case-insensitive exact matches.
 | SSH public key | `/id_rsa.pub`, `/.ssh/id_rsa.pub` | `ssh` | `ssh-public-key` |
 | authorized_keys | `/authorized_keys`, `/.ssh/authorized_keys` | `ssh` | `authorized-keys` |
 | .netrc | `/.netrc`, `/_netrc` | `gitlab-username-password` | `netrc` |
+| git credential store | `/.git-credentials` | `gitlab-username-password` | `git-credentials` |
 | .npmrc | `/.npmrc` | `gitlab-username-password` | `npmrc` |
 | .pypirc | `/.pypirc` | `gitlab-username-password` | `pypirc` |
 | GitLab API user | `/api/v4/user` | `gitlab-username-password` | `gitlab-api-user` |
