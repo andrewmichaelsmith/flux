@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import uuid
@@ -25,7 +26,7 @@ API_KEY = (os.environ.get("TRACEBIT_API_KEY") or "").strip()
 SENSOR_ID = (os.environ.get("SENSOR_ID") or "").strip()
 CANARY_TYPES = [
     value.strip()
-    for value in (os.environ.get("TRACEBIT_ENV_CANARY_TYPES_CSV") or "aws").split(",")
+    for value in (os.environ.get("TRACEBIT_ENV_CANARY_TYPES_CSV") or "aws,gitlab-username-password").split(",")
     if value.strip()
 ]
 TRACEBIT_SOURCE = (os.environ.get("TRACEBIT_ENV_CANARY_SOURCE") or "flux").strip()
@@ -1473,6 +1474,17 @@ def _aws(r: dict[str, object]) -> dict[str, str]:
     return aws if isinstance(aws, dict) else {}
 
 
+def _fake_db_password() -> str:
+    # Per-hit synthetic DB password for renderers that embed a plaintext
+    # DB cred alongside an AWS canary. NOT a Tracebit-backed canary — a
+    # replay against MySQL/Postgres won't fire an alert (Tracebit's
+    # gitlab-username-password type only fires against their hosted gitlab
+    # URL, which wouldn't be where a wp-config-style probe replays this).
+    # The point is to avoid shipping a *fixed literal* across every sensor,
+    # which turns into a farm-wide fingerprint.
+    return secrets.token_urlsafe(16)
+
+
 def _gitlab_creds(r: dict[str, object], canary_type: str) -> dict[str, object]:
     http = r.get("http") if isinstance(r, dict) else None
     if not isinstance(http, dict):
@@ -1553,12 +1565,13 @@ def render_claude_credentials_json(r: dict[str, object]) -> bytes:
 
 def render_wp_config_php(r: dict[str, object]) -> bytes:
     aws = _aws(r)
+    db_password = _fake_db_password()
     return (
         "<?php\n"
         "/** MySQL settings */\n"
         "define('DB_NAME', 'wordpress');\n"
         "define('DB_USER', 'wp_prod');\n"
-        "define('DB_PASSWORD', 'h6T!9pq2Wz@LmRnV');\n"
+        f"define('DB_PASSWORD', '{db_password}');\n"
         "define('DB_HOST', 'db.internal:3306');\n"
         "define('DB_CHARSET', 'utf8mb4');\n"
         "\n"
@@ -1669,6 +1682,7 @@ def render_docker_compose_yml(r: dict[str, object]) -> bytes:
 
 def render_application_properties(r: dict[str, object]) -> bytes:
     aws = _aws(r)
+    db_password = _fake_db_password()
     return (
         "# Spring Boot production config\n"
         "spring.application.name=internal-tools\n"
@@ -1676,7 +1690,7 @@ def render_application_properties(r: dict[str, object]) -> bytes:
         "\n"
         "spring.datasource.url=jdbc:postgresql://db.internal:5432/prod\n"
         "spring.datasource.username=prod_rw\n"
-        "spring.datasource.password=h6T!9pq2Wz@LmRnV\n"
+        f"spring.datasource.password={db_password}\n"
         "\n"
         f"aws.access.key.id={aws.get('awsAccessKeyId', '')}\n"
         f"aws.access.key.secret={aws.get('awsSecretAccessKey', '')}\n"
@@ -1687,6 +1701,7 @@ def render_application_properties(r: dict[str, object]) -> bytes:
 
 def render_application_yml(r: dict[str, object]) -> bytes:
     aws = _aws(r)
+    db_password = _fake_db_password()
     return (
         "spring:\n"
         "  application:\n"
@@ -1694,7 +1709,7 @@ def render_application_yml(r: dict[str, object]) -> bytes:
         "  datasource:\n"
         "    url: jdbc:postgresql://db.internal:5432/prod\n"
         "    username: prod_rw\n"
-        "    password: h6T!9pq2Wz@LmRnV\n"
+        f"    password: {db_password}\n"
         "aws:\n"
         f"  access-key-id: {aws.get('awsAccessKeyId', '')}\n"
         f"  access-key-secret: {aws.get('awsSecretAccessKey', '')}\n"
@@ -1705,6 +1720,10 @@ def render_application_yml(r: dict[str, object]) -> bytes:
 
 def render_env_production(r: dict[str, object]) -> bytes:
     aws = _aws(r)
+    # Password is URL-safe already (secrets.token_urlsafe emits only
+    # `-`, `_`, alphanum) so no extra percent-encoding is needed for the
+    # userinfo component of DATABASE_URL.
+    db_password = _fake_db_password()
     return (
         "# production .env — rotate quarterly (INFRA-218)\n"
         "NODE_ENV=production\n"
@@ -1712,7 +1731,7 @@ def render_env_production(r: dict[str, object]) -> bytes:
         f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
         f"AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
         "AWS_REGION=us-east-1\n"
-        "DATABASE_URL=postgresql://prod_rw:h6T!9pq2Wz@LmRnV@db.internal:5432/prod\n"
+        f"DATABASE_URL=postgresql://prod_rw:{db_password}@db.internal:5432/prod\n"
     ).encode("utf-8")
 
 
@@ -1721,6 +1740,7 @@ def render_phpinfo(r: dict[str, object]) -> bytes:
     ak = aws.get("awsAccessKeyId", "")
     sk = aws.get("awsSecretAccessKey", "")
     st = aws.get("awsSessionToken", "")
+    db_password = _fake_db_password()
     return (
         "<!DOCTYPE html>\n"
         "<html><head><title>phpinfo()</title>\n"
@@ -1739,7 +1759,7 @@ def render_phpinfo(r: dict[str, object]) -> bytes:
         "<tr><td>AWS_DEFAULT_REGION</td><td>us-east-1</td></tr>\n"
         "<tr><td>DB_HOST</td><td>db.internal</td></tr>\n"
         "<tr><td>DB_USER</td><td>prod_rw</td></tr>\n"
-        "<tr><td>DB_PASSWORD</td><td>h6T!9pq2Wz@LmRnV</td></tr>\n"
+        f"<tr><td>DB_PASSWORD</td><td>{db_password}</td></tr>\n"
         "</table>\n"
         "<h2>Loaded Modules</h2>\n"
         "<p>core, date, libxml, openssl, pcre, sqlite3, zlib, ctype, curl, "

@@ -428,6 +428,65 @@ def test_canary_trap_renderers_embed_canary(path, needle):
     assert needle in body, f"expected {needle!r} in rendered {path}; got {body[:200]!r}"
 
 
+@pytest.mark.parametrize("path", [
+    "/wp-config.php",
+    "/application.properties",
+    "/application.yml",
+    "/.env.production",
+    "/phpinfo.php",
+])
+def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
+    # Regression: the ``h6T!9pq2Wz@LmRnV`` / ``prod_rw`` DB-password literal
+    # that used to be baked into these renderers acted as a cross-sensor
+    # fingerprint — a scanner pulling /wp-config.php and /application.yml from
+    # different hosts could confirm they were the same honeypot operator by
+    # matching on the shared literal. DB-cred canaries aren't a thing in
+    # Tracebit Community today (gitlab-username-password only fires against the
+    # specific hosted gitlab URL, not arbitrary MySQL/Postgres endpoints), so
+    # we substitute a per-hit random value instead. Assert the old literal is
+    # gone AND that two renders produce different passwords.
+    trap = tbenv._TRAP_BY_PATH[path]
+    body_1 = trap.render(FAKE_TRACEBIT)
+    body_2 = trap.render(FAKE_TRACEBIT)
+    for fingerprint in (b"h6T!9pq2Wz@LmRnV", b"h6T!9pq2Wz"):
+        assert fingerprint not in body_1, f"{path!r} still embeds fixed DB password literal"
+    # Passwords generated from secrets.token_urlsafe(16) are ~22 chars — the
+    # rendered bodies should differ somewhere. (Same AWS canary mock is used
+    # for both, so anything that varies is necessarily the DB password.)
+    assert body_1 != body_2, f"{path!r} renders identically across calls — password not randomized"
+
+
+def test_render_env_production_database_url_is_parseable():
+    # The DB password is random per hit and gets inlined into a postgres://
+    # userinfo component. It must stay parseable so the rendered .env is
+    # credible — secrets.token_urlsafe uses only [A-Za-z0-9_-], none of
+    # which need percent-encoding inside URL userinfo.
+    from urllib.parse import urlsplit
+    body = tbenv.render_env_production(FAKE_TRACEBIT).decode("utf-8")
+    db_line = next(line for line in body.splitlines() if line.startswith("DATABASE_URL="))
+    parsed = urlsplit(db_line.split("=", 1)[1])
+    assert parsed.scheme == "postgresql"
+    assert parsed.username == "prod_rw"
+    assert parsed.password  # non-empty
+    assert parsed.hostname == "db.internal"
+
+
+def test_default_canary_types_includes_gitlab_username_password():
+    # /.env bare handler uses CANARY_TYPES when the caller doesn't pass an
+    # explicit list. Default should request both aws (fires globally via
+    # STS) and gitlab-username-password (fires against the Tracebit-hosted
+    # gitlab URL, which format_env_payload emits alongside the creds).
+    # Previously default was just ["aws"], which is why the canary dashboard
+    # showed ~99% AWS even though the other types cost nothing extra to request.
+    import importlib
+    module = importlib.reload(tbenv)
+    try:
+        assert "aws" in module.CANARY_TYPES
+        assert "gitlab-username-password" in module.CANARY_TYPES
+    finally:
+        importlib.reload(tbenv)
+
+
 def test_find_canary_trap_returns_none_when_disabled(monkeypatch):
     monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", False)
     assert tbenv.find_canary_trap("/.aws/credentials") is None
