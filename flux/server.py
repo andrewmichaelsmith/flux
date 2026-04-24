@@ -1817,6 +1817,45 @@ def render_authorized_keys(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_ssh_config(r: dict[str, object]) -> bytes:
+    # `~/.ssh/config` maps logical host aliases to real hosts + identity
+    # files. Without this, a harvested /id_rsa is useless — the attacker
+    # has no signal about which host accepts it. Tracebit's ssh canary
+    # pairs the key with an ``sshIp``; pin the config to that IP and point
+    # IdentityFile at the sibling /.ssh/id_rsa trap so an attacker running
+    # ``ssh bastion`` fires the canary.
+    ssh = r.get("ssh") if isinstance(r, dict) else None
+    if not isinstance(ssh, dict):
+        return b""
+    ssh_ip = str(ssh.get("sshIp", "") or "")
+    if not ssh_ip:
+        return b""
+    return (
+        "Host bastion\n"
+        f"    HostName {ssh_ip}\n"
+        "    User root\n"
+        "    IdentityFile ~/.ssh/id_rsa\n"
+        "    IdentitiesOnly yes\n"
+        "    ServerAliveInterval 60\n"
+    ).encode("utf-8")
+
+
+def render_known_hosts(r: dict[str, object]) -> bytes:
+    # A real ``~/.ssh/known_hosts`` lists hosts the user has connected to,
+    # each with the host key the ssh client saw on first contact. For our
+    # purposes it's the second half of the IP↔key pairing: harvesters who
+    # grab ``known_hosts`` alongside ``id_rsa`` learn which host the key
+    # holder has SSH'd to — sshIp, where the Tracebit canary fires.
+    ssh = r.get("ssh") if isinstance(r, dict) else None
+    if not isinstance(ssh, dict):
+        return b""
+    ssh_ip = str(ssh.get("sshIp", "") or "")
+    pub = _decode_ssh_value(str(ssh.get("sshPublicKey", "") or "")).strip()
+    if not ssh_ip or not pub:
+        return b""
+    return f"{ssh_ip} {pub}\n".encode("utf-8")
+
+
 def render_netrc(r: dict[str, object]) -> bytes:
     creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
     if not isinstance(creds, dict):
@@ -2130,6 +2169,20 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/private.key",
             "/deploy_key",
             "/deploy.key",
+            # Tracebit issues ed25519, so the id_ed25519 filename is the
+            # most literal match; id_dsa / id_ecdsa covered because
+            # scanner dictionaries probe every algo by convention.
+            "/.ssh/id_ed25519",
+            "/.ssh/id_dsa",
+            "/.ssh/id_ecdsa",
+            "/id_ed25519",
+            "/id_dsa",
+            "/id_ecdsa",
+            # `/root/.ssh/id_rsa` and `/home/.ssh/id_rsa` are common
+            # path-prefix variants — scanners hunt for home-dir leakage
+            # below a misconfigured webroot.
+            "/root/.ssh/id_rsa",
+            "/home/.ssh/id_rsa",
         ),
         ("ssh",),
         render_ssh_private_key,
@@ -2143,8 +2196,32 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(
+        "ssh-config",
+        ("/.ssh/config",),
+        ("ssh",),
+        render_ssh_config,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "known-hosts",
+        ("/.ssh/known_hosts", "/known_hosts"),
+        ("ssh",),
+        render_known_hosts,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
         "authorized-keys",
-        ("/authorized_keys", "/.ssh/authorized_keys"),
+        (
+            "/authorized_keys",
+            "/.ssh/authorized_keys",
+            "/.ssh/authorized_keys2",
+            # Webroot-prefix variants — common scanner pattern where a
+            # directory (e.g. the CMS upload area) is assumed to sit atop
+            # an unexpected ``.ssh/`` leak.
+            "/static/.ssh/authorized_keys",
+            "/downloads/.ssh/authorized_keys",
+            "/blog/.ssh/authorized_keys",
+        ),
         ("ssh",),
         render_authorized_keys,
         "text/plain; charset=utf-8",

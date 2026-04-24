@@ -129,9 +129,11 @@ case-insensitive exact matches.
 | Spring YAML | `/application.yml`, `/application.yaml` | `aws` | `application-yml` |
 | Production .env | `/.env.production`, `/.env.prod`, `/.env.live` | `aws` | `env-production` |
 | phpinfo() | `/phpinfo.php`, `/info.php`, `/php.php`, `/test.php` | `aws` | `phpinfo` |
-| SSH private key | `/id_rsa`, `/.ssh/id_rsa`, `/ssh/id_rsa`, `/ssh/id_rsa.key`, `/keys/id_rsa`, `/private.key`, `/deploy_key`, `/deploy.key` | `ssh` | `ssh-private-key` |
+| SSH private key | `/id_rsa`, `/.ssh/id_rsa`, `/ssh/id_rsa`, `/ssh/id_rsa.key`, `/keys/id_rsa`, `/private.key`, `/deploy_key`, `/deploy.key`, `/.ssh/id_ed25519`, `/.ssh/id_dsa`, `/.ssh/id_ecdsa`, `/id_ed25519`, `/id_dsa`, `/id_ecdsa`, `/root/.ssh/id_rsa`, `/home/.ssh/id_rsa` | `ssh` | `ssh-private-key` |
 | SSH public key | `/id_rsa.pub`, `/.ssh/id_rsa.pub` | `ssh` | `ssh-public-key` |
-| authorized_keys | `/authorized_keys`, `/.ssh/authorized_keys` | `ssh` | `authorized-keys` |
+| SSH client config | `/.ssh/config` | `ssh` | `ssh-config` |
+| known_hosts | `/.ssh/known_hosts`, `/known_hosts` | `ssh` | `known-hosts` |
+| authorized_keys | `/authorized_keys`, `/.ssh/authorized_keys`, `/.ssh/authorized_keys2`, `/static/.ssh/authorized_keys`, `/downloads/.ssh/authorized_keys`, `/blog/.ssh/authorized_keys` | `ssh` | `authorized-keys` |
 | .netrc | `/.netrc`, `/_netrc` | `gitlab-username-password` | `netrc` |
 | git credential store | `/.git-credentials` | `gitlab-username-password` | `git-credentials` |
 | .npmrc | `/.npmrc` | `gitlab-username-password` | `npmrc` |
@@ -146,6 +148,16 @@ case-insensitive exact matches.
 `/users/sign_in` returns the cookie canary as `Set-Cookie:
 _gitlab_session=<value>`. `/api/v4/user` embeds the username/password
 canary as a plausible GitLab API user response.
+
+The `ssh` canary fires only when the stolen key is replayed against
+Tracebit's ``sshIp`` (returned alongside the keypair). That's why
+``ssh-config`` and ``known-hosts`` exist — without a target-host hint,
+a harvested ``/id_rsa`` points at nothing, so an attacker runs
+``ssh -i id_rsa <arbitrary-host>`` and the canary never fires. The
+three traps together (``id_rsa`` → ``config`` → ``known_hosts``) give
+a scanner walking an exposed ``.ssh/`` the full key + `Host bastion
+HostName <sshIp>` mapping, which resolves to an ``ssh bastion`` replay
+the canary can catch.
 
 † **The AI-credential-file traps probably don't make sense yet.**
 Tracebit Community doesn't expose an OpenAI / Anthropic / LLM canary

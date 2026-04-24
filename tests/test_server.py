@@ -407,7 +407,20 @@ FAKE_TRACEBIT = {
     ("/phpinfo.php", b"AKIAFAKEEXAMPLE01"),
     ("/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_ed25519", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_dsa", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/root/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/home/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/authorized_keys", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
+    ("/.ssh/authorized_keys2", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
+    ("/static/.ssh/authorized_keys", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
+    # The config + known_hosts traps are the other half of the IP↔key
+    # pairing — without them, a harvested /id_rsa has no target to
+    # replay against, so the canary can't fire.
+    ("/.ssh/config", b"HostName 203.0.113.99"),
+    ("/.ssh/config", b"IdentityFile ~/.ssh/id_rsa"),
+    ("/.ssh/known_hosts", b"203.0.113.99 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
+    ("/known_hosts", b"203.0.113.99 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
     ("/.netrc", b"login deploybot42"),
     ("/.git-credentials", b"https://deploybot42:"),
     ("/.npmrc", b"p@ssCanaryValue"),
@@ -456,6 +469,16 @@ def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
     # rendered bodies should differ somewhere. (Same AWS canary mock is used
     # for both, so anything that varies is necessarily the DB password.)
     assert body_1 != body_2, f"{path!r} renders identically across calls — password not randomized"
+
+
+def test_ssh_config_and_known_hosts_return_empty_when_ssh_missing():
+    # If Tracebit didn't return an ssh block (e.g. the handler was asked
+    # for aws-only by mistake), the config/known_hosts traps must render
+    # an empty body rather than spraying a truncated IdentityFile stub or
+    # a bare ``ssh-ed25519 AAAA`` line with no host.
+    for r in ({"aws": {}}, {}, {"ssh": None}, {"ssh": {}}):
+        assert tbenv.render_ssh_config(r) == b""
+        assert tbenv.render_known_hosts(r) == b""
 
 
 def test_ssh_renderers_base64_decode_tracebit_values():
