@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import json
 
 import pytest
 
@@ -401,6 +402,16 @@ FAKE_TRACEBIT = {
     ("/firebase.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
     ("/.docker/config.json", b'"auths"'),
     ("/docker-compose.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
+    ("/docker-compose.prod.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
+    ("/docker-compose.production.yaml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
+    ("/docker-compose.staging.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
+    ("/docker-compose.override.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
+    ("/actuator/env", b'"AWS_ACCESS_KEY_ID"'),
+    ("/actuator/env", b'"value": "AKIAFAKEEXAMPLE01"'),
+    ("/env", b'"activeProfiles"'),
+    ("/manage/env", b'"activeProfiles"'),
+    ("/management/env", b"applicationConfig"),
+    ("/api/actuator/env", b"applicationConfig"),
     ("/application.properties", b"aws.access.key.id=AKIAFAKEEXAMPLE01"),
     ("/application.yml", b"access-key-id: AKIAFAKEEXAMPLE01"),
     ("/.env.production", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
@@ -535,6 +546,27 @@ def test_render_env_production_database_url_is_parseable():
     assert parsed.username == "prod_rw"
     assert parsed.password  # non-empty
     assert parsed.hostname == "db.internal"
+
+
+def test_render_actuator_env_json_is_valid_and_per_hit_unique():
+    # The actuator /env response MUST parse as JSON (scanners filter on shape)
+    # and MUST embed a per-hit DB password — a fixed literal would fingerprint
+    # every sensor identically (see the README "per-hit and Tracebit-backed"
+    # design principle).
+    body1 = tbenv.render_actuator_env_json(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body1)
+    assert payload["activeProfiles"] == ["production"]
+    sources = {s["name"]: s for s in payload["propertySources"]}
+    assert "systemEnvironment" in sources
+    assert sources["systemEnvironment"]["properties"]["AWS_ACCESS_KEY_ID"]["value"] \
+        == "AKIAFAKEEXAMPLE01"
+    app_source = next(s for name, s in sources.items() if name.startswith("applicationConfig"))
+    pw1 = app_source["properties"]["spring.datasource.password"]["value"]
+    assert pw1, "password must not be empty"
+    # Second call mints a new synthetic password — never reused.
+    body2 = tbenv.render_actuator_env_json(FAKE_TRACEBIT).decode("utf-8")
+    pw2 = json.loads(body2)["propertySources"][2]["properties"]["spring.datasource.password"]["value"]
+    assert pw1 != pw2
 
 
 def test_default_canary_types_includes_gitlab_username_password():

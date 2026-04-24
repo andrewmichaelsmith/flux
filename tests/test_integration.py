@@ -101,6 +101,30 @@ async def test_integration_aws_credentials_file(live_server):
             assert b"[default]" in body
 
 
+async def test_integration_actuator_env_serves_json_canary(live_server):
+    """Spring Boot Actuator /env round-trip: 200, Spring content-type,
+    JSON shape with activeProfiles + propertySources, embedded canary."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/actuator/env",
+            headers={"X-Forwarded-For": "203.0.113.22"},
+        ) as resp:
+            assert resp.status == 200
+            assert "spring-boot.actuator" in resp.headers["Content-Type"]
+            body = await resp.read()
+            payload = json.loads(body)
+            assert payload["activeProfiles"] == ["production"]
+            # AWS canary value surfaces under systemEnvironment in the response.
+            sys_env = next(
+                s for s in payload["propertySources"] if s["name"] == "systemEnvironment"
+            )
+            assert sys_env["properties"]["AWS_ACCESS_KEY_ID"]["value"] == "AKIAFAKEINTEG01"
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e["result"] == "actuator-env" for e in entries)
+
+
 async def test_integration_gitlab_sign_in_sets_cookie_over_the_wire(live_server):
     """Set-Cookie arrives on the client, not just inside the mocked response."""
     base, _ = live_server

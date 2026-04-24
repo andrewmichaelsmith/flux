@@ -1736,6 +1736,67 @@ def render_env_production(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_actuator_env_json(r: dict[str, object]) -> bytes:
+    # Spring Boot Actuator `/env` response shape: activeProfiles + a list of
+    # propertySources, each holding `properties: {<key>: {value, origin?}}`.
+    # Unmasked values are the misconfiguration we're simulating — the
+    # `management.endpoint.env.show-values=ALWAYS` flag (or an ancient 1.x
+    # actuator with no masking) is what makes this endpoint a credential
+    # leak in the wild. A scanner that reaches this path is expecting the
+    # raw credential back; mask it and the response fails the scanner's
+    # filter and they move on.
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    payload = {
+        "activeProfiles": ["production"],
+        "propertySources": [
+            {
+                "name": "server.ports",
+                "properties": {
+                    "local.server.port": {"value": 8080},
+                },
+            },
+            {
+                "name": "systemEnvironment",
+                "properties": {
+                    "AWS_ACCESS_KEY_ID": {
+                        "value": aws.get("awsAccessKeyId", ""),
+                        "origin": 'System Environment Property "AWS_ACCESS_KEY_ID"',
+                    },
+                    "AWS_SECRET_ACCESS_KEY": {
+                        "value": aws.get("awsSecretAccessKey", ""),
+                        "origin": 'System Environment Property "AWS_SECRET_ACCESS_KEY"',
+                    },
+                    "AWS_SESSION_TOKEN": {
+                        "value": aws.get("awsSessionToken", ""),
+                    },
+                    "AWS_DEFAULT_REGION": {"value": "us-east-1"},
+                    "JAVA_HOME": {"value": "/usr/lib/jvm/java-17-openjdk"},
+                    "PATH": {
+                        "value": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    },
+                },
+            },
+            {
+                "name": "applicationConfig: [classpath:/application.yml]",
+                "properties": {
+                    "spring.application.name": {"value": "internal-tools"},
+                    "spring.datasource.url": {
+                        "value": "jdbc:postgresql://db.internal:5432/prod",
+                    },
+                    "spring.datasource.username": {"value": "prod_rw"},
+                    "spring.datasource.password": {"value": db_password},
+                    "spring.datasource.driver-class-name": {
+                        "value": "org.postgresql.Driver",
+                    },
+                    "management.endpoints.web.exposure.include": {"value": "*"},
+                },
+            },
+        ],
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
 def render_phpinfo(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     ak = aws.get("awsAccessKeyId", "")
@@ -2125,7 +2186,18 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "docker-compose",
-        ("/docker-compose.yml", "/docker-compose.yaml", "/compose.yml", "/compose.yaml"),
+        (
+            "/docker-compose.yml", "/docker-compose.yaml",
+            "/compose.yml", "/compose.yaml",
+            # Environment-suffixed variants observed in scanner dictionaries —
+            # typical deploys ship separate compose files per env and scanners
+            # enumerate the obvious ones.
+            "/docker-compose.prod.yml", "/docker-compose.prod.yaml",
+            "/docker-compose.production.yml", "/docker-compose.production.yaml",
+            "/docker-compose.dev.yml", "/docker-compose.dev.yaml",
+            "/docker-compose.staging.yml", "/docker-compose.staging.yaml",
+            "/docker-compose.override.yml", "/docker-compose.override.yaml",
+        ),
         ("aws",),
         render_docker_compose_yml,
         "application/yaml; charset=utf-8",
@@ -2143,6 +2215,29 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_application_yml,
         "application/yaml; charset=utf-8",
+    ),
+    # Spring Boot Actuator `/env` endpoint. A Spring app exposing
+    # `management.endpoints.web.exposure.include=*` serves the full
+    # environment — system env vars, JVM props, application.yml values —
+    # as JSON. Scanners hunt this path specifically because it returns
+    # raw `spring.datasource.password` and `AWS_SECRET_ACCESS_KEY` values
+    # in one response. Path aliases cover the legacy 1.x actuator
+    # (`/env`), common `management.endpoints.web.base-path` overrides
+    # (`/manage`, `/management`), and a `/api`-prefixed reverse-proxy
+    # shape.
+    CanaryTrap(
+        "actuator-env",
+        (
+            "/actuator/env",
+            "/actuator/env.json",
+            "/env",
+            "/manage/env",
+            "/management/env",
+            "/api/actuator/env",
+        ),
+        ("aws",),
+        render_actuator_env_json,
+        "application/vnd.spring-boot.actuator.v3+json; charset=utf-8",
     ),
     CanaryTrap(
         "env-production",
