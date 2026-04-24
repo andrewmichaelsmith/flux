@@ -77,6 +77,39 @@ Docs: [`CONFIG.md`](./CONFIG.md) (env vars) ·
 
 ## Canary file trap table
 
+### Design principle: every credential is per-hit and Tracebit-backed
+
+The point of a canary is that using it fires an alert at Tracebit. A
+trap renderer that ships a **fixed literal** credential (hardcoded DB
+password, hardcoded API key) provides no detection value — a replay
+triggers nothing — and ships the same string across every sensor in
+the fleet, which becomes a cross-sensor fingerprint. Every
+secret-shaped field in a rendered response must therefore be either:
+
+1. **A per-request Tracebit canary** — `_aws(r)` or
+   `_gitlab_creds(r, ...)`. Fires when replayed against the matching
+   target (AWS STS globally, the Tracebit-hosted gitlab URL for u/p
+   and cookie, the Tracebit sshIp for ssh).
+2. **A per-hit random synthetic** — `_fake_db_password()` or similar.
+   Does *not* fire (no Tracebit path exists for the cred type, e.g.
+   MySQL/Postgres), but is unique per rendering so the rendered body
+   can't be fingerprinted across the fleet.
+
+Hardcoded literals in the "plausible filler" around the canary are
+fine when the value isn't credential-shaped — usernames like
+`wp_prod`, host names like `db.internal`, bucket names, comments.
+What must never be fixed is anything that looks like a password,
+token, or key.
+
+When the canary type doesn't exist in Tracebit Community yet (LLM
+API keys, Google service accounts), the trap must either (a) dress
+an AWS canary in plausible shape so a field-name-keyed harvester
+still exfils a live canary value (see the AI-credential traps below)
+or (b) emit a per-hit random synthetic so the response isn't
+fingerprintable — never a fixed literal.
+
+### Trap table
+
 All gated on `TRACEBIT_API_KEY`, with per-IP TTL caching to protect quota.
 Toggle the whole category with `CANARY_TRAPS_ENABLED`. Paths are
 case-insensitive exact matches.
