@@ -349,6 +349,7 @@ def test_all_trap_families_default_on():
     assert tbenv.WEBSHELL_ENABLED
     assert tbenv.LLM_ENDPOINT_ENABLED
     assert tbenv.SONICWALL_ENABLED
+    assert tbenv.CISCO_WEBVPN_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -1038,6 +1039,7 @@ async def test_dispatch_llm_malformed_json_still_200(flux_client):
 
 def test_sonicwall_enabled_by_default():
     assert tbenv.SONICWALL_ENABLED
+    assert tbenv.CISCO_WEBVPN_ENABLED
 
 
 def test_sonicwall_default_paths_cover_cve_2024_53704_chain():
@@ -1240,6 +1242,73 @@ async def test_dispatch_sonicwall_malformed_json_still_200(flux_client):
     entry = entries[-1]
     assert entry["result"] == "sonicwall-auth"
     assert entry["sonicwallUsername"] == ""
+
+
+# --- Fake Cisco WebVPN trap ---
+
+
+def test_cisco_webvpn_enabled_by_default():
+    assert tbenv.CISCO_WEBVPN_ENABLED
+
+
+def test_cisco_webvpn_default_paths_match_observed_sequence():
+    for path in (
+        "/+CSCOE+/logon.html",
+        "/+CSCOE+/logon_forms.js",
+        "/+CSCOL+/Java.jar",
+        "/+CSCOL+/a1.jar",
+    ):
+        assert tbenv.is_cisco_webvpn_path(path), f"expected match: {path}"
+
+
+def test_cisco_webvpn_path_non_match():
+    for path in ["/", "/+CSCOE+/", "/+CSCOE+/logon.php", "/+CSCOL+/", "/.env"]:
+        assert not tbenv.is_cisco_webvpn_path(path)
+
+
+def test_cisco_webvpn_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "CISCO_WEBVPN_ENABLED", False)
+    assert not tbenv.is_cisco_webvpn_path("/+CSCOE+/logon.html")
+
+
+def test_render_cisco_webvpn_logon_forms_js_shape():
+    body = tbenv.render_cisco_webvpn_logon_forms_js().decode("utf-8")
+    assert "window.webvpn" in body
+
+
+async def test_dispatch_cisco_webvpn_logon_html(flux_client):
+    resp = await flux_client.get(
+        "/+CSCOE+/logon.html",
+        headers={"X-Forwarded-For": "203.0.113.51", "Host": "vpn.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Secure Access SSL VPN" in text
+    assert "/+CSCOE+/logon_forms.js" in text
+
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "cisco-webvpn-logon"
+    assert entry["ciscoWebvpnPath"] == "/+CSCOE+/logon.html"
+
+
+async def test_dispatch_cisco_webvpn_jar(flux_client):
+    resp = await flux_client.get("/+CSCOL+/Java.jar", headers={"X-Forwarded-For": "203.0.113.52"})
+    assert resp.status == 200
+    body = await resp.read()
+    assert body.startswith(b"PK")
+
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "cisco-webvpn-java-jar"
+
+
+async def test_dispatch_cisco_webvpn_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "CISCO_WEBVPN_ENABLED", False)
+    resp = await flux_client.get("/+CSCOE+/logon.html", headers={"X-Forwarded-For": "203.0.113.53"})
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
 
 
 # --- _env_bool: explicit env var parsing ---

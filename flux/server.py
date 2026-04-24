@@ -258,6 +258,27 @@ SONICWALL_PATHS = {
     if value.strip()
 }
 
+# --- Fake Cisco WebVPN + Secure Client launcher (CVE bait) ---------------
+# Common scanner sequence seen in fleet telemetry:
+#   /+CSCOE+/logon.html (landing page)
+#   /+CSCOE+/logon_forms.js (JS helper)
+#   /+CSCOL+/Java.jar and /+CSCOL+/a1.jar (legacy AnyConnect artifacts)
+# Returning plausible content keeps the flow alive long enough to capture
+# follow-on fetches and payload replay attempts.
+CISCO_WEBVPN_ENABLED = _env_bool("HONEYPOT_CISCO_WEBVPN_ENABLED")
+_CISCO_WEBVPN_DEFAULT_PATHS = ",".join([
+    "/+cscoe+/logon.html",
+    "/+cscoe+/logon_forms.js",
+    "/+cscol+/java.jar",
+    "/+cscol+/a1.jar",
+    "/+cscoe+/portal.html",
+])
+CISCO_WEBVPN_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_CISCO_WEBVPN_PATHS_CSV") or _CISCO_WEBVPN_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -384,6 +405,12 @@ def is_sonicwall_path(path: str) -> bool:
     if not SONICWALL_ENABLED:
         return False
     return path.lower() in SONICWALL_PATHS
+
+
+def is_cisco_webvpn_path(path: str) -> bool:
+    if not CISCO_WEBVPN_ENABLED:
+        return False
+    return path.lower() in CISCO_WEBVPN_PATHS
 
 
 def extract_sonicwall_username(body: bytes, content_type: str) -> str:
@@ -700,6 +727,38 @@ def render_anthropic_message(model: str) -> bytes:
 # We don't need to mint a real session — the scanner's next payload is the
 # intel we want, and SonicOS's success envelope is simple enough to fake.
 
+
+
+
+def render_cisco_webvpn_logon_html(host: str) -> bytes:
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>SSL VPN Service</title>
+  <script src="/+CSCOE+/logon_forms.js"></script>
+</head>
+<body>
+  <h1>Secure Access SSL VPN</h1>
+  <form method="post" action="/+webvpn+/index.html">
+    <input type="text" name="username" autocomplete="username" />
+    <input type="password" name="password" autocomplete="current-password" />
+    <input type="hidden" name="group_list" value="DefaultWEBVPNGroup" />
+    <button type="submit">Login</button>
+  </form>
+  <small>Host: {host or "vpn-gateway"}</small>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_cisco_webvpn_logon_forms_js() -> bytes:
+    return b"""(function(){\nwindow.webvpn={validate:function(){return true;},version:"9.18.2"};\n})();\n"""
+
+
+def render_cisco_webvpn_jar_stub(name: str) -> bytes:
+    return f"PK\x03\x04{name}-placeholder".encode("utf-8")
 
 def render_sonicwall_is_sslvpn_enabled() -> bytes:
     # SonicOS 7 returns a status envelope alongside the boolean. Field names
@@ -2614,6 +2673,58 @@ async def _handle_sonicwall(
     )
 
 
+
+
+async def _handle_cisco_webvpn(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    lpath = path.lower()
+    method = request.method
+    host = str(log_context.get("host", ""))
+
+    if lpath in {"/+cscoe+/logon.html", "/+cscoe+/portal.html"}:
+        result_tag = "cisco-webvpn-logon"
+        body = render_cisco_webvpn_logon_html(host)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/+cscoe+/logon_forms.js":
+        result_tag = "cisco-webvpn-logon-forms-js"
+        body = render_cisco_webvpn_logon_forms_js()
+        content_type = "application/javascript; charset=utf-8"
+    elif lpath == "/+cscol+/java.jar":
+        result_tag = "cisco-webvpn-java-jar"
+        body = render_cisco_webvpn_jar_stub("Java.jar")
+        content_type = "application/java-archive"
+    elif lpath == "/+cscol+/a1.jar":
+        result_tag = "cisco-webvpn-a1-jar"
+        body = render_cisco_webvpn_jar_stub("a1.jar")
+        content_type = "application/java-archive"
+    else:
+        append_log({**log_context, "status": 404, "result": "cisco-webvpn-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "ciscoWebvpnPath": path,
+        "ciscoWebvpnMethod": method,
+        "bytes": len(body),
+    })
+
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": content_type,
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_webshell(
     request: web.Request,
     log_context: dict[str, object],
@@ -3011,6 +3122,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_sonicwall_path(path):
         return await _handle_sonicwall(request, log_context, path, request_body)
 
+    if is_cisco_webvpn_path(path):
+        return await _handle_cisco_webvpn(request, log_context, path)
+
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)
 
@@ -3076,6 +3190,8 @@ def main() -> int:
         active.append("llm-endpoint")
     if SONICWALL_ENABLED:
         active.append("sonicwall-ssl-vpn")
+    if CISCO_WEBVPN_ENABLED:
+        active.append("cisco-webvpn")
     print(
         f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
         file=sys.stderr,

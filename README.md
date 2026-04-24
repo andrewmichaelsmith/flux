@@ -42,6 +42,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | Modular tarpit + fingerprinting | Slow-drip response plus six fingerprinting modules (cookie, ETag, redirect chain, variable drip, Content-Length mismatch, DNS callback); fires on `.env` variants and on configurable first-contact paths (`/`, `/index.html`, `/robots.txt`, …) | 2026-04-20 | no |
 | Fake LLM-API endpoint | Ollama / OpenAI / Anthropic-proxy JSON on `/v1/models`, `/v1/chat/completions`, `/anthropic/v1/messages`, `/api/chat`, … ; logs model + auth header + prompt prefix — [docs](./docs/fake-llm-api.md) | 2026-04-20 | no |
 | Fake SonicWall SSL VPN | SonicOS 7 JSON responses on the three paths in the CVE-2024-53704 auth-bypass chain; logs submitted username, body sha + preview, and replayed session cookies — [docs](./docs/fake-sonicwall.md) | 2026-04-21 | no |
+| Fake Cisco WebVPN endpoint | Cisco SSL VPN landing page + launcher assets on `/+CSCOE+/...` and `/+CSCOL+/...`; logs exact path + method for multi-step probe correlation — [docs](./docs/fake-cisco-webvpn.md) | 2026-04-24 | no |
 
 All traps log one JSON line per event to the configured log path. See
 [`LOGS.md`](./LOGS.md) for the schema.
@@ -200,6 +201,7 @@ under [`docs/`](./docs/):
 
 - [Fake LLM-API endpoint](./docs/fake-llm-api.md)
 - [Fake SonicWall SSL VPN endpoint](./docs/fake-sonicwall.md)
+- [Fake Cisco WebVPN endpoint](./docs/fake-cisco-webvpn.md)
 - [Fake webshell](./docs/fake-webshell.md)
 
 The other traps (`.env`, `/.git/`, canary file traps, tarpit +
