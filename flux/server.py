@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -1769,12 +1770,31 @@ def render_phpinfo(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def _decode_ssh_value(raw: str) -> str:
+    # Tracebit Community returns ``sshPrivateKey`` and ``sshPublicKey`` as
+    # base64 over the on-wire JSON. If we serve the base64 verbatim to a
+    # scanner on /id_rsa, ``ssh -i`` reads "invalid format" and no replay
+    # ever fires the canary — which matches the dashboard reality of only
+    # ~5 SSH canaries ever issued despite ~700 SSH-path hits/30d (attackers
+    # fetch the "key", fail to use it, move on). Decode to the real PEM /
+    # OpenSSH-authorized-keys string before serving. If the upstream format
+    # changes back to raw PEM someday, a string starting with "-----BEGIN"
+    # or "ssh-" base64-decodes to gibberish and UnicodeDecodeError bails
+    # us out — fall back to serving the value as-is.
+    if not raw:
+        return ""
+    try:
+        decoded = base64.b64decode(raw, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return raw
+    return decoded
+
+
 def render_ssh_private_key(r: dict[str, object]) -> bytes:
     ssh = r.get("ssh") if isinstance(r, dict) else None
     if not isinstance(ssh, dict):
         return b""
-    pk = ssh.get("sshPrivateKey", "") or ""
-    # Tracebit returns the PEM as-is; ensure it ends with a newline.
+    pk = _decode_ssh_value(str(ssh.get("sshPrivateKey", "") or ""))
     return (pk if pk.endswith("\n") else pk + "\n").encode("utf-8")
 
 
@@ -1782,7 +1802,7 @@ def render_ssh_public_key(r: dict[str, object]) -> bytes:
     ssh = r.get("ssh") if isinstance(r, dict) else None
     if not isinstance(ssh, dict):
         return b""
-    pub = ssh.get("sshPublicKey", "") or ""
+    pub = _decode_ssh_value(str(ssh.get("sshPublicKey", "") or ""))
     return (pub if pub.endswith("\n") else pub + "\n").encode("utf-8")
 
 
@@ -1790,7 +1810,7 @@ def render_authorized_keys(r: dict[str, object]) -> bytes:
     ssh = r.get("ssh") if isinstance(r, dict) else None
     if not isinstance(ssh, dict):
         return b""
-    pub = (ssh.get("sshPublicKey", "") or "").strip()
+    pub = _decode_ssh_value(str(ssh.get("sshPublicKey", "") or "")).strip()
     return (
         f"# production deploy keys — rotate via scripts/rotate-keys.sh\n"
         f"{pub}\n"

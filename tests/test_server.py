@@ -1,6 +1,8 @@
 """Tests for flux.server."""
 from __future__ import annotations
 
+import base64
+
 import pytest
 
 from flux import server as tbenv
@@ -454,6 +456,47 @@ def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
     # rendered bodies should differ somewhere. (Same AWS canary mock is used
     # for both, so anything that varies is necessarily the DB password.)
     assert body_1 != body_2, f"{path!r} renders identically across calls — password not randomized"
+
+
+def test_ssh_renderers_base64_decode_tracebit_values():
+    # Tracebit Community returns sshPrivateKey / sshPublicKey as base64
+    # over the on-wire JSON. If flux serves the base64 verbatim on /id_rsa
+    # an attacker running `ssh -i stolen_id_rsa` gets "invalid format" and
+    # the canary never fires — which matches the dashboard reality of ~5
+    # SSH canaries ever issued despite ~700 SSH-path hits/30d. Lock in the
+    # decode so a future edit can't silently regress it.
+    real_priv = "-----BEGIN OPENSSH PRIVATE KEY-----\nABC123\n-----END OPENSSH PRIVATE KEY-----\n"
+    real_pub = "ssh-ed25519 AAAAC3Nza... canary@flux\n"
+    response = {
+        "ssh": {
+            "sshPrivateKey": base64.b64encode(real_priv.encode()).decode(),
+            "sshPublicKey": base64.b64encode(real_pub.encode()).decode(),
+        },
+    }
+    assert tbenv.render_ssh_private_key(response).startswith(b"-----BEGIN OPENSSH PRIVATE KEY-----")
+    assert tbenv.render_ssh_public_key(response).startswith(b"ssh-ed25519 ")
+    assert b"ssh-ed25519 " in tbenv.render_authorized_keys(response)
+    # ``format_env_payload`` deliberately names its env var ``_B64`` and
+    # ships the raw base64 — scanners that exfil the line can decode it
+    # themselves, and we don't want to double-decode.
+    env_body = tbenv.format_env_payload(response)
+    assert f"SSH_PRIVATE_KEY_B64={response['ssh']['sshPrivateKey']}" in env_body
+
+
+def test_ssh_renderers_fallback_when_value_is_raw_pem():
+    # Defensive: if the upstream format ever flips back to raw PEM
+    # (or the fixture in tests passes PEM, as some older tests do), a
+    # PEM string isn't valid base64 — the decoder falls through to the
+    # raw value rather than exploding.
+    response = {
+        "ssh": {
+            "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKEKEY\n-----END OPENSSH PRIVATE KEY-----",
+            "sshPublicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE canary@flux",
+        },
+    }
+    assert b"BEGIN OPENSSH PRIVATE KEY" in tbenv.render_ssh_private_key(response)
+    assert b"ssh-ed25519 AAAA" in tbenv.render_ssh_public_key(response)
+    assert b"ssh-ed25519 AAAA" in tbenv.render_authorized_keys(response)
 
 
 def test_render_env_production_database_url_is_parseable():
