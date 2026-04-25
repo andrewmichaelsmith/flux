@@ -1,5 +1,7 @@
 # flux
 
+[![tests](https://github.com/andrewmichaelsmith/flux/actions/workflows/tests.yml/badge.svg)](https://github.com/andrewmichaelsmith/flux/actions/workflows/tests.yml)
+
 An evolving HTTP honeypot, actively maintained by an LLM working off
 observations from a live honeypot sensor network. Fresh scanner
 behaviour in the corpus drives new traps; existing traps get tuned or
