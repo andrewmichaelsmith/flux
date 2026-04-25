@@ -296,6 +296,28 @@ GEOSERVER_ENABLED = _env_bool("HONEYPOT_GEOSERVER_ENABLED")
 # via env if a future deployment wants to advertise a different release.
 GEOSERVER_VERSION = (os.environ.get("HONEYPOT_GEOSERVER_VERSION") or "2.25.1").strip()
 
+# --- Fake ColdFusion admin / component browser ---------------------------
+# Enterprise-multi-scanner added ColdFusion-shaped paths in April 2026:
+# `/indice.cfm`, `/menu.cfm`, `/base.cfm`, and `/CFIDE/componentutils/`.
+# Return plausible ColdFusion pages and log query/body payload indicators so
+# follow-on CVE probes are separable from plain enumeration.
+COLDFUSION_ENABLED = _env_bool("HONEYPOT_COLDFUSION_ENABLED")
+_COLDFUSION_DEFAULT_PATHS = ",".join([
+    "/indice.cfm",
+    "/menu.cfm",
+    "/base.cfm",
+    "/cfide/componentutils",
+    "/cfide/componentutils/",
+    "/cfide/administrator/index.cfm",
+    "/cfide/adminapi/administrator.cfc",
+])
+COLDFUSION_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_COLDFUSION_PATHS_CSV") or _COLDFUSION_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+COLDFUSION_VERSION = (os.environ.get("HONEYPOT_COLDFUSION_VERSION") or "2021.0.05").strip()
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -458,6 +480,44 @@ def is_geoserver_path(path: str) -> bool:
     if p == "/geoserver":
         return True
     return p.startswith("/geoserver/")
+
+
+_COLDFUSION_EXPLOIT_INDICATORS = (
+    "../",
+    "..\\",
+    "adminpassword",
+    "cfadminpassword",
+    "administrator.cfc",
+    "accessmanager.cfc",
+    "runtime.getruntime",
+    "java.lang.runtime",
+    "processbuilder",
+    "javax.naming",
+    "jndi:",
+    "wddxpacket",
+    "deserialize",
+    "objectinputstream",
+    "cfclient",
+    "method=login",
+)
+
+
+def _coldfusion_has_exploit(path: str, query: str, body_preview: str) -> bool:
+    haystack = f"{path} {query} {body_preview}".lower()
+    return any(needle in haystack for needle in _COLDFUSION_EXPLOIT_INDICATORS)
+
+
+def is_coldfusion_path(path: str) -> bool:
+    if not COLDFUSION_ENABLED:
+        return False
+    p = path.lower()
+    if p in COLDFUSION_PATHS:
+        return True
+    return (
+        p.startswith("/cfide/componentutils/")
+        or p.startswith("/cfide/administrator/")
+        or p.startswith("/cfide/adminapi/")
+    )
 
 
 def extract_sonicwall_username(body: bytes, content_type: str) -> str:
@@ -906,6 +966,123 @@ def render_geoserver_capabilities(service: str, version: str) -> bytes:
     <ows:ProviderName>GeoServer</ows:ProviderName>
   </ows:ServiceProvider>
 </{svc}_Capabilities>
+"""
+    return body.encode("utf-8")
+
+
+def render_coldfusion_public_page(path: str, host: str, version: str) -> bytes:
+    title = {
+        "/indice.cfm": "Application Index",
+        "/menu.cfm": "Application Menu",
+        "/base.cfm": "Application Base",
+    }.get(path.lower(), "ColdFusion Application")
+    safe_host = host or "cfusion.internal"
+    body = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>{title}</title>
+  <meta name="generator" content="Adobe ColdFusion {version}" />
+</head>
+<body>
+  <h1>{title}</h1>
+  <p>ColdFusion application server on {safe_host}</p>
+  <ul>
+    <li><a href="/CFIDE/componentutils/">Component Browser</a></li>
+    <li><a href="/CFIDE/administrator/index.cfm">ColdFusion Administrator</a></li>
+  </ul>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_coldfusion_componentutils(host: str, version: str) -> bytes:
+    safe_host = host or "cfusion.internal"
+    body = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ColdFusion Component Browser</title>
+  <meta name="generator" content="Adobe ColdFusion {version}" />
+</head>
+<body>
+  <h1>ColdFusion Component Browser</h1>
+  <p>Browse components installed on {safe_host}</p>
+  <form method="get" action="/CFIDE/componentutils/cfcexplorer.cfc">
+    <label>Component path <input name="path" value="cfdocs" /></label>
+    <input type="hidden" name="method" value="getcfcinhtml" />
+    <button type="submit">Browse</button>
+  </form>
+  <ul>
+    <li><a href="/CFIDE/adminapi/administrator.cfc?method=login">Administrator API</a></li>
+    <li><a href="/CFIDE/administrator/index.cfm">ColdFusion Administrator</a></li>
+  </ul>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_coldfusion_admin_login(host: str, version: str) -> bytes:
+    safe_host = host or "cfusion.internal"
+    body = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ColdFusion Administrator</title>
+  <meta name="generator" content="Adobe ColdFusion {version}" />
+</head>
+<body>
+  <h1>ColdFusion Administrator</h1>
+  <p>Server: {safe_host}</p>
+  <form method="post" action="/CFIDE/administrator/enter.cfm">
+    <label>Password <input type="password" name="cfadminPassword" autocomplete="current-password" /></label>
+    <input type="hidden" name="requestedURL" value="/CFIDE/administrator/index.cfm" />
+    <button type="submit">Login</button>
+  </form>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_coldfusion_admin_dashboard(host: str, version: str) -> bytes:
+    safe_host = host or "cfusion.internal"
+    body = f"""<!doctype html>
+<html>
+<head><meta charset="utf-8" /><title>ColdFusion Administrator</title></head>
+<body>
+  <h1>ColdFusion Administrator</h1>
+  <table>
+    <tr><th>Edition</th><td>Enterprise</td></tr>
+    <tr><th>Version</th><td>{version}</td></tr>
+    <tr><th>Server</th><td>{safe_host}</td></tr>
+  </table>
+  <ul>
+    <li><a href="/CFIDE/administrator/settings/mappings.cfm">Mappings</a></li>
+    <li><a href="/CFIDE/administrator/datasources/index.cfm">Data Sources</a></li>
+    <li><a href="/CFIDE/adminapi/administrator.cfc?method=getVersion">Admin API</a></li>
+  </ul>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_coldfusion_adminapi(method_name: str, version: str) -> bytes:
+    method = (method_name or "getVersion").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<wddxPacket version="1.0">
+  <header/>
+  <data>
+    <struct>
+      <var name="method"><string>{method}</string></var>
+      <var name="success"><boolean value="true"/></var>
+      <var name="version"><string>{version}</string></var>
+    </struct>
+  </data>
+</wddxPacket>
 """
     return body.encode("utf-8")
 
@@ -3072,6 +3249,88 @@ async def _handle_geoserver(
     )
 
 
+async def _handle_coldfusion(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    lpath = path.lower()
+    method = request.method
+    host = str(log_context.get("host", ""))
+    query = str(log_context.get("query", "") or "")
+    content_type_req = request.headers.get("Content-Type", "")
+    has_auth = bool(request.headers.get("Authorization", "")) or bool(request.headers.get("Cookie", ""))
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:512].decode("utf-8", errors="replace")
+
+    has_exploit = _coldfusion_has_exploit(path, query, body_preview)
+    query_params = parse_qs(query, keep_blank_values=True) if query else {}
+    method_name = ""
+    for key in ("method", "METHOD"):
+        values = query_params.get(key)
+        if values and values[0]:
+            method_name = values[0][:120]
+            break
+
+    log_extra: dict[str, object] = {
+        "coldfusionPath": path,
+        "coldfusionMethod": method,
+        "coldfusionHasAuth": has_auth,
+        "coldfusionHasExploit": has_exploit,
+        "contentType": content_type_req[:120],
+    }
+    if method_name:
+        log_extra["coldfusionAction"] = method_name
+    if body_preview:
+        log_extra["bodyPreview"] = body_preview
+    if has_exploit:
+        log_extra["coldfusionPayloadPreview"] = (query + " | " + body_preview)[:400]
+
+    if lpath in {"/indice.cfm", "/menu.cfm", "/base.cfm"}:
+        result_tag = "coldfusion-public-cfm"
+        body = render_coldfusion_public_page(path, host, COLDFUSION_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/cfide/componentutils" or lpath.startswith("/cfide/componentutils/"):
+        result_tag = "coldfusion-componentutils"
+        body = render_coldfusion_componentutils(host, COLDFUSION_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath.startswith("/cfide/administrator/"):
+        result_tag = "coldfusion-admin-post" if method == "POST" else "coldfusion-admin-login"
+        if method == "POST":
+            body = render_coldfusion_admin_dashboard(host, COLDFUSION_VERSION)
+        else:
+            body = render_coldfusion_admin_login(host, COLDFUSION_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath.startswith("/cfide/adminapi/"):
+        result_tag = "coldfusion-adminapi"
+        body = render_coldfusion_adminapi(method_name, COLDFUSION_VERSION)
+        content_type = "text/xml; charset=utf-8"
+    else:
+        append_log({**log_context, "status": 404, "result": "coldfusion-miss", **log_extra})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        **log_extra,
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": content_type,
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_webshell(
     request: web.Request,
     log_context: dict[str, object],
@@ -3475,6 +3734,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_geoserver_path(path):
         return await _handle_geoserver(request, log_context, path, request_body)
 
+    if is_coldfusion_path(path):
+        return await _handle_coldfusion(request, log_context, path, request_body)
+
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)
 
@@ -3544,6 +3806,8 @@ def main() -> int:
         active.append("cisco-webvpn")
     if GEOSERVER_ENABLED:
         active.append("geoserver")
+    if COLDFUSION_ENABLED:
+        active.append("coldfusion")
     print(
         f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
         file=sys.stderr,

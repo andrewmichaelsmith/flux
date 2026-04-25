@@ -157,6 +157,33 @@ Extras on every `sonicwall-*` line:
 | `bytes` | int | Size of the JSON body returned. |
 | `bodyPreview` | string | Up to `HONEYPOT_WEBSHELL_BODY_DECODE_LIMIT` chars of the request body; omitted on GETs / empty bodies. |
 
+### Fake ColdFusion admin / component browser
+
+One log line per hit.
+
+| `result` | `status` | Meaning |
+| --- | --- | --- |
+| `coldfusion-public-cfm` | 200 | `/indice.cfm`, `/menu.cfm`, or `/base.cfm` public ColdFusion anchor |
+| `coldfusion-componentutils` | 200 | `/CFIDE/componentutils/` component browser surface |
+| `coldfusion-admin-login` | 200 | Administrator login page |
+| `coldfusion-admin-post` | 200 | POST to Administrator, with body/auth hints logged |
+| `coldfusion-adminapi` | 200 | `/CFIDE/adminapi/...` WDDX-shaped API response |
+| `coldfusion-miss` | 404 | Matched the path family but no renderer (shouldn't occur; defensive) |
+
+Extras on every `coldfusion-*` line:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `coldfusionPath` | string | The path that matched. |
+| `coldfusionMethod` | string | `GET` / `POST` / `HEAD`. |
+| `coldfusionHasAuth` | bool | `true` if `Authorization` or `Cookie` was present. |
+| `coldfusionHasExploit` | bool | Query/path/body contained ColdFusion exploit indicators such as AdminAPI, WDDX, Java runtime, traversal, or admin-password parameters. |
+| `coldfusionAction` | string | Query-string `method` value, when present. |
+| `contentType` | string | First 120 chars of `Content-Type`. |
+| `bytes` | int | Size of the response body returned. |
+| `bodyPreview` | string | First 512 chars of request body; omitted on GETs / empty bodies. |
+| `coldfusionPayloadPreview` | string | Up to 400 chars of `query | body-preview`; only present when `coldfusionHasExploit` is true. |
+
 ### Canary-backed file traps
 
 One log line per hit. All entries share the same shape:

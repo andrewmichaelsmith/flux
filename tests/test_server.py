@@ -351,6 +351,7 @@ def test_all_trap_families_default_on():
     assert tbenv.SONICWALL_ENABLED
     assert tbenv.CISCO_WEBVPN_ENABLED
     assert tbenv.GEOSERVER_ENABLED
+    assert tbenv.COLDFUSION_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -1482,6 +1483,144 @@ async def test_dispatch_geoserver_disabled_returns_404(flux_client, monkeypatch)
     monkeypatch.setattr(tbenv, "GEOSERVER_ENABLED", False)
     resp = await flux_client.get(
         "/geoserver/web/", headers={"X-Forwarded-For": "203.0.113.67"}
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- ColdFusion trap ---
+
+
+def test_coldfusion_enabled_by_default():
+    assert tbenv.COLDFUSION_ENABLED
+
+
+def test_coldfusion_default_paths_cover_observed_family():
+    for path in (
+        "/indice.cfm",
+        "/menu.cfm",
+        "/base.cfm",
+        "/CFIDE/componentutils/",
+        "/CFIDE/administrator/index.cfm",
+        "/CFIDE/adminapi/administrator.cfc",
+    ):
+        assert tbenv.is_coldfusion_path(path), f"expected match: {path}"
+
+
+def test_coldfusion_path_non_match():
+    for path in ["/", "/index.cfm", "/administrator/", "/cfide", "/geoserver/web/"]:
+        assert not tbenv.is_coldfusion_path(path), f"unexpected match: {path}"
+
+
+def test_coldfusion_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "COLDFUSION_ENABLED", False)
+    assert not tbenv.is_coldfusion_path("/CFIDE/componentutils/")
+
+
+def test_coldfusion_has_exploit_detects_adminapi_and_runtime():
+    assert tbenv._coldfusion_has_exploit(
+        "/CFIDE/adminapi/administrator.cfc", "method=login", ""
+    )
+    assert tbenv._coldfusion_has_exploit(
+        "/CFIDE/componentutils/",
+        "",
+        '<wddxPacket><string>Runtime.getRuntime().exec("id")</string></wddxPacket>',
+    )
+    assert not tbenv._coldfusion_has_exploit("/menu.cfm", "", "normal")
+
+
+def test_render_coldfusion_public_page_links_followups():
+    body = tbenv.render_coldfusion_public_page(
+        "/menu.cfm", "victim.example", "2021.0.05",
+    ).decode("utf-8")
+    assert "Adobe ColdFusion 2021.0.05" in body
+    assert "/CFIDE/componentutils/" in body
+    assert "/CFIDE/administrator/index.cfm" in body
+
+
+def test_render_coldfusion_adminapi_escapes_method_name():
+    body = tbenv.render_coldfusion_adminapi("<x>", "2021.0.05").decode("utf-8")
+    assert "&lt;x&gt;" in body
+    assert "<x>" not in body
+
+
+async def test_dispatch_coldfusion_public_cfm(flux_client):
+    resp = await flux_client.get(
+        "/menu.cfm",
+        headers={"X-Forwarded-For": "203.0.113.71", "Host": "cf.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "ColdFusion application server" in text
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "coldfusion-public-cfm"
+    assert entry["coldfusionPath"] == "/menu.cfm"
+    assert entry["coldfusionHasExploit"] is False
+
+
+async def test_dispatch_coldfusion_componentutils_logs_exploit_body(flux_client):
+    body = b'<wddxPacket><string>Runtime.getRuntime().exec("id")</string></wddxPacket>'
+    resp = await flux_client.post(
+        "/CFIDE/componentutils/",
+        data=body,
+        headers={
+            "X-Forwarded-For": "203.0.113.72",
+            "Content-Type": "text/xml",
+        },
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "ColdFusion Component Browser" in text
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "coldfusion-componentutils"
+    assert entry["coldfusionHasExploit"] is True
+    assert "coldfusionPayloadPreview" in entry
+    assert "Runtime.getRuntime" in entry["bodyPreview"]
+
+
+async def test_dispatch_coldfusion_admin_post_captures_auth_and_body(flux_client):
+    resp = await flux_client.post(
+        "/CFIDE/administrator/enter.cfm",
+        data="cfadminPassword=guess",
+        headers={
+            "X-Forwarded-For": "203.0.113.73",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": "CFID=1; CFTOKEN=abc",
+        },
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Data Sources" in text
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "coldfusion-admin-post"
+    assert entry["coldfusionHasAuth"] is True
+    assert entry["coldfusionHasExploit"] is True
+    assert "cfadminPassword" in entry["bodyPreview"]
+
+
+async def test_dispatch_coldfusion_adminapi_logs_method(flux_client):
+    resp = await flux_client.get(
+        "/CFIDE/adminapi/administrator.cfc?method=login",
+        headers={"X-Forwarded-For": "203.0.113.74"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "<wddxPacket" in text
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "coldfusion-adminapi"
+    assert entry["coldfusionAction"] == "login"
+    assert entry["coldfusionHasExploit"] is True
+
+
+async def test_dispatch_coldfusion_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "COLDFUSION_ENABLED", False)
+    resp = await flux_client.get(
+        "/CFIDE/componentutils/", headers={"X-Forwarded-For": "203.0.113.75"}
     )
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)

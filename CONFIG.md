@@ -137,6 +137,20 @@ The POST body read cap is shared with the webshell trap
 the decoded preview written to the log is capped by
 `HONEYPOT_WEBSHELL_BODY_DECODE_LIMIT` (default 8 KiB).
 
+## Fake ColdFusion admin / component browser
+
+No Tracebit key required.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_COLDFUSION_ENABLED` | on | Master switch. |
+| `HONEYPOT_COLDFUSION_PATHS_CSV` | *(built-in — `/indice.cfm`, `/menu.cfm`, `/base.cfm`, `/CFIDE/componentutils/`, `/CFIDE/administrator/index.cfm`, `/CFIDE/adminapi/administrator.cfc`)* | Exact, case-insensitive seeds. The handler also serves subpaths under `/CFIDE/componentutils/`, `/CFIDE/administrator/`, and `/CFIDE/adminapi/`. |
+| `HONEYPOT_COLDFUSION_VERSION` | `2021.0.05` | Version string shown in HTML/XML responses. |
+
+The POST body read cap is shared with the webshell trap
+(`HONEYPOT_WEBSHELL_BODY_READ_LIMIT`, default 64 KiB off the wire).
+ColdFusion log previews are capped at 512 chars for exploit triage.
+
 ## Bind address / port
 
 Flux listens on `127.0.0.1:18081` (aiohttp). To change, edit
