@@ -137,7 +137,7 @@ case-insensitive exact matches.
 | known_hosts | `/.ssh/known_hosts`, `/known_hosts` | `ssh` | `known-hosts` |
 | authorized_keys | `/authorized_keys`, `/.ssh/authorized_keys`, `/.ssh/authorized_keys2`, `/static/.ssh/authorized_keys`, `/downloads/.ssh/authorized_keys`, `/blog/.ssh/authorized_keys` | `ssh` | `authorized-keys` |
 | .netrc | `/.netrc`, `/_netrc` | `gitlab-username-password` | `netrc` |
-| git credential store | `/.git-credentials` | `gitlab-username-password` | `git-credentials` |
+| git credential store | `/.git-credentials`; fake-git also serves `/.git/credentials` | `gitlab-username-password` | `git-credentials` / `fake-git` |
 | .npmrc | `/.npmrc` | `gitlab-username-password` | `npmrc` |
 | .pypirc | `/.pypirc` | `gitlab-username-password` | `pypirc` |
 | GitLab API user | `/api/v4/user` | `gitlab-username-password` | `gitlab-api-user` |

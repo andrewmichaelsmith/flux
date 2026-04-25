@@ -1598,6 +1598,12 @@ def _build_fake_repo(
     files: dict[str, bytes] = {
         "/.git/head": b"ref: refs/heads/main\n",
         "/.git/config": config_text.encode("utf-8"),
+        # Some scanners ask for a credential-store file inside the exposed
+        # repo metadata rather than the conventional home-directory
+        # `/.git-credentials` path. Keep it in the fake repo so dispatch
+        # records the request as fake-git while still handing out a GitLab
+        # username/password canary.
+        "/.git/credentials": render_git_credentials(tracebit_response or {}),
         "/.git/index": git_index_body,
         "/.git/description": b"Unnamed repository; edit this file 'description' to name the repository.\n",
         "/.git/packed-refs": (

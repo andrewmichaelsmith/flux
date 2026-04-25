@@ -2013,6 +2013,15 @@ def test_fake_git_index_is_valid_dirc_header():
     assert len(index) == 32
 
 
+def test_fake_git_credentials_leaf_embeds_gitlab_canary():
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, _meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    body = files["/.git/credentials"].decode("utf-8")
+    assert body.startswith("https://deploybot42:")
+    assert "p%40ssCanaryValue" in body
+    assert "@gitlab.canary.example" in body
+
+
 # --- _close_http_session lifecycle ---
 
 

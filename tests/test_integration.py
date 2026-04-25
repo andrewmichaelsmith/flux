@@ -334,6 +334,34 @@ async def test_integration_git_credentials_canary_trap(live_server, monkeypatch)
     assert any(e.get("result") == "git-credentials" for e in entries)
 
 
+async def test_integration_fake_git_credentials_leaf_serves_canary(live_server, monkeypatch):
+    """Scanners also probe `/.git/credentials` as if the credential-store
+    file were inside the exposed repo metadata; fake-git should serve that
+    variant instead of logging `fake-git-miss`."""
+    async def fake_issue(*_a, **_kw):
+        return FAKE_TRACEBIT
+
+    monkeypatch.setattr(tbenv, "issue_credentials", fake_issue)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_DRIP_INTERVAL_MS", 0)
+    tbenv._FAKE_GIT_CACHE.clear()
+
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/.git/credentials",
+            headers={"X-Forwarded-For": "203.0.113.52"},
+        ) as resp:
+            assert resp.status == 200
+            body = (await resp.read()).decode()
+            assert body.startswith("https://integbot:")
+            assert "@gitlab.canary.example" in body
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e.get("result") == "fake-git" and e.get("path") == "/.git/credentials" for e in entries)
+    assert not any(e.get("result") == "fake-git-miss" and e.get("path") == "/.git/credentials" for e in entries)
+
+
 async def test_integration_fake_git_502s_when_tracebit_fails(live_server, monkeypatch):
     async def boom(*_a, **_kw):
         raise aiohttp.ClientConnectionError("nope")

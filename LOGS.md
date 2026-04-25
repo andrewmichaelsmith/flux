@@ -48,7 +48,7 @@ Every line has a `result` identifying what the handler did, and a
 
 | `result` | `status` | Extras | Meaning |
 | --- | --- | --- | --- |
-| `fake-git` | 200 | `commitSha`, `rootTreeSha`, `secretsBlobSha`, `canaryTypes`, `fakeGitBytes`, `fakeGitDripBytes`, `fakeGitDripIntervalMs` | Object served from the synthetic repo. |
+| `fake-git` | 200 | `commitSha`, `rootTreeSha`, `secretsBlobSha`, `canaryTypes`, `fakeGitBytes`, `fakeGitDripBytes`, `fakeGitDripIntervalMs` | Object served from the synthetic repo. Includes `/.git/credentials`, which returns a Git credential-store line with a GitLab username/password canary. |
 | `fake-git-miss` | 404 | `commitSha`, `gitKey` | Path resolved to the repo but wasn't a file in it. `gitKey` is the canonical `/.git/...` lookup key (lowercased, prefix-stripped) — so `/login/.GiT/FOO` logs `path=/login/.GiT/FOO`, `gitKey=/.git/foo`. |
 | `fake-git-error` | 502 | — | Canary issuance failed. |
 | `fake-git-disconnect` | 200 | `fakeGitBytesSent`, `commitSha` | Scanner hung up mid-drip. |
