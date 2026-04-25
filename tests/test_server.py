@@ -350,6 +350,7 @@ def test_all_trap_families_default_on():
     assert tbenv.LLM_ENDPOINT_ENABLED
     assert tbenv.SONICWALL_ENABLED
     assert tbenv.CISCO_WEBVPN_ENABLED
+    assert tbenv.GEOSERVER_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -1305,6 +1306,183 @@ async def test_dispatch_cisco_webvpn_jar(flux_client):
 async def test_dispatch_cisco_webvpn_disabled_returns_404(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "CISCO_WEBVPN_ENABLED", False)
     resp = await flux_client.get("/+CSCOE+/logon.html", headers={"X-Forwarded-For": "203.0.113.53"})
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- GeoServer trap (CVE-2024-36401 bait) ---
+
+
+def test_geoserver_enabled_by_default():
+    assert tbenv.GEOSERVER_ENABLED
+
+
+def test_is_geoserver_path_match():
+    for path in (
+        "/geoserver",
+        "/geoserver/",
+        "/geoserver/web/",
+        "/geoserver/web/wicket/bookmarkable/org.geoserver.web.AboutGeoServerPage",
+        "/geoserver/index.html",
+        "/geoserver/ows",
+        "/geoserver/wfs",
+        "/geoserver/rest/workspaces",
+        "/GeoServer/Web/",  # case-insensitive
+    ):
+        assert tbenv.is_geoserver_path(path), f"expected match: {path}"
+
+
+def test_is_geoserver_path_non_match():
+    for path in [
+        "/",
+        "/.env",
+        "/admin/",
+        "/geo",
+        "/geoserveradmin",  # no trailing slash, not /geoserver itself
+        "/wp-admin/",
+    ]:
+        assert not tbenv.is_geoserver_path(path), f"unexpected match: {path}"
+
+
+def test_is_geoserver_path_disabled(monkeypatch):
+    monkeypatch.setattr(tbenv, "GEOSERVER_ENABLED", False)
+    assert not tbenv.is_geoserver_path("/geoserver/web/")
+
+
+def test_geoserver_has_ognl_detects_runtime():
+    assert tbenv._geoserver_has_ognl(
+        "service=wfs&exec(Runtime.getRuntime", ""
+    )
+    assert tbenv._geoserver_has_ognl(
+        "", '<wfs:Query><Filter><PropertyName>exec(Runtime.getRuntime().exec("id"))</PropertyName></Filter></wfs:Query>'
+    )
+    assert tbenv._geoserver_has_ognl(
+        "evaluateProperty=foo", ""
+    )
+
+
+def test_geoserver_has_ognl_clean_returns_false():
+    assert not tbenv._geoserver_has_ognl("service=wfs&request=GetCapabilities", "")
+    assert not tbenv._geoserver_has_ognl("", "<Query>boring</Query>")
+
+
+def test_render_geoserver_landing_includes_login_and_version():
+    body = tbenv.render_geoserver_landing("victim.example", "2.25.1").decode("utf-8")
+    assert "GeoServer" in body
+    assert "2.25.1" in body
+    assert "/geoserver/j_spring_security_check" in body
+    assert "AboutGeoServerPage" in body
+
+
+def test_render_geoserver_about_includes_version():
+    body = tbenv.render_geoserver_about("h", "2.25.1").decode("utf-8")
+    assert "About GeoServer" in body
+    assert "2.25.1" in body
+
+
+def test_render_geoserver_capabilities_xml_root_matches_service():
+    body = tbenv.render_geoserver_capabilities("wms", "2.25.1").decode("utf-8")
+    assert "<WMS_Capabilities" in body
+    assert "</WMS_Capabilities>" in body
+
+
+async def test_dispatch_geoserver_root_redirects(flux_client):
+    resp = await flux_client.get(
+        "/geoserver/",
+        headers={"X-Forwarded-For": "203.0.113.61", "Host": "victim.example"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/geoserver/web/"
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "geoserver-redirect-root"
+    assert entry["geoserverPath"] == "/geoserver/"
+
+
+async def test_dispatch_geoserver_web_landing(flux_client):
+    resp = await flux_client.get(
+        "/geoserver/web/",
+        headers={"X-Forwarded-For": "203.0.113.62", "Host": "victim.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "GeoServer" in text
+    assert "Login" in text
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "geoserver-web-landing"
+    assert entry["geoserverHasOgnl"] is False
+
+
+async def test_dispatch_geoserver_about_page_logs_ognl_payload(flux_client):
+    # AboutGeoServerPage is the CVE-2024-36401 trigger surface; an OGNL-bearing
+    # query must flip geoserverHasOgnl and capture the payload preview.
+    resp = await flux_client.get(
+        "/geoserver/web/wicket/bookmarkable/org.geoserver.web.AboutGeoServerPage"
+        "?evaluateProperty=exec(Runtime.getRuntime().exec(%22id%22))",
+        headers={"X-Forwarded-For": "203.0.113.63"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "About GeoServer" in text
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "geoserver-about-page"
+    assert entry["geoserverHasOgnl"] is True
+    assert "geoserverPayloadPreview" in entry
+
+
+async def test_dispatch_geoserver_ows_capabilities(flux_client):
+    resp = await flux_client.get(
+        "/geoserver/ows?service=wfs&version=2.0.0&request=GetCapabilities",
+        headers={"X-Forwarded-For": "203.0.113.64"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "<WFS_Capabilities" in text
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "geoserver-ogc-wfs"
+
+
+async def test_dispatch_geoserver_rest_returns_401(flux_client):
+    resp = await flux_client.get(
+        "/geoserver/rest/workspaces",
+        headers={"X-Forwarded-For": "203.0.113.65"},
+    )
+    assert resp.status == 401
+    assert resp.headers.get("WWW-Authenticate", "").startswith("Basic ")
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "geoserver-rest-401"
+
+
+async def test_dispatch_geoserver_post_body_logs_ognl(flux_client):
+    body = (
+        b'<wfs:GetPropertyValue xmlns:wfs="http://www.opengis.net/wfs/2.0">'
+        b'<valueReference>exec(Runtime.getRuntime().exec(\'id\'))</valueReference>'
+        b'</wfs:GetPropertyValue>'
+    )
+    resp = await flux_client.post(
+        "/geoserver/wfs",
+        data=body,
+        headers={
+            "X-Forwarded-For": "203.0.113.66",
+            "Content-Type": "application/xml",
+        },
+    )
+    assert resp.status == 200
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "geoserver-ogc-wfs"
+    assert entry["geoserverHasOgnl"] is True
+
+
+async def test_dispatch_geoserver_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "GEOSERVER_ENABLED", False)
+    resp = await flux_client.get(
+        "/geoserver/web/", headers={"X-Forwarded-For": "203.0.113.67"}
+    )
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)
     assert entries[-1]["result"] == "not-handled"

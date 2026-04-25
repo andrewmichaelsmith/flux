@@ -279,6 +279,23 @@ CISCO_WEBVPN_PATHS = {
     if value.strip()
 }
 
+# --- Fake GeoServer admin / OGC endpoints (CVE-2024-36401 bait) ----------
+# Two scanner families are observed probing this surface:
+#   1. Banner-grab fleets fetching /geoserver/, /geoserver/web/, /geoserver/index.html
+#   2. Enterprise multi-target scanners hitting /geoserver/web/wicket/
+#      bookmarkable/org.geoserver.web.AboutGeoServerPage — the surface where
+#      CVE-2024-36401 (OGC Filter property-name evaluation -> RCE) lands.
+# Plus the OGC service endpoints (/ows, /wfs, /wms, /wcs, /wps) where the
+# same CVE is also reachable via crafted &evaluateProperty / &valueReference
+# parameters. Returning plausible HTML/XML keeps the probe alive past the
+# fingerprint stage so we capture the follow-on payload bodies.
+GEOSERVER_ENABLED = _env_bool("HONEYPOT_GEOSERVER_ENABLED")
+# Reported version shown in the landing page + GetCapabilities. Pinned to a
+# version that is in-window for the OGC Filter CVE so scanners deciding
+# whether to ship the exploit body don't bail on a "patched" banner. Override
+# via env if a future deployment wants to advertise a different release.
+GEOSERVER_VERSION = (os.environ.get("HONEYPOT_GEOSERVER_VERSION") or "2.25.1").strip()
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -411,6 +428,36 @@ def is_cisco_webvpn_path(path: str) -> bool:
     if not CISCO_WEBVPN_ENABLED:
         return False
     return path.lower() in CISCO_WEBVPN_PATHS
+
+
+# OGNL / Java-runtime indicators surfaced when CVE-2024-36401 (or related
+# expression-language exploits) ships its payload in an OGC Filter or wicket
+# parameter. Match is case-insensitive against the raw query string + body
+# preview; presence flips the geoserverHasOgnl log field for fast triage.
+_GEOSERVER_OGNL_INDICATORS = (
+    "runtime.getruntime",
+    "java.lang.runtime",
+    "processbuilder",
+    "exec(",
+    "system-properties",
+    "javax.naming",
+    "valuereference",
+    "evaluateproperty",
+)
+
+
+def _geoserver_has_ognl(query: str, body_preview: str) -> bool:
+    haystack = f"{query} {body_preview}".lower()
+    return any(needle in haystack for needle in _GEOSERVER_OGNL_INDICATORS)
+
+
+def is_geoserver_path(path: str) -> bool:
+    if not GEOSERVER_ENABLED:
+        return False
+    p = path.lower()
+    if p == "/geoserver":
+        return True
+    return p.startswith("/geoserver/")
 
 
 def extract_sonicwall_username(body: bytes, content_type: str) -> str:
@@ -759,6 +806,108 @@ def render_cisco_webvpn_logon_forms_js() -> bytes:
 
 def render_cisco_webvpn_jar_stub(name: str) -> bytes:
     return f"PK\x03\x04{name}-placeholder".encode("utf-8")
+
+
+def render_geoserver_landing(host: str, version: str) -> bytes:
+    """HTML landing for /geoserver/web/ — mimics GeoServer 2.x admin UI shell.
+
+    Apache Wicket markup is intentionally close to the upstream login.html
+    so wicket-aware scanners follow into AboutGeoServerPage / Demos."""
+    safe_host = host or "geoserver.internal"
+    body = f"""<!doctype html>
+<html lang="en" xml:lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <title>GeoServer: Welcome</title>
+  <link rel="stylesheet" type="text/css" href="/geoserver/wicket/resource/org.geoserver.web.GeoServerBasePage/css/blueprint/screen.css" />
+</head>
+<body class="page">
+  <div id="page">
+    <div id="header">
+      <a href="/geoserver/web/"><h1>GeoServer</h1></a>
+      <span id="serverVersion">Version {version}</span>
+    </div>
+    <div id="loginform">
+      <form method="post" action="/geoserver/j_spring_security_check">
+        <fieldset>
+          <legend>Login</legend>
+          <label for="username">User:</label>
+          <input type="text" id="username" name="username" autocomplete="username" />
+          <label for="password">Password:</label>
+          <input type="password" id="password" name="password" autocomplete="current-password" />
+          <button type="submit" name="submit">Login</button>
+        </fieldset>
+      </form>
+    </div>
+    <div id="demos">
+      <h2>About &amp; Status</h2>
+      <ul>
+        <li><a href="/geoserver/web/wicket/bookmarkable/org.geoserver.web.AboutGeoServerPage">About GeoServer</a></li>
+        <li><a href="/geoserver/web/wicket/bookmarkable/org.geoserver.web.demo.DemoRequestsPage">Demo requests</a></li>
+        <li><a href="/geoserver/web/wicket/bookmarkable/org.geoserver.web.LayerPreviewPage">Layer preview</a></li>
+      </ul>
+      <h2>Service Capabilities</h2>
+      <ul>
+        <li><a href="/geoserver/ows?service=wfs&amp;version=2.0.0&amp;request=GetCapabilities">WFS 2.0.0</a></li>
+        <li><a href="/geoserver/ows?service=wms&amp;version=1.3.0&amp;request=GetCapabilities">WMS 1.3.0</a></li>
+        <li><a href="/geoserver/ows?service=wcs&amp;version=2.0.1&amp;request=GetCapabilities">WCS 2.0.1</a></li>
+      </ul>
+    </div>
+    <div id="footer">
+      <p>GeoServer {version} on {safe_host} &mdash; <a href="/geoserver/web/wicket/bookmarkable/org.geoserver.web.AboutGeoServerPage">about</a></p>
+    </div>
+  </div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_geoserver_about(host: str, version: str) -> bytes:
+    """About page — visited as the CVE-2024-36401 trigger surface. Server
+    responds with a plausible Wicket-rendered AboutGeoServerPage so scanners
+    that fingerprint on the response body proceed to ship the exploit."""
+    safe_host = host or "geoserver.internal"
+    body = f"""<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8" /><title>About GeoServer</title></head>
+<body class="page">
+  <h1>About GeoServer</h1>
+  <table>
+    <tr><th>Version</th><td>{version}</td></tr>
+    <tr><th>Git Revision</th><td>release/{version}</td></tr>
+    <tr><th>Build Date</th><td>15-Apr-2024 09:14</td></tr>
+    <tr><th>GeoTools Version</th><td>31.1</td></tr>
+    <tr><th>GeoWebCache Version</th><td>1.25.1</td></tr>
+    <tr><th>Hostname</th><td>{safe_host}</td></tr>
+  </table>
+  <p>GeoServer is an open-source server for sharing geospatial data.</p>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_geoserver_capabilities(service: str, version: str) -> bytes:
+    """Minimal OGC GetCapabilities-shaped XML for /ows /wfs /wms /wcs /wps.
+    Real capabilities run thousands of lines; scanners typically only sniff
+    the root element + ServiceIdentification/Title to confirm the service is
+    live before sending the exploit body."""
+    svc = (service or "wfs").upper()
+    body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<{svc}_Capabilities version="2.0.0" xmlns:ows="http://www.opengis.net/ows/1.1" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <ows:ServiceIdentification>
+    <ows:Title>GeoServer {svc}</ows:Title>
+    <ows:Abstract>This is the {svc} service of GeoServer.</ows:Abstract>
+    <ows:ServiceType>{svc}</ows:ServiceType>
+    <ows:ServiceTypeVersion>2.0.0</ows:ServiceTypeVersion>
+  </ows:ServiceIdentification>
+  <ows:ServiceProvider>
+    <ows:ProviderName>GeoServer</ows:ProviderName>
+  </ows:ServiceProvider>
+</{svc}_Capabilities>
+"""
+    return body.encode("utf-8")
 
 def render_sonicwall_is_sslvpn_enabled() -> bytes:
     # SonicOS 7 returns a status envelope alongside the boolean. Field names
@@ -2725,6 +2874,136 @@ async def _handle_cisco_webvpn(
     )
 
 
+async def _handle_geoserver(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    lpath = path.lower()
+    method = request.method
+    host = str(log_context.get("host", ""))
+    query = str(log_context.get("query", "") or "")
+
+    body_preview = ""
+    if request_body:
+        try:
+            body_preview = request_body[:512].decode("utf-8", errors="replace")
+        except UnicodeDecodeError:
+            body_preview = ""
+
+    has_ognl = _geoserver_has_ognl(query, body_preview)
+
+    log_extra: dict[str, object] = {
+        "geoserverPath": path,
+        "geoserverMethod": method,
+        "geoserverHasOgnl": has_ognl,
+    }
+    if has_ognl:
+        # Truncate aggressively: a single OGNL payload can run multi-KB and
+        # the existing log fields stay compact.
+        log_extra["geoserverPayloadPreview"] = (query + " | " + body_preview)[:400]
+
+    # /geoserver and /geoserver/ -> 302 to /geoserver/web/. Real GeoServer
+    # redirects this way, and a 302 keeps banner-grab fleets happy without
+    # rendering any content.
+    if lpath in {"/geoserver", "/geoserver/"}:
+        append_log({
+            **log_context,
+            "status": 302,
+            "result": "geoserver-redirect-root",
+            **log_extra,
+            "bytes": 0,
+        })
+        return web.Response(
+            status=302,
+            body=b"",
+            headers={"Location": "/geoserver/web/", "Cache-Control": "no-store"},
+        )
+
+    # /geoserver/index.html and the /geoserver/web/ admin shell.
+    if lpath == "/geoserver/index.html" or lpath.startswith("/geoserver/web"):
+        # Distinguish the AboutGeoServerPage CVE trigger from the generic
+        # admin shell so analysis can grep for it directly.
+        if "aboutgeoserverpage" in lpath:
+            result_tag = "geoserver-about-page"
+            body = render_geoserver_about(host, GEOSERVER_VERSION)
+        else:
+            result_tag = "geoserver-web-landing"
+            body = render_geoserver_landing(host, GEOSERVER_VERSION)
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": result_tag,
+            **log_extra,
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={
+                "Content-Type": "text/html; charset=utf-8",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    # OGC service endpoints — same surface as the wicket page for CVE-2024-36401.
+    for svc_path, svc in (
+        ("/geoserver/ows", "wfs"),
+        ("/geoserver/wfs", "wfs"),
+        ("/geoserver/wms", "wms"),
+        ("/geoserver/wcs", "wcs"),
+        ("/geoserver/wps", "wps"),
+    ):
+        if lpath == svc_path:
+            body = render_geoserver_capabilities(svc, GEOSERVER_VERSION)
+            append_log({
+                **log_context,
+                "status": 200,
+                "result": f"geoserver-ogc-{svc}",
+                **log_extra,
+                "bytes": len(body),
+            })
+            return web.Response(
+                status=200, body=body,
+                headers={
+                    "Content-Type": "application/xml; charset=utf-8",
+                    "Cache-Control": "no-store",
+                },
+            )
+
+    # /geoserver/rest/... — 401 Basic. Real GeoServer requires HTTP Basic
+    # auth on the REST API; serving a 401 with the proper challenge keeps
+    # tooling like geoserver-cli happy.
+    if lpath.startswith("/geoserver/rest"):
+        append_log({
+            **log_context,
+            "status": 401,
+            "result": "geoserver-rest-401",
+            **log_extra,
+            "bytes": 0,
+        })
+        return web.Response(
+            status=401, body=b"",
+            headers={
+                "WWW-Authenticate": 'Basic realm="GeoServer Realm"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    # Anything else under /geoserver/ — log + 404.
+    append_log({
+        **log_context,
+        "status": 404,
+        "result": "geoserver-miss",
+        **log_extra,
+        "bytes": 0,
+    })
+    return web.Response(
+        status=404, body=b"not found\n",
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+    )
+
+
 async def _handle_webshell(
     request: web.Request,
     log_context: dict[str, object],
@@ -3125,6 +3404,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_cisco_webvpn_path(path):
         return await _handle_cisco_webvpn(request, log_context, path)
 
+    if is_geoserver_path(path):
+        return await _handle_geoserver(request, log_context, path, request_body)
+
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)
 
@@ -3192,6 +3474,8 @@ def main() -> int:
         active.append("sonicwall-ssl-vpn")
     if CISCO_WEBVPN_ENABLED:
         active.append("cisco-webvpn")
+    if GEOSERVER_ENABLED:
+        active.append("geoserver")
     print(
         f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
         file=sys.stderr,

@@ -43,6 +43,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | Fake LLM-API endpoint | Ollama / OpenAI / Anthropic-proxy JSON on `/v1/models`, `/v1/chat/completions`, `/anthropic/v1/messages`, `/api/chat`, … ; logs model + auth header + prompt prefix — [docs](./docs/fake-llm-api.md) | 2026-04-20 | no |
 | Fake SonicWall SSL VPN | SonicOS 7 JSON responses on the three paths in the CVE-2024-53704 auth-bypass chain; logs submitted username, body sha + preview, and replayed session cookies — [docs](./docs/fake-sonicwall.md) | 2026-04-21 | no |
 | Fake Cisco WebVPN endpoint | Cisco SSL VPN landing page + launcher assets on `/+CSCOE+/...` and `/+CSCOL+/...`; logs exact path + method for multi-step probe correlation — [docs](./docs/fake-cisco-webvpn.md) | 2026-04-24 | no |
+| Fake GeoServer admin / OGC | GeoServer 2.x admin shell + About page + OGC `*_Capabilities` on `/geoserver/...`; flags OGNL/expression-language indicators in query string + body so CVE-2024-36401 payloads are easy to triage — [docs](./docs/fake-geoserver.md) | 2026-04-25 | no |
 
 All traps log one JSON line per event to the configured log path. See
 [`LOGS.md`](./LOGS.md) for the schema.
@@ -202,6 +203,7 @@ under [`docs/`](./docs/):
 - [Fake LLM-API endpoint](./docs/fake-llm-api.md)
 - [Fake SonicWall SSL VPN endpoint](./docs/fake-sonicwall.md)
 - [Fake Cisco WebVPN endpoint](./docs/fake-cisco-webvpn.md)
+- [Fake GeoServer admin / OGC](./docs/fake-geoserver.md)
 - [Fake webshell](./docs/fake-webshell.md)
 
 The other traps (`.env`, `/.git/`, canary file traps, tarpit +
