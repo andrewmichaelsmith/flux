@@ -78,14 +78,18 @@ Docs: [`CONFIG.md`](./CONFIG.md) (env vars) ·
 
 ## Canary file trap table
 
-### Design principle: every credential is per-hit and Tracebit-backed
+### Design principle: every credential is per-hit unique
 
-The point of a canary is that using it fires an alert at Tracebit. A
-trap renderer that ships a **fixed literal** credential (hardcoded DB
-password, hardcoded API key) provides no detection value — a replay
-triggers nothing — and ships the same string across every sensor in
-the fleet, which becomes a cross-sensor fingerprint. Every
-secret-shaped field in a rendered response must therefore be either:
+A trap renderer that ships a **fixed literal** credential (hardcoded
+DB password, hardcoded API key) provides no detection value — a
+replay triggers nothing — and ships the same string across every
+sensor in the fleet, which becomes a cross-sensor fingerprint. Every
+secret-shaped field in a rendered response must therefore be per-hit
+unique. We back it with Tracebit when that adds detection value
+(replay against AWS STS, the Tracebit-hosted gitlab URL, the Tracebit
+sshIp); when there's no matching canary type we fall back to a
+per-hit random synthetic. Concretely, every secret-shaped field is
+either:
 
 1. **A per-request Tracebit canary** — `_aws(r)` or
    `_gitlab_creds(r, ...)`. Fires when replayed against the matching
