@@ -1317,7 +1317,69 @@ async def issue_credentials(
         },
     ) as response:
         response.raise_for_status()
-        return await response.json()
+        result = await response.json()
+    _schedule_confirmations(result)
+    return result
+
+
+# Issued canaries don't show up as "active" in the Tracebit dashboard
+# until /confirm-credentials is POSTed with their confirmationId — the
+# OpenAPI spec is explicit about this. Without it, attackers harvesting
+# our /id_rsa, .env, etc. get valid canary creds, but the operator's
+# active-key list stays at whatever was confirmed manually. Fire one
+# best-effort confirmation per issued canary, in the background, so the
+# attacker-facing response isn't slowed by the extra round trip.
+_CONFIRM_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _extract_confirmation_ids(response: object) -> list[str]:
+    if not isinstance(response, dict):
+        return []
+    ids: list[str] = []
+    for block_key, id_field in (("aws", "awsConfirmationId"), ("ssh", "sshConfirmationId")):
+        block = response.get(block_key)
+        if isinstance(block, dict):
+            value = block.get(id_field)
+            if isinstance(value, str) and value:
+                ids.append(value)
+    http = response.get("http")
+    if isinstance(http, dict):
+        for details in http.values():
+            if isinstance(details, dict):
+                value = details.get("confirmationId")
+                if isinstance(value, str) and value:
+                    ids.append(value)
+    return ids
+
+
+async def confirm_credential(confirmation_id: str) -> None:
+    if not confirmation_id or not API_KEY:
+        return
+    confirm_url = f"{API_BASE_URL}/api/v1/credentials/confirm-credentials"
+    session = await _get_http_session()
+    try:
+        async with session.post(
+            confirm_url,
+            json={"id": confirmation_id},
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Accept": "application/json",
+            },
+        ) as response:
+            response.raise_for_status()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return
+
+
+def _schedule_confirmations(response: object) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    for confirmation_id in _extract_confirmation_ids(response):
+        task = loop.create_task(confirm_credential(confirmation_id))
+        _CONFIRM_TASKS.add(task)
+        task.add_done_callback(_CONFIRM_TASKS.discard)
 
 
 def format_env_payload(tracebit_response: dict[str, object]) -> str:

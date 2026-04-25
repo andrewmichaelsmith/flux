@@ -2032,6 +2032,185 @@ async def test_close_http_session_is_safe_when_nothing_opened():
     assert tbenv._http_session is None
 
 
+# --- /confirm-credentials ---
+#
+# Tracebit's dashboard only marks an issued canary as "active / deployed"
+# once /confirm-credentials is POSTed with its confirmationId. Without
+# this, the active-key list stays at whatever was confirmed manually
+# (the symptom the user noticed: only 3 active SSH keys despite many
+# id_rsa hits). These tests pin down extraction, dispatch, and the
+# wiring from issue_credentials.
+
+
+def test_extract_confirmation_ids_finds_aws_ssh_and_http():
+    ids = tbenv._extract_confirmation_ids(FAKE_TRACEBIT)
+    assert set(ids) == {"conf-aws-1", "conf-ssh-1", "conf-gup-1", "conf-gc-1"}
+
+
+def test_extract_confirmation_ids_skips_missing_or_malformed():
+    # Empty / non-dict / missing top-level keys — no ids, no exceptions.
+    assert tbenv._extract_confirmation_ids({}) == []
+    assert tbenv._extract_confirmation_ids(None) == []
+    assert tbenv._extract_confirmation_ids("not a dict") == []
+    # Block present but the confirmation id is missing or wrong shape.
+    assert tbenv._extract_confirmation_ids({"aws": {"awsAccessKeyId": "x"}}) == []
+    assert tbenv._extract_confirmation_ids({"ssh": {"sshConfirmationId": ""}}) == []
+    assert tbenv._extract_confirmation_ids({"http": {"x": {"confirmationId": None}}}) == []
+
+
+async def test_schedule_confirmations_fires_one_task_per_id(monkeypatch):
+    """_schedule_confirmations creates one create_task per extracted id,
+    each calling confirm_credential. Drains the tasks via asyncio.sleep
+    so the test is deterministic."""
+    seen: list[str] = []
+
+    async def fake_confirm(confirmation_id):
+        seen.append(confirmation_id)
+
+    monkeypatch.setattr(tbenv, "confirm_credential", fake_confirm)
+    tbenv._schedule_confirmations(FAKE_TRACEBIT)
+    # Yield to the event loop so the scheduled tasks run.
+    for _ in range(3):
+        import asyncio
+        await asyncio.sleep(0)
+    assert set(seen) == {"conf-aws-1", "conf-ssh-1", "conf-gup-1", "conf-gc-1"}
+
+
+async def test_schedule_confirmations_no_running_loop_is_silent():
+    """Called from a sync context (no loop) — must not raise. Lets us
+    keep _schedule_confirmations safe to call from anywhere without
+    extra guards at the caller."""
+    # Run inside a thread without an event loop.
+    import asyncio as _asyncio
+    import threading
+
+    errors: list[BaseException] = []
+
+    def runner():
+        try:
+            tbenv._schedule_confirmations(FAKE_TRACEBIT)
+        except BaseException as exc:  # pragma: no cover — failure path
+            errors.append(exc)
+
+    t = threading.Thread(target=runner)
+    t.start()
+    t.join(timeout=1.0)
+    assert errors == [], f"unexpected raise: {errors!r}"
+    _ = _asyncio  # keep import grouped with the other asyncio uses
+
+
+class _FakeResp:
+    def __init__(self, payload, *, status=200):
+        self._payload = payload
+        self.status = status
+        self.raised = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+    def raise_for_status(self):
+        self.raised = True
+
+    async def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    def __init__(self):
+        self.posts: list[tuple[str, dict]] = []
+        self.issue_payload: dict | None = None
+
+    def post(self, url, *, json=None, headers=None):
+        self.posts.append((url, json))
+        if "confirm-credentials" in url:
+            return _FakeResp(None, status=204)
+        return _FakeResp(self.issue_payload)
+
+
+async def test_issue_credentials_posts_confirm_for_each_canary_type(monkeypatch):
+    """End-to-end: issue_credentials returns the response and schedules a
+    /confirm-credentials POST for every confirmationId in it. This is the
+    bug fix — issued SSH keys (and aws / http canaries) now show up as
+    active in the Tracebit dashboard."""
+    fake = _FakeSession()
+    fake.issue_payload = FAKE_TRACEBIT
+
+    async def get_session():
+        return fake
+
+    monkeypatch.setattr(tbenv, "_get_http_session", get_session)
+    monkeypatch.setattr(tbenv, "API_KEY", "test-key")
+
+    result = await tbenv.issue_credentials(
+        request_id="req-1",
+        client_ip="203.0.113.50",
+        host="trap.example",
+        user_agent="curl/8",
+        path="/.env",
+        proto="https",
+    )
+    assert result is FAKE_TRACEBIT
+
+    # Drain the scheduled fire-and-forget confirmations.
+    import asyncio
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    issue_calls = [body for url, body in fake.posts if url.endswith("/issue-credentials")]
+    confirm_calls = [body for url, body in fake.posts if url.endswith("/confirm-credentials")]
+    assert len(issue_calls) == 1
+    assert {body["id"] for body in confirm_calls} == {
+        "conf-aws-1", "conf-ssh-1", "conf-gup-1", "conf-gc-1",
+    }
+
+
+async def test_confirm_credential_skips_when_api_key_missing(monkeypatch):
+    """No API_KEY → no POST. Mirrors the existing dispatch-time gating
+    so tests that null out API_KEY don't accidentally trigger network."""
+    posted: list[str] = []
+
+    class _Recorder:
+        def post(self, url, **_):
+            posted.append(url)
+            return _FakeResp(None)
+
+    async def get_session():
+        return _Recorder()
+
+    monkeypatch.setattr(tbenv, "_get_http_session", get_session)
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    await tbenv.confirm_credential("conf-x")
+    assert posted == []
+
+
+async def test_confirm_credential_swallows_network_errors(monkeypatch):
+    """Confirmation is best-effort — a Tracebit outage must not raise
+    out of the fire-and-forget task and crash the worker."""
+    import aiohttp as _aiohttp
+
+    class _BoomResp:
+        async def __aenter__(self):
+            raise _aiohttp.ClientConnectionError("connection refused")
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _BoomSession:
+        def post(self, *_a, **_kw):
+            return _BoomResp()
+
+    async def get_session():
+        return _BoomSession()
+
+    monkeypatch.setattr(tbenv, "_get_http_session", get_session)
+    monkeypatch.setattr(tbenv, "API_KEY", "test-key")
+    # Must return None without raising.
+    assert await tbenv.confirm_credential("conf-x") is None
+
+
 # --- Method handling ---
 
 
