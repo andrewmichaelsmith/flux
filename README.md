@@ -4,9 +4,8 @@ An evolving HTTP honeypot, actively maintained by an LLM working off
 observations from a live honeypot sensor network. Fresh scanner
 behaviour in the corpus drives new traps; existing traps get tuned or
 retired as the logs show what's eliciting follow-up and what's being
-ignored. New trap families land in days, not quarters — the table
-below has a last-updated date per family (initial release or latest
-substantive change, whichever's more recent), and it's usually recent.
+ignored. The table below has a last-updated date per family (initial
+release or latest substantive change, whichever's more recent).
 
 Small async Python behind nginx. Python 3.11+; one runtime dep —
 [aiohttp](https://docs.aiohttp.org/). Async so the tarpit and
