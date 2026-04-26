@@ -37,7 +37,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | --- | --- | --- | --- |
 | Fake `/.env` canary issuer | Mints a per-request Tracebit Community canary and returns it as a `.env`-style payload | 2026-04-22 | yes |
 | Fake `/.git/` repository | Serves a loose-object git tree whose `config/secrets.yml` embeds a canary AND whose `.git/config` `[remote "origin"] url` embeds the same canary as HTTP Basic userinfo — so scrapers that only fetch `.git/config` (without cloning) still walk away with a live canary. Matches `<prefix>/.git/*` (apps deployed at subpaths) and is case-insensitive on the `.git` segment; ships a minimal-valid `/.git/index` (DIRC header) so `git-dumper`-style tools don't bail on a missing index. Per-IP cached so fan-out sees a consistent tree | 2026-04-23 | yes |
-| Canary file traps | Plausible file-format responses for `/wp-config.php`, `/backup.sql`, `/id_rsa`, `/.aws/credentials`, `/api/v4/user`, `/users/sign_in`, `/actuator/env`, `/.vscode/sftp.json`, … — full table [below](#canary-file-trap-table) | 2026-04-26 | yes |
+| Canary file traps | Plausible file-format responses for `/wp-config.php`, `/backup.sql`, `/id_rsa`, `/.aws/credentials`, `/api/v4/user`, `/users/sign_in`, `/actuator/env`, `/.vscode/sftp.json`, CI/CD config files, … — full table [below](#canary-file-trap-table) | 2026-04-26 | yes |
 | AI-credential-file canaries | `/.openai/config.json`, `/.anthropic/config.json`, `/.cursor/mcp.json`, `/.claude/.credentials.json` — listed in the same table; broken out in the footnote because Tracebit has no LLM canary type yet | 2026-04-22 | yes |
 | Fake webshell | Plausible File Manager on known `*.php` shell probe paths plus shell-jacking regex families (`/.well-known/<name>.php`, `/.trash<N>/*`, `/.tmb/`, `/.dj/`, `/.alf/`, …); simulates `id` / `whoami` / `uname -a` / `cat /etc/passwd` on follow-up commands — [docs](./docs/fake-webshell.md) | 2026-04-22 | no |
 | Modular tarpit + fingerprinting | Slow-drip response plus six fingerprinting modules (cookie, ETag, redirect chain, variable drip, Content-Length mismatch, DNS callback); fires on `.env` variants and on configurable first-contact paths (`/`, `/index.html`, `/robots.txt`, …) | 2026-04-20 | no |
@@ -135,6 +135,11 @@ case-insensitive exact matches.
 | Firebase / GCP SA | `/firebase.json`, `/google-services.json`, `/serviceaccount.json`, `/service-account.json` | `aws` | `firebase-json` |
 | Docker client | `/.docker/config.json`, `/docker/config.json` | `aws` | `docker-config` |
 | Docker Compose | `/docker-compose.yml`, `/docker-compose.yaml`, `/compose.yml`, `/compose.yaml`, plus `.prod`, `.production`, `.dev`, `.staging`, `.override` variants (both `.yml` and `.yaml`) | `aws` | `docker-compose` |
+| GitHub Actions workflows | `/.github/workflows/{deploy,main,ci,build,test,docker,release,cd}.yml` plus `.yaml` variants | `aws` | `github-actions-workflow` |
+| GitLab CI config | `/.gitlab-ci.yml`, `/.gitlab-ci.yaml`, `/.gitlab/.gitlab-ci.yml` | `aws` | `gitlab-ci` |
+| Jenkins Pipeline | `/Jenkinsfile`, `/Jenkinsfile.bak` | `aws` | `jenkinsfile` |
+| Bitbucket Pipelines | `/bitbucket-pipelines.yml`, `/bitbucket-pipelines.yaml` | `aws` | `bitbucket-pipelines` |
+| Generic CI deploy config | `/appveyor.yml`, `/.circleci/config.yml`, `/azure-pipelines.yml`, `/deployment.yml`, `/deploy.yml`, `/drone.yml`, `/.drone.yml` plus `.yaml` variants where applicable | `aws` | `generic-ci-config` |
 | Spring properties | `/application.properties` | `aws` | `application-properties` |
 | Spring YAML | `/application.yml`, `/application.yaml` | `aws` | `application-yml` |
 | Spring Boot Actuator `/env` | `/actuator/env`, `/actuator/env.json`, `/env`, `/manage/env`, `/management/env`, `/api/actuator/env` | `aws` | `actuator-env` |
@@ -214,6 +219,7 @@ under [`docs/`](./docs/):
 - [Fake GeoServer admin / OGC](./docs/fake-geoserver.md)
 - [Fake ColdFusion admin / component browser](./docs/fake-coldfusion.md)
 - [Cmd-injection / printenv responder](./docs/cmd-injection.md)
+- [CI/CD config canaries](./docs/ci-cd-config.md)
 - [Fake webshell](./docs/fake-webshell.md)
 
 The other traps (`.env`, `/.git/`, canary file traps, tarpit +

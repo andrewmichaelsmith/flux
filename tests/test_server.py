@@ -419,6 +419,11 @@ FAKE_TRACEBIT = {
     ("/docker-compose.production.yaml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
     ("/docker-compose.staging.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
     ("/docker-compose.override.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
+    ("/.github/workflows/ci.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
+    ("/.gitlab-ci.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
+    ("/jenkinsfile", b"AWS_ACCESS_KEY_ID = 'AKIAFAKEEXAMPLE01'"),
+    ("/bitbucket-pipelines.yml", b"export AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/appveyor.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
     ("/actuator/env", b'"AWS_ACCESS_KEY_ID"'),
     ("/actuator/env", b'"value": "AKIAFAKEEXAMPLE01"'),
     ("/env", b'"activeProfiles"'),
@@ -474,6 +479,11 @@ def test_canary_trap_renderers_embed_canary(path, needle):
     "/application.yml",
     "/.env.production",
     "/phpinfo.php",
+    "/.github/workflows/ci.yml",
+    "/.gitlab-ci.yml",
+    "/jenkinsfile",
+    "/bitbucket-pipelines.yml",
+    "/appveyor.yml",
 ])
 def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
     # Regression: the ``h6T!9pq2Wz@LmRnV`` / ``prod_rw`` DB-password literal
@@ -2704,3 +2714,42 @@ async def test_dispatch_sftp_config_returns_canary_json(flux_client, monkeypatch
     assert body["password"] == "p@ssCanaryValue"
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "sftp-config"
+
+
+# --- CI/CD config canary trap ---
+
+
+def test_ci_cd_config_paths_registered():
+    expected = {
+        "/.github/workflows/deploy.yml": "github-actions-workflow",
+        "/.github/workflows/ci.yml": "github-actions-workflow",
+        "/.github/workflows/docker.yml": "github-actions-workflow",
+        "/.gitlab-ci.yml": "gitlab-ci",
+        "/.gitlab/.gitlab-ci.yml": "gitlab-ci",
+        "/Jenkinsfile": "jenkinsfile",
+        "/bitbucket-pipelines.yml": "bitbucket-pipelines",
+        "/appveyor.yml": "generic-ci-config",
+        "/.circleci/config.yml": "generic-ci-config",
+        "/azure-pipelines.yml": "generic-ci-config",
+        "/deployment.yml": "generic-ci-config",
+    }
+    for path, name in expected.items():
+        trap = tbenv.find_canary_trap(path)
+        assert trap is not None, f"missing trap: {path}"
+        assert trap.name == name
+
+
+async def test_dispatch_github_actions_workflow_returns_canary_yml(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(
+        "/.github/workflows/ci.yml",
+        headers={"X-Forwarded-For": "203.0.113.91"},
+    )
+    assert resp.status == 200
+    body = await resp.text()
+    assert "AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01" in body
+    assert "aws s3 sync" in body
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "github-actions-workflow"

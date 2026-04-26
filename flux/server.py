@@ -2318,6 +2318,144 @@ def render_docker_compose_yml(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_github_actions_workflow(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    deploy_password = _fake_db_password()
+    return (
+        "name: deploy\n"
+        "\n"
+        "on:\n"
+        "  push:\n"
+        "    branches: [main]\n"
+        "  workflow_dispatch:\n"
+        "\n"
+        "jobs:\n"
+        "  deploy:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    env:\n"
+        "      AWS_DEFAULT_REGION: us-east-1\n"
+        f"      AWS_ACCESS_KEY_ID: {aws.get('awsAccessKeyId', '')}\n"
+        f"      AWS_SECRET_ACCESS_KEY: {aws.get('awsSecretAccessKey', '')}\n"
+        f"      AWS_SESSION_TOKEN: {aws.get('awsSessionToken', '')}\n"
+        f"      DATABASE_URL: postgresql://ci_deploy:{deploy_password}@db.internal:5432/prod\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - uses: actions/setup-node@v4\n"
+        "        with:\n"
+        "          node-version: '22'\n"
+        "      - run: npm ci && npm run build\n"
+        "      - run: aws s3 sync dist/ s3://internal-tools-prod --delete\n"
+        "      - run: aws cloudfront create-invalidation --distribution-id E2INTERNAL --paths '/*'\n"
+    ).encode("utf-8")
+
+
+def render_gitlab_ci_yml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    deploy_password = _fake_db_password()
+    return (
+        "stages:\n"
+        "  - test\n"
+        "  - build\n"
+        "  - deploy\n"
+        "\n"
+        "variables:\n"
+        "  AWS_DEFAULT_REGION: us-east-1\n"
+        f"  AWS_ACCESS_KEY_ID: {aws.get('awsAccessKeyId', '')}\n"
+        f"  AWS_SECRET_ACCESS_KEY: {aws.get('awsSecretAccessKey', '')}\n"
+        f"  AWS_SESSION_TOKEN: {aws.get('awsSessionToken', '')}\n"
+        f"  DATABASE_URL: postgresql://ci_deploy:{deploy_password}@db.internal:5432/prod\n"
+        "\n"
+        "build-image:\n"
+        "  stage: build\n"
+        "  image: docker:27\n"
+        "  services:\n"
+        "    - docker:27-dind\n"
+        "  script:\n"
+        "    - docker build -t registry.internal/tools:$CI_COMMIT_SHA .\n"
+        "\n"
+        "deploy-production:\n"
+        "  stage: deploy\n"
+        "  image: amazon/aws-cli:2.15.57\n"
+        "  only:\n"
+        "    - main\n"
+        "  script:\n"
+        "    - aws ecs update-service --cluster prod --service internal-tools --force-new-deployment\n"
+    ).encode("utf-8")
+
+
+def render_jenkinsfile(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    deploy_password = _fake_db_password()
+    return (
+        "pipeline {\n"
+        "  agent any\n"
+        "  environment {\n"
+        "    AWS_DEFAULT_REGION = 'us-east-1'\n"
+        f"    AWS_ACCESS_KEY_ID = '{aws.get('awsAccessKeyId', '')}'\n"
+        f"    AWS_SECRET_ACCESS_KEY = '{aws.get('awsSecretAccessKey', '')}'\n"
+        f"    AWS_SESSION_TOKEN = '{aws.get('awsSessionToken', '')}'\n"
+        f"    DATABASE_URL = 'postgresql://ci_deploy:{deploy_password}@db.internal:5432/prod'\n"
+        "  }\n"
+        "  stages {\n"
+        "    stage('Build') {\n"
+        "      steps { sh 'npm ci && npm run build' }\n"
+        "    }\n"
+        "    stage('Deploy') {\n"
+        "      when { branch 'main' }\n"
+        "      steps { sh 'aws ecs update-service --cluster prod --service internal-tools --force-new-deployment' }\n"
+        "    }\n"
+        "  }\n"
+        "}\n"
+    ).encode("utf-8")
+
+
+def render_bitbucket_pipelines_yml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    deploy_password = _fake_db_password()
+    return (
+        "image: node:22\n"
+        "\n"
+        "pipelines:\n"
+        "  branches:\n"
+        "    main:\n"
+        "      - step:\n"
+        "          name: Build and deploy\n"
+        "          caches:\n"
+        "            - node\n"
+        "          script:\n"
+        "            - export AWS_DEFAULT_REGION=us-east-1\n"
+        f"            - export AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"            - export AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"            - export AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        f"            - export DATABASE_URL=postgresql://ci_deploy:{deploy_password}@db.internal:5432/prod\n"
+        "            - npm ci\n"
+        "            - npm run build\n"
+        "            - pipe: atlassian/aws-s3-deploy:1.6.0\n"
+        "              variables:\n"
+        "                S3_BUCKET: internal-tools-prod\n"
+        "                LOCAL_PATH: dist\n"
+    ).encode("utf-8")
+
+
+def render_generic_ci_yml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    deploy_password = _fake_db_password()
+    return (
+        "version: 1\n"
+        "name: internal-tools-deploy\n"
+        "environment:\n"
+        "  AWS_DEFAULT_REGION: us-east-1\n"
+        f"  AWS_ACCESS_KEY_ID: {aws.get('awsAccessKeyId', '')}\n"
+        f"  AWS_SECRET_ACCESS_KEY: {aws.get('awsSecretAccessKey', '')}\n"
+        f"  AWS_SESSION_TOKEN: {aws.get('awsSessionToken', '')}\n"
+        f"  DATABASE_URL: postgresql://ci_deploy:{deploy_password}@db.internal:5432/prod\n"
+        "steps:\n"
+        "  - checkout\n"
+        "  - run: npm ci && npm run build\n"
+        "  - run: aws deploy push --application-name internal-tools --s3-location s3://internal-tools-deploy/app.zip\n"
+    ).encode("utf-8")
+
+
 def render_application_properties(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     db_password = _fake_db_password()
@@ -2875,6 +3013,71 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ),
         ("aws",),
         render_docker_compose_yml,
+        "application/yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "github-actions-workflow",
+        (
+            "/.github/workflows/deploy.yml",
+            "/.github/workflows/deploy.yaml",
+            "/.github/workflows/main.yml",
+            "/.github/workflows/main.yaml",
+            "/.github/workflows/ci.yml",
+            "/.github/workflows/ci.yaml",
+            "/.github/workflows/build.yml",
+            "/.github/workflows/build.yaml",
+            "/.github/workflows/test.yml",
+            "/.github/workflows/test.yaml",
+            "/.github/workflows/docker.yml",
+            "/.github/workflows/docker.yaml",
+            "/.github/workflows/release.yml",
+            "/.github/workflows/release.yaml",
+            "/.github/workflows/cd.yml",
+            "/.github/workflows/cd.yaml",
+        ),
+        ("aws",),
+        render_github_actions_workflow,
+        "application/yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "gitlab-ci",
+        ("/.gitlab-ci.yml", "/.gitlab-ci.yaml", "/.gitlab/.gitlab-ci.yml"),
+        ("aws",),
+        render_gitlab_ci_yml,
+        "application/yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "jenkinsfile",
+        ("/jenkinsfile", "/jenkinsfile.bak"),
+        ("aws",),
+        render_jenkinsfile,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "bitbucket-pipelines",
+        ("/bitbucket-pipelines.yml", "/bitbucket-pipelines.yaml"),
+        ("aws",),
+        render_bitbucket_pipelines_yml,
+        "application/yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "generic-ci-config",
+        (
+            "/appveyor.yml",
+            "/appveyor.yaml",
+            "/.circleci/config.yml",
+            "/.circleci/config.yaml",
+            "/azure-pipelines.yml",
+            "/azure-pipelines.yaml",
+            "/deployment.yml",
+            "/deployment.yaml",
+            "/deploy.yml",
+            "/deploy.yaml",
+            "/drone.yml",
+            "/.drone.yml",
+        ),
+        ("aws",),
+        render_generic_ci_yml,
         "application/yaml; charset=utf-8",
     ),
     CanaryTrap(
