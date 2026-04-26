@@ -352,6 +352,7 @@ def test_all_trap_families_default_on():
     assert tbenv.CISCO_WEBVPN_ENABLED
     assert tbenv.GEOSERVER_ENABLED
     assert tbenv.COLDFUSION_ENABLED
+    assert tbenv.CMD_INJECTION_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -2401,3 +2402,305 @@ async def test_dispatch_rejects_unsupported_methods(flux_client):
     downstream and stops tarpit/canary logic from running on odd verbs."""
     resp = await flux_client.put("/anything", data=b"x")
     assert resp.status == 405
+
+
+# --- Cmd-injection trap (/admin/config?cmd=, /printenv, /cgi-bin/printenv) ---
+
+
+def test_cmd_injection_enabled_by_default():
+    assert tbenv.CMD_INJECTION_ENABLED
+
+
+def test_cmd_injection_default_paths_cover_observed_family():
+    for path in (
+        "/admin/config",
+        "/printenv",
+        "/cgi-bin/printenv",
+        "/cgi-bin/test-cgi",
+    ):
+        assert tbenv.is_cmd_injection_path(path), f"expected match: {path}"
+
+
+def test_cmd_injection_path_non_match():
+    for path in ["/", "/admin", "/admin/", "/admin/config.php", "/printenv.php", "/etc/printenv"]:
+        assert not tbenv.is_cmd_injection_path(path), f"unexpected match: {path}"
+
+
+def test_cmd_injection_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "CMD_INJECTION_ENABLED", False)
+    assert not tbenv.is_cmd_injection_path("/admin/config")
+    assert not tbenv.is_cmd_injection_path("/printenv")
+
+
+def test_classify_cmd_injection_command_creds():
+    for cmd in (
+        "cat /root/.aws/credentials",
+        "cat ~/.aws/credentials",
+        "cat /home/ubuntu/.aws/credentials",
+        "  cat   /root/.aws/credentials  ",
+    ):
+        assert tbenv.classify_cmd_injection_command(cmd) == "creds-aws", cmd
+
+
+def test_classify_cmd_injection_command_aws_config():
+    assert tbenv.classify_cmd_injection_command("cat /root/.aws/config") == "creds-aws-config"
+
+
+def test_classify_cmd_injection_command_passwd_env_id_uname():
+    assert tbenv.classify_cmd_injection_command("cat /etc/passwd") == "passwd"
+    assert tbenv.classify_cmd_injection_command("cat /etc/shadow") == "passwd"
+    assert tbenv.classify_cmd_injection_command("printenv") == "env"
+    assert tbenv.classify_cmd_injection_command("env") == "env"
+    assert tbenv.classify_cmd_injection_command("id") == "id"
+    assert tbenv.classify_cmd_injection_command("whoami") == "whoami"
+    assert tbenv.classify_cmd_injection_command("uname -a") == "uname"
+    assert tbenv.classify_cmd_injection_command("uname") == "uname"
+    assert tbenv.classify_cmd_injection_command("hostname") == "hostname"
+    assert tbenv.classify_cmd_injection_command("pwd") == "pwd"
+    assert tbenv.classify_cmd_injection_command("ls -la") == "ls"
+
+
+def test_classify_cmd_injection_command_unknown():
+    assert tbenv.classify_cmd_injection_command("rm -rf /") == "unknown"
+    assert tbenv.classify_cmd_injection_command("nonsense") == "unknown"
+    assert tbenv.classify_cmd_injection_command("") == ""
+
+
+def test_extract_cmd_injection_command_prefers_query_then_form():
+    src, key, cmd = tbenv.extract_cmd_injection_command(
+        {"cmd": ["whoami"]}, {"cmd": ["id"]},
+    )
+    assert (src, key, cmd) == ("query", "cmd", "whoami")
+    src, key, cmd = tbenv.extract_cmd_injection_command(
+        {}, {"command": ["whoami"]},
+    )
+    assert (src, key, cmd) == ("form", "command", "whoami")
+    src, key, cmd = tbenv.extract_cmd_injection_command({}, {})
+    assert (src, key, cmd) == ("", "", "")
+
+
+def test_render_printenv_dump_embeds_aws_canary():
+    body = tbenv.render_printenv_dump(FAKE_TRACEBIT, host="victim.example").decode("utf-8")
+    assert "AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
+    assert "HOSTNAME=victim.example" in body
+    # Per-hit unique synthetic DB password — must not be a fixed literal.
+    body2 = tbenv.render_printenv_dump(FAKE_TRACEBIT, host="victim.example").decode("utf-8")
+    pw1 = next(line for line in body.split("\n") if line.startswith("DATABASE_URL="))
+    pw2 = next(line for line in body2.split("\n") if line.startswith("DATABASE_URL="))
+    assert pw1 != pw2, "DATABASE_URL must contain a per-hit-unique password"
+
+
+def test_render_printenv_dump_sanitises_host_header():
+    """An attacker-controlled Host can't smuggle newlines/control chars or
+    `=` (which would forge a fake env line) into the dump."""
+    body = tbenv.render_printenv_dump(
+        FAKE_TRACEBIT, host="victim.example\nINJECTED=yes",
+    ).decode("utf-8")
+    # The newline and `=` are stripped — the leftover chars get appended to
+    # the hostname token but can't break out of the line.
+    hostname_lines = [ln for ln in body.split("\n") if ln.startswith("HOSTNAME=")]
+    assert len(hostname_lines) == 1, f"hostname must be one line: {hostname_lines}"
+    # Two lines named SERVER_NAME and HOSTNAME — both share the sanitized host.
+    server_name_lines = [ln for ln in body.split("\n") if ln.startswith("SERVER_NAME=")]
+    assert len(server_name_lines) == 1
+    # No control character survived.
+    assert "\n" not in hostname_lines[0]
+
+
+async def test_dispatch_admin_config_no_cmd_returns_landing(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "CMD_INJECTION_ENABLED", True)
+    resp = await flux_client.get(
+        "/admin/config",
+        headers={"X-Forwarded-For": "203.0.113.80"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Admin Configuration" in text
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "cmd-injection-probe"
+    assert entries[-1]["cmd"] == ""
+    assert entries[-1]["cmdFamily"] == ""
+
+
+async def test_dispatch_admin_config_cmd_creds_issues_canary(flux_client, monkeypatch):
+    """cat /root/.aws/credentials → AWS canary in the response body, logged
+    as cmd-injection-creds-leak with cmdFamily=creds-aws."""
+    monkeypatch.setattr(tbenv, "CMD_INJECTION_ENABLED", True)
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(
+        "/admin/config?cmd=cat%20/root/.aws/credentials",
+        headers={"X-Forwarded-For": "203.0.113.81"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"AKIAFAKEEXAMPLE01" in body, body
+    assert b"aws_secret_access_key" in body
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cmd-injection-creds-leak"
+    assert entry["cmdFamily"] == "creds-aws"
+    assert entry["cmdSource"] == "query"
+    assert entry["cmdKey"] == "cmd"
+    assert entry["canaryStatus"] == "issued"
+
+
+async def test_dispatch_admin_config_cmd_passwd_returns_static(flux_client, monkeypatch):
+    """Non-credential commands return static fake output and do NOT mint a
+    Tracebit canary."""
+    monkeypatch.setattr(tbenv, "CMD_INJECTION_ENABLED", True)
+    # No API_KEY needed — no canary is issued for /etc/passwd.
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    resp = await flux_client.get(
+        "/admin/config?cmd=cat%20/etc/passwd",
+        headers={"X-Forwarded-For": "203.0.113.82"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"root:x:0:0:root" in body
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cmd-injection-command"
+    assert entry["cmdFamily"] == "passwd"
+
+
+async def test_dispatch_admin_config_cmd_id_uses_simulate(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "CMD_INJECTION_ENABLED", True)
+    resp = await flux_client.get(
+        "/admin/config?cmd=id",
+        headers={"X-Forwarded-For": "203.0.113.83"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"uid=33(www-data)" in body
+
+
+async def test_dispatch_printenv_always_issues_canary(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "CMD_INJECTION_ENABLED", True)
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(
+        "/printenv",
+        headers={"X-Forwarded-For": "203.0.113.84"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"AWS_SECRET_ACCESS_KEY=" in body
+    assert b"AKIAFAKEEXAMPLE01" in body
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cmd-injection-printenv"
+    assert entry["cmdFamily"] == "env"
+
+
+async def test_dispatch_cgi_bin_printenv_routes_through_handler(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "CMD_INJECTION_ENABLED", True)
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(
+        "/cgi-bin/printenv",
+        headers={"X-Forwarded-For": "203.0.113.85"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cmd-injection-printenv"
+
+
+async def test_dispatch_admin_config_form_post_extracts_cmd(flux_client, monkeypatch):
+    """POST with form-encoded body should also surface the cmd value."""
+    monkeypatch.setattr(tbenv, "CMD_INJECTION_ENABLED", True)
+    resp = await flux_client.post(
+        "/admin/config",
+        data="cmd=whoami",
+        headers={
+            "X-Forwarded-For": "203.0.113.86",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["cmdSource"] == "form"
+    assert entry["cmd"] == "whoami"
+
+
+async def test_dispatch_cmd_injection_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "CMD_INJECTION_ENABLED", False)
+    resp = await flux_client.get("/admin/config?cmd=id", headers={"X-Forwarded-For": "203.0.113.87"})
+    assert resp.status == 404
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "not-handled"
+
+
+async def test_cmd_injection_canary_failure_falls_back_to_static(flux_client, monkeypatch):
+    """If Tracebit issuance fails for a creds-aws cmd, log it but still 200
+    with an empty body (no canary leaked, no 502 to tip off the scanner)."""
+    monkeypatch.setattr(tbenv, "CMD_INJECTION_ENABLED", True)
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+
+    async def _failed(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _failed)
+    resp = await flux_client.get(
+        "/admin/config?cmd=cat%20/root/.aws/credentials",
+        headers={"X-Forwarded-For": "203.0.113.88"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["canaryStatus"] == "issue-failed"
+    assert entry["cmdFamily"] == "creds-aws"
+
+
+# --- wp-config suffix-variant expansion ---
+
+
+def test_wp_config_canary_covers_editor_leftover_suffixes():
+    """The April 2026 not-handled audit found .save / .swp / .~ / .bak / .txt
+    variants outnumbering the bare /wp-config.php — make sure the canary trap
+    intercepts every plausible save/swap/comment shape."""
+    for path in (
+        "/wp-config.php.save",
+        "/wp-config.php.swp",
+        "/wp-config.php.swo",
+        "/wp-config.php.old",
+        "/wp-config.php.orig",
+        "/wp-config.php.txt",
+        "/wp-config.php~",
+        "/wp-config.bak",
+    ):
+        assert tbenv.find_canary_trap(path) is not None, f"missing trap: {path}"
+
+
+# --- sftp-config canary trap ---
+
+
+def test_sftp_config_paths_registered():
+    for path in (
+        "/.vscode/sftp.json",
+        "/sftp-config.json",
+        "/sftp.json",
+        "/.ftpconfig",
+    ):
+        trap = tbenv.find_canary_trap(path)
+        assert trap is not None, f"missing trap: {path}"
+        assert trap.name == "sftp-config"
+
+
+def test_render_sftp_config_json_embeds_gitlab_credentials():
+    body = tbenv.render_sftp_config_json(FAKE_TRACEBIT)
+    payload = json.loads(body)
+    assert payload["username"] == "deploybot42"
+    assert payload["password"] == "p@ssCanaryValue"
+    assert payload["protocol"] == "sftp"
+
+
+async def test_dispatch_sftp_config_returns_canary_json(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(
+        "/.vscode/sftp.json",
+        headers={"X-Forwarded-For": "203.0.113.90"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["password"] == "p@ssCanaryValue"
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "sftp-config"

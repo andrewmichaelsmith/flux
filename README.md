@@ -37,7 +37,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | --- | --- | --- | --- |
 | Fake `/.env` canary issuer | Mints a per-request Tracebit Community canary and returns it as a `.env`-style payload | 2026-04-22 | yes |
 | Fake `/.git/` repository | Serves a loose-object git tree whose `config/secrets.yml` embeds a canary AND whose `.git/config` `[remote "origin"] url` embeds the same canary as HTTP Basic userinfo — so scrapers that only fetch `.git/config` (without cloning) still walk away with a live canary. Matches `<prefix>/.git/*` (apps deployed at subpaths) and is case-insensitive on the `.git` segment; ships a minimal-valid `/.git/index` (DIRC header) so `git-dumper`-style tools don't bail on a missing index. Per-IP cached so fan-out sees a consistent tree | 2026-04-23 | yes |
-| Canary file traps | Plausible file-format responses for `/wp-config.php`, `/backup.sql`, `/id_rsa`, `/.aws/credentials`, `/api/v4/user`, `/users/sign_in`, `/actuator/env`, … — full table [below](#canary-file-trap-table) | 2026-04-26 | yes |
+| Canary file traps | Plausible file-format responses for `/wp-config.php`, `/backup.sql`, `/id_rsa`, `/.aws/credentials`, `/api/v4/user`, `/users/sign_in`, `/actuator/env`, `/.vscode/sftp.json`, … — full table [below](#canary-file-trap-table) | 2026-04-26 | yes |
 | AI-credential-file canaries | `/.openai/config.json`, `/.anthropic/config.json`, `/.cursor/mcp.json`, `/.claude/.credentials.json` — listed in the same table; broken out in the footnote because Tracebit has no LLM canary type yet | 2026-04-22 | yes |
 | Fake webshell | Plausible File Manager on known `*.php` shell probe paths plus shell-jacking regex families (`/.well-known/<name>.php`, `/.trash<N>/*`, `/.tmb/`, `/.dj/`, `/.alf/`, …); simulates `id` / `whoami` / `uname -a` / `cat /etc/passwd` on follow-up commands — [docs](./docs/fake-webshell.md) | 2026-04-22 | no |
 | Modular tarpit + fingerprinting | Slow-drip response plus six fingerprinting modules (cookie, ETag, redirect chain, variable drip, Content-Length mismatch, DNS callback); fires on `.env` variants and on configurable first-contact paths (`/`, `/index.html`, `/robots.txt`, …) | 2026-04-20 | no |
@@ -46,6 +46,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | Fake Cisco WebVPN endpoint | Cisco SSL VPN landing page + launcher assets on `/+CSCOE+/...` and `/+CSCOL+/...`; logs exact path + method for multi-step probe correlation — [docs](./docs/fake-cisco-webvpn.md) | 2026-04-24 | no |
 | Fake GeoServer admin / OGC | GeoServer 2.x admin shell + About page + OGC `*_Capabilities` on `/geoserver/...`; flags OGNL/expression-language indicators in query string + body so CVE-2024-36401 payloads are easy to triage — [docs](./docs/fake-geoserver.md) | 2026-04-25 | no |
 | Fake ColdFusion admin / component browser | ColdFusion public `.cfm` anchors plus `/CFIDE/componentutils/`, Administrator, and AdminAPI surfaces; logs method, auth/session hints, and exploit payload indicators — [docs](./docs/fake-coldfusion.md) | 2026-04-25 | no |
+| Cmd-injection / printenv responder | `/admin/config?cmd=…` (admin-shell exploit shape) plus `/printenv`, `/cgi-bin/printenv`, `/cgi-bin/test-cgi`; classifies the cmd value, returns a plausible `cat /etc/passwd` / `id` / `uname` body, and mints a per-request Tracebit AWS canary when the cmd asks for `~/.aws/credentials` or env vars — [docs](./docs/cmd-injection.md) | 2026-04-26 | yes |
 
 All traps log one JSON line per event to the configured log path. See
 [`LOGS.md`](./LOGS.md) for the schema.
@@ -127,9 +128,10 @@ case-insensitive exact matches.
 | AWS credentials file (INI) | `/.aws/credentials` | `aws` | `aws-credentials-file` |
 | AWS SDK config (INI) | `/.aws/config` | `aws` | `aws-config-file` |
 | Postgres pgpass | `/.pgpass` | `gitlab-username-password` | `pgpass` |
-| WordPress config | `/wp-config.php`, backup/text/swap variants (`.bak`, `.old`, `.save`, `.txt`, `.swp`, `~`, `::$DATA`), `/wp-config-backup.php`, `/backup/wp-config.php`, and the observed double-encoded `.bak` form | `aws` | `wp-config` |
+| WordPress config | `/wp-config.php` plus editor-leftover suffix variants (`.bak`, `.save`, `.swp`, `.swo`, `.old`, `.orig`, `.txt`, `~`, `::$DATA`) and short/relocation forms (`/wp-config.bak`, `/wp-config.old`, `/wp-config.txt`, `/wp-config-backup.php`, `/backup/wp-config.php`); also matches the observed double-encoded `.bak` form | `aws` | `wp-config` |
 | SQL dump | `/backup.sql`, `/db.sql`, `/dump.sql`, `/database.sql`, `/backup/db.sql`, `/sql/backup.sql` | `aws` | `sql-dump` |
 | Generic JSON config | `/config.json`, `/settings.json`, `/credentials.json`, `/secrets.json` | `aws` | `config-json` |
+| SFTP deploy config | `/.vscode/sftp.json`, `/sftp-config.json`, `/sftp.json`, `/.ftpconfig` | `gitlab-username-password` | `sftp-config` |
 | Firebase / GCP SA | `/firebase.json`, `/google-services.json`, `/serviceaccount.json`, `/service-account.json` | `aws` | `firebase-json` |
 | Docker client | `/.docker/config.json`, `/docker/config.json` | `aws` | `docker-config` |
 | Docker Compose | `/docker-compose.yml`, `/docker-compose.yaml`, `/compose.yml`, `/compose.yaml`, plus `.prod`, `.production`, `.dev`, `.staging`, `.override` variants (both `.yml` and `.yaml`) | `aws` | `docker-compose` |
@@ -211,6 +213,7 @@ under [`docs/`](./docs/):
 - [Fake Cisco WebVPN endpoint](./docs/fake-cisco-webvpn.md)
 - [Fake GeoServer admin / OGC](./docs/fake-geoserver.md)
 - [Fake ColdFusion admin / component browser](./docs/fake-coldfusion.md)
+- [Cmd-injection / printenv responder](./docs/cmd-injection.md)
 - [Fake webshell](./docs/fake-webshell.md)
 
 The other traps (`.env`, `/.git/`, canary file traps, tarpit +

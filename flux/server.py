@@ -318,6 +318,45 @@ COLDFUSION_PATHS = {
 }
 COLDFUSION_VERSION = (os.environ.get("HONEYPOT_COLDFUSION_VERSION") or "2021.0.05").strip()
 
+# --- Fake command-injection / env-leak responder -------------------------
+# Two distinct shapes routed through one handler:
+#
+#   /admin/config?cmd=...   — generic "exposed admin endpoint that runs a
+#       shell command from the cmd= query param" pattern. Scanners enumerate
+#       this against admin/config/router/router-config etc. We extract the
+#       cmd value, classify it, and return plausible output. Crucially, when
+#       the cmd asks for a credential file (cat /root/.aws/credentials and
+#       friends) we mint a Tracebit AWS canary and return it as the "leaked"
+#       file contents — turning the probe into a credential-replay trap.
+#
+#   /printenv, /cgi-bin/printenv, /cgi-bin/test-cgi — Apache demo CGI scripts
+#       that print the runtime environment. Enabled-by-default on misconfigured
+#       boxes since the 1990s and still hunted because the env block tends to
+#       carry AWS_*, DATABASE_URL, etc. We always 200 here with a fake env
+#       block whose AWS_* values are a Tracebit canary; per-IP cache bounds
+#       quota burn (one canary per source per cache TTL).
+#
+# Default-on; no env var per-trap to disable. Per-IP cache caps Tracebit
+# spend the same way fake-git does.
+CMD_INJECTION_ENABLED = _env_bool("HONEYPOT_CMD_INJECTION_ENABLED")
+_CMD_INJECTION_DEFAULT_PATHS = ",".join([
+    "/admin/config",
+    "/printenv",
+    "/cgi-bin/printenv",
+    "/cgi-bin/test-cgi",
+])
+CMD_INJECTION_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_CMD_INJECTION_PATHS_CSV") or _CMD_INJECTION_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# Param names commonly used to smuggle the command in cmd-injection probes.
+# Distinct from the webshell list because that one is biased toward PHP
+# webshells (`c`, `pass`, `key`); cmd-injection probes against admin-config
+# endpoints overwhelmingly use `cmd` itself, with `command` and `exec` as
+# minor variants.
+CMD_INJECTION_COMMAND_KEYS = ("cmd", "command", "exec", "c")
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -480,6 +519,78 @@ def is_geoserver_path(path: str) -> bool:
     if p == "/geoserver":
         return True
     return p.startswith("/geoserver/")
+
+
+def is_cmd_injection_path(path: str) -> bool:
+    if not CMD_INJECTION_ENABLED:
+        return False
+    return path.lower() in CMD_INJECTION_PATHS
+
+
+# Regex that matches a `cat`-of-a-credential-file probe. Supports URL-decoded
+# `cat /root/.aws/credentials`, tilde-home `cat ~/.aws/credentials`, and
+# `aws/config` as the second-most-common variant. Whitespace is normalised
+# before matching so single/multi/tab separators all work.
+_CRED_FILE_AWS_CREDS_RE = re.compile(
+    r"\bcat\s+(/root/|~/|/home/[^/]+/)?\.aws/credentials\b",
+)
+_CRED_FILE_AWS_CONFIG_RE = re.compile(
+    r"\bcat\s+(/root/|~/|/home/[^/]+/)?\.aws/config\b",
+)
+_PASSWD_RE = re.compile(r"\bcat\s+/etc/(passwd|shadow)\b")
+_PRINTENV_RE = re.compile(r"\b(printenv|env)\b\s*$")
+_HOSTNAME_RE = re.compile(r"^\s*hostname\s*$")
+_ID_RE = re.compile(r"^\s*id\s*$")
+_WHOAMI_RE = re.compile(r"^\s*whoami\s*$")
+_UNAME_RE = re.compile(r"^\s*uname(\s+-[arms]+)?\s*$")
+_PWD_RE = re.compile(r"^\s*pwd\s*$")
+_LS_RE = re.compile(r"^\s*ls(\s+-[la]+)?\s*$")
+
+
+def classify_cmd_injection_command(command: str) -> str:
+    """Return the family tag for the command. Used to route to a renderer
+    and to label the log row for triage. 'unknown' for anything we don't
+    recognise — those get an empty body, matching shell behaviour for
+    assignments / builtins like `cd`."""
+    if not command:
+        return ""
+    norm = " ".join(command.split())  # collapse whitespace
+    norm_lower = norm.lower()
+    if _CRED_FILE_AWS_CREDS_RE.search(norm_lower):
+        return "creds-aws"
+    if _CRED_FILE_AWS_CONFIG_RE.search(norm_lower):
+        return "creds-aws-config"
+    if _PASSWD_RE.search(norm_lower):
+        return "passwd"
+    if _PRINTENV_RE.search(norm_lower):
+        return "env"
+    if _ID_RE.match(norm_lower):
+        return "id"
+    if _WHOAMI_RE.match(norm_lower):
+        return "whoami"
+    if _UNAME_RE.match(norm_lower):
+        return "uname"
+    if _HOSTNAME_RE.match(norm_lower):
+        return "hostname"
+    if _PWD_RE.match(norm_lower):
+        return "pwd"
+    if _LS_RE.match(norm_lower):
+        return "ls"
+    return "unknown"
+
+
+def extract_cmd_injection_command(
+    query_params: dict[str, list[str]],
+    form_params: dict[str, list[str]],
+) -> tuple[str, str, str]:
+    """Return (source, key, command). source='' means no cmd= present."""
+    for source, collection in (("query", query_params), ("form", form_params)):
+        for key in CMD_INJECTION_COMMAND_KEYS:
+            for candidate in (key, key.upper()):
+                values = collection.get(candidate)
+                if values and values[0]:
+                    return source, candidate, values[0]
+    return "", "", ""
 
 
 _COLDFUSION_EXPLOIT_INDICATORS = (
@@ -1960,6 +2071,53 @@ def render_aws_credentials_ini(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_fake_passwd() -> bytes:
+    """Static `/etc/passwd`-shape body. Same content as the webshell trap's
+    `cat /etc/passwd` simulation — kept identical so a scanner that probes
+    both endpoints sees a consistent host."""
+    return (
+        "root:x:0:0:root:/root:/bin/bash\n"
+        "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+        "bin:x:2:2:bin:/bin:/usr/sbin/nologin\n"
+        "sys:x:3:3:sys:/dev:/usr/sbin/nologin\n"
+        "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n"
+        "mysql:x:112:116:MySQL Server,,,:/nonexistent:/bin/false\n"
+    ).encode("utf-8")
+
+
+def render_printenv_dump(r: dict[str, object], *, host: str = "") -> bytes:
+    """Plausible `printenv`/CGI-environment block with AWS_* values bound to
+    a Tracebit canary. Synthesised non-credential context (hostname, PWD,
+    PATH, USER) keeps the shape recognisable; the canary lives in AWS_*
+    only — a replay against AWS fires Tracebit."""
+    aws = _aws(r)
+    safe_host = (host or "web-01").split(":", 1)[0] or "web-01"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "web-01"
+    db_pw = _fake_db_password()
+    lines = [
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        f"HOSTNAME={safe_host}",
+        "USER=www-data",
+        "HOME=/var/www",
+        "PWD=/var/www/html",
+        "SHELL=/bin/bash",
+        "LANG=C.UTF-8",
+        "SERVER_SOFTWARE=Apache/2.4.41 (Ubuntu)",
+        "SERVER_NAME=" + safe_host,
+        "SERVER_PORT=443",
+        "GATEWAY_INTERFACE=CGI/1.1",
+        "REQUEST_METHOD=GET",
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}",
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}",
+        f"AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}",
+        "AWS_DEFAULT_REGION=us-east-1",
+        f"DATABASE_URL=postgres://app:{db_pw}@db.internal:5432/app_prod",
+        "RAILS_ENV=production",
+        "NODE_ENV=production",
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def render_aws_config_ini(r: dict[str, object]) -> bytes:
     # `~/.aws/config` is the sibling of `~/.aws/credentials`: region / output
     # format / profile definitions. Some SDK setups stash the access key here
@@ -2080,6 +2238,32 @@ def render_config_json(r: dict[str, object]) -> bytes:
             "region": "us-east-1",
         },
         "features": {"s3_uploads": True, "dynamodb_sessions": True},
+    }, indent=2).encode("utf-8")
+
+
+def render_sftp_config_json(r: dict[str, object]) -> bytes:
+    """`.vscode/sftp.json` (or `sftp-config.json` for Sublime SFTP).
+    Editor extensions store SFTP deploy creds in plaintext at the project
+    root; scanners hunt every plausible filename. The 'password' field
+    here is the gitlab-username-password Tracebit canary, so a replay
+    against the canary's hosted gitlab URL fires the alert."""
+    creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    username = str(creds.get("username", "") or "deploy")
+    password = str(creds.get("password", "") or "")
+    return json.dumps({
+        "name": "production",
+        "host": "deploy.internal",
+        "protocol": "sftp",
+        "port": 22,
+        "username": username,
+        "password": password,
+        "remotePath": "/var/www/app",
+        "uploadOnSave": True,
+        "useTempFile": False,
+        "openSsh": False,
+        "ignore": [".git", ".vscode", "node_modules"],
     }, indent=2).encode("utf-8")
 
 
@@ -2606,13 +2790,19 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         "wp-config",
         (
             "/wp-config.php",
+            # Editor-/admin-leftover suffix variants. Scanner dictionaries
+            # enumerate every plausible save/swap/comment/text shape because
+            # they're what survives a sloppy deploy or an interrupted edit.
             "/wp-config.php.bak",
-            "/wp-config.php.old",
             "/wp-config.php.save",
-            "/wp-config.php.txt",
             "/wp-config.php.swp",
+            "/wp-config.php.swo",
+            "/wp-config.php.old",
+            "/wp-config.php.orig",
+            "/wp-config.php.txt",
             "/wp-config.php~",
-            "/wp-config.php::$DATA",
+            "/wp-config.php::$DATA",  # NTFS alternate-stream syntax
+            "/wp-config.bak",
             "/wp-config.old",
             "/wp-config.txt",
             "/wp-config-backup.php",
@@ -2637,6 +2827,22 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("/config.json", "/settings.json", "/credentials.json", "/secrets.json"),
         ("aws",),
         render_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "sftp-config",
+        (
+            # VS Code Liximomo/SFTP extension
+            "/.vscode/sftp.json",
+            # Sublime SFTP — single-file project root variant
+            "/sftp-config.json",
+            # Sibling of `.git/`-as-deploy-source: scanners enumerate the
+            # file at the project root regardless of editor.
+            "/sftp.json",
+            "/.ftpconfig",
+        ),
+        ("gitlab-username-password",),
+        render_sftp_config_json,
         "application/json; charset=utf-8",
     ),
     CanaryTrap(
@@ -3396,6 +3602,125 @@ async def _handle_webshell(
     )
 
 
+async def _handle_cmd_injection(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+    request_id: str,
+) -> web.Response:
+    """Respond to admin-config command-injection probes and CGI printenv
+    leaks. See the CMD_INJECTION_ENABLED block at the top of this module
+    for the design — most cmds get plausible static output, credential-file
+    cmds get a fresh Tracebit canary in the response body."""
+    method = request.method
+    lpath = path.lower()
+    is_printenv = lpath in {"/printenv", "/cgi-bin/printenv", "/cgi-bin/test-cgi"}
+
+    query_params = parse_qs(query_string, keep_blank_values=True) if query_string else {}
+    content_type_req = request.headers.get("Content-Type", "")
+    form_params = parse_form_body(request_body, content_type_req)
+    cmd_source, cmd_key, command = extract_cmd_injection_command(query_params, form_params)
+
+    # /printenv-shape paths behave as if the cmd was 'printenv' regardless
+    # of any query — that's the whole point of those CGI scripts.
+    family = ""
+    if is_printenv:
+        family = "env"
+    elif command:
+        family = classify_cmd_injection_command(command)
+
+    # Decide whether to mint a canary. Only the credential-file probes get
+    # one; everything else returns static text. Per-IP cache caps the
+    # quota burn from repeated `cat .aws/credentials` from the same source.
+    needs_canary = family in {"creds-aws", "creds-aws-config", "env"}
+    tracebit_response: dict[str, object] | None = None
+    canary_status = ""
+    client_ip = str(log_context.get("clientIp", ""))
+    host = str(log_context.get("host", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+
+    if needs_canary and API_KEY:
+        tracebit_response = await _get_or_issue_canary(
+            ("aws",), client_ip, request_id, host, user_agent, path, proto,
+        )
+        if tracebit_response is None:
+            canary_status = "issue-failed"
+            # Fall through to a static response — better to look alive
+            # than to 502 and tell the scanner to skip us.
+            needs_canary = False
+
+    body: bytes = b""
+    if family == "creds-aws" and tracebit_response is not None:
+        body = render_aws_credentials_ini(tracebit_response)
+        canary_status = "issued"
+    elif family == "creds-aws-config" and tracebit_response is not None:
+        body = render_aws_config_ini(tracebit_response)
+        canary_status = "issued"
+    elif family == "env" and tracebit_response is not None:
+        body = render_printenv_dump(tracebit_response, host=host)
+        canary_status = "issued"
+    elif family == "passwd":
+        body = render_fake_passwd()
+    elif family in {"id", "whoami", "hostname", "uname", "pwd", "ls"}:
+        body = simulate_command_output(command).encode("utf-8")
+    elif command and family == "unknown":
+        # Many shells produce no output for builtins / assignments. Empty
+        # body avoids leaking a "this is fake" canned error message.
+        body = b""
+    elif not command and not is_printenv:
+        # GET /admin/config with no cmd — return a small landing page so
+        # the scanner moves on to its next step instead of bailing.
+        body = (
+            b"<!doctype html>\n<html><head><title>Admin Config</title></head>"
+            b"<body><h1>Admin Configuration</h1>"
+            b"<p>Use ?cmd=&lt;command&gt; to inspect runtime state.</p>"
+            b"</body></html>\n"
+        )
+
+    if is_printenv:
+        result_tag = "cmd-injection-printenv"
+        content_type = "text/plain; charset=utf-8"
+    elif family in {"creds-aws", "creds-aws-config", "env"} and tracebit_response is not None:
+        result_tag = "cmd-injection-creds-leak"
+        # Mimic the file the cmd asked for.
+        content_type = "text/plain; charset=utf-8"
+    elif command:
+        result_tag = f"cmd-injection-command"
+        content_type = "text/plain; charset=utf-8" if family != "" else "text/plain; charset=utf-8"
+    else:
+        result_tag = "cmd-injection-probe"
+        content_type = "text/html; charset=utf-8"
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "cmdInjectionPath": path,
+        "cmdSource": cmd_source,
+        "cmdKey": cmd_key,
+        "cmd": command,
+        "cmdFamily": family,
+        "method": method,
+        "outputBytes": len(body),
+    }
+    if canary_status:
+        log_entry["canaryStatus"] = canary_status
+    if tracebit_response is not None:
+        log_entry["canaryTypes"] = [k for k, v in tracebit_response.items() if v]
+    append_log(log_entry)
+
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": content_type,
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _send_canary_trap(
     request: web.Request,
     trap: "CanaryTrap",
@@ -3753,6 +4078,11 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_coldfusion_path(path):
         return await _handle_coldfusion(request, log_context, path, request_body)
 
+    if is_cmd_injection_path(path):
+        return await _handle_cmd_injection(
+            request, log_context, path, query_string, request_body, request_id,
+        )
+
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)
 
@@ -3824,6 +4154,8 @@ def main() -> int:
         active.append("geoserver")
     if COLDFUSION_ENABLED:
         active.append("coldfusion")
+    if CMD_INJECTION_ENABLED:
+        active.append("cmd-injection")
     print(
         f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
         file=sys.stderr,
