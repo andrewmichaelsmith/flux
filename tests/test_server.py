@@ -2424,6 +2424,7 @@ def test_cmd_injection_enabled_by_default():
 def test_cmd_injection_default_paths_cover_observed_family():
     for path in (
         "/admin/config",
+        "/admin/config.php",
         "/printenv",
         "/cgi-bin/printenv",
         "/cgi-bin/test-cgi",
@@ -2432,7 +2433,7 @@ def test_cmd_injection_default_paths_cover_observed_family():
 
 
 def test_cmd_injection_path_non_match():
-    for path in ["/", "/admin", "/admin/", "/admin/config.php", "/printenv.php", "/etc/printenv"]:
+    for path in ["/", "/admin", "/admin/", "/admin/config.php.bak", "/printenv.php", "/etc/printenv"]:
         assert not tbenv.is_cmd_injection_path(path), f"unexpected match: {path}"
 
 
@@ -2581,6 +2582,22 @@ async def test_dispatch_admin_config_cmd_id_uses_simulate(flux_client, monkeypat
     assert resp.status == 200
     body = await resp.read()
     assert b"uid=33(www-data)" in body
+
+
+async def test_dispatch_admin_config_php_cmd_id_uses_same_handler(flux_client, monkeypatch):
+    """The current log pass found scanners using the PHP-suffixed variant
+    of the same exposed admin-config shape."""
+    monkeypatch.setattr(tbenv, "CMD_INJECTION_ENABLED", True)
+    resp = await flux_client.get(
+        "/admin/config.php?cmd=id",
+        headers={"X-Forwarded-For": "203.0.113.89"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"uid=33(www-data)" in body
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cmd-injection-command"
+    assert entry["cmdInjectionPath"] == "/admin/config.php"
 
 
 async def test_dispatch_printenv_always_issues_canary(flux_client, monkeypatch):

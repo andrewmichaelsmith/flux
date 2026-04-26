@@ -3,12 +3,13 @@
 Responds to "exposed admin endpoint that runs a shell command" probes
 and to classic CGI environment-leak scripts.
 
-| Path                | Method | Response                                                                           |
-| ------------------- | ------ | ---------------------------------------------------------------------------------- |
+| Path                | Method   | Response                                                                        |
+| ------------------- | -------- | ------------------------------------------------------------------------------- |
 | `/admin/config`     | GET/POST | landing HTML if no `cmd=` param; otherwise simulated command output (see below) |
-| `/printenv`         | GET    | fake env-block whose `AWS_*` values are a Tracebit canary                          |
-| `/cgi-bin/printenv` | GET    | same as `/printenv`                                                                |
-| `/cgi-bin/test-cgi` | GET    | same as `/printenv`                                                                |
+| `/admin/config.php` | GET/POST | same handler; observed scanner variant of the admin-config probe shape          |
+| `/printenv`         | GET      | fake env-block whose `AWS_*` values are a Tracebit canary                       |
+| `/cgi-bin/printenv` | GET      | same as `/printenv`                                                             |
+| `/cgi-bin/test-cgi` | GET      | same as `/printenv`                                                             |
 
 The handler reads the `cmd` value from `?cmd=…`, the equivalent
 `POST` form param (`cmd`, `command`, `exec`, `c`), and classifies it

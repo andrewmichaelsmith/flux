@@ -321,8 +321,9 @@ COLDFUSION_VERSION = (os.environ.get("HONEYPOT_COLDFUSION_VERSION") or "2021.0.0
 # --- Fake command-injection / env-leak responder -------------------------
 # Two distinct shapes routed through one handler:
 #
-#   /admin/config?cmd=...   — generic "exposed admin endpoint that runs a
-#       shell command from the cmd= query param" pattern. Scanners enumerate
+#   /admin/config?cmd=... and /admin/config.php?cmd=... — generic
+#       "exposed admin endpoint that runs a shell command from cmd="
+#       pattern. Scanners enumerate
 #       this against admin/config/router/router-config etc. We extract the
 #       cmd value, classify it, and return plausible output. Crucially, when
 #       the cmd asks for a credential file (cat /root/.aws/credentials and
@@ -341,6 +342,7 @@ COLDFUSION_VERSION = (os.environ.get("HONEYPOT_COLDFUSION_VERSION") or "2021.0.0
 CMD_INJECTION_ENABLED = _env_bool("HONEYPOT_CMD_INJECTION_ENABLED")
 _CMD_INJECTION_DEFAULT_PATHS = ",".join([
     "/admin/config",
+    "/admin/config.php",
     "/printenv",
     "/cgi-bin/printenv",
     "/cgi-bin/test-cgi",
