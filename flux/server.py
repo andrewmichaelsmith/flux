@@ -2604,7 +2604,23 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "wp-config",
-        ("/wp-config.php", "/wp-config.php.bak", "/wp-config.old", "/wp-config.txt"),
+        (
+            "/wp-config.php",
+            "/wp-config.php.bak",
+            "/wp-config.php.old",
+            "/wp-config.php.save",
+            "/wp-config.php.txt",
+            "/wp-config.php.swp",
+            "/wp-config.php~",
+            "/wp-config.php::$DATA",
+            "/wp-config.old",
+            "/wp-config.txt",
+            "/wp-config-backup.php",
+            "/backup/wp-config.php",
+            # Double-encoded scanners normalize once to a still-encoded
+            # path before dispatch, e.g. `%2577%2570...` -> `%77%70...`.
+            "/%77%70%2d%63%6f%6e%66%69%67.%70%68%70.%62%61%6b",
+        ),
         ("aws",),
         render_wp_config_php,
         "application/x-php; charset=utf-8",

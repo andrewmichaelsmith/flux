@@ -400,6 +400,15 @@ FAKE_TRACEBIT = {
     ("/.pgpass", b":deploybot42:p@ssCanaryValue"),
     ("/.claude/.credentials.json", b'"accessToken": "AKIAFAKEEXAMPLE01"'),
     ("/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/wp-config.php.old", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/wp-config.php.save", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/wp-config.php.txt", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/wp-config.php.swp", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/wp-config.php~", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/wp-config.php::$data", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/wp-config-backup.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/backup/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/%77%70%2d%63%6f%6e%66%69%67.%70%68%70.%62%61%6b", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/backup.sql", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/config.json", b'"access_key_id": "AKIAFAKEEXAMPLE01"'),
     ("/firebase.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
@@ -459,6 +468,7 @@ def test_canary_trap_renderers_embed_canary(path, needle):
 
 @pytest.mark.parametrize("path", [
     "/wp-config.php",
+    "/wp-config.php.old",
     "/application.properties",
     "/application.yml",
     "/.env.production",
@@ -645,6 +655,30 @@ async def test_dispatch_routes_aws_credentials_file_to_trap(flux_client, monkeyp
     assert b"AKIAFAKEEXAMPLE01" in body
     entries = _log_entries(flux_client.log_path)
     assert entries[-1]["result"] == "aws-credentials-file"
+
+
+@pytest.mark.parametrize("path", [
+    "/wp-config.php.old",
+    "/wp-config.php.save",
+    "/wp-config.php.txt",
+    "/wp-config.php.swp",
+    "/wp-config.php~",
+    "/wp-config.php::$DATA",
+    "/wp-config-backup.php",
+    "/backup/wp-config.php",
+    "/%2577%2570%252D%2563%256F%256E%2566%2569%2567.%2570%2568%2570.%2562%2561%256B",
+])
+async def test_dispatch_routes_wp_config_backup_variants_to_trap(flux_client, monkeypatch, path):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.12"})
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"AKIAFAKEEXAMPLE01" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "wp-config"
 
 
 async def test_dispatch_trap_404s_without_api_key(flux_client, monkeypatch):
