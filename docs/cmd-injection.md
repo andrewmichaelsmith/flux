@@ -10,6 +10,9 @@ and to classic CGI environment-leak scripts.
 | `/printenv`         | GET      | fake env-block whose `AWS_*` values are a Tracebit canary                       |
 | `/cgi-bin/printenv` | GET      | same as `/printenv`                                                             |
 | `/cgi-bin/test-cgi` | GET      | same as `/printenv`                                                             |
+| `*eval-stdin.php` with `phpunit` in the path | GET/POST | echoes simple PHP probe output such as `md5("Hello PHPUnit")` |
+| `/?...auto_prepend_file=php://input` / `/hello.world?...` | POST | PHP-CGI RCE probe; decodes `base64_decode(...)` command hints and echoes PHP probe output |
+| `/cgi-bin/.../bin/sh` path traversal | POST | Apache CGI shell probe; logs the stdin command body and returns empty 200 |
 
 The handler reads the `cmd` value from `?cmd=…`, the equivalent
 `POST` form param (`cmd`, `command`, `exec`, `c`), and classifies it
@@ -27,10 +30,14 @@ the same way the fake-git trap does.
 
 Logged fields per event (in addition to the standard `LOGS.md` schema):
 `result` (`cmd-injection-probe` / `cmd-injection-command` /
-`cmd-injection-creds-leak` / `cmd-injection-printenv`),
+`cmd-injection-creds-leak` / `cmd-injection-printenv` /
+`cmd-injection-php-cgi-rce` / `cmd-injection-apache-cgi-shell` /
+`phpunit-eval-stdin`),
 `cmdInjectionPath`, `cmdSource` (`query` / `form` / `""`), `cmdKey`,
 `cmd`, `cmdFamily`, `outputBytes`, and `canaryStatus` (`issued` /
-`issue-failed`) when a Tracebit canary was minted.
+`issue-failed`) when a Tracebit canary was minted. Body-RCE rows also
+include `bodyPreview`; PHP-CGI rows include `decodedCommand` when a
+`base64_decode(...)` payload was decoded.
 
 ## Why
 
@@ -49,3 +56,8 @@ Two observed shapes drove this trap:
    block whose AWS values are a Tracebit canary lets us measure
    "how often does this class of scanner replay env-harvested AWS
    creds, and how fast?".
+3. Body capture showed high-volume active RCE probes whose useful signal
+   was entirely in the request body: PHPUnit `eval-stdin.php`, PHP-CGI
+   `php://input`, and Apache CGI path-traversal `/bin/sh`. These now
+   get 200 responses and structured body/decoded-command logging instead
+   of falling through as generic 404s.

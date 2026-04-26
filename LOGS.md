@@ -22,8 +22,8 @@ Every line includes these — they're built in `_handle()` before dispatch.
 | `userAgent` | string | From `User-Agent` header. |
 | `protocol` | string | From `X-Forwarded-Proto`, default `http`. |
 | `headers` | object | Subset: `Host`, all `X-Forwarded-*`, `True-Client-Ip`, `X-Real-Ip`, `X-Client-Ip`, `X-Azure-Clientip`, `X-Azure-Socketip`, `X-Originating-Ip`, `X-Host`, `Cf-Connecting-Ip`, `Content-Type`, `Content-Length`. Values truncated to 512 chars. |
-| `bodyBytesRead` | int | 0 unless the request read a body (webshell `POST`). |
-| `bodySha256` | string | SHA256 hex of the body, or `""`. |
+| `bodyBytesRead` | int | 0 unless the request read a capped body (`GET`/`POST` payloads). |
+| `bodySha256` | string | SHA256 hex when body bytes were present, or `""`. |
 
 ## Result tags
 
@@ -157,6 +157,23 @@ Extras on every `sonicwall-*` line:
 | `bytes` | int | Size of the JSON body returned. |
 | `bodyPreview` | string | Up to `HONEYPOT_WEBSHELL_BODY_DECODE_LIMIT` chars of the request body; omitted on GETs / empty bodies. |
 
+### Fake Cisco WebVPN / AnyConnect
+
+One log line per hit.
+
+| `result` | `status` | Meaning |
+| --- | --- | --- |
+| `cisco-anyconnect-config-auth` | 200 | `POST /` with AnyConnect `config-auth` XML body |
+| `cisco-webvpn-logon` | 200 | `/+CSCOE+/logon.html` or `/+CSCOE+/portal.html` |
+| `cisco-webvpn-logon-forms-js` | 200 | `/+CSCOE+/logon_forms.js` |
+| `cisco-webvpn-java-jar` | 200 | `/+CSCOL+/Java.jar` |
+| `cisco-webvpn-a1-jar` | 200 | `/+CSCOL+/a1.jar` |
+| `cisco-webvpn-miss` | 404 | Matched the path family but no renderer |
+
+Extras include `ciscoWebvpnPath`, `ciscoWebvpnMethod`, `bytes`,
+`ciscoWebvpnUsername`, `ciscoWebvpnHasPassword`, and
+`ciscoAnyconnectVersion` when those values are present.
+
 ### Fake ColdFusion admin / component browser
 
 One log line per hit.
@@ -183,6 +200,22 @@ Extras on every `coldfusion-*` line:
 | `bytes` | int | Size of the response body returned. |
 | `bodyPreview` | string | First 512 chars of request body; omitted on GETs / empty bodies. |
 | `coldfusionPayloadPreview` | string | Up to 400 chars of `query | body-preview`; only present when `coldfusionHasExploit` is true. |
+
+### Cmd-Injection / Body-RCE
+
+| `result` | `status` | Meaning |
+| --- | --- | --- |
+| `cmd-injection-probe` | 200 | Admin-config path with no command |
+| `cmd-injection-command` | 200 | Admin-config command with static simulated output or empty shell output |
+| `cmd-injection-creds-leak` | 200 | Command asked for AWS credentials/config and got a Tracebit AWS canary |
+| `cmd-injection-printenv` | 200 | `/printenv`-shape route returned an env block with Tracebit AWS values |
+| `cmd-injection-php-cgi-rce` | 200 | PHP-CGI `auto_prepend_file=php://input` body payload |
+| `cmd-injection-apache-cgi-shell` | 200 | Apache CGI path-traversal `/bin/sh` body payload |
+| `phpunit-eval-stdin` | 200 | PHPUnit `eval-stdin.php` body probe |
+
+Common extras include `cmdInjectionPath`, `cmdSource`, `cmdKey`, `cmd`,
+`cmdFamily`, `outputBytes`, `bodyPreview`, and `decodedCommand` for decoded
+PHP-CGI `base64_decode(...)` payloads.
 
 ### Canary-backed file traps
 
