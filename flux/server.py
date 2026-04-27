@@ -322,6 +322,26 @@ IVANTI_VPN_PATHS = {
     if value.strip()
 }
 
+# --- Fake IBM Aspera Faspex portal (CVE-2022-47986 bait) ----------------
+# CMS expansion fleets started probing `/aspera/faspex/` in late April 2026.
+# Real exploitation typically follows with a crafted POST to
+# `/aspera/faspex/account/logout` (YAML deserialization in older releases).
+# We return plausible HTML/JSON so scanners continue into the follow-on step,
+# then capture method/query/body metadata for payload triage.
+ASPERA_FASPEX_ENABLED = _env_bool("HONEYPOT_ASPERA_FASPEX_ENABLED")
+_ASPERA_FASPEX_DEFAULT_PATHS = ",".join([
+    "/aspera/faspex/",
+    "/aspera/faspex",
+    "/aspera/faspex/account/logout",
+    "/aspera/faspex/package_relay/relay_package",
+])
+ASPERA_FASPEX_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_ASPERA_FASPEX_PATHS_CSV") or _ASPERA_FASPEX_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+ASPERA_FASPEX_VERSION = (os.environ.get("HONEYPOT_ASPERA_FASPEX_VERSION") or "4.4.1").strip()
+
 # --- Fake GeoServer admin / OGC endpoints (CVE-2024-36401 bait) ----------
 # Two scanner families are observed probing this surface:
 #   1. Banner-grab fleets fetching /geoserver/, /geoserver/web/, /geoserver/index.html
@@ -540,6 +560,12 @@ def is_ivanti_vpn_path(path: str) -> bool:
     if not IVANTI_VPN_ENABLED:
         return False
     return path.lower() in IVANTI_VPN_PATHS
+
+
+def is_aspera_faspex_path(path: str) -> bool:
+    if not ASPERA_FASPEX_ENABLED:
+        return False
+    return path.lower() in ASPERA_FASPEX_PATHS
 
 
 # OGNL / Java-runtime indicators surfaced when CVE-2024-36401 (or related
@@ -1204,6 +1230,42 @@ def render_ivanti_namedusers_json() -> bytes:
             "users": [],
             "total": 0,
         },
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_aspera_faspex_landing(host: str, version: str) -> bytes:
+    safe_host = host or "faspex-gateway"
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>IBM Aspera Faspex</title>
+</head>
+<body>
+  <div id="login-container">
+    <h1>IBM Aspera Faspex</h1>
+    <p class="version">Version {version}</p>
+    <form method="post" action="/aspera/faspex/session">
+      <label>Username</label>
+      <input type="text" name="user[email]" autocomplete="username" />
+      <label>Password</label>
+      <input type="password" name="user[password]" autocomplete="current-password" />
+      <button type="submit">Sign In</button>
+    </form>
+  </div>
+  <small>Node: {safe_host}</small>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_aspera_logout_json() -> bytes:
+    payload = {
+        "status": "ok",
+        "message": "signed out",
+        "csrf": uuid.uuid4().hex,
     }
     return json.dumps(payload).encode("utf-8")
 
@@ -3969,6 +4031,58 @@ async def _handle_ivanti_vpn(
     return web.Response(status=200, body=body, headers=headers)
 
 
+async def _handle_aspera_faspex(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    lpath = path.lower()
+    method = request.method
+    host = str(log_context.get("host", ""))
+
+    if lpath in {"/aspera/faspex", "/aspera/faspex/"}:
+        result_tag = "aspera-faspex-landing"
+        body = render_aspera_faspex_landing(host, ASPERA_FASPEX_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/aspera/faspex/account/logout":
+        result_tag = "aspera-faspex-logout"
+        body = render_aspera_logout_json()
+        content_type = "application/json; charset=utf-8"
+    elif lpath == "/aspera/faspex/package_relay/relay_package":
+        result_tag = "aspera-faspex-relay-package"
+        body = b"relay package accepted\n"
+        content_type = "text/plain; charset=utf-8"
+    else:
+        append_log({**log_context, "status": 404, "result": "aspera-faspex-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "asperaFaspexPath": path,
+        "asperaFaspexMethod": method,
+        "bytes": len(body),
+    }
+    if request_body:
+        preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+        if preview:
+            log_entry["bodyPreview"] = preview[:400]
+    append_log(log_entry)
+
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": content_type,
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_geoserver(
     request: web.Request,
     log_context: dict[str, object],
@@ -4707,6 +4821,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_ivanti_vpn_path(path):
         return await _handle_ivanti_vpn(request, log_context, path, request_body)
+
+    if is_aspera_faspex_path(path):
+        return await _handle_aspera_faspex(request, log_context, path, request_body)
 
     if is_geoserver_path(path):
         return await _handle_geoserver(request, log_context, path, request_body)

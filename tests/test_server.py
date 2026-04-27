@@ -1553,6 +1553,98 @@ async def test_dispatch_ivanti_disabled_returns_404(flux_client, monkeypatch):
     assert entries[-1]["result"] == "not-handled"
 
 
+# --- Fake IBM Aspera Faspex trap ---
+
+
+def test_aspera_faspex_enabled_by_default():
+    assert tbenv.ASPERA_FASPEX_ENABLED
+
+
+def test_aspera_faspex_default_paths_match_observed_sequence():
+    for path in (
+        "/aspera/faspex/",
+        "/aspera/faspex",
+        "/aspera/faspex/account/logout",
+        "/aspera/faspex/package_relay/relay_package",
+    ):
+        assert tbenv.is_aspera_faspex_path(path), f"expected match: {path}"
+
+
+def test_aspera_faspex_path_non_match():
+    for path in (
+        "/",
+        "/aspera/",
+        "/aspera/faspex/account/login",
+        "/aspera/faspex/admin",
+        "/.env",
+    ):
+        assert not tbenv.is_aspera_faspex_path(path), f"unexpected match: {path}"
+
+
+def test_aspera_faspex_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "ASPERA_FASPEX_ENABLED", False)
+    assert not tbenv.is_aspera_faspex_path("/aspera/faspex/")
+
+
+def test_render_aspera_faspex_landing_shape():
+    body = tbenv.render_aspera_faspex_landing("faspex.example", "4.4.1").decode("utf-8")
+    assert "IBM Aspera Faspex" in body
+    assert "Version 4.4.1" in body
+    assert "/aspera/faspex/session" in body
+    assert "faspex.example" in body
+
+
+def test_render_aspera_logout_json_shape():
+    payload = json.loads(tbenv.render_aspera_logout_json())
+    assert payload["status"] == "ok"
+    assert payload["message"] == "signed out"
+    assert payload["csrf"]
+
+
+async def test_dispatch_aspera_faspex_landing(flux_client):
+    resp = await flux_client.get(
+        "/aspera/faspex/",
+        headers={"X-Forwarded-For": "203.0.113.81", "Host": "faspex.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "IBM Aspera Faspex" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "aspera-faspex-landing"
+    assert entry["asperaFaspexPath"] == "/aspera/faspex/"
+
+
+async def test_dispatch_aspera_faspex_logout_captures_body_preview(flux_client):
+    resp = await flux_client.post(
+        "/aspera/faspex/account/logout",
+        data=b"--- !ruby/hash:ActionController::Parameters\nexploit: true\n",
+        headers={
+            "X-Forwarded-For": "203.0.113.82",
+            "Content-Type": "application/x-yaml",
+        },
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["status"] == "ok"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "aspera-faspex-logout"
+    assert entry["asperaFaspexMethod"] == "POST"
+    assert "bodyPreview" in entry
+
+
+async def test_dispatch_aspera_faspex_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "ASPERA_FASPEX_ENABLED", False)
+    resp = await flux_client.get(
+        "/aspera/faspex/",
+        headers={"X-Forwarded-For": "203.0.113.83"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
 # --- GeoServer trap (CVE-2024-36401 bait) ---
 
 
