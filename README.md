@@ -44,6 +44,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | Fake LLM-API endpoint | Ollama / OpenAI / Anthropic-proxy JSON on `/v1/models`, `/v1/chat/completions`, `/anthropic/v1/messages`, `/api/chat`, … ; logs model + auth header + prompt prefix — [docs](./docs/fake-llm-api.md) | 2026-04-20 | no |
 | Fake SonicWall SSL VPN | SonicOS 7 JSON responses on the three paths in the CVE-2024-53704 auth-bypass chain; logs submitted username, body sha + preview, and replayed session cookies — [docs](./docs/fake-sonicwall.md) | 2026-04-21 | no |
 | Fake Cisco WebVPN endpoint | Cisco SSL VPN landing page + launcher assets on `/+CSCOE+/...` and `/+CSCOL+/...`; also recognizes AnyConnect `config-auth` XML POSTs to `/` and logs submitted usernames without storing passwords — [docs](./docs/fake-cisco-webvpn.md) | 2026-04-26 | no |
+| Fake Ivanti Connect Secure / Pulse Secure VPN | Ivanti SSL VPN welcome + login POST + HostChecker installer assets on `/dana-na/...` and `/dana-cached/hc/...`; mints a per-request `DSID` cookie, logs username + has-password, and flips `ivantiHasCmdInjection` on shell-meta payloads aimed at `/dana-ws/namedusers` (CVE-2023-46805 / CVE-2024-21887 / CVE-2025-22457 chain bait) — [docs](./docs/fake-ivanti-vpn.md) | 2026-04-27 | no |
 | Fake GeoServer admin / OGC | GeoServer 2.x admin shell + About page + OGC `*_Capabilities` on `/geoserver/...`; flags OGNL/expression-language indicators in query string + body so CVE-2024-36401 payloads are easy to triage — [docs](./docs/fake-geoserver.md) | 2026-04-25 | no |
 | Fake ColdFusion admin / component browser | ColdFusion public `.cfm` anchors plus `/CFIDE/componentutils/`, Administrator, and AdminAPI surfaces; logs method, auth/session hints, and exploit payload indicators — [docs](./docs/fake-coldfusion.md) | 2026-04-25 | no |
 | Cmd-injection / printenv responder | `/admin/config?cmd=…` and `/admin/config.php?cmd=…` (admin-shell exploit shape) plus `/printenv`, `/cgi-bin/printenv`, `/cgi-bin/test-cgi`; classifies the cmd value, returns a plausible `cat /etc/passwd` / `id` / `uname` body, and mints a per-request Tracebit AWS canary when the cmd asks for `~/.aws/credentials` or env vars — [docs](./docs/cmd-injection.md) | 2026-04-26 | yes |
@@ -217,6 +218,7 @@ under [`docs/`](./docs/):
 - [Fake LLM-API endpoint](./docs/fake-llm-api.md)
 - [Fake SonicWall SSL VPN endpoint](./docs/fake-sonicwall.md)
 - [Fake Cisco WebVPN endpoint](./docs/fake-cisco-webvpn.md)
+- [Fake Ivanti Connect Secure / Pulse Secure VPN endpoint](./docs/fake-ivanti-vpn.md)
 - [Fake GeoServer admin / OGC](./docs/fake-geoserver.md)
 - [Fake ColdFusion admin / component browser](./docs/fake-coldfusion.md)
 - [Cmd-injection / printenv responder](./docs/cmd-injection.md)

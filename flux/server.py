@@ -291,6 +291,37 @@ CISCO_WEBVPN_PATHS = {
     if value.strip()
 }
 
+# --- Fake Ivanti Connect Secure / Pulse Secure VPN ----------------------
+# Enterprise multi-scanner dictionaries added Ivanti-shaped paths in late
+# April 2026, fingerprinting CVE-2023-46805 (auth bypass) +
+# CVE-2024-21887 (command injection) + CVE-2025-22457 (stack overflow,
+# active exploitation per CISA KEV) probe chains. Common URL families:
+#   /dana-na/auth/url_default/welcome.cgi  — generic SSL VPN landing
+#   /dana-na/auth/url_admin/welcome.cgi    — admin portal landing
+#   /dana-na/auth/url_default/login.cgi    — POST credential endpoint
+#   /dana-cached/hc/HostCheckerInstaller.* — HostChecker launcher assets
+#   /dana-ws/namedusers                    — REST endpoint where the
+#                                            CVE-2024-21887 cmdinjection
+#                                            POST body lands
+# Returning plausible HTML / JSON keeps the probe alive past banner-grab
+# so the follow-on exploit body lands in `bodyPreview` / `bodySha256`.
+IVANTI_VPN_ENABLED = _env_bool("HONEYPOT_IVANTI_VPN_ENABLED")
+_IVANTI_VPN_DEFAULT_PATHS = ",".join([
+    "/dana-na/auth/url_default/welcome.cgi",
+    "/dana-na/auth/url_admin/welcome.cgi",
+    "/dana-na/auth/welcome.cgi",
+    "/dana-na/auth/url_default/login.cgi",
+    "/dana-cached/hc/hostcheckerinstaller.osx",
+    "/dana-cached/hc/hostcheckerinstaller.exe",
+    "/dana-cached/hc/hostcheckerinstaller.dmg",
+    "/dana-ws/namedusers",
+])
+IVANTI_VPN_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_IVANTI_VPN_PATHS_CSV") or _IVANTI_VPN_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+
 # --- Fake GeoServer admin / OGC endpoints (CVE-2024-36401 bait) ----------
 # Two scanner families are observed probing this surface:
 #   1. Banner-grab fleets fetching /geoserver/, /geoserver/web/, /geoserver/index.html
@@ -503,6 +534,12 @@ def is_cisco_webvpn_path(path: str) -> bool:
     if not CISCO_WEBVPN_ENABLED:
         return False
     return path.lower() in CISCO_WEBVPN_PATHS
+
+
+def is_ivanti_vpn_path(path: str) -> bool:
+    if not IVANTI_VPN_ENABLED:
+        return False
+    return path.lower() in IVANTI_VPN_PATHS
 
 
 # OGNL / Java-runtime indicators surfaced when CVE-2024-36401 (or related
@@ -1099,6 +1136,107 @@ def render_cisco_anyconnect_config_auth(host: str) -> bytes:
 </config-auth>
 """
     return body.encode("utf-8")
+
+
+def render_ivanti_welcome_html(host: str) -> bytes:
+    safe_host = host or "ivanti-vpn"
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Ivanti Connect Secure</title>
+  <link rel="stylesheet" type="text/css" href="/dana-na/css/ds.css" />
+</head>
+<body class="welcome-bg">
+  <div id="welcomePage">
+    <h1>Welcome to {safe_host}</h1>
+    <form name="frmLogin" method="post" action="/dana-na/auth/url_default/login.cgi">
+      <input type="hidden" name="tz_offset" value="0" />
+      <input type="hidden" name="realm" value="Users" />
+      <label>Username</label>
+      <input type="text" name="username" autocomplete="username" />
+      <label>Password</label>
+      <input type="password" name="password" autocomplete="current-password" />
+      <button type="submit" name="btnSubmit">Sign In</button>
+    </form>
+    <small>Secure Access</small>
+  </div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_ivanti_login_post(dsid: str) -> bytes:
+    body = f"""<!doctype html>
+<html><head><title>Authenticated</title>
+<meta http-equiv="refresh" content="0; url=/dana/home/index.cgi" />
+</head><body>
+<p>Redirecting...</p>
+<script>document.cookie="DSID={dsid}; path=/; secure";</script>
+</body></html>
+"""
+    return body.encode("utf-8")
+
+
+def render_ivanti_hostchecker_stub(name: str) -> bytes:
+    # Real HostCheckerInstaller payloads are platform binaries (Mach-O / PE
+    # / DMG). Returning a magic-bytes-prefixed stub is enough to keep
+    # banner-grab probes happy without serving anything executable.
+    suffix = name.lower().rsplit(".", 1)[-1]
+    if suffix == "exe":
+        prefix = b"MZ\x90\x00"  # PE/COFF DOS header magic
+    elif suffix == "dmg":
+        prefix = b"koly"        # DMG trailer magic (placed up front, harmless)
+    else:
+        prefix = b"\xcf\xfa\xed\xfe"  # Mach-O 64-bit little-endian magic
+    return prefix + f"-ivanti-{name}-placeholder".encode("utf-8")
+
+
+def render_ivanti_namedusers_json() -> bytes:
+    # `/dana-ws/namedusers` is the REST surface where CVE-2024-21887 command
+    # injection POSTs land. A live Ivanti returns a JSON envelope here when
+    # auth is missing; we return a plausible empty list so the scanner ships
+    # the exploit body anyway and we capture it.
+    payload = {
+        "result": "success",
+        "data": {
+            "users": [],
+            "total": 0,
+        },
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def extract_ivanti_form(body: bytes, content_type: str) -> tuple[str, bool]:
+    form = parse_form_body(body, content_type)
+    username = ""
+    for key in ("username", "user", "login"):
+        values = form.get(key) or form.get(key.upper())
+        if values and values[0]:
+            username = values[0][:120]
+            break
+    has_password = any(bool((form.get(key) or form.get(key.upper()) or [""])[0]) for key in ("password", "pass"))
+    return username, has_password
+
+
+_IVANTI_CMD_INJECTION_INDICATORS = (
+    ";",
+    "|",
+    "&&",
+    "$(",
+    "`",
+    "/bin/sh",
+    "/bin/bash",
+    "wget ",
+    "curl ",
+    "../",
+)
+
+
+def _ivanti_has_cmd_injection(body_preview: str, query: str) -> bool:
+    haystack = f"{query} {body_preview}".lower()
+    return any(needle in haystack for needle in _IVANTI_CMD_INJECTION_INDICATORS)
 
 
 def render_geoserver_landing(host: str, version: str) -> bytes:
@@ -3748,6 +3886,89 @@ async def _handle_cisco_webvpn(
     )
 
 
+async def _handle_ivanti_vpn(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    lpath = path.lower()
+    method = request.method
+    host = str(log_context.get("host", ""))
+    query = str(log_context.get("query", "") or "")
+    content_type_req = request.headers.get("Content-Type", "")
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    has_cmd_injection = _ivanti_has_cmd_injection(body_preview, query)
+
+    if lpath in {
+        "/dana-na/auth/url_default/welcome.cgi",
+        "/dana-na/auth/url_admin/welcome.cgi",
+        "/dana-na/auth/welcome.cgi",
+    }:
+        result_tag = "ivanti-welcome"
+        body = render_ivanti_welcome_html(host)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/dana-na/auth/url_default/login.cgi":
+        result_tag = "ivanti-login-post"
+        # Per-request DSID so the scanner gets a consistent token to replay
+        # in any follow-on `/dana-ws/` request, but every hit generates a
+        # fresh value (no fixed literal across the fleet).
+        dsid = uuid.uuid4().hex
+        body = render_ivanti_login_post(dsid)
+        content_type = "text/html; charset=utf-8"
+    elif lpath in {
+        "/dana-cached/hc/hostcheckerinstaller.osx",
+        "/dana-cached/hc/hostcheckerinstaller.exe",
+        "/dana-cached/hc/hostcheckerinstaller.dmg",
+    }:
+        result_tag = "ivanti-hostchecker-installer"
+        body = render_ivanti_hostchecker_stub(lpath.rsplit("/", 1)[-1])
+        content_type = "application/octet-stream"
+    elif lpath == "/dana-ws/namedusers":
+        result_tag = "ivanti-namedusers"
+        body = render_ivanti_namedusers_json()
+        content_type = "application/json; charset=utf-8"
+    else:
+        # Path matched the set but no renderer — defensive 404, matches the
+        # cisco-webvpn / sonicwall miss pattern.
+        append_log({**log_context, "status": 404, "result": "ivanti-vpn-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "ivantiPath": path,
+        "ivantiMethod": method,
+        "ivantiHasCmdInjection": has_cmd_injection,
+        "bytes": len(body),
+    }
+    if request_body and result_tag == "ivanti-login-post":
+        username, has_password = extract_ivanti_form(request_body, content_type_req)
+        if username:
+            log_entry["ivantiUsername"] = username
+        log_entry["ivantiHasPassword"] = has_password
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview[:400]
+    append_log(log_entry)
+
+    headers = {"Content-Type": content_type, "Cache-Control": "no-store"}
+    if result_tag == "ivanti-login-post":
+        # Ivanti sets the DSID cookie on auth success. Reading the body
+        # we just rendered to keep the value consistent.
+        dsid_match = re.search(r"DSID=([0-9a-f]+)", body.decode("utf-8", errors="ignore"))
+        if dsid_match:
+            headers["Set-Cookie"] = f"DSID={dsid_match.group(1)}; Path=/; Secure; HttpOnly"
+    return web.Response(status=200, body=body, headers=headers)
+
+
 async def _handle_geoserver(
     request: web.Request,
     log_context: dict[str, object],
@@ -4483,6 +4704,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_cisco_webvpn_path(path) or is_cisco_anyconnect_config_auth(path, request_body):
         return await _handle_cisco_webvpn(request, log_context, path, request_body)
+
+    if is_ivanti_vpn_path(path):
+        return await _handle_ivanti_vpn(request, log_context, path, request_body)
 
     if is_geoserver_path(path):
         return await _handle_geoserver(request, log_context, path, request_body)
