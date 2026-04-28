@@ -38,7 +38,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | Fake `/.env` canary issuer | Mints a per-request Tracebit Community canary and returns it as a `.env`-style payload | 2026-04-22 | yes |
 | Fake `/.git/` repository | Serves a loose-object git tree whose `config/secrets.yml` embeds a canary AND whose `.git/config` `[remote "origin"] url` embeds the same canary as HTTP Basic userinfo — so scrapers that only fetch `.git/config` (without cloning) still walk away with a live canary. Matches `<prefix>/.git/*` (apps deployed at subpaths) and is case-insensitive on the `.git` segment; ships a minimal-valid `/.git/index` (DIRC header) so `git-dumper`-style tools don't bail on a missing index. Per-IP cached so fan-out sees a consistent tree | 2026-04-23 | yes |
 | Canary file traps | Plausible file-format responses for `/wp-config.php`, `/backup.sql`, `/id_rsa`, `/.aws/credentials`, `/api/v4/user`, `/users/sign_in`, `/actuator/env`, `/.vscode/sftp.json`, CI/CD config files, … — full table [below](#canary-file-trap-table) | 2026-04-26 | yes |
-| AI-credential-file canaries | `/.openai/config.json`, `/.anthropic/config.json`, `/.cursor/mcp.json`, `/.claude/.credentials.json` — listed in the same table; broken out in the footnote because Tracebit has no LLM canary type yet | 2026-04-22 | yes |
+| AI-credential-file canaries | AI editor / coding-assistant configs (`/.claude/settings.json`, `/.cline/{settings,mcp_settings}.json`, `/.continue/config.json`, `/.cursor/mcp.json`, `/.aider.conf.yml`, `/.sourcegraph/cody.json`, `/.config/open-interpreter/config.yaml`, …) plus AI infrastructure / proxy configs (`/litellm_config.yaml`, `/langsmith.env`, `/.huggingface/token`, `/.streamlit/secrets.toml`, `/baseten.yaml`, generic MCP configs, `/.bito/`, `/.codeium/`, `/.roost/`, `/cohere_config.json`, …) — listed in the same table; broken out in the footnote because Tracebit has no LLM canary type yet | 2026-04-28 | yes |
 | Fake webshell | Plausible File Manager on known `*.php` shell probe paths plus shell-jacking regex families (`/.well-known/<name>.php`, `/.trash<N>/*`, `/.tmb/`, `/.dj/`, `/.alf/`, …); simulates `id` / `whoami` / `uname -a` / `cat /etc/passwd` on follow-up commands — [docs](./docs/fake-webshell.md) | 2026-04-22 | no |
 | Modular tarpit + fingerprinting | Slow-drip response plus six fingerprinting modules (cookie, ETag, redirect chain, variable drip, Content-Length mismatch, DNS callback); fires on `.env` variants and on configurable first-contact paths (`/`, `/index.html`, `/robots.txt`, …) | 2026-04-20 | no |
 | Fake LLM-API endpoint | Ollama / OpenAI / Anthropic-proxy JSON on `/v1/models`, `/v1/chat/completions`, `/anthropic/v1/messages`, `/api/chat`, … ; logs model + auth header + prompt prefix — [docs](./docs/fake-llm-api.md) | 2026-04-20 | no |
@@ -163,6 +163,21 @@ case-insensitive exact matches.
 | Anthropic config file | `/.anthropic/config.json` | `aws` (†) | `anthropic-config` |
 | Cursor MCP config | `/.cursor/mcp.json` | `aws` (†) | `cursor-mcp` |
 | Claude Code credentials | `/.claude/.credentials.json` | `aws` (†) | `claude-credentials` |
+| Claude Desktop settings | `/.claude/settings.json` | `aws` (†) | `claude-settings` |
+| Cline settings | `/.cline/settings.json` | `aws` (†) | `cline-settings` |
+| Generic MCP server configs | `/.cline/mcp_settings.json`, `/mcp_settings.json`, `/mcp.json`, `/.mcp/mcp.json` | `aws` (†) | `mcp-config` |
+| Continue.dev config | `/.continue/config.json` | `aws` (†) | `continue-config` |
+| Sourcegraph Cody config | `/.sourcegraph/cody.json` | `aws` (†) | `cody-config` |
+| Aider config | `/.aider.conf.yml` | `aws` (†) | `aider-conf` |
+| Open-Interpreter config | `/.config/open-interpreter/config.yaml` | `aws` (†) | `open-interpreter-config` |
+| LiteLLM proxy config | `/litellm_config.yaml`, `/litellm/config.yaml`, `/proxy_config.yaml` | `aws` (†) | `litellm-config` |
+| LangSmith env | `/langsmith.env` | `aws` (†) | `langsmith-env` |
+| HuggingFace token | `/.huggingface/token`, `/.cache/huggingface/token` | `aws` (†) | `huggingface-token` |
+| Streamlit secrets | `/.streamlit/secrets.toml` | `aws` (†) | `streamlit-secrets` |
+| OpenAI flat config | `/openai.json` | `aws` (†) | `openai-config-flat` |
+| Anthropic flat config | `/anthropic.json` | `aws` (†) | `anthropic-config-flat` |
+| Generic AI provider config | `/cohere_config.json`, `/tabnine_config.json`, `/.bito/config.json`, `/.codeium/config.json`, `/.roost/config.json`, `/pinecone_config.json`, `/.lobechat/config.json`, `/chatgpt-next-web.json` | `aws` (†) | `ai-provider-config` |
+| Baseten model deploy config | `/baseten.yaml` | `aws` (†) | `baseten-config` |
 
 `/users/sign_in` returns the cookie canary as `Set-Cookie:
 _gitlab_session=<value>`. `/api/v4/user` embeds the username/password

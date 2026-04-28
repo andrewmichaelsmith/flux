@@ -3196,6 +3196,222 @@ def render_cursor_mcp_json(r: dict[str, object]) -> bytes:
     }, indent=2).encode("utf-8")
 
 
+# --- AI editor / coding-assistant config files (expansion) ---------------
+#
+# Scanner dictionaries spotted in late-April 2026 broadened from the
+# `/.openai/config.json` / `/.anthropic/config.json` / `/.cursor/mcp.json`
+# / `/.claude/.credentials.json` set above to a much wider AI-developer
+# tooling surface — Cline, Continue.dev, Aider, Open-Interpreter, Cody,
+# generic MCP catch-alls, Streamlit secrets, LiteLLM proxy, LangSmith,
+# HuggingFace tokens, and a long tail of small-name code assistants.
+# All renderers below dress an AWS Tracebit canary in the relevant
+# tool's documented config shape — same caveat as the original four:
+# Tracebit Community has no LLM canary type yet, so a key-format
+# (`sk-ant-...`, `hf_...`) prefix filter will drop the value as
+# obviously-fake. A field-name harvester (`api_key`, `apiKey`,
+# `accessToken`, `OPENAI_API_KEY`) will still serialize and ship,
+# tripping the AWS canary on replay. The probe is the primary intel.
+
+
+def render_claude_settings_json(r: dict[str, object]) -> bytes:
+    # Claude Desktop / Claude Code `~/.claude/settings.json`. Distinct from
+    # `.credentials.json` (OAuth tokens): this file holds MCP server
+    # definitions + provider API key + permissions.
+    aws = _aws(r)
+    return json.dumps({
+        "model": "claude-3-5-sonnet-20241022",
+        "apiKey": aws.get("awsSecretAccessKey", ""),
+        "anthropicApiKey": aws.get("awsAccessKeyId", ""),
+        "permissions": {
+            "allow": ["Bash(git:*)", "Read", "Write"],
+            "deny": [],
+        },
+        "mcpServers": {
+            "github": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": aws.get("awsAccessKeyId", ""),
+                },
+            },
+            "internal-tools": {
+                "command": "uvx",
+                "args": ["--from", "internal-tools-mcp", "serve"],
+                "env": {
+                    "API_KEY": aws.get("awsSessionToken", ""),
+                    "BASE_URL": "https://tools.internal.lan",
+                },
+            },
+        },
+    }, indent=2).encode("utf-8")
+
+
+def render_cline_settings_json(r: dict[str, object]) -> bytes:
+    # Cline (VS Code extension) settings file. Provider + API key +
+    # model id at the top level; MCP servers nested.
+    aws = _aws(r)
+    return json.dumps({
+        "apiProvider": "anthropic",
+        "apiKey": aws.get("awsSecretAccessKey", ""),
+        "apiModelId": "claude-3-5-sonnet-20241022",
+        "openAiApiKey": aws.get("awsAccessKeyId", ""),
+        "openRouterApiKey": aws.get("awsSessionToken", ""),
+        "alwaysAllowReadOnly": False,
+    }, indent=2).encode("utf-8")
+
+
+def render_continue_config_json(r: dict[str, object]) -> bytes:
+    # Continue.dev's `~/.continue/config.json`. Models list with provider
+    # + apiKey per entry.
+    aws = _aws(r)
+    return json.dumps({
+        "models": [
+            {
+                "title": "Claude 3.5 Sonnet",
+                "provider": "anthropic",
+                "model": "claude-3-5-sonnet-20241022",
+                "apiKey": aws.get("awsSecretAccessKey", ""),
+            },
+            {
+                "title": "GPT-4o",
+                "provider": "openai",
+                "model": "gpt-4o",
+                "apiKey": aws.get("awsAccessKeyId", ""),
+            },
+        ],
+        "tabAutocompleteModel": {
+            "title": "Codestral",
+            "provider": "mistral",
+            "model": "codestral-latest",
+            "apiKey": aws.get("awsSessionToken", ""),
+        },
+    }, indent=2).encode("utf-8")
+
+
+def render_cody_config_json(r: dict[str, object]) -> bytes:
+    # Sourcegraph Cody config. Access token + endpoint URL.
+    aws = _aws(r)
+    return json.dumps({
+        "endpoint": "https://sourcegraph.com",
+        "accessToken": aws.get("awsSecretAccessKey", ""),
+        "customHeaders": {},
+        "autocomplete": {"enabled": True},
+    }, indent=2).encode("utf-8")
+
+
+def render_aider_conf_yml(r: dict[str, object]) -> bytes:
+    # Aider's `~/.aider.conf.yml` — YAML with provider API keys.
+    aws = _aws(r)
+    return (
+        f"openai-api-key: {aws.get('awsAccessKeyId', '')}\n"
+        f"anthropic-api-key: {aws.get('awsSecretAccessKey', '')}\n"
+        "model: claude-3-5-sonnet-20241022\n"
+        "auto-commits: false\n"
+        "dirty-commits: true\n"
+        "git: true\n"
+    ).encode("utf-8")
+
+
+def render_open_interpreter_yaml(r: dict[str, object]) -> bytes:
+    # Open Interpreter `~/.config/open-interpreter/config.yaml`.
+    aws = _aws(r)
+    return (
+        "llm:\n"
+        "  provider: anthropic\n"
+        "  model: claude-3-5-sonnet-20241022\n"
+        f"  api_key: {aws.get('awsSecretAccessKey', '')}\n"
+        "  context_window: 200000\n"
+        "  max_tokens: 4096\n"
+        "auto_run: false\n"
+        "offline: false\n"
+    ).encode("utf-8")
+
+
+def render_litellm_config_yaml(r: dict[str, object]) -> bytes:
+    # LiteLLM proxy `config.yaml` — model_list with per-model api_key.
+    aws = _aws(r)
+    return (
+        "model_list:\n"
+        "  - model_name: claude-3-5-sonnet\n"
+        "    litellm_params:\n"
+        "      model: anthropic/claude-3-5-sonnet-20241022\n"
+        f"      api_key: {aws.get('awsSecretAccessKey', '')}\n"
+        "  - model_name: gpt-4o\n"
+        "    litellm_params:\n"
+        "      model: openai/gpt-4o\n"
+        f"      api_key: {aws.get('awsAccessKeyId', '')}\n"
+        "general_settings:\n"
+        f"  master_key: {aws.get('awsSessionToken', '')}\n"
+        "  database_url: postgres://litellm:" + _fake_db_password() + "@db.internal:5432/litellm\n"
+    ).encode("utf-8")
+
+
+def render_langsmith_env(r: dict[str, object]) -> bytes:
+    # LangSmith `.env`-style — env-var key=value lines.
+    aws = _aws(r)
+    return (
+        f"LANGSMITH_API_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"LANGCHAIN_API_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        "LANGSMITH_TRACING=true\n"
+        "LANGSMITH_PROJECT=internal-tools\n"
+        "LANGSMITH_ENDPOINT=https://api.smith.langchain.com\n"
+    ).encode("utf-8")
+
+
+def render_huggingface_token(r: dict[str, object]) -> bytes:
+    # HuggingFace CLI stores its auth token at `~/.huggingface/token`
+    # (or under `~/.cache/huggingface/`) as plain text — single line, no
+    # newline. Real HF tokens start with `hf_`; we ship the AWS access key
+    # raw because (a) a key-format-filtering harvester will drop either
+    # way, and (b) a `cat`-and-exfil scanner just wants any string.
+    aws = _aws(r)
+    return aws.get("awsAccessKeyId", "").encode("utf-8")
+
+
+def render_streamlit_secrets_toml(r: dict[str, object]) -> bytes:
+    # Streamlit's `~/.streamlit/secrets.toml` — TOML, often used as a
+    # generic secrets file by self-hosted Streamlit apps.
+    aws = _aws(r)
+    return (
+        f'OPENAI_API_KEY = "{aws.get("awsAccessKeyId", "")}"\n'
+        f'ANTHROPIC_API_KEY = "{aws.get("awsSecretAccessKey", "")}"\n'
+        f'HUGGINGFACE_TOKEN = "{aws.get("awsSessionToken", "")}"\n'
+        "\n"
+        "[database]\n"
+        'host = "db.internal"\n'
+        'port = 5432\n'
+        'database = "appdb"\n'
+        'user = "app_prod"\n'
+        f'password = "{_fake_db_password()}"\n'
+    ).encode("utf-8")
+
+
+def render_generic_ai_api_config_json(r: dict[str, object]) -> bytes:
+    # Generic provider config JSON (Cohere, Tabnine, Bito, Codeium,
+    # Roost, Pinecone-shaped, etc.). Field names match what the various
+    # docs use most commonly: `api_key`, `apiKey`, `model`, `base_url`.
+    aws = _aws(r)
+    return json.dumps({
+        "api_key": aws.get("awsSecretAccessKey", ""),
+        "apiKey": aws.get("awsAccessKeyId", ""),
+        "session_token": aws.get("awsSessionToken", ""),
+        "base_url": "https://api.example.com",
+        "model": "claude-3-5-sonnet-20241022",
+        "environment": "production",
+    }, indent=2).encode("utf-8")
+
+
+def render_baseten_yaml(r: dict[str, object]) -> bytes:
+    # Baseten config (deployed-model platform) — YAML with api_key.
+    aws = _aws(r)
+    return (
+        "model_name: internal-summariser\n"
+        f"api_key: {aws.get('awsSecretAccessKey', '')}\n"
+        "environment: production\n"
+        "remote_url: https://app.baseten.co\n"
+    ).encode("utf-8")
+
+
 @dataclass(frozen=True)
 class CanaryTrap:
     name: str                      # log tag, e.g. "aws-credentials-file"
@@ -3595,6 +3811,133 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_claude_credentials_json,
         "application/json; charset=utf-8",
+    ),
+    # AI editor / coding-assistant config files. See the comment block
+    # above render_claude_settings_json for the late-April-2026 expansion
+    # rationale and the same "no Tracebit LLM canary type yet" caveat.
+    CanaryTrap(
+        "claude-settings",
+        ("/.claude/settings.json",),
+        ("aws",),
+        render_claude_settings_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "cline-settings",
+        ("/.cline/settings.json",),
+        ("aws",),
+        render_cline_settings_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "mcp-config",
+        (
+            "/.cline/mcp_settings.json",
+            "/mcp_settings.json",
+            "/mcp.json",
+            "/.mcp/mcp.json",
+        ),
+        ("aws",),
+        render_cursor_mcp_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "continue-config",
+        ("/.continue/config.json",),
+        ("aws",),
+        render_continue_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "cody-config",
+        ("/.sourcegraph/cody.json",),
+        ("aws",),
+        render_cody_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "aider-conf",
+        ("/.aider.conf.yml",),
+        ("aws",),
+        render_aider_conf_yml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "open-interpreter-config",
+        ("/.config/open-interpreter/config.yaml",),
+        ("aws",),
+        render_open_interpreter_yaml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    # AI infrastructure / proxy / framework configs.
+    CanaryTrap(
+        "litellm-config",
+        (
+            "/litellm_config.yaml",
+            "/litellm/config.yaml",
+            "/proxy_config.yaml",
+        ),
+        ("aws",),
+        render_litellm_config_yaml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "langsmith-env",
+        ("/langsmith.env",),
+        ("aws",),
+        render_langsmith_env,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "huggingface-token",
+        ("/.huggingface/token", "/.cache/huggingface/token"),
+        ("aws",),
+        render_huggingface_token,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "streamlit-secrets",
+        ("/.streamlit/secrets.toml",),
+        ("aws",),
+        render_streamlit_secrets_toml,
+        "application/toml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "openai-config-flat",
+        ("/openai.json",),
+        ("aws",),
+        render_openai_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "anthropic-config-flat",
+        ("/anthropic.json",),
+        ("aws",),
+        render_anthropic_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "ai-provider-config",
+        (
+            "/cohere_config.json",
+            "/tabnine_config.json",
+            "/.bito/config.json",
+            "/.codeium/config.json",
+            "/.roost/config.json",
+            "/pinecone_config.json",
+            "/.lobechat/config.json",
+            "/chatgpt-next-web.json",
+        ),
+        ("aws",),
+        render_generic_ai_api_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "baseten-config",
+        ("/baseten.yaml",),
+        ("aws",),
+        render_baseten_yaml,
+        "application/x-yaml; charset=utf-8",
     ),
 )
 

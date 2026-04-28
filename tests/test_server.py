@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 
 import pytest
 
@@ -3113,3 +3114,184 @@ async def test_dispatch_github_actions_workflow_returns_canary_yml(flux_client, 
     assert "aws s3 sync" in body
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "github-actions-workflow"
+
+
+# --- AI editor / coding-assistant config canary expansion ---
+
+
+def test_ai_toolchain_config_paths_registered():
+    """Late-April 2026 dictionary expansion: AI editor + coding-assistant
+    + AI infrastructure config paths."""
+    expected = {
+        "/.claude/settings.json": "claude-settings",
+        "/.cline/settings.json": "cline-settings",
+        "/.cline/mcp_settings.json": "mcp-config",
+        "/mcp_settings.json": "mcp-config",
+        "/mcp.json": "mcp-config",
+        "/.mcp/mcp.json": "mcp-config",
+        "/.continue/config.json": "continue-config",
+        "/.sourcegraph/cody.json": "cody-config",
+        "/.aider.conf.yml": "aider-conf",
+        "/.config/open-interpreter/config.yaml": "open-interpreter-config",
+        "/litellm_config.yaml": "litellm-config",
+        "/litellm/config.yaml": "litellm-config",
+        "/proxy_config.yaml": "litellm-config",
+        "/langsmith.env": "langsmith-env",
+        "/.huggingface/token": "huggingface-token",
+        "/.cache/huggingface/token": "huggingface-token",
+        "/.streamlit/secrets.toml": "streamlit-secrets",
+        "/openai.json": "openai-config-flat",
+        "/anthropic.json": "anthropic-config-flat",
+        "/cohere_config.json": "ai-provider-config",
+        "/tabnine_config.json": "ai-provider-config",
+        "/.bito/config.json": "ai-provider-config",
+        "/.codeium/config.json": "ai-provider-config",
+        "/.roost/config.json": "ai-provider-config",
+        "/pinecone_config.json": "ai-provider-config",
+        "/.lobechat/config.json": "ai-provider-config",
+        "/chatgpt-next-web.json": "ai-provider-config",
+        "/baseten.yaml": "baseten-config",
+    }
+    for path, name in expected.items():
+        trap = tbenv.find_canary_trap(path)
+        assert trap is not None, f"missing trap: {path}"
+        assert trap.name == name, f"{path} mapped to {trap.name}, expected {name}"
+
+
+def test_render_claude_settings_embeds_aws_canary():
+    body = tbenv.render_claude_settings_json(FAKE_TRACEBIT)
+    payload = json.loads(body)
+    assert payload["apiKey"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["anthropicApiKey"] == "AKIAFAKEEXAMPLE01"
+    # MCP servers stanza ships canary as GitHub PAT — same shape as
+    # the existing /.cursor/mcp.json renderer.
+    pat = payload["mcpServers"]["github"]["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"]
+    assert pat == "AKIAFAKEEXAMPLE01"
+
+
+def test_render_cline_settings_embeds_aws_canary():
+    body = tbenv.render_cline_settings_json(FAKE_TRACEBIT)
+    payload = json.loads(body)
+    assert payload["apiProvider"] == "anthropic"
+    assert payload["apiKey"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["openAiApiKey"] == "AKIAFAKEEXAMPLE01"
+
+
+def test_render_continue_config_embeds_aws_canary_per_model():
+    body = tbenv.render_continue_config_json(FAKE_TRACEBIT)
+    payload = json.loads(body)
+    keys = {m["apiKey"] for m in payload["models"]}
+    assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in keys
+    assert "AKIAFAKEEXAMPLE01" in keys
+
+
+def test_render_cody_config_embeds_aws_canary():
+    body = tbenv.render_cody_config_json(FAKE_TRACEBIT)
+    payload = json.loads(body)
+    assert payload["accessToken"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["endpoint"].startswith("https://")
+
+
+def test_render_aider_conf_embeds_aws_canary():
+    body = tbenv.render_aider_conf_yml(FAKE_TRACEBIT).decode("utf-8")
+    assert "openai-api-key: AKIAFAKEEXAMPLE01" in body
+    assert "anthropic-api-key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+
+
+def test_render_open_interpreter_yaml_embeds_aws_canary():
+    body = tbenv.render_open_interpreter_yaml(FAKE_TRACEBIT).decode("utf-8")
+    assert "api_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    assert "provider: anthropic" in body
+
+
+def test_render_litellm_config_embeds_aws_canary_in_model_list():
+    body = tbenv.render_litellm_config_yaml(FAKE_TRACEBIT).decode("utf-8")
+    assert "api_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    assert "api_key: AKIAFAKEEXAMPLE01" in body
+    assert "master_key: FwoGZXIvYXdzEXAMPLEFAKE=" in body
+    assert "model_list:" in body
+
+
+def test_render_litellm_db_password_is_per_hit_random():
+    """LiteLLM proxy config embeds a Postgres URL — the password must be a
+    per-hit synthetic, never a fixed literal across the fleet."""
+    body1 = tbenv.render_litellm_config_yaml(FAKE_TRACEBIT).decode("utf-8")
+    body2 = tbenv.render_litellm_config_yaml(FAKE_TRACEBIT).decode("utf-8")
+    # Two renders should produce different DB passwords. Extract by regex.
+    m1 = re.search(r"postgres://litellm:([^@]+)@", body1)
+    m2 = re.search(r"postgres://litellm:([^@]+)@", body2)
+    assert m1 and m2
+    assert m1.group(1) != m2.group(1), "DB password must be per-hit unique, not a fixed literal"
+
+
+def test_render_langsmith_env_embeds_aws_canary():
+    body = tbenv.render_langsmith_env(FAKE_TRACEBIT).decode("utf-8")
+    assert "LANGSMITH_API_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    assert "LANGCHAIN_API_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+
+
+def test_render_huggingface_token_is_aws_canary_string():
+    """HF tokens are single-line, no newline."""
+    body = tbenv.render_huggingface_token(FAKE_TRACEBIT)
+    assert body == b"AKIAFAKEEXAMPLE01"
+
+
+def test_render_streamlit_secrets_toml_embeds_aws_canary():
+    body = tbenv.render_streamlit_secrets_toml(FAKE_TRACEBIT).decode("utf-8")
+    assert 'OPENAI_API_KEY = "AKIAFAKEEXAMPLE01"' in body
+    assert 'ANTHROPIC_API_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"' in body
+    assert "[database]" in body
+
+
+def test_render_streamlit_db_password_is_per_hit_random():
+    body1 = tbenv.render_streamlit_secrets_toml(FAKE_TRACEBIT).decode("utf-8")
+    body2 = tbenv.render_streamlit_secrets_toml(FAKE_TRACEBIT).decode("utf-8")
+    m1 = re.search(r'\[database\][^\[]*password = "([^"]+)"', body1, re.S)
+    m2 = re.search(r'\[database\][^\[]*password = "([^"]+)"', body2, re.S)
+    assert m1 and m2
+    assert m1.group(1) != m2.group(1), "Streamlit DB password must be per-hit unique"
+
+
+def test_render_generic_ai_provider_embeds_aws_canary():
+    body = tbenv.render_generic_ai_api_config_json(FAKE_TRACEBIT)
+    payload = json.loads(body)
+    assert payload["api_key"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["apiKey"] == "AKIAFAKEEXAMPLE01"
+
+
+def test_render_baseten_yaml_embeds_aws_canary():
+    body = tbenv.render_baseten_yaml(FAKE_TRACEBIT).decode("utf-8")
+    assert "api_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+
+
+@pytest.mark.parametrize("path,expected_result,canary_substring", [
+    ("/.claude/settings.json", "claude-settings", "AKIAFAKEEXAMPLE01"),
+    ("/.cline/settings.json", "cline-settings", "AKIAFAKEEXAMPLE01"),
+    ("/.cline/mcp_settings.json", "mcp-config", "AKIAFAKEEXAMPLE01"),
+    ("/.continue/config.json", "continue-config", "AKIAFAKEEXAMPLE01"),
+    ("/.sourcegraph/cody.json", "cody-config", "wJalrXUtnFEMI"),
+    ("/.aider.conf.yml", "aider-conf", "AKIAFAKEEXAMPLE01"),
+    ("/.config/open-interpreter/config.yaml", "open-interpreter-config", "wJalrXUtnFEMI"),
+    ("/litellm_config.yaml", "litellm-config", "AKIAFAKEEXAMPLE01"),
+    ("/langsmith.env", "langsmith-env", "wJalrXUtnFEMI"),
+    ("/.huggingface/token", "huggingface-token", "AKIAFAKEEXAMPLE01"),
+    ("/.cache/huggingface/token", "huggingface-token", "AKIAFAKEEXAMPLE01"),
+    ("/.streamlit/secrets.toml", "streamlit-secrets", "AKIAFAKEEXAMPLE01"),
+    ("/openai.json", "openai-config-flat", "AKIAFAKEEXAMPLE01"),
+    ("/anthropic.json", "anthropic-config-flat", "AKIAFAKEEXAMPLE01"),
+    ("/cohere_config.json", "ai-provider-config", "wJalrXUtnFEMI"),
+    ("/.bito/config.json", "ai-provider-config", "wJalrXUtnFEMI"),
+    ("/baseten.yaml", "baseten-config", "wJalrXUtnFEMI"),
+])
+async def test_dispatch_routes_ai_toolchain_paths_to_traps(
+    flux_client, monkeypatch, path, expected_result, canary_substring,
+):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.93"})
+    assert resp.status == 200, f"expected 200 for {path}"
+    body = await resp.read()
+    assert canary_substring.encode("utf-8") in body, f"{path} body missing {canary_substring}"
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == expected_result
