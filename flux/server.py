@@ -342,6 +342,58 @@ ASPERA_FASPEX_PATHS = {
 }
 ASPERA_FASPEX_VERSION = (os.environ.get("HONEYPOT_ASPERA_FASPEX_VERSION") or "4.4.1").strip()
 
+# --- Fake Hikvision IP-camera ISAPI surface (CVE-2021-36260 bait) -------
+# Long-running banner-grab probes consistently fetch a small set of
+# ISAPI endpoints to identify Hikvision firmware before shipping a
+# command-injection body in the language parameter (CVE-2021-36260,
+# CVSS 9.8, unauthenticated). Real Hikvision firmware advertises its
+# server as `App-webs/` and answers these paths with XML; returning
+# plausibly-shaped XML keeps single-path scanners coming back daily
+# and gives multi-step scanners somewhere to ship the exploit body.
+HIKVISION_ENABLED = _env_bool("HONEYPOT_HIKVISION_ENABLED")
+_HIKVISION_DEFAULT_PATHS = ",".join([
+    # CVE-2021-36260 sink — language parameter command injection.
+    "/sdk/weblanguage",
+    # Common ISAPI banner-grab paths (no auth required, harvested before
+    # exploit body is shipped).
+    "/isapi/security/usercheck",
+    "/isapi/system/deviceinfo",
+])
+HIKVISION_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_HIKVISION_PATHS_CSV") or _HIKVISION_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# Firmware-style version embedded in the deviceInfo response. Picked from
+# a release in the public-disclosure window for CVE-2021-36260 so scanners
+# deciding whether to ship the exploit body don't bail on a "patched"
+# banner.
+HIKVISION_FIRMWARE_VERSION = (os.environ.get("HONEYPOT_HIKVISION_FIRMWARE_VERSION") or "V5.5.82 build 191205").strip()
+
+# Shell-meta indicators flagged on body / query string for fast triage.
+# CVE-2021-36260 ships the command inside <language>$(...)</language> or
+# <language>`...`</language>; broader scanners also try ;, &&, ||, |, etc.
+_HIKVISION_CMDI_INDICATORS = (
+    "$(",
+    "`",
+    "&&",
+    "||",
+    ";",
+    "|",
+    "<language>",  # raw injection-shape body
+    "wget ",
+    "curl ",
+    "/bin/sh",
+    "bash -",
+    "nc -",
+)
+
+
+def _hikvision_has_cmdi(query: str, body_preview: str) -> bool:
+    haystack = f"{query} {body_preview}".lower()
+    return any(needle in haystack for needle in _HIKVISION_CMDI_INDICATORS)
+
+
 # --- Fake GeoServer admin / OGC endpoints (CVE-2024-36401 bait) ----------
 # Two scanner families are observed probing this surface:
 #   1. Banner-grab fleets fetching /geoserver/, /geoserver/web/, /geoserver/index.html
@@ -566,6 +618,12 @@ def is_aspera_faspex_path(path: str) -> bool:
     if not ASPERA_FASPEX_ENABLED:
         return False
     return path.lower() in ASPERA_FASPEX_PATHS
+
+
+def is_hikvision_path(path: str) -> bool:
+    if not HIKVISION_ENABLED:
+        return False
+    return path.lower() in HIKVISION_PATHS
 
 
 # OGNL / Java-runtime indicators surfaced when CVE-2024-36401 (or related
@@ -3523,7 +3581,20 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "firebase-json",
-        ("/firebase.json", "/google-services.json", "/serviceaccount.json", "/service-account.json"),
+        (
+            "/firebase.json", "/google-services.json",
+            "/serviceaccount.json", "/service-account.json",
+            # Firebase Admin SDK + GCP service-account key file names that
+            # multi-platform credential scanners enumerate alongside the
+            # GCP path family below.
+            "/firebase-adminsdk.json", "/gcp-service-account.json",
+            # GCP gcloud CLI Application Default Credentials JSON. The
+            # gcloud CLI also stores credentials in `credentials.db` /
+            # `access_tokens.db` (SQLite) at the same path; we don't serve
+            # those because a malformed SQLite is more revealing than a
+            # 404, but the JSON sibling is the most replay-valuable file.
+            "/.config/gcloud/application_default_credentials.json",
+        ),
         ("aws",),
         render_firebase_json,
         "application/json; charset=utf-8",
@@ -4426,6 +4497,92 @@ async def _handle_aspera_faspex(
     )
 
 
+async def _handle_hikvision(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake Hikvision ISAPI surface. GETs return plausible XML so banner-grab
+    fleets keep coming back; POST/PUT bodies are scanned for shell-meta
+    indicators (CVE-2021-36260 command-injection sink ships the command in
+    the language parameter)."""
+    lpath = path.lower()
+    method = request.method
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    has_cmdi = _hikvision_has_cmdi(query_string or "", body_preview)
+
+    if lpath == "/sdk/weblanguage":
+        result_tag = "hikvision-sdk-weblanguage"
+        body = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b'<Language version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">\n'
+            b'<language>en</language>\n'
+            b'</Language>\n'
+        )
+    elif lpath == "/isapi/system/deviceinfo":
+        result_tag = "hikvision-isapi-deviceinfo"
+        body = (
+            f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<DeviceInfo version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">\n'
+            f'<deviceName>IP CAMERA</deviceName>\n'
+            f'<deviceID>fa379a2c-1ec1-11b2-8000-00408cdf0000</deviceID>\n'
+            f'<model>DS-2CD2042WD-I</model>\n'
+            f'<serialNumber>DS-2CD2042WD-I20191205AAWRB12345678</serialNumber>\n'
+            f'<firmwareVersion>{HIKVISION_FIRMWARE_VERSION}</firmwareVersion>\n'
+            f'<firmwareReleasedDate>build 191205</firmwareReleasedDate>\n'
+            f'<deviceType>IPCamera</deviceType>\n'
+            f'</DeviceInfo>\n'
+        ).encode("utf-8")
+    elif lpath == "/isapi/security/usercheck":
+        result_tag = "hikvision-isapi-usercheck"
+        body = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b'<userCheck version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">\n'
+            b'<statusValue>200</statusValue>\n'
+            b'<statusString>OK</statusString>\n'
+            b'<isDefaultPassword>false</isDefaultPassword>\n'
+            b'<isRiskPassword>false</isRiskPassword>\n'
+            b'<isActivated>true</isActivated>\n'
+            b'</userCheck>\n'
+        )
+    else:
+        # Path matched the set but no renderer — defensive 404.
+        append_log({**log_context, "status": 404, "result": "hikvision-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    log_entry = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "hikvisionPath": path,
+        "hikvisionMethod": method,
+        "hikvisionHasCmdInjection": has_cmdi,
+        "bytes": len(body),
+    }
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview
+    append_log(log_entry)
+
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": "application/xml; charset=utf-8",
+            # Match the server-header fingerprint real Hikvision firmware
+            # advertises; scanners gate follow-on payloads on this string.
+            "Server": "App-webs/",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_geoserver(
     request: web.Request,
     log_context: dict[str, object],
@@ -5167,6 +5324,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_aspera_faspex_path(path):
         return await _handle_aspera_faspex(request, log_context, path, request_body)
+
+    if is_hikvision_path(path):
+        return await _handle_hikvision(request, log_context, path, query_string, request_body)
 
     if is_geoserver_path(path):
         return await _handle_geoserver(request, log_context, path, request_body)
