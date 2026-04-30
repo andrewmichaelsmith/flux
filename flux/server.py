@@ -433,6 +433,109 @@ COLDFUSION_PATHS = {
 }
 COLDFUSION_VERSION = (os.environ.get("HONEYPOT_COLDFUSION_VERSION") or "2021.0.05").strip()
 
+# --- Fake Atlassian Confluence (CVE-2022-26134 OGNL RCE bait) ------------
+# Active scanners send URL-encoded OGNL Runtime.exec() payloads in the
+# request path itself (the canonical CVE-2022-26134 shape) and follow
+# up against `pages/createpage-entervariables.action`,
+# `pages/doenterpagevariables.action`, `templates/editor-preload-container`,
+# and `users/user-dark-features` under bare, `/confluence/`, and `/wiki/`
+# prefixes. The exploit body typically embeds an out-of-band callback
+# domain (Interactsh / OAST.me / DNSlog family) that we lift from the
+# payload — the same callback hostname recurring across sensors is a
+# durable attribution signal regardless of source IP rotation.
+CONFLUENCE_ENABLED = _env_bool("HONEYPOT_CONFLUENCE_ENABLED")
+_CONFLUENCE_DEFAULT_PATHS = ",".join([
+    # Core CVE-2022-26134 sinks.
+    "/pages/createpage-entervariables.action",
+    "/confluence/pages/createpage-entervariables.action",
+    "/wiki/pages/createpage-entervariables.action",
+    "/pages/doenterpagevariables.action",
+    "/confluence/pages/doenterpagevariables.action",
+    "/wiki/pages/doenterpagevariables.action",
+    # Pre-exploit fingerprint paths under each common deployment prefix.
+    "/templates/editor-preload-container",
+    "/confluence/templates/editor-preload-container",
+    "/wiki/templates/editor-preload-container",
+    "/users/user-dark-features",
+    "/confluence/users/user-dark-features",
+    "/wiki/users/user-dark-features",
+    # Login surface — a real login.action makes the trap look like a
+    # production Confluence install on first contact.
+    "/login.action",
+    "/confluence/login.action",
+    "/wiki/login.action",
+])
+CONFLUENCE_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_CONFLUENCE_PATHS_CSV") or _CONFLUENCE_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# Pinned to a build in the public-disclosure window for CVE-2022-26134
+# so scanners deciding whether to ship the exploit body don't bail on a
+# patched banner.
+CONFLUENCE_VERSION = (os.environ.get("HONEYPOT_CONFLUENCE_VERSION") or "7.18.1").strip()
+
+# OGNL-injection indicators. The canonical CVE-2022-26134 path embeds
+# `${@java.lang.Runtime@getRuntime().exec("...")}` URL-encoded as
+# `%24%7B%40...%7D`. Real Confluence traffic never contains these.
+_CONFLUENCE_OGNL_INDICATORS = (
+    "${@",            # raw OGNL
+    "%24%7b%40",      # URL-encoded OGNL (case-insensitive, normalised)
+    "@java.lang.runtime",
+    "getruntime()",
+    "ognl.runtime",
+    ".getmethods(",
+    ".getsuperclass(",
+)
+
+
+def _confluence_has_ognl(path: str, query: str, body_preview: str) -> bool:
+    haystack = f"{path} {query} {body_preview}".lower()
+    return any(needle in haystack for needle in _CONFLUENCE_OGNL_INDICATORS)
+
+
+# OAST / Interactsh / DNSlog-family hostnames seen in OOB callback
+# payloads. Anchored on `.<domain>` so partial matches like
+# `notoast.me.example.com` don't trigger a false positive.
+_OAST_DOMAINS = (
+    "oast.me",
+    "oast.fun",
+    "oast.live",
+    "oast.online",
+    "oast.pro",
+    "oast.site",
+    "interact.sh",
+    "interactsh.com",
+    "burpcollaborator.net",
+    "dnslog.cn",
+    "ceye.io",
+    "requestbin.net",
+    "pipedream.net",
+)
+_OAST_HOST_RE = re.compile(
+    r"([a-z0-9][a-z0-9.\-]{0,253}\.(?:"
+    + "|".join(re.escape(d) for d in _OAST_DOMAINS)
+    + r"))",
+    re.IGNORECASE,
+)
+
+
+def _extract_oast_callback(text: str) -> str:
+    """Return the first OAST-family hostname found in the (possibly
+    URL-encoded) text, or '' if none. Decodes percent-encoding once
+    because real-world payloads are typically URL-encoded inside the
+    request path."""
+    if not text:
+        return ""
+    try:
+        decoded = unquote(text)
+    except (UnicodeDecodeError, ValueError):
+        decoded = text
+    haystack = f"{decoded} {text}".lower()
+    match = _OAST_HOST_RE.search(haystack)
+    return match.group(1) if match else ""
+
+
 # --- Fake command-injection / env-leak responder -------------------------
 # Two distinct shapes routed through one handler:
 #
@@ -853,6 +956,29 @@ def is_coldfusion_path(path: str) -> bool:
         or p.startswith("/cfide/administrator/")
         or p.startswith("/cfide/adminapi/")
     )
+
+
+def is_confluence_path(path: str) -> bool:
+    if not CONFLUENCE_ENABLED:
+        return False
+    p = path.lower()
+    if p in CONFLUENCE_PATHS:
+        return True
+    # CVE-2022-26134 ships the OGNL Runtime.exec() expression inside the
+    # request path (URL-encoded). Real Confluence never sees these; routing
+    # them to the Confluence handler captures the OAST callback domain.
+    if "%24%7b%40" in p or "${@" in p:
+        return True
+    # Common deeper Confluence sub-paths used as fingerprint pivots.
+    if (
+        p.startswith("/pages/")
+        or p.startswith("/confluence/pages/")
+        or p.startswith("/wiki/pages/")
+    ):
+        # Only match the action variants — bare /pages/ on its own is too
+        # generic and would steal traffic from other web apps.
+        return p.endswith(".action") or "createpage-entervariables" in p or "doenterpagevariables" in p
+    return False
 
 
 def extract_sonicwall_username(body: bytes, content_type: str) -> str:
@@ -1576,6 +1702,85 @@ def render_coldfusion_adminapi(method_name: str, version: str) -> bytes:
 </wddxPacket>
 """
     return body.encode("utf-8")
+
+
+def render_confluence_login_html(host: str, version: str) -> bytes:
+    """Confluence 7.x login page shell. Wicket-aware scanners follow into
+    `pages/createpage-entervariables.action` from the page links rendered
+    here, so the trap doesn't have to advertise those paths in the body —
+    the version banner alone is enough for the canonical CVE-2022-26134
+    follow-on probe."""
+    safe_host = host or "confluence.internal"
+    atl_token = uuid.uuid4().hex
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="application-name" content="Confluence" />
+  <meta name="confluence-base-url" content="https://{safe_host}" />
+  <meta name="ajs-version-number" content="{version}" />
+  <title>Log in - Confluence</title>
+</head>
+<body class="aui-page-focused aui-page-size-medium">
+  <div id="page">
+    <header id="header" role="banner">
+      <h1 id="title-text">Log In</h1>
+    </header>
+    <section id="main" role="main">
+      <form name="loginform" id="loginform" method="post" action="/dologin.action" class="aui">
+        <input type="hidden" name="atl_token" value="{atl_token}" />
+        <input type="hidden" name="os_destination" value="" />
+        <input type="hidden" name="login" value="Log in" />
+        <fieldset>
+          <div class="field-group">
+            <label for="os_username">Username</label>
+            <input id="os_username" type="text" name="os_username" autocomplete="username" />
+          </div>
+          <div class="field-group">
+            <label for="os_password">Password</label>
+            <input id="os_password" type="password" name="os_password" autocomplete="current-password" />
+          </div>
+          <div class="field-group">
+            <input type="checkbox" id="os_cookie" name="os_cookie" value="true" />
+            <label for="os_cookie">Remember me</label>
+          </div>
+          <button type="submit" id="loginButton" name="login" class="aui-button aui-button-primary">Log in</button>
+        </fieldset>
+      </form>
+    </section>
+    <footer id="footer" role="contentinfo">
+      <small id="footer-build-information">Confluence {version} - {safe_host}</small>
+    </footer>
+  </div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_confluence_dark_features_json() -> bytes:
+    """`/users/user-dark-features` returns a JSON list of feature flags on
+    real Confluence — used as a fingerprint by scanners. A small plausible
+    array is enough to keep the probe happy without leaking anything
+    specific."""
+    payload = {
+        "siteFeatures": [],
+        "userFeatures": [],
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_confluence_editor_preload_html(version: str) -> bytes:
+    """`/templates/editor-preload-container` returns the editor template
+    HTML. Real responses are a fragment, not a full page; mirroring that
+    shape avoids a `not-handled` 404 that would tip off the scanner."""
+    body = (
+        f'<div class="editor-preload-container" data-version="{version}">'
+        f'<div class="content-body"></div>'
+        f'</div>'
+    )
+    return body.encode("utf-8")
+
 
 def render_sonicwall_is_sslvpn_enabled() -> bytes:
     # SonicOS 7 returns a status envelope alongside the boolean. Field names
@@ -4795,6 +5000,114 @@ async def _handle_coldfusion(
     )
 
 
+async def _handle_confluence(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake Atlassian Confluence surface. Returns a plausible login page
+    on the path matchers, the small JSON / HTML fragments real Confluence
+    serves on `user-dark-features` / `editor-preload-container`, and a
+    permissive 200 on any path containing an OGNL injection (the canonical
+    CVE-2022-26134 shape, URL-encoded inside the path itself).
+
+    The OAST callback hostname is extracted from path/query/body so the
+    same probe is correlatable across sensors regardless of source IP."""
+    lpath = path.lower()
+    method = request.method
+    host = str(log_context.get("host", ""))
+    query = str(log_context.get("query", "") or "")
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode(
+            "utf-8", errors="replace",
+        )
+
+    has_ognl = _confluence_has_ognl(path, query, body_preview)
+    oast_callback = _extract_oast_callback(path)
+    if not oast_callback:
+        oast_callback = _extract_oast_callback(query)
+    if not oast_callback and body_preview:
+        oast_callback = _extract_oast_callback(body_preview)
+
+    log_extra: dict[str, object] = {
+        "confluencePath": path,
+        "confluenceMethod": method,
+        "confluenceHasOgnl": has_ognl,
+    }
+    if oast_callback:
+        log_extra["confluenceOastCallback"] = oast_callback[:253]
+    if has_ognl:
+        # OGNL payloads can run multi-KB; keep the log compact while still
+        # carrying enough for triage / sensor-cross-correlation.
+        log_extra["confluencePayloadPreview"] = (
+            f"{path} | {query} | {body_preview}"
+        )[:400]
+    if body_preview and not has_ognl:
+        # Plain login-form POSTs etc. — keep the preview short.
+        log_extra["bodyPreview"] = body_preview[:400]
+
+    # OGNL-injection paths and `*-entervariables.action` / `doenterpagevariables.action`
+    # both render the login HTML — that response body is what real
+    # Confluence returns when the OGNL expression executes successfully.
+    if (
+        "${@" in lpath
+        or "%24%7b%40" in lpath
+        or "createpage-entervariables.action" in lpath
+        or "doenterpagevariables.action" in lpath
+    ):
+        result_tag = "confluence-ognl-probe" if has_ognl else "confluence-action"
+        body = render_confluence_login_html(host, CONFLUENCE_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath.endswith("/user-dark-features"):
+        result_tag = "confluence-dark-features"
+        body = render_confluence_dark_features_json()
+        content_type = "application/json; charset=utf-8"
+    elif lpath.endswith("/templates/editor-preload-container"):
+        result_tag = "confluence-editor-preload"
+        body = render_confluence_editor_preload_html(CONFLUENCE_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath.endswith("/login.action") or lpath in CONFLUENCE_PATHS:
+        result_tag = "confluence-login"
+        body = render_confluence_login_html(host, CONFLUENCE_VERSION)
+        content_type = "text/html; charset=utf-8"
+    else:
+        # Path matched the matcher (e.g. via the OGNL prefilter) but no
+        # specific renderer claimed it — defensive 404 + log so analysis
+        # can grep for it.
+        append_log({
+            **log_context,
+            "status": 404,
+            "result": "confluence-miss",
+            **log_extra,
+        })
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        **log_extra,
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": content_type,
+            # Mirror the X-Confluence-Request-Time header real Confluence
+            # emits — gives wicket-aware scanners one more reason to keep
+            # going past the login page.
+            "X-Confluence-Request-Time": str(int(time.time() * 1000)),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_webshell(
     request: web.Request,
     log_context: dict[str, object],
@@ -5077,25 +5390,27 @@ async def _send_fake_git(
             "Cache-Control": "no-store",
             "X-Accel-Buffering": "no",
         })
-        await response.prepare(request)
-        append_log({
-            **log_context,
-            "status": 200,
-            "result": "fake-git",
-            "commitSha": meta.get("commitSha", ""),
-            "rootTreeSha": meta.get("rootTreeSha", ""),
-            "secretsBlobSha": meta.get("secretsBlobSha", ""),
-            "canaryTypes": meta.get("canaryTypes", []),
-            "fakeGitBytes": len(content),
-            "fakeGitDripBytes": FAKE_GIT_DRIP_BYTES,
-            "fakeGitDripIntervalMs": FAKE_GIT_DRIP_INTERVAL_MS,
-        })
-        if request.method == "HEAD":
-            return response
-
-        interval_s = FAKE_GIT_DRIP_INTERVAL_MS / 1000.0
         bytes_sent = 0
+        prepared = False
         try:
+            await response.prepare(request)
+            prepared = True
+            append_log({
+                **log_context,
+                "status": 200,
+                "result": "fake-git",
+                "commitSha": meta.get("commitSha", ""),
+                "rootTreeSha": meta.get("rootTreeSha", ""),
+                "secretsBlobSha": meta.get("secretsBlobSha", ""),
+                "canaryTypes": meta.get("canaryTypes", []),
+                "fakeGitBytes": len(content),
+                "fakeGitDripBytes": FAKE_GIT_DRIP_BYTES,
+                "fakeGitDripIntervalMs": FAKE_GIT_DRIP_INTERVAL_MS,
+            })
+            if request.method == "HEAD":
+                return response
+
+            interval_s = FAKE_GIT_DRIP_INTERVAL_MS / 1000.0
             for offset in range(0, len(content), FAKE_GIT_DRIP_BYTES):
                 chunk = content[offset:offset + FAKE_GIT_DRIP_BYTES]
                 await response.write(chunk)
@@ -5103,8 +5418,14 @@ async def _send_fake_git(
                 if offset + FAKE_GIT_DRIP_BYTES < len(content):
                     await asyncio.sleep(interval_s)
         except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientConnectionError):
+            # Scanners regularly close the socket between SYN-ACK and the
+            # first byte of body — `prepare()` then raises the same family
+            # of errors as `write()`. Treat both the same way so a fast
+            # disconnect is a logged event, not an unhandled traceback.
             append_log({
-                **log_context, "status": 200, "result": "fake-git-disconnect",
+                **log_context,
+                "status": 200,
+                "result": "fake-git-disconnect" if prepared else "fake-git-prepare-disconnect",
                 "fakeGitBytesSent": bytes_sent,
                 "commitSha": meta.get("commitSha", ""),
             })
@@ -5188,31 +5509,33 @@ async def _send_tarpit(
             "X-Accel-Buffering": "no",
             **extra_headers,
         })
-        await response.prepare(request)
-
-        log_entry: dict[str, object] = {
-            **log_context,
-            "status": 200,
-            "result": "tarpit",
-            "tarpitChunkBytes": TARPIT_CHUNK_BYTES,
-            "tarpitIntervalMs": TARPIT_INTERVAL_MS,
-            "tarpitSeconds": TARPIT_SECONDS,
-        }
-        if aug_meta:
-            log_entry["modules"] = aug_meta
-        append_log(log_entry)
-
-        if request.method == "HEAD":
-            return response
-
-        if MOD_VARIABLE_DRIP_ENABLED:
-            interval_ms = float(MOD_VARIABLE_DRIP_INITIAL_MS)
-        else:
-            interval_ms = float(TARPIT_INTERVAL_MS)
-
-        deadline = (time.monotonic() + TARPIT_SECONDS) if TARPIT_SECONDS > 0 else None
         chunks_sent = 0
+        prepared = False
         try:
+            await response.prepare(request)
+            prepared = True
+
+            log_entry: dict[str, object] = {
+                **log_context,
+                "status": 200,
+                "result": "tarpit",
+                "tarpitChunkBytes": TARPIT_CHUNK_BYTES,
+                "tarpitIntervalMs": TARPIT_INTERVAL_MS,
+                "tarpitSeconds": TARPIT_SECONDS,
+            }
+            if aug_meta:
+                log_entry["modules"] = aug_meta
+            append_log(log_entry)
+
+            if request.method == "HEAD":
+                return response
+
+            if MOD_VARIABLE_DRIP_ENABLED:
+                interval_ms = float(MOD_VARIABLE_DRIP_INITIAL_MS)
+            else:
+                interval_ms = float(TARPIT_INTERVAL_MS)
+
+            deadline = (time.monotonic() + TARPIT_SECONDS) if TARPIT_SECONDS > 0 else None
             while deadline is None or time.monotonic() < deadline:
                 await response.write(build_tarpit_chunk(request_id, path, chunks_sent))
                 chunks_sent += 1
@@ -5220,10 +5543,14 @@ async def _send_tarpit(
                 if MOD_VARIABLE_DRIP_ENABLED:
                     interval_ms = min(interval_ms * 1.5, float(MOD_VARIABLE_DRIP_MAX_MS))
         except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientConnectionError):
+            # `prepare()` raises the same family of errors as `write()` when
+            # a scanner closes the socket before headers go out. Treat both
+            # cases the same so the connection-reset path stays a logged
+            # event, not an unhandled traceback.
             append_log({
                 **log_context,
                 "status": 200,
-                "result": "tarpit-disconnect",
+                "result": "tarpit-disconnect" if prepared else "tarpit-prepare-disconnect",
                 "tarpitChunksSent": chunks_sent,
             })
         return response
@@ -5334,6 +5661,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_coldfusion_path(path):
         return await _handle_coldfusion(request, log_context, path, request_body)
 
+    if is_confluence_path(path):
+        return await _handle_confluence(request, log_context, path, request_body)
+
     if is_cmd_injection_path(path):
         return await _handle_cmd_injection(
             request, log_context, path, query_string, request_body, request_id,
@@ -5412,10 +5742,18 @@ def main() -> int:
         active.append("sonicwall-ssl-vpn")
     if CISCO_WEBVPN_ENABLED:
         active.append("cisco-webvpn")
+    if IVANTI_VPN_ENABLED:
+        active.append("ivanti-vpn")
+    if ASPERA_FASPEX_ENABLED:
+        active.append("aspera-faspex")
+    if HIKVISION_ENABLED:
+        active.append("hikvision")
     if GEOSERVER_ENABLED:
         active.append("geoserver")
     if COLDFUSION_ENABLED:
         active.append("coldfusion")
+    if CONFLUENCE_ENABLED:
+        active.append("confluence")
     if CMD_INJECTION_ENABLED:
         active.append("cmd-injection")
     print(

@@ -151,6 +151,23 @@ The POST body read cap is shared with the webshell trap
 (`HONEYPOT_WEBSHELL_BODY_READ_LIMIT`, default 64 KiB off the wire).
 ColdFusion log previews are capped at 512 chars for exploit triage.
 
+## Fake Atlassian Confluence (CVE-2022-26134 OGNL RCE bait)
+
+No Tracebit key required.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_CONFLUENCE_ENABLED` | on | Master switch. |
+| `HONEYPOT_CONFLUENCE_PATHS_CSV` | *(built-in — `/login.action`, `/pages/createpage-entervariables.action`, `/pages/doenterpagevariables.action`, `/templates/editor-preload-container`, `/users/user-dark-features` plus the same set under `/confluence/` and `/wiki/` deployment prefixes)* | Exact, case-insensitive seeds. The handler also matches any path containing `${@...}` or its URL-encoded form `%24%7B%40...` — those are the canonical CVE-2022-26134 OGNL injection payloads, embedded in the request path itself. |
+| `HONEYPOT_CONFLUENCE_VERSION` | `7.18.1` | Version banner shown in the login page and `meta` tags. Pinned to a build in the public-disclosure window for CVE-2022-26134 so the scanner ships the exploit body instead of bailing on a patched banner. |
+
+The handler decodes URL-encoded payloads and lifts any OAST-family
+callback hostname (`oast.me`, `oast.fun`, `interact.sh`, `dnslog.cn`,
+`burpcollaborator.net`, `ceye.io`, `requestbin.net`, `pipedream.net`,
+…) into the `confluenceOastCallback` log field. The same callback
+hostname recurring across sensors is a strong attribution signal
+regardless of source IP rotation.
+
 ## Bind address / port
 
 Flux listens on `127.0.0.1:18081` (aiohttp). To change, edit

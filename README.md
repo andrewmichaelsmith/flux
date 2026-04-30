@@ -49,6 +49,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | Fake Hikvision IP camera | Hikvision ISAPI surface (`/SDK/webLanguage`, `/ISAPI/Security/userCheck`, `/ISAPI/System/deviceInfo`); returns plausible XML with `Server: App-webs/` and a CVE-2021-36260-window firmware banner, flips `hikvisionHasCmdInjection` on shell-meta indicators in body/query so language-parameter command-injection payloads are easy to triage — [docs](./docs/fake-hikvision.md) | 2026-04-29 | no |
 | Fake GeoServer admin / OGC | GeoServer 2.x admin shell + About page + OGC `*_Capabilities` on `/geoserver/...`; flags OGNL/expression-language indicators in query string + body so CVE-2024-36401 payloads are easy to triage — [docs](./docs/fake-geoserver.md) | 2026-04-25 | no |
 | Fake ColdFusion admin / component browser | ColdFusion public `.cfm` anchors plus `/CFIDE/componentutils/`, Administrator, and AdminAPI surfaces; logs method, auth/session hints, and exploit payload indicators — [docs](./docs/fake-coldfusion.md) | 2026-04-25 | no |
+| Fake Atlassian Confluence | Confluence 7.x login surface on `pages/createpage-entervariables.action`, `pages/doenterpagevariables.action`, `templates/editor-preload-container`, `users/user-dark-features`, `login.action` (bare, `/confluence/`, `/wiki/` prefixes); also matches URL-encoded `${@...}` OGNL injections in the request path itself; extracts the OAST/Interactsh callback hostname from the payload (CVE-2022-26134 bait) — [docs](./docs/fake-confluence.md) | 2026-04-30 | no |
 | Cmd-injection / printenv responder | `/admin/config?cmd=…` and `/admin/config.php?cmd=…` (admin-shell exploit shape) plus `/printenv`, `/cgi-bin/printenv`, `/cgi-bin/test-cgi`; classifies the cmd value, returns a plausible `cat /etc/passwd` / `id` / `uname` body, and mints a per-request Tracebit AWS canary when the cmd asks for `~/.aws/credentials` or env vars — [docs](./docs/cmd-injection.md) | 2026-04-26 | yes |
 | PHP/body-RCE responders | Body-driven exploit responders for PHPUnit `eval-stdin.php`, PHP-CGI `auto_prepend_file=php://input`, and Apache CGI path-traversal `/bin/sh`; logs request-body payloads and decoded base64 command hints — [docs](./docs/cmd-injection.md) | 2026-04-26 | no |
 
@@ -240,6 +241,7 @@ under [`docs/`](./docs/):
 - [Fake Hikvision IP camera trap](./docs/fake-hikvision.md)
 - [Fake GeoServer admin / OGC](./docs/fake-geoserver.md)
 - [Fake ColdFusion admin / component browser](./docs/fake-coldfusion.md)
+- [Fake Atlassian Confluence](./docs/fake-confluence.md)
 - [Cmd-injection / printenv responder](./docs/cmd-injection.md)
 - [CI/CD config canaries](./docs/ci-cd-config.md)
 - [Fake webshell](./docs/fake-webshell.md)
