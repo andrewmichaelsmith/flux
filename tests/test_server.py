@@ -34,6 +34,36 @@ def test_default_webshell_paths_include_azure_wp_checker_anchor():
         assert tbenv.is_webshell_path(path), f"expected webshell match: {path}"
 
 
+def test_default_webshell_paths_include_style_php_family():
+    """style.php is a recurring webshell-rename: legitimate WordPress serves
+    style.css, never style.php, so any /style.php — at the root or under any of
+    the four standard WP directory prefixes — is the scanner's confirmation
+    fingerprint. The bare /js/style.php and /wp-style.php variants share the
+    same intent."""
+    must_match = [
+        "/style.php",
+        "/wp-style.php",
+        "/wp-admin/style.php",
+        "/wp-content/style.php",
+        "/wp-content/themes/style.php",
+        "/wp-includes/style.php",
+        "/js/style.php",
+    ]
+    for path in must_match:
+        assert tbenv.is_webshell_path(path), f"expected webshell match: {path}"
+
+
+def test_style_css_is_not_a_webshell_path():
+    """The .css cousin is the legitimate WP file and must stay 404 so we
+    don't mistake real-browser fetches for scanner traffic."""
+    for path in [
+        "/style.css",
+        "/wp-content/style.css",
+        "/wp-content/themes/twentytwentyfour/style.css",
+    ]:
+        assert not tbenv.is_webshell_path(path), f"unexpected match: {path}"
+
+
 def test_webshell_path_is_case_insensitive():
     assert tbenv.is_webshell_path("/WP-Content/Plugins/HelloPress/WP_FILEMANAGER.PHP")
 

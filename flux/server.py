@@ -153,6 +153,20 @@ _WEBSHELL_DEFAULT_PATHS = ",".join([
     "/wp-block.php", "/wp-good.php", "/wp-kikikoko.php",
     #   - non-.php backdoors ("dr0v" is a specific observed marker name)
     "/dr0v",
+    #   - "style.php" webshell-jacking family (active since Jan 2026):
+    #     dedicated single-path checker fleet renames its eval(...) shell
+    #     `style.php` and probes both the bare root and the four standard
+    #     WordPress directory prefixes. Real WP serves style.css, never
+    #     style.php — any 200 here is the scanner's confirmation signal.
+    #     Same handler returns the fake login + simulates command output
+    #     when a follow-on `?cmd=` lands.
+    "/style.php",
+    "/wp-style.php",
+    "/wp-admin/style.php",
+    "/wp-content/style.php",
+    "/wp-content/themes/style.php",
+    "/wp-includes/style.php",
+    "/js/style.php",
 ])
 WEBSHELL_PATHS = {
     value.strip().lower()
