@@ -2800,6 +2800,91 @@ def render_aws_config_ini(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_terraform_tfstate(r: dict[str, object]) -> bytes:
+    # `terraform.tfstate` is the JSON snapshot Terraform writes when applying
+    # against a non-remote backend. Provider credentials and resource IDs end
+    # up in plaintext under `resources[].instances[].attributes`, so an
+    # exposed tfstate is a one-shot AWS/GCP/Azure credential leak — exactly
+    # the value scanners are after.
+    #
+    # Two design choices worth a comment:
+    #
+    # 1. `lineage` (uuid) and `serial` (monotonic int) are emitted random
+    #    per-hit. Real tfstates have a stable lineage per state file; here
+    #    they vary per request because every fetch should look like an
+    #    independent leak (a fixed lineage across the fleet would itself be
+    #    a fingerprint).
+    #
+    # 2. The canary AWS access key + secret are placed both in an
+    #    `aws_iam_access_key` resource (where Terraform actually stores them)
+    #    and in a top-level `outputs` block. Some scrapers extract via
+    #    `outputs[].value`, others walk `resources[]`; covering both shapes
+    #    means a field-keyed harvester catches the canary either way.
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "")
+    secret_key = aws.get("awsSecretAccessKey", "")
+    state = {
+        "version": 4,
+        "terraform_version": "1.7.5",
+        "serial": secrets.randbelow(900) + 100,
+        "lineage": str(uuid.uuid4()),
+        "outputs": {
+            "deploy_access_key_id": {
+                "value": access_key,
+                "type": "string",
+            },
+            "deploy_secret_access_key": {
+                "value": secret_key,
+                "type": "string",
+                "sensitive": True,
+            },
+        },
+        "resources": [
+            {
+                "mode": "managed",
+                "type": "aws_iam_access_key",
+                "name": "deploy",
+                "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+                "instances": [
+                    {
+                        "schema_version": 0,
+                        "attributes": {
+                            "id": access_key,
+                            "user": "deploy",
+                            "secret": secret_key,
+                            "status": "Active",
+                            "create_date": "2024-08-01T00:00:00Z",
+                            "pgp_key": "",
+                            "key_fingerprint": "",
+                        },
+                        "sensitive_attributes": [],
+                    },
+                ],
+            },
+            {
+                "mode": "managed",
+                "type": "aws_s3_bucket",
+                "name": "primary",
+                "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+                "instances": [
+                    {
+                        "schema_version": 0,
+                        "attributes": {
+                            "id": "app-prod-data",
+                            "bucket": "app-prod-data",
+                            "region": "us-east-1",
+                            "arn": "arn:aws:s3:::app-prod-data",
+                        },
+                        "sensitive_attributes": [],
+                    },
+                ],
+            },
+        ],
+        "check_results": None,
+    }
+    return (json.dumps(state, indent=2) + "\n").encode("utf-8")
+
+
 def render_pgpass(r: dict[str, object]) -> bytes:
     # Postgres `.pgpass` format: one line per entry, colon-separated
     # hostname:port:database:username:password. libpq reads this file if it
@@ -3795,6 +3880,21 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_aws_config_ini,
         "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "terraform-tfstate",
+        (
+            # `.terraform/terraform.tfstate` is the in-repo path Terraform
+            # writes when initialised against a local backend. The bare
+            # `/terraform.tfstate` and `.backup` sibling are scanner-dictionary
+            # variants — same shape, same canary placement.
+            "/.terraform/terraform.tfstate",
+            "/terraform.tfstate",
+            "/terraform.tfstate.backup",
+        ),
+        ("aws",),
+        render_terraform_tfstate,
+        "application/json; charset=utf-8",
     ),
     CanaryTrap(
         "pgpass",

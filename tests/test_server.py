@@ -708,6 +708,42 @@ async def test_dispatch_routes_aws_credentials_file_to_trap(flux_client, monkeyp
     assert entries[-1]["result"] == "aws-credentials-file"
 
 
+@pytest.mark.parametrize("path", [
+    "/.terraform/terraform.tfstate",
+    "/terraform.tfstate",
+    "/terraform.tfstate.backup",
+])
+async def test_dispatch_routes_terraform_tfstate_to_trap(flux_client, monkeypatch, path):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.14"})
+    assert resp.status == 200
+    assert resp.headers["Content-Type"] == "application/json; charset=utf-8"
+    body = await resp.read()
+    parsed = json.loads(body)
+    assert parsed["version"] == 4
+    assert parsed["resources"][0]["type"] == "aws_iam_access_key"
+    attrs = parsed["resources"][0]["instances"][0]["attributes"]
+    assert attrs["id"] == "AKIAFAKEEXAMPLE01"
+    assert attrs["secret"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert parsed["outputs"]["deploy_access_key_id"]["value"] == "AKIAFAKEEXAMPLE01"
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "terraform-tfstate"
+
+
+def test_terraform_tfstate_lineage_and_serial_per_hit_unique():
+    """Lineage uuid + serial vary per render so the rendered body can't be
+    cross-sensor fingerprinted."""
+    a = json.loads(tbenv.render_terraform_tfstate(FAKE_TRACEBIT))
+    b = json.loads(tbenv.render_terraform_tfstate(FAKE_TRACEBIT))
+    assert a["lineage"] != b["lineage"]
+    # serial is a small int so a tie is possible but improbable; sample a few
+    serials = {json.loads(tbenv.render_terraform_tfstate(FAKE_TRACEBIT))["serial"] for _ in range(8)}
+    assert len(serials) > 1, "serial should vary across renders"
+
+
 async def test_handle_swallows_body_read_disconnect():
     """A scanner that sends Content-Length and drops the socket before the body
     arrives makes `request.content.read()` raise ConnectionResetError. Without
