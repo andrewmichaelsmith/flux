@@ -129,7 +129,7 @@ Toggle the whole category with `CANARY_TRAPS_ENABLED`. Paths are
 case-insensitive exact matches.
 
 | Trap | Paths | Canary type | Log tag |
-| --- | --- | --- |
+| --- | --- | --- | --- |
 | AWS credentials file (INI) | `/.aws/credentials` | `aws` | `aws-credentials-file` |
 | AWS SDK config (INI) | `/.aws/config` | `aws` | `aws-config-file` |
 | Terraform tfstate (JSON) — [docs](./docs/terraform-tfstate.md) | `/.terraform/terraform.tfstate`, `/terraform.tfstate`, `/terraform.tfstate.backup` | `aws` | `terraform-tfstate` |
