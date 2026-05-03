@@ -5808,7 +5808,14 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if read_body:
         # Cap body size off the wire. aiohttp returns exactly N bytes or fewer;
         # the scanner's Content-Length is advisory only, not trusted.
-        request_body = await request.content.read(WEBSHELL_BODY_READ_LIMIT)
+        try:
+            request_body = await request.content.read(WEBSHELL_BODY_READ_LIMIT)
+        except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientConnectionError):
+            # Scanners that send a Content-Length header and then drop the
+            # socket before the body arrives are extremely common. Without
+            # this handler aiohttp logs a 30-line stack trace per occurrence;
+            # the disconnect itself isn't actionable, so close out quietly.
+            return web.Response(status=499, body=b"")
         body_bytes_read = len(request_body)
         if body_bytes_read:
             body_sha256 = hashlib.sha256(request_body).hexdigest()

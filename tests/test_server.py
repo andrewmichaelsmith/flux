@@ -708,6 +708,25 @@ async def test_dispatch_routes_aws_credentials_file_to_trap(flux_client, monkeyp
     assert entries[-1]["result"] == "aws-credentials-file"
 
 
+async def test_handle_swallows_body_read_disconnect():
+    """A scanner that sends Content-Length and drops the socket before the body
+    arrives makes `request.content.read()` raise ConnectionResetError. Without
+    a handler this becomes a 30-line stack trace per hit. handle() should
+    return a 499 Response and not let the exception propagate."""
+    class _Stream:
+        async def read(self, n):
+            raise ConnectionResetError("Connection lost")
+
+    class _Request:
+        method = "POST"
+        headers = {"Host": "x", "User-Agent": "u"}
+        content = _Stream()
+        rel_url = type("U", (), {"raw_path": "/x", "raw_query_string": ""})()
+
+    resp = await tbenv.handle(_Request())
+    assert resp.status == 499
+
+
 @pytest.mark.parametrize("path", [
     "/wp-config.php.old",
     "/wp-config.php.save",
