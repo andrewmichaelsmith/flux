@@ -566,6 +566,135 @@ def _confluence_has_ognl(path: str, query: str, body_preview: str) -> bool:
     return any(needle in haystack for needle in _CONFLUENCE_OGNL_INDICATORS)
 
 
+# --- Fake Next.js application + SSJS-injection probe responder ----------
+# Probes seen in the wild send a base64-encoded JS payload via `?cmd=...`
+# against Next.js conventional routes. The decoded body is an
+# IIFE that calls `require('child_process').execSync(cmd)` inside a
+# try/catch — a classic server-side-JavaScript-injection (SSJS) test.
+# A bare 404 leaks "this isn't Next.js"; emitting a plausible page-data
+# JSON keeps the scanner alive past the fingerprint stage and a careful
+# echo simulation invites a real exploitation follow-up that we capture
+# in the next request.
+NEXTJS_ENABLED = _env_bool("HONEYPOT_NEXTJS_ENABLED")
+_NEXTJS_DEFAULT_PATHS = ",".join([
+    "/api/endpoint",
+    "/api/test",
+    # Literal `[[...slug]]` is the catch-all-route declaration shape;
+    # scanners targeting Next.js sometimes probe the literal form.
+    "/api/[[...slug]]",
+    # Ubiquiti UniFi controllers also expose `/api/v2/about`; Next.js
+    # is the more common host of that path in the wild, so route it
+    # here for now (low FP risk — no other handler claims it).
+    "/api/v2/about",
+])
+NEXTJS_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_NEXTJS_PATHS_CSV") or _NEXTJS_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# Path prefixes that route to the trap. `_next/data/<buildId>/*.json` is
+# Next.js's ISR data endpoint; `_next/static/chunks/pages/...` is the
+# build-output JS chunk path. Both are characteristic enough that hits
+# only come from Next.js-aware scanners. We deliberately do NOT match
+# `/api/` as a prefix — too generic, and the observable probes use a
+# small set of Next.js-conventional `/api/*` paths covered above.
+_NEXTJS_PATH_PREFIXES = ("/_next/data/", "/_next/static/chunks/pages/")
+NEXTJS_BODY_DECODE_LIMIT = max(int((os.environ.get("HONEYPOT_NEXTJS_BODY_DECODE_LIMIT") or "8192").strip() or "8192"), 512)
+
+# SSJS-injection indicators inside the decoded `cmd=` payload (or raw
+# body). A real Next.js endpoint never sees these strings.
+_NEXTJS_SSJS_INDICATORS = (
+    "child_process",
+    # Observed verbatim in a probe (note: `child-process` with a hyphen
+    # is not a real Node module, so the scanner's payload would always
+    # `catch` and return its sentinel string — a fingerprint of the
+    # probe itself, not a real exploit.)
+    "child-process",
+    "execsync",
+    "require(",
+    "(function()",
+    "function () {",
+    "process.env",
+    "global.process",
+    "globalthis",
+)
+
+# Extracts the literal `var cmd = "..."` / `var cmd = '...'` from the
+# decoded JS so the trap can reflect the operator's own probe-marker
+# string (`echo VULN_TEST` etc.) back to them.
+_NEXTJS_CMD_LITERAL_RE = re.compile(
+    r"""var\s+cmd\s*=\s*['"]([^'"]{0,512})['"]""",
+    re.IGNORECASE,
+)
+
+
+def _nextjs_decode_cmd_param(query: str) -> str:
+    """Extract the `cmd=` query value and base64-decode it. Returns the
+    decoded string, or "" if the param is absent / undecodable / too
+    large. Tolerant of URL-safe base64 and missing padding."""
+    if not query:
+        return ""
+    try:
+        params = parse_qs(query, keep_blank_values=True)
+    except Exception:  # pragma: no cover — parse_qs is permissive
+        return ""
+    raw = ""
+    for key in ("cmd", "command", "exec"):
+        values = params.get(key)
+        if values:
+            raw = values[0]
+            break
+    if not raw or len(raw) > NEXTJS_BODY_DECODE_LIMIT:
+        return ""
+    # Try base64 first (the observed shape); fall back to the raw value
+    # so plaintext probes (?cmd=id) still get logged.
+    candidate = raw.replace("-", "+").replace("_", "/")
+    candidate += "=" * (-len(candidate) % 4)
+    try:
+        decoded = base64.b64decode(candidate, validate=False)
+    except Exception:
+        return raw[:NEXTJS_BODY_DECODE_LIMIT]
+    try:
+        text = decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw[:NEXTJS_BODY_DECODE_LIMIT]
+    return text[:NEXTJS_BODY_DECODE_LIMIT] if text.strip() else raw[:NEXTJS_BODY_DECODE_LIMIT]
+
+
+def _nextjs_has_ssjs(decoded_payload: str) -> bool:
+    if not decoded_payload:
+        return False
+    haystack = decoded_payload.lower()
+    return any(needle in haystack for needle in _NEXTJS_SSJS_INDICATORS)
+
+
+def _nextjs_extract_cmd_literal(decoded_payload: str) -> str:
+    """Return the inner `var cmd = "..."` literal, or "" if absent."""
+    if not decoded_payload:
+        return ""
+    match = _NEXTJS_CMD_LITERAL_RE.search(decoded_payload)
+    return match.group(1) if match else ""
+
+
+def _nextjs_simulate_command(cmd_literal: str) -> str:
+    """Mimic the output of trivial `echo` probes so a follow-up
+    exploitation payload is more likely to be sent. Anything other than
+    a literal `echo <safe-token>` falls back to the same sentinel string
+    the scanner's own catch-block returns ("ERROR") — that keeps the
+    response surface small and looks like a partial-eval failure
+    instead of a working RCE for unrecognised commands."""
+    text = cmd_literal.strip()
+    if not text:
+        return "ERROR"
+    if text.lower().startswith("echo "):
+        body = text[5:].strip().strip('"\'')
+        # Reject anything but printable ASCII; we don't want to reflect
+        # arbitrary attacker bytes back even into a log row.
+        if re.fullmatch(r"[\w\-.: /]{0,256}", body):
+            return f"{body}\n"
+    return "ERROR"
+
+
 # OAST / Interactsh / DNSlog-family hostnames seen in OOB callback
 # payloads. Anchored on `.<domain>` so partial matches like
 # `notoast.me.example.com` don't trigger a false positive.
@@ -1034,6 +1163,15 @@ def is_coldfusion_path(path: str) -> bool:
         or p.startswith("/cfide/administrator/")
         or p.startswith("/cfide/adminapi/")
     )
+
+
+def is_nextjs_path(path: str) -> bool:
+    if not NEXTJS_ENABLED:
+        return False
+    p = path.lower()
+    if p in NEXTJS_PATHS:
+        return True
+    return p.startswith(_NEXTJS_PATH_PREFIXES)
 
 
 def is_confluence_path(path: str) -> bool:
@@ -5395,6 +5533,110 @@ async def _handle_confluence(
     )
 
 
+def render_nextjs_page_data(path: str) -> bytes:
+    """Plausible response body for a Next.js ISR data fetch. Real
+    `_next/data/<buildId>/<page>.json` returns a wrapped pageProps
+    object; an empty-but-shaped JSON keeps Next.js-aware scanners
+    moving past the fingerprint check without leaking specifics."""
+    payload = {
+        "pageProps": {},
+        "__N_SSG": True,
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_nextjs_static_chunk() -> bytes:
+    """`_next/static/chunks/pages/...js` is the build-output chunk; a
+    minimal valid JS module is enough to look like a real chunk
+    response."""
+    body = (
+        "(self.webpackChunk_N_E=self.webpackChunk_N_E||[]).push("
+        "[[404],{}]);\n"
+    )
+    return body.encode("utf-8")
+
+
+async def _handle_nextjs(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake Next.js surface that catches server-side-JavaScript
+    injection probes via `?cmd=<base64>`. Decodes the payload, logs the
+    probe shape, and reflects a simulated `echo` result back when the
+    payload contains a literal `var cmd = "echo X"` — designed to
+    invite a follow-up exploitation request."""
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:NEXTJS_BODY_DECODE_LIMIT].decode(
+            "utf-8", errors="replace",
+        )
+
+    decoded_cmd = _nextjs_decode_cmd_param(query_string)
+    has_ssjs = _nextjs_has_ssjs(decoded_cmd) or _nextjs_has_ssjs(body_preview)
+    cmd_literal = (
+        _nextjs_extract_cmd_literal(decoded_cmd)
+        or _nextjs_extract_cmd_literal(body_preview)
+    )
+
+    log_extra: dict[str, object] = {
+        "nextjsPath": path,
+        "nextjsHasSsjs": has_ssjs,
+    }
+    if decoded_cmd:
+        log_extra["nextjsCmdDecoded"] = decoded_cmd[:512]
+    if cmd_literal:
+        log_extra["nextjsCmdLiteral"] = cmd_literal[:256]
+    if body_preview:
+        log_extra["bodyPreview"] = body_preview[:400]
+
+    lpath = path.lower()
+    if has_ssjs:
+        # Reflect a simulated echo so scanner thinks SSJS evaluation
+        # worked. Anything other than `echo <safe-token>` falls back to
+        # "ERROR" — matches the scanner's own catch-block sentinel and
+        # avoids reflecting attacker bytes verbatim.
+        result_tag = "nextjs-ssjs-probe"
+        body = _nextjs_simulate_command(cmd_literal).encode("utf-8")
+        content_type = "text/plain; charset=utf-8"
+    elif lpath.startswith("/_next/data/"):
+        result_tag = "nextjs-page-data"
+        body = render_nextjs_page_data(path)
+        content_type = "application/json; charset=utf-8"
+    elif lpath.startswith("/_next/static/chunks/pages/"):
+        result_tag = "nextjs-static-chunk"
+        body = render_nextjs_static_chunk()
+        content_type = "application/javascript; charset=utf-8"
+    else:
+        # `/api/*` route hit without an SSJS payload — return an empty
+        # JSON object, the canonical "endpoint exists but returned
+        # nothing" shape from a Next.js API route.
+        result_tag = "nextjs-api"
+        body = b"{}"
+        content_type = "application/json; charset=utf-8"
+
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        **log_extra,
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": content_type,
+            "Cache-Control": "no-store",
+            # Set a plausible build-id header — real Next.js does not emit
+            # this on every response, but emitting it on the data routes
+            # mirrors the shape scanners look for.
+            "X-Powered-By": "Next.js",
+        },
+    )
+
+
 async def _handle_webshell(
     request: web.Request,
     log_context: dict[str, object],
@@ -5960,6 +6202,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_confluence_path(path):
         return await _handle_confluence(request, log_context, path, request_body)
+
+    if is_nextjs_path(path):
+        return await _handle_nextjs(request, log_context, path, query_string, request_body)
 
     if is_cmd_injection_path(path):
         return await _handle_cmd_injection(

