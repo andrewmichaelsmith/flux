@@ -44,6 +44,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | Fake SonicWall SSL VPN | SonicOS 7 JSON responses on the three paths in the CVE-2024-53704 auth-bypass chain; logs submitted username, body sha + preview, and replayed session cookies — [docs](./docs/fake-sonicwall.md) | no |
 | Fake Cisco WebVPN endpoint | Cisco SSL VPN landing page + launcher assets on `/+CSCOE+/...` and `/+CSCOL+/...`; also recognizes AnyConnect `config-auth` XML POSTs to `/` and logs submitted usernames without storing passwords — [docs](./docs/fake-cisco-webvpn.md) | no |
 | Fake Ivanti Connect Secure / Pulse Secure VPN | Ivanti SSL VPN welcome + login POST + HostChecker installer assets on `/dana-na/...` and `/dana-cached/hc/...`; mints a per-request `DSID` cookie, logs username + has-password, and flips `ivantiHasCmdInjection` on shell-meta payloads aimed at `/dana-ws/namedusers` (CVE-2023-46805 / CVE-2024-21887 / CVE-2025-22457 chain bait) — [docs](./docs/fake-ivanti-vpn.md) | no |
+| Fake FortiGate SSL VPN | FortiOS SSL VPN login + `/remote/logincheck` credential POST (mints per-request `SVPNCOOKIE`) plus `/api/v2/cmdb/system/{admin,status,global}` and `/api/v2/monitor/router/policy` REST stubs; flips `fortigateHasCmdInjection` on shell-meta payloads aimed at the REST surface (CVE-2024-21762 / CVE-2023-27997 / CVE-2024-48887 bait) — [docs](./docs/fake-fortigate-vpn.md) | no |
 | Fake IBM Aspera Faspex portal | Aspera Faspex login/logout/relay surfaces on `/aspera/faspex/...`; emits plausible HTML/JSON, logs follow-on payload previews on logout/relay endpoints, and keeps scanner chains alive past initial fingerprinting (CVE-2022-47986 bait) — [docs](./docs/fake-aspera-faspex.md) | no |
 | Fake Hikvision IP camera | Hikvision ISAPI surface (`/SDK/webLanguage`, `/ISAPI/Security/userCheck`, `/ISAPI/System/deviceInfo`); returns plausible XML with `Server: App-webs/` and a CVE-2021-36260-window firmware banner, flips `hikvisionHasCmdInjection` on shell-meta indicators in body/query so language-parameter command-injection payloads are easy to triage — [docs](./docs/fake-hikvision.md) | no |
 | Fake D-Link / Linksys HNAP1 router | SOAP-over-HTTP HNAP1 control endpoint at `/HNAP1`; GETs return a `<DeviceSettings>` envelope with vendor / model / `Server: Mathopd/` banner, POSTs return a generic SOAP `OK` whose response element name tracks the SOAPAction header. Logs the raw `SOAPAction` value and flips `hnap1HasCmdInjection` on shell-meta indicators in the header / query / body so CVE-2015-2051 dropper payloads are easy to triage — [docs](./docs/fake-hnap1.md) | no |
@@ -239,6 +240,7 @@ under [`docs/`](./docs/):
 - [Fake SonicWall SSL VPN endpoint](./docs/fake-sonicwall.md)
 - [Fake Cisco WebVPN endpoint](./docs/fake-cisco-webvpn.md)
 - [Fake Ivanti Connect Secure / Pulse Secure VPN endpoint](./docs/fake-ivanti-vpn.md)
+- [Fake FortiGate SSL VPN endpoint](./docs/fake-fortigate-vpn.md)
 - [Fake IBM Aspera Faspex trap](./docs/fake-aspera-faspex.md)
 - [Fake Hikvision IP camera trap](./docs/fake-hikvision.md)
 - [Fake D-Link / Linksys HNAP1 router trap](./docs/fake-hnap1.md)

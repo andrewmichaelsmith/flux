@@ -137,6 +137,22 @@ The POST body read cap is shared with the webshell trap
 the decoded preview written to the log is capped by
 `HONEYPOT_WEBSHELL_BODY_DECODE_LIMIT` (default 8 KiB).
 
+## Fake FortiGate SSL VPN (CVE-2024-21762 / CVE-2023-27997 / CVE-2024-48887 bait)
+
+No Tracebit key required.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_FORTIGATE_VPN_ENABLED` | on | Master switch. |
+| `HONEYPOT_FORTIGATE_VPN_PATHS_CSV` | *(built-in — `/remote/login`, `/remote/logincheck`, `/remote/fgt_lang`, `/remote/error`, `/api/v2/cmdb/system/admin`, `/api/v2/cmdb/system/status`, `/api/v2/cmdb/system/global`, `/api/v2/monitor/router/policy`)* | Exact, case-insensitive. Override to add/remove without a code change. |
+| `HONEYPOT_FORTIGATE_VPN_VERSION` | `7.4.4` | FortiOS version banner shown in the HTML comment + REST envelopes. Pinned to a build inside the CVE-2024-21762 / CVE-2023-27997 vulnerable window so banner-grab scrapers ship the exploit body. |
+| `HONEYPOT_FORTIGATE_VPN_BUILD` | `2662` | FortiOS build number paired with the version string. |
+
+The `SVPNCOOKIE` minted on `/remote/logincheck` and the `FGVM…` serial
+in the `/api/v2/cmdb/system/{status,global}` and
+`/api/v2/monitor/router/policy` envelopes are per-request unique
+(`uuid4().hex`). No fixed credential / serial literals.
+
 ## Fake ColdFusion admin / component browser
 
 No Tracebit key required.

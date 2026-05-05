@@ -356,6 +356,49 @@ ASPERA_FASPEX_PATHS = {
 }
 ASPERA_FASPEX_VERSION = (os.environ.get("HONEYPOT_ASPERA_FASPEX_VERSION") or "4.4.1").strip()
 
+# --- Fake FortiGate SSL VPN (CVE-2024-21762 / CVE-2023-27997 bait) -------
+# Multi-target VPN scanners started bundling FortiGate's `/remote/login` next
+# to Cisco AnyConnect (`/+CSCOE+/logon.html`) and Microsoft RDP Web Access
+# (`/RDWeb/Pages/`) probes in May 2026 — the FortiGate-specific path was the
+# new addition. FortiOS SSL VPN exposes:
+#   /remote/login                       — login landing (?lang=en is the
+#                                         observed first-contact form)
+#   /remote/logincheck                  — credential POST sink
+#   /remote/fgt_lang                    — language pack stub fetched by the
+#                                         JS on the login page
+#   /remote/error                       — error redirect target
+#   /api/v2/cmdb/system/admin           — REST admin enumeration (bait for
+#                                         CVE-2024-48887 admin password
+#                                         reset and post-auth chains)
+#   /api/v2/monitor/router/policy       — REST monitor (post-auth fingerprint
+#                                         used after login-page banner-grab
+#                                         confirms a vulnerable build)
+#   /api/v2/cmdb/system/status          — version / build banner
+# Returning the FortiOS login HTML keeps banner-grab probes alive past the
+# initial fingerprint so a follow-on CVE-2024-21762 (heap overflow,
+# unauthenticated, CVSS 9.8) or CVE-2023-27997 (xortigate, heap overflow,
+# unauthenticated, CVSS 9.8) body lands in the access log.
+FORTIGATE_VPN_ENABLED = _env_bool("HONEYPOT_FORTIGATE_VPN_ENABLED")
+_FORTIGATE_VPN_DEFAULT_PATHS = ",".join([
+    "/remote/login",
+    "/remote/logincheck",
+    "/remote/fgt_lang",
+    "/remote/error",
+    "/api/v2/cmdb/system/admin",
+    "/api/v2/cmdb/system/status",
+    "/api/v2/cmdb/system/global",
+    "/api/v2/monitor/router/policy",
+])
+FORTIGATE_VPN_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_FORTIGATE_VPN_PATHS_CSV") or _FORTIGATE_VPN_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# FortiOS build advertised in the response. 7.4.4 is in the
+# CVE-2024-21762 / CVE-2023-27997 vulnerable window.
+FORTIGATE_VPN_VERSION = (os.environ.get("HONEYPOT_FORTIGATE_VPN_VERSION") or "7.4.4").strip()
+FORTIGATE_VPN_BUILD = (os.environ.get("HONEYPOT_FORTIGATE_VPN_BUILD") or "2662").strip()
+
 # --- Fake Hikvision IP-camera ISAPI surface (CVE-2021-36260 bait) -------
 # Long-running banner-grab probes consistently fetch a small set of
 # ISAPI endpoints to identify Hikvision firmware before shipping a
@@ -922,6 +965,12 @@ def is_aspera_faspex_path(path: str) -> bool:
     if not ASPERA_FASPEX_ENABLED:
         return False
     return path.lower() in ASPERA_FASPEX_PATHS
+
+
+def is_fortigate_vpn_path(path: str) -> bool:
+    if not FORTIGATE_VPN_ENABLED:
+        return False
+    return path.lower() in FORTIGATE_VPN_PATHS
 
 
 def is_hikvision_path(path: str) -> bool:
@@ -1632,6 +1681,195 @@ def render_ivanti_namedusers_json() -> bytes:
         },
     }
     return json.dumps(payload).encode("utf-8")
+
+
+def render_fortigate_login_html(host: str, version: str, build: str) -> bytes:
+    """FortiOS SSL VPN login landing.
+
+    Real FortiOS serves a heavily-obfuscated login.js bundle and a small
+    HTML scaffold that posts to /remote/logincheck. We return the
+    scaffold + a comment carrying the version banner — enough that
+    fingerprint scrapers (which usually grep for `FortiGate` and a build
+    number, not bytewise diff against a real device) move on to the
+    second-stage probe.
+    """
+    safe_host = host or "fortigate"
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>Please Login</title>
+  <link rel="icon" href="/remote/fgt_favicon" />
+  <link rel="stylesheet" href="/remote/fgt_lang?lang=en" />
+  <!-- FortiGate / FortiOS {version}, build {build} -->
+</head>
+<body class="fortinet-login">
+  <div id="header">
+    <img src="/remote/fortinet.png" alt="FortiGate" />
+  </div>
+  <div id="main">
+    <form name="f" method="post" action="/remote/logincheck" autocomplete="off">
+      <input type="hidden" name="ajax" value="1" />
+      <input type="hidden" name="realm" value="" />
+      <table>
+        <tr><td>Name:</td><td><input type="text" name="username" /></td></tr>
+        <tr><td>Password:</td><td><input type="password" name="credential" /></td></tr>
+      </table>
+      <button type="submit">Login</button>
+    </form>
+  </div>
+  <div id="footer">
+    <small>{safe_host}</small>
+  </div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_fortigate_logincheck() -> bytes:
+    """Body returned for /remote/logincheck.
+
+    Real FortiOS replies with a short `ret=N,redir=...` text/plain blob
+    after evaluating the credential. We always emit auth-failure so the
+    scanner moves on (and ships any follow-on auth-bypass body); the
+    session cookie is set in the handler — minted per-request, never a
+    fixed literal.
+    """
+    return b"ret=1,redir=/remote/login&error=1\r\n"
+
+
+def render_fortigate_lang_stub() -> bytes:
+    # Real `fgt_lang?lang=en` returns a JSON map of UI strings. Returning
+    # an empty object is plausible enough for fingerprint scrapers.
+    return b"{}\n"
+
+
+def render_fortigate_error_html(host: str) -> bytes:
+    safe_host = host or "fortigate"
+    body = f"""<!doctype html>
+<html><head><title>Error</title></head>
+<body><div id="err">An error occurred. <a href="/remote/login?lang=en">Return to login</a></div>
+<small>{safe_host}</small>
+</body></html>
+"""
+    return body.encode("utf-8")
+
+
+def render_fortigate_admin_json(version: str, build: str) -> bytes:
+    """`/api/v2/cmdb/system/admin` — REST admin enumeration.
+
+    Real FortiOS returns 401 here without a session token; we emit a
+    canonical "permission_denied" envelope so scanners know the path is
+    live and ship a follow-on auth-bypass / token-replay attempt.
+    """
+    payload = {
+        "http_method": "GET",
+        "revision": uuid.uuid4().hex,
+        "results": [],
+        "vdom": "root",
+        "path": "system",
+        "name": "admin",
+        "status": "error",
+        "error": -11,
+        "http_status": 401,
+        "version": f"v{version}",
+        "build": int(build) if build.isdigit() else build,
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_fortigate_status_json(host: str, version: str, build: str) -> bytes:
+    """`/api/v2/cmdb/system/status` — version banner.
+
+    Public on real FortiOS pre-auth in some configs; banner-grab probes
+    sometimes skip the login HTML and go straight here.
+    """
+    safe_host = host or "fortigate"
+    payload = {
+        "http_method": "GET",
+        "results": {
+            "version": f"v{version}",
+            "build": int(build) if build.isdigit() else build,
+            "branch_point": build,
+            "release_version_information": f"FortiGate-VM64 v{version}",
+            "serial": "FGVM" + uuid.uuid4().hex[:12].upper(),
+            "hostname": safe_host,
+            "model": "FortiGate-VM64",
+            "model_name": "FortiGate",
+        },
+        "vdom": "root",
+        "path": "system",
+        "name": "status",
+        "status": "success",
+        "http_status": 200,
+        "version": f"v{version}",
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def render_fortigate_router_policy_json() -> bytes:
+    """`/api/v2/monitor/router/policy` — empty policy table envelope."""
+    payload = {
+        "http_method": "GET",
+        "results": [],
+        "vdom": "root",
+        "path": "router",
+        "name": "policy",
+        "action": "select",
+        "status": "success",
+        "serial": "FGVM" + uuid.uuid4().hex[:12].upper(),
+        "version": "v7.4.4",
+        "build": 2662,
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def extract_fortigate_logincheck_form(body: bytes, content_type: str) -> tuple[str, bool]:
+    """Pull `username` and check for credential / password presence.
+
+    FortiOS logincheck uses field names `username` + `credential`.
+    Real Forti deployments are seen with both `credential` and the
+    generic `password` in the wild, so we accept either.
+    """
+    form = parse_form_body(body, content_type)
+    username = ""
+    for key in ("username", "user", "login"):
+        values = form.get(key) or form.get(key.upper())
+        if values and values[0]:
+            username = values[0][:120]
+            break
+    has_password = any(
+        bool((form.get(key) or form.get(key.upper()) or [""])[0])
+        for key in ("credential", "password", "pass", "passwd")
+    )
+    return username, has_password
+
+
+_FORTIGATE_CMD_INJECTION_INDICATORS = (
+    ";",
+    "|",
+    "&&",
+    "$(",
+    "`",
+    "/bin/sh",
+    "/bin/bash",
+    "wget ",
+    "curl ",
+    "../",
+    # CVE-2024-21762 PoC bodies frequently embed the heap-overflow
+    # marker in a multipart boundary or in a magic Forti-auth header
+    # value.
+    "fgt_lang",
+    "param_str",
+)
+
+
+def _fortigate_has_cmd_injection(body_preview: str, query: str) -> bool:
+    haystack = f"{query} {body_preview}".lower()
+    return any(needle in haystack for needle in _FORTIGATE_CMD_INJECTION_INDICATORS)
 
 
 def render_aspera_faspex_landing(host: str, version: str) -> bytes:
@@ -5018,6 +5256,99 @@ async def _handle_aspera_faspex(
     )
 
 
+async def _handle_fortigate_vpn(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    lpath = path.lower()
+    method = request.method
+    host = str(log_context.get("host", ""))
+    query = str(log_context.get("query", "") or "")
+    content_type_req = request.headers.get("Content-Type", "")
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    has_cmd_injection = _fortigate_has_cmd_injection(body_preview, query)
+
+    set_cookie_value: str | None = None
+
+    if lpath == "/remote/login":
+        result_tag = "fortigate-login"
+        body = render_fortigate_login_html(host, FORTIGATE_VPN_VERSION, FORTIGATE_VPN_BUILD)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/remote/logincheck":
+        result_tag = "fortigate-logincheck"
+        body = render_fortigate_logincheck()
+        content_type = "text/plain; charset=utf-8"
+        # SVPNCOOKIE is the cookie name FortiOS sets for an authenticated
+        # SSL VPN session. We mint a fresh per-request hex value so every
+        # hit ships a distinct cookie — no fixed literal across the fleet.
+        set_cookie_value = f"SVPNCOOKIE={uuid.uuid4().hex}; Path=/; Secure; HttpOnly"
+    elif lpath == "/remote/fgt_lang":
+        result_tag = "fortigate-fgt-lang"
+        body = render_fortigate_lang_stub()
+        content_type = "application/json; charset=utf-8"
+    elif lpath == "/remote/error":
+        result_tag = "fortigate-error"
+        body = render_fortigate_error_html(host)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/api/v2/cmdb/system/admin":
+        result_tag = "fortigate-cmdb-admin"
+        body = render_fortigate_admin_json(FORTIGATE_VPN_VERSION, FORTIGATE_VPN_BUILD)
+        content_type = "application/json; charset=utf-8"
+    elif lpath == "/api/v2/cmdb/system/status":
+        result_tag = "fortigate-cmdb-status"
+        body = render_fortigate_status_json(host, FORTIGATE_VPN_VERSION, FORTIGATE_VPN_BUILD)
+        content_type = "application/json; charset=utf-8"
+    elif lpath == "/api/v2/cmdb/system/global":
+        result_tag = "fortigate-cmdb-global"
+        body = render_fortigate_status_json(host, FORTIGATE_VPN_VERSION, FORTIGATE_VPN_BUILD)
+        content_type = "application/json; charset=utf-8"
+    elif lpath == "/api/v2/monitor/router/policy":
+        result_tag = "fortigate-monitor-router-policy"
+        body = render_fortigate_router_policy_json()
+        content_type = "application/json; charset=utf-8"
+    else:
+        append_log({**log_context, "status": 404, "result": "fortigate-vpn-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "fortigatePath": path,
+        "fortigateMethod": method,
+        "fortigateHasCmdInjection": has_cmd_injection,
+        "bytes": len(body),
+    }
+    if request_body and result_tag == "fortigate-logincheck":
+        username, has_password = extract_fortigate_logincheck_form(request_body, content_type_req)
+        if username:
+            log_entry["fortigateUsername"] = username
+        log_entry["fortigateHasPassword"] = has_password
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview[:400]
+    append_log(log_entry)
+
+    headers = {
+        "Content-Type": content_type,
+        "Cache-Control": "no-store",
+        # FortiOS leaks "Server: xxxxxxxx-xxxxx" — a single space-prefixed
+        # hex run that scanners use to fingerprint the appliance class.
+        "Server": "xxxxxxxx-xxxxx",
+    }
+    if set_cookie_value:
+        headers["Set-Cookie"] = set_cookie_value
+    return web.Response(status=200, body=body, headers=headers)
+
+
 async def _handle_hikvision(
     request: web.Request,
     log_context: dict[str, object],
@@ -6187,6 +6518,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_aspera_faspex_path(path):
         return await _handle_aspera_faspex(request, log_context, path, request_body)
+
+    if is_fortigate_vpn_path(path):
+        return await _handle_fortigate_vpn(request, log_context, path, request_body)
 
     if is_hikvision_path(path):
         return await _handle_hikvision(request, log_context, path, query_string, request_body)
