@@ -3866,6 +3866,187 @@ def render_npmrc(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+# --- Node.js dependency-manifest canary set ---------------------------------
+# Scanners harvesting Node.js codebases pull /package.json, /package-lock.json,
+# /yarn.lock, /.yarnrc, and /.yarnrc.yml together — yarn.lock + package-lock
+# leak the resolved registry URL (which can carry an _authToken in the userinfo
+# component on the wire), package.json names every internal dependency by
+# package, and .yarnrc[.yml] holds the npmRegistryServer + npmAuthToken.
+# Returning a coherent set with the same gitlab-username-password canary
+# embedded in every URL means any one of the five files is enough to replay
+# the token; pulling the whole set just gives the scanner more replay
+# opportunities. Per-hit synthetic integrity hashes keep the lockfiles from
+# turning into a fleet-wide fingerprint.
+_NODE_DEPS_INTERNAL_HOST = "npm.internal-tools.lan"
+_NODE_DEPS_PACKAGES: tuple[tuple[str, str], ...] = (
+    # (package_name, version) — fixed identifiers (filler, not credentials).
+    # Chosen to look like a small internal Node service: an Express API,
+    # ORM, logger, internal auth client, internal feature-flag client.
+    ("@internal-tools/auth-client", "2.4.1"),
+    ("@internal-tools/feature-flags", "1.7.0"),
+    ("@internal-tools/db-orm", "0.12.3"),
+)
+
+
+def _fake_npm_integrity() -> str:
+    # npm/yarn lockfiles list a `sha512-<base64(sha512)>` integrity hash
+    # per resolved tarball. A real value is the hash of the package
+    # tarball; ours is a per-hit random sha512 so two adjacent sensors
+    # don't ship the same literal across the fleet.
+    digest = hashlib.sha512(secrets.token_bytes(32)).digest()
+    return "sha512-" + base64.b64encode(digest).decode("ascii")
+
+
+def _node_deps_canary_userinfo(r: dict[str, object]) -> tuple[str, str, str]:
+    """Returns (username, password, internal_host). The password is the
+    gitlab-username-password canary value when Tracebit returned one — that's
+    the credential a scanner replays out of the resolved-URL userinfo. If the
+    canary issuance failed the password falls back to a per-hit synthetic so
+    we never ship a fixed literal across the fleet."""
+    block = _gitlab_creds(r, "gitlab-username-password")
+    creds = block.get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    username = str(creds.get("username", "") or "deploy")
+    password = str(creds.get("password", "") or "") or _fake_db_password()
+    return username, password, _NODE_DEPS_INTERNAL_HOST
+
+
+def render_package_json(r: dict[str, object]) -> bytes:
+    username, password, host = _node_deps_canary_userinfo(r)
+    encoded_password = quote(password, safe="") if password else ""
+    # `dependencies` mixes public packages (express, pino) with three
+    # internal ones whose `git+https://` URL embeds the canary userinfo.
+    # That URL is the high-signal piece — any scanner that strips it for
+    # token replay trips Tracebit's gitlab-username-password callback.
+    payload = {
+        "name": "internal-tools-api",
+        "version": "1.4.2",
+        "private": True,
+        "description": "internal tooling API",
+        "main": "dist/server.js",
+        "scripts": {
+            "start": "node dist/server.js",
+            "build": "tsc -p .",
+            "test": "jest",
+        },
+        "dependencies": {
+            "express": "^4.19.2",
+            "pino": "^9.0.0",
+            "pg": "^8.11.5",
+            _NODE_DEPS_PACKAGES[0][0]: (
+                f"git+https://{username}:{encoded_password}@{host}/internal/auth-client.git"
+                f"#v{_NODE_DEPS_PACKAGES[0][1]}"
+            ),
+            _NODE_DEPS_PACKAGES[1][0]: f"^{_NODE_DEPS_PACKAGES[1][1]}",
+            _NODE_DEPS_PACKAGES[2][0]: f"^{_NODE_DEPS_PACKAGES[2][1]}",
+        },
+        "devDependencies": {
+            "typescript": "^5.4.5",
+            "jest": "^29.7.0",
+            "@types/node": "^20.12.7",
+        },
+        "publishConfig": {
+            "registry": f"https://{host}/",
+        },
+        "repository": {
+            "type": "git",
+            "url": f"git+https://{host}/internal/internal-tools-api.git",
+        },
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def render_package_lock_json(r: dict[str, object]) -> bytes:
+    username, password, host = _node_deps_canary_userinfo(r)
+    encoded_password = quote(password, safe="") if password else ""
+    auth_url = f"https://{username}:{encoded_password}@{host}"
+    # npm package-lock.json v3 schema: top-level `packages` map keyed by
+    # path. Each entry has `version`, `resolved`, `integrity`. The
+    # `resolved` URL on every internal package carries the canary userinfo;
+    # the integrity hash is per-hit synthetic so the lockfile body itself
+    # isn't a cross-sensor literal.
+    name = "internal-tools-api"
+    pkgs: dict[str, dict[str, object]] = {
+        "": {
+            "name": name,
+            "version": "1.4.2",
+            "license": "UNLICENSED",
+            "dependencies": {
+                "express": "^4.19.2",
+                "pino": "^9.0.0",
+                "pg": "^8.11.5",
+                _NODE_DEPS_PACKAGES[0][0]: f"git+{auth_url}/internal/auth-client.git",
+                _NODE_DEPS_PACKAGES[1][0]: f"^{_NODE_DEPS_PACKAGES[1][1]}",
+                _NODE_DEPS_PACKAGES[2][0]: f"^{_NODE_DEPS_PACKAGES[2][1]}",
+            },
+        },
+    }
+    for pkg_name, version in _NODE_DEPS_PACKAGES:
+        pkgs[f"node_modules/{pkg_name}"] = {
+            "version": version,
+            "resolved": f"{auth_url}/{pkg_name}/-/{pkg_name.split('/')[-1]}-{version}.tgz",
+            "integrity": _fake_npm_integrity(),
+            "license": "UNLICENSED",
+        }
+    payload = {
+        "name": name,
+        "version": "1.4.2",
+        "lockfileVersion": 3,
+        "requires": True,
+        "packages": pkgs,
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def render_yarn_lock(r: dict[str, object]) -> bytes:
+    username, password, host = _node_deps_canary_userinfo(r)
+    encoded_password = quote(password, safe="") if password else ""
+    auth_url = f"https://{username}:{encoded_password}@{host}"
+    # yarn.lock v1 format. Each block is:
+    #   "<name>@<range>":
+    #     version "<resolved version>"
+    #     resolved "<tarball-url>#<integrity>"
+    #     integrity <integrity>
+    lines: list[str] = [
+        "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n",
+        "# yarn lockfile v1\n",
+        "\n",
+    ]
+    for pkg_name, version in _NODE_DEPS_PACKAGES:
+        integrity = _fake_npm_integrity()
+        tarball_basename = f"{pkg_name.split('/')[-1]}-{version}.tgz"
+        resolved = f"{auth_url}/{pkg_name}/-/{tarball_basename}#{integrity}"
+        lines.append(f'"{pkg_name}@^{version}":\n')
+        lines.append(f'  version "{version}"\n')
+        lines.append(f'  resolved "{resolved}"\n')
+        lines.append(f"  integrity {integrity}\n")
+        lines.append("\n")
+    return "".join(lines).encode("utf-8")
+
+
+def render_yarnrc(r: dict[str, object]) -> bytes:
+    # Classic yarn v1 .yarnrc — key/value pairs, no YAML.
+    _, password, host = _node_deps_canary_userinfo(r)
+    return (
+        f'registry "https://{host}/"\n'
+        f'"//{host}/:_authToken" "{password}"\n'
+        "always-auth true\n"
+    ).encode("utf-8")
+
+
+def render_yarnrc_yml(r: dict[str, object]) -> bytes:
+    # Yarn berry (>=2) .yarnrc.yml — npmRegistryServer + npmAuthToken,
+    # YAML-shaped. We hand-format because the file is tiny and we need
+    # to keep it stdlib-only.
+    _, password, host = _node_deps_canary_userinfo(r)
+    return (
+        f'npmRegistryServer: "https://{host}/"\n'
+        f'npmAuthToken: "{password}"\n'
+        "npmAlwaysAuth: true\n"
+    ).encode("utf-8")
+
+
 def render_pypirc(r: dict[str, object]) -> bytes:
     creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
     if not isinstance(creds, dict):
@@ -4360,7 +4541,13 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "docker-config",
-        ("/.docker/config.json", "/docker/config.json"),
+        (
+            "/.docker/config.json",
+            "/docker/config.json",
+            # Webroot-prefix variants — same pattern as ssh-private-key.
+            "/root/.docker/config.json",
+            "/home/.docker/config.json",
+        ),
         ("aws",),
         render_docker_config,
         "application/json; charset=utf-8",
@@ -4576,17 +4763,82 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "git-credentials",
-        ("/.git-credentials",),
+        # `/root/.git-credentials` + `/home/.git-credentials` mirror the
+        # ssh-private-key webroot-prefix variants — observed in scanner
+        # dictionaries probing for home-dir leakage below misconfigured
+        # webroots.
+        (
+            "/.git-credentials",
+            "/root/.git-credentials",
+            "/home/.git-credentials",
+        ),
         ("gitlab-username-password",),
         render_git_credentials,
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(
         "npmrc",
-        ("/.npmrc",),
+        # Webroot-prefix variants (`/root/.npmrc`, `/home/.npmrc`) are
+        # observed in scanner dictionaries alongside the bare `/.npmrc`
+        # — same pattern as the ssh-private-key trap. Without the
+        # prefixed variants they 404.
+        (
+            "/.npmrc",
+            "/root/.npmrc",
+            "/home/.npmrc",
+        ),
         ("gitlab-username-password",),
         render_npmrc,
         "text/plain; charset=utf-8",
+    ),
+    # Node.js dependency-manifest set. yarn.lock + package-lock.json +
+    # package.json + .yarnrc[.yml] are pulled together by scanners
+    # harvesting Node.js codebases; the resolved-URL userinfo is the
+    # high-signal piece, so every URL carries the
+    # gitlab-username-password canary.
+    CanaryTrap(
+        "yarn-lock",
+        (
+            "/yarn.lock",
+            "/yarn.lock.bak",
+            "/yarn.lock.old",
+        ),
+        ("gitlab-username-password",),
+        render_yarn_lock,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "package-lock-json",
+        (
+            "/package-lock.json",
+            "/package-lock.json.bak",
+            "/package-lock.json.old",
+            "/var/backups/npm/package-lock.json.old",
+        ),
+        ("gitlab-username-password",),
+        render_package_lock_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "package-json",
+        ("/package.json",),
+        ("gitlab-username-password",),
+        render_package_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "yarnrc",
+        ("/.yarnrc",),
+        ("gitlab-username-password",),
+        render_yarnrc,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "yarnrc-yml",
+        ("/.yarnrc.yml",),
+        ("gitlab-username-password",),
+        render_yarnrc_yml,
+        "application/yaml; charset=utf-8",
     ),
     CanaryTrap(
         "pypirc",

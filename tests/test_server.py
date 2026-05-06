@@ -494,7 +494,22 @@ FAKE_TRACEBIT = {
     ("/known_hosts", b"203.0.113.99 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
     ("/.netrc", b"login deploybot42"),
     ("/.git-credentials", b"https://deploybot42:"),
+    ("/root/.git-credentials", b"https://deploybot42:"),
+    ("/home/.git-credentials", b"https://deploybot42:"),
     ("/.npmrc", b"p@ssCanaryValue"),
+    ("/root/.npmrc", b"p@ssCanaryValue"),
+    ("/home/.npmrc", b"p@ssCanaryValue"),
+    ("/root/.docker/config.json", b'"auths"'),
+    ("/home/.docker/config.json", b'"auths"'),
+    # Node.js dependency manifest set — canary userinfo on every URL.
+    ("/yarn.lock", b"deploybot42:p%40ssCanaryValue@npm.internal-tools.lan"),
+    ("/yarn.lock.bak", b"deploybot42:p%40ssCanaryValue@npm.internal-tools.lan"),
+    ("/package-lock.json", b"deploybot42:p%40ssCanaryValue@npm.internal-tools.lan"),
+    ("/package-lock.json.bak", b"deploybot42:p%40ssCanaryValue@npm.internal-tools.lan"),
+    ("/var/backups/npm/package-lock.json.old", b"deploybot42:p%40ssCanaryValue@npm.internal-tools.lan"),
+    ("/package.json", b"deploybot42:p%40ssCanaryValue@npm.internal-tools.lan"),
+    ("/.yarnrc", b'"//npm.internal-tools.lan/:_authToken" "p@ssCanaryValue"'),
+    ("/.yarnrc.yml", b'npmAuthToken: "p@ssCanaryValue"'),
     ("/.pypirc", b"username = deploybot42"),
     ("/api/v4/user", b'"username": "deploybot42"'),
     ("/users/sign_in", b"<title>Sign in"),
@@ -546,6 +561,39 @@ def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
     # rendered bodies should differ somewhere. (Same AWS canary mock is used
     # for both, so anything that varies is necessarily the DB password.)
     assert body_1 != body_2, f"{path!r} renders identically across calls — password not randomized"
+
+
+@pytest.mark.parametrize("path", [
+    "/yarn.lock",
+    "/yarn.lock.bak",
+    "/package-lock.json",
+    "/package-lock.json.bak",
+    "/var/backups/npm/package-lock.json.old",
+])
+def test_node_deps_lockfiles_have_per_hit_unique_integrity(path):
+    # Each render synthesises a fresh sha512 integrity hash per package
+    # (`_fake_npm_integrity()`); two adjacent renders on different sensors
+    # would otherwise share the same lockfile body and turn the fleet into
+    # a single fingerprint. Same rule as the wp-config DB-password
+    # regression — credential-shaped fields stay per-hit unique.
+    trap = tbenv._TRAP_BY_PATH[path]
+    body_1 = trap.render(FAKE_TRACEBIT)
+    body_2 = trap.render(FAKE_TRACEBIT)
+    assert b"sha512-" in body_1, f"{path!r} should embed sha512- integrity hashes"
+    assert body_1 != body_2, f"{path!r} renders identically across calls — integrity not randomized"
+
+
+def test_node_deps_canary_password_falls_back_to_synthetic_when_tracebit_missing():
+    # If the Tracebit issuance failed, _node_deps_canary_userinfo falls
+    # back to _fake_db_password() — never a fixed literal. This protects
+    # against fleet-wide fingerprinting when canary minting hits a quota
+    # ceiling.
+    user_a, pw_a, host_a = tbenv._node_deps_canary_userinfo({})
+    user_b, pw_b, host_b = tbenv._node_deps_canary_userinfo({})
+    assert host_a == host_b == "npm.internal-tools.lan"
+    assert user_a == user_b == "deploy"
+    assert pw_a and pw_b, "fallback password must not be empty"
+    assert pw_a != pw_b, "fallback password must be per-call unique"
 
 
 def test_ssh_config_and_known_hosts_return_empty_when_ssh_missing():

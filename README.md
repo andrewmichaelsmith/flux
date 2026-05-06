@@ -141,7 +141,7 @@ case-insensitive exact matches.
 | Generic JSON config | `/config.json`, `/settings.json`, `/credentials.json`, `/secrets.json` | `aws` | `config-json` |
 | SFTP deploy config | `/.vscode/sftp.json`, `/sftp-config.json`, `/sftp.json`, `/.ftpconfig` | `gitlab-username-password` | `sftp-config` |
 | Firebase / GCP SA | `/firebase.json`, `/google-services.json`, `/serviceaccount.json`, `/service-account.json`, `/firebase-adminsdk.json`, `/gcp-service-account.json`, `/.config/gcloud/application_default_credentials.json` | `aws` | `firebase-json` |
-| Docker client | `/.docker/config.json`, `/docker/config.json` | `aws` | `docker-config` |
+| Docker client | `/.docker/config.json`, `/docker/config.json`, `/root/.docker/config.json`, `/home/.docker/config.json` | `aws` | `docker-config` |
 | Docker Compose | `/docker-compose.yml`, `/docker-compose.yaml`, `/compose.yml`, `/compose.yaml`, plus `.prod`, `.production`, `.dev`, `.staging`, `.override` variants (both `.yml` and `.yaml`) | `aws` | `docker-compose` |
 | GitHub Actions workflows | `/.github/workflows/{deploy,main,ci,build,test,docker,release,cd}.yml` plus `.yaml` variants | `aws` | `github-actions-workflow` |
 | GitLab CI config | `/.gitlab-ci.yml`, `/.gitlab-ci.yaml`, `/.gitlab/.gitlab-ci.yml` | `aws` | `gitlab-ci` |
@@ -159,8 +159,9 @@ case-insensitive exact matches.
 | known_hosts | `/.ssh/known_hosts`, `/known_hosts` | `ssh` | `known-hosts` |
 | authorized_keys | `/authorized_keys`, `/.ssh/authorized_keys`, `/.ssh/authorized_keys2`, `/static/.ssh/authorized_keys`, `/downloads/.ssh/authorized_keys`, `/blog/.ssh/authorized_keys` | `ssh` | `authorized-keys` |
 | .netrc | `/.netrc`, `/_netrc` | `gitlab-username-password` | `netrc` |
-| git credential store | `/.git-credentials`; fake-git also serves `/.git/credentials` | `gitlab-username-password` | `git-credentials` / `fake-git` |
-| .npmrc | `/.npmrc` | `gitlab-username-password` | `npmrc` |
+| git credential store | `/.git-credentials`, `/root/.git-credentials`, `/home/.git-credentials`; fake-git also serves `/.git/credentials` | `gitlab-username-password` | `git-credentials` / `fake-git` |
+| .npmrc | `/.npmrc`, `/root/.npmrc`, `/home/.npmrc` | `gitlab-username-password` | `npmrc` |
+| Node.js dependency manifests — [docs](./docs/node-deps-canary.md) | `/yarn.lock(.bak\|.old)`, `/package-lock.json(.bak\|.old)`, `/var/backups/npm/package-lock.json.old`, `/package.json`, `/.yarnrc`, `/.yarnrc.yml` | `gitlab-username-password` | `yarn-lock` / `package-lock-json` / `package-json` / `yarnrc` / `yarnrc-yml` |
 | .pypirc | `/.pypirc` | `gitlab-username-password` | `pypirc` |
 | GitLab API user | `/api/v4/user` | `gitlab-username-password` | `gitlab-api-user` |
 | GitLab sign-in | `/users/sign_in` | `gitlab-cookie` | `gitlab-sign-in` |
@@ -249,6 +250,7 @@ under [`docs/`](./docs/):
 - [Fake Atlassian Confluence](./docs/fake-confluence.md)
 - [Cmd-injection / printenv responder](./docs/cmd-injection.md)
 - [CI/CD config canaries](./docs/ci-cd-config.md)
+- [Node.js dependency-manifest canary set](./docs/node-deps-canary.md)
 - [Fake webshell](./docs/fake-webshell.md)
 
 The other traps (`.env`, `/.git/`, canary file traps, tarpit +
