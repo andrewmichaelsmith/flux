@@ -904,6 +904,13 @@ def is_tarpit_path(path: str) -> bool:
     stripped = path.rstrip("/") or "/"
     if stripped == "/.env":
         return False
+    # Paths with a dedicated CanaryTrap entry (e.g. `/.env.production`,
+    # `/.env.vault`, `/mailer/.env`) take the canary response, not the
+    # generic tarpit. Without this exemption the dispatch order in
+    # `handle()` — tarpit first, canary trap second — silently shadows
+    # those entries and turns them into dead code.
+    if stripped.lower() in _TRAP_BY_PATH:
+        return False
     if stripped.endswith("/.env"):
         return True
     leaf = stripped.rsplit("/", 1)[-1]
@@ -3635,6 +3642,96 @@ def render_env_production(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_env_vault(r: dict[str, object]) -> bytes:
+    # `.env.vault` is the dotenv-vault file format: per-environment
+    # encrypted ciphertext entries that need a `DOTENV_KEY` decryption
+    # URL to be useful. A clean .env.vault is therefore *not* a
+    # credential leak on its own — scanners harvesting these paths are
+    # opportunistically grabbing the file in case the operator also
+    # committed plaintext fallbacks or left a debug block at the
+    # bottom (which happens often enough that the scanner pattern
+    # exists).
+    #
+    # The renderer reproduces that misconfiguration shape: realistic
+    # ciphertext entries plus a "REMOVE before merge" plaintext
+    # AWS/DB block at the bottom carrying the per-request canary.
+    # Per-hit unique ciphertext + DB password keep the response from
+    # turning the fleet into a single fingerprint.
+    aws = _aws(r)
+    enc_dev = secrets.token_urlsafe(96)
+    enc_staging = secrets.token_urlsafe(96)
+    enc_prod = secrets.token_urlsafe(96)
+    db_password = _fake_db_password()
+    return (
+        "#/-------------------.env.vault---------------------/\n"
+        "#/         cloud-agnostic vaulting standard         /\n"
+        "#/   [how it works](https://dotenv.org/env-vault)   /\n"
+        "#/--------------------------------------------------/\n"
+        "\n"
+        "# development\n"
+        f'DOTENV_VAULT_DEVELOPMENT="{enc_dev}"\n'
+        "DOTENV_VAULT_DEVELOPMENT_VERSION=2\n"
+        "\n"
+        "# staging\n"
+        f'DOTENV_VAULT_STAGING="{enc_staging}"\n'
+        "DOTENV_VAULT_STAGING_VERSION=2\n"
+        "\n"
+        "# production\n"
+        f'DOTENV_VAULT_PRODUCTION="{enc_prod}"\n'
+        "DOTENV_VAULT_PRODUCTION_VERSION=5\n"
+        "\n"
+        "# accidentally committed plaintext fallback (REMOVE before merge):\n"
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "AWS_REGION=us-east-1\n"
+        f"DATABASE_URL=postgresql://prod_rw:{db_password}@db.internal:5432/prod\n"
+    ).encode("utf-8")
+
+
+def render_pprof_dump(r: dict[str, object]) -> bytes:
+    # Go's `net/http/pprof` package serves debug/profiling endpoints
+    # under `/debug/pprof/`. The most common scanner targets are
+    # `/debug/pprof/` (HTML index), `/debug/pprof/heap` (memory
+    # profile), `/debug/pprof/cmdline` (NUL-separated process args),
+    # and `/debug/pprof/goroutine` (stack traces). Real Go output for
+    # these is a mix of binary protobuf, NUL-separated text, and
+    # plaintext — and harvesters that find an exposed pprof endpoint
+    # grep raw bytes for `AKIA...` / `AWS_SECRET_ACCESS_KEY` rather
+    # than parse pprof's protobuf, since the value is the same: a
+    # process whose memory contains live cloud credentials.
+    #
+    # The renderer returns a plaintext heap-profile-shaped body that
+    # leaks the canary AWS credentials in the same place a sloppy
+    # service would: cmdline args + an embedded environment block.
+    # `text/plain` content-type matches Go's `?debug=1` text output,
+    # so a scanner reading the body gets the canary plainly.
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    return (
+        "heap profile: 14: 6815744 [318: 23068672] @ heap/1048576\n"
+        "1: 524288 [1: 524288] @ 0x4afba1 0x4ad04c 0x4abc41 0x4abdcb 0x47bb56\n"
+        "#\t0x4afba0\tmain.loadAwsCredentials+0x80\t/build/cmd/server/main.go:142\n"
+        "#\t0x4ad04b\tmain.main+0x21b\t/build/cmd/server/main.go:88\n"
+        "\n"
+        "# command line\n"
+        "# /usr/local/bin/server -config=/etc/app/config.yaml\n"
+        "\n"
+        "# environment\n"
+        f"# AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"# AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"# AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "# AWS_REGION=us-east-1\n"
+        f"# DATABASE_URL=postgresql://prod_rw:{db_password}@db.internal:5432/prod\n"
+        "\n"
+        "# runtime.MemStats\n"
+        "# Alloc = 6815744\n"
+        "# TotalAlloc = 23068672\n"
+        "# Sys = 22020096\n"
+        "# NumGC = 4\n"
+    ).encode("utf-8")
+
+
 def render_actuator_env_json(r: dict[str, object]) -> bytes:
     # Spring Boot Actuator `/env` response shape: activeProfiles + a list of
     # propertySources, each holding `properties: {<key>: {value, origin?}}`.
@@ -4674,9 +4771,69 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "env-production",
-        ("/.env.production", "/.env.prod", "/.env.live"),
+        (
+            "/.env.production",
+            "/.env.prod",
+            "/.env.live",
+            # Webroot-prefix `.env` variants observed against new
+            # path families. Same render shape — a scanner harvesting
+            # `<dir>/.env` is after the same kind of plaintext
+            # secret block a `.env.production` leak would expose.
+            "/mailer/.env",
+        ),
         ("aws",),
         render_env_production,
+        "text/plain; charset=utf-8",
+    ),
+    # `.env.vault` is the dotenv-vault file format. The renderer
+    # reproduces a sloppy commit shape — encrypted vault entries plus
+    # a plaintext fallback block left at the bottom — so an
+    # opportunistic harvester walks away with the canary AWS creds.
+    CanaryTrap(
+        "env-vault",
+        (
+            "/.env.vault",
+            "/.env.vault.bak",
+            "/.env.vault.example",
+        ),
+        ("aws",),
+        render_env_vault,
+        "text/plain; charset=utf-8",
+    ),
+    # Go `net/http/pprof` debug endpoints. `/debug/pprof/heap` and
+    # `/debug/pprof/cmdline` are the highest-value scanner targets
+    # because a process whose memory + cmdline contain live AWS
+    # creds turns an exposed pprof endpoint into a one-shot leak.
+    # All paths share one renderer (plaintext heap-profile shape
+    # with embedded env block) — harvesters grep raw bytes, the
+    # exact pprof endpoint shape doesn't matter.
+    CanaryTrap(
+        "pprof-dump",
+        (
+            "/debug/pprof",
+            "/debug/pprof/",
+            "/debug/pprof/heap",
+            "/debug/pprof/cmdline",
+            "/debug/pprof/goroutine",
+            "/debug/pprof/profile",
+            "/debug/pprof/symbol",
+            "/debug/pprof/trace",
+            "/debug/pprof/threadcreate",
+            "/debug/pprof/block",
+            "/debug/pprof/mutex",
+            "/debug/pprof/allocs",
+            # Reverse-proxy-prefixed variants (Go services behind a
+            # `/api`-rooted ingress) — same shape, same render.
+            "/api/debug/pprof",
+            "/api/debug/pprof/",
+            "/api/debug/pprof/heap",
+            "/api/debug/pprof/cmdline",
+            "/api/debug/pprof/goroutine",
+            "/api/debug/pprof/profile",
+            "/api/debug/pprof/allocs",
+        ),
+        ("aws",),
+        render_pprof_dump,
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(

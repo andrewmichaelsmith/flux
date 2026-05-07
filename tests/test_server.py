@@ -398,6 +398,30 @@ def test_tarpit_enabled_by_default():
     assert tbenv.TARPIT_ENABLED
 
 
+@pytest.mark.parametrize("path", [
+    # Regression: dispatch order in `handle()` runs the tarpit check
+    # before the canary-trap lookup, so any path that matches both was
+    # silently shadowed by tarpit and never reached the canary
+    # renderer. `is_tarpit_path` now exempts paths with a CanaryTrap
+    # entry so the canary fires as documented.
+    "/.env.production",
+    "/.env.prod",
+    "/.env.live",
+    "/.env.vault",
+    "/.env.vault.bak",
+    "/.env.vault.example",
+    "/mailer/.env",
+])
+def test_canary_trap_paths_do_not_match_tarpit(path):
+    assert path.lower() in tbenv._TRAP_BY_PATH, (
+        f"{path!r} should be a CanaryTrap entry"
+    )
+    assert not tbenv.is_tarpit_path(path), (
+        f"{path!r} matches is_tarpit_path — tarpit dispatch (line 6806) "
+        f"runs before canary dispatch and would shadow the canary trap"
+    )
+
+
 # --- Canary-backed file traps ---
 
 FAKE_TRACEBIT = {
@@ -475,6 +499,19 @@ FAKE_TRACEBIT = {
     ("/application.properties", b"aws.access.key.id=AKIAFAKEEXAMPLE01"),
     ("/application.yml", b"access-key-id: AKIAFAKEEXAMPLE01"),
     ("/.env.production", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/.env.prod", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/.env.live", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/mailer/.env", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/.env.vault", b"DOTENV_VAULT_PRODUCTION="),
+    ("/.env.vault", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/.env.vault.bak", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/.env.vault.example", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/debug/pprof/", b"heap profile:"),
+    ("/debug/pprof/heap", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/debug/pprof/cmdline", b"AWS_SECRET_ACCESS_KEY="),
+    ("/debug/pprof/goroutine", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/debug/pprof/allocs", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/api/debug/pprof/heap", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/phpinfo.php", b"AKIAFAKEEXAMPLE01"),
     ("/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
@@ -535,6 +572,9 @@ def test_canary_trap_renderers_embed_canary(path, needle):
     "/application.properties",
     "/application.yml",
     "/.env.production",
+    "/.env.vault",
+    "/mailer/.env",
+    "/debug/pprof/heap",
     "/phpinfo.php",
     "/.github/workflows/ci.yml",
     "/.gitlab-ci.yml",

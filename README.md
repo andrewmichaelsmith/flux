@@ -151,7 +151,9 @@ case-insensitive exact matches.
 | Spring properties | `/application.properties` | `aws` | `application-properties` |
 | Spring YAML | `/application.yml`, `/application.yaml` | `aws` | `application-yml` |
 | Spring Boot Actuator `/env` | `/actuator/env`, `/actuator/env.json`, `/env`, `/manage/env`, `/management/env`, `/api/actuator/env` | `aws` | `actuator-env` |
-| Production .env | `/.env.production`, `/.env.prod`, `/.env.live` | `aws` | `env-production` |
+| Production .env | `/.env.production`, `/.env.prod`, `/.env.live`, `/mailer/.env` | `aws` | `env-production` |
+| dotenv-vault file — [docs](./docs/env-vault.md) | `/.env.vault`, `/.env.vault.bak`, `/.env.vault.example` | `aws` | `env-vault` |
+| Go pprof debug endpoint — [docs](./docs/pprof-dump.md) | `/debug/pprof[/heap\|/cmdline\|/goroutine\|/profile\|/symbol\|/trace\|/threadcreate\|/block\|/mutex\|/allocs]` plus `/api`-prefixed variants | `aws` | `pprof-dump` |
 | phpinfo() | `/phpinfo.php`, `/info.php`, `/php.php`, `/test.php` | `aws` | `phpinfo` |
 | SSH private key | `/id_rsa`, `/.ssh/id_rsa`, `/ssh/id_rsa`, `/ssh/id_rsa.key`, `/keys/id_rsa`, `/private.key`, `/deploy_key`, `/deploy.key`, `/.ssh/id_ed25519`, `/.ssh/id_dsa`, `/.ssh/id_ecdsa`, `/id_ed25519`, `/id_dsa`, `/id_ecdsa`, `/root/.ssh/id_rsa`, `/home/.ssh/id_rsa` | `ssh` | `ssh-private-key` |
 | SSH public key | `/id_rsa.pub`, `/.ssh/id_rsa.pub` | `ssh` | `ssh-public-key` |
