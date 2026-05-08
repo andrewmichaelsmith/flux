@@ -151,6 +151,7 @@ case-insensitive exact matches.
 | Spring properties | `/application.properties` | `aws` | `application-properties` |
 | Spring YAML | `/application.yml`, `/application.yaml` | `aws` | `application-yml` |
 | Spring Boot Actuator `/env` | `/actuator/env`, `/actuator/env.json`, `/env`, `/manage/env`, `/management/env`, `/api/actuator/env` | `aws` | `actuator-env` |
+| Spring Boot Actuator surface — [docs](./docs/actuator-surface.md) | `/actuator/{heapdump,configprops,health,mappings,threaddump}` plus `/manage`, `/management`, `/api/actuator` reverse-proxy aliases | `aws` | `actuator-heapdump` / `actuator-configprops` / `actuator-health` / `actuator-mappings` / `actuator-threaddump` |
 | Production .env | `/.env.production`, `/.env.prod`, `/.env.live`, `/mailer/.env` | `aws` | `env-production` |
 | dotenv-vault file — [docs](./docs/env-vault.md) | `/.env.vault`, `/.env.vault.bak`, `/.env.vault.example` | `aws` | `env-vault` |
 | Go pprof debug endpoint — [docs](./docs/pprof-dump.md) | `/debug/pprof[/heap\|/cmdline\|/goroutine\|/profile\|/symbol\|/trace\|/threadcreate\|/block\|/mutex\|/allocs]` plus `/api`-prefixed variants | `aws` | `pprof-dump` |

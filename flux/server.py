@@ -3793,6 +3793,346 @@ def render_actuator_env_json(r: dict[str, object]) -> bytes:
     return json.dumps(payload, indent=2).encode("utf-8")
 
 
+def render_actuator_heapdump(r: dict[str, object]) -> bytes:
+    # Spring Boot Actuator `/heapdump` returns a binary HPROF (Java heap
+    # profile) on a misconfigured app — the same format `jmap -dump:format=b`
+    # produces. Real heapdumps are megabytes; harvesters typically `grep`
+    # the raw bytes for `AKIA…` / `AWS_SECRET_ACCESS_KEY` / `password=`
+    # rather than parse HPROF, because Java string constants land as
+    # contiguous UTF-8 in the dump.
+    #
+    # We emit a minimal HPROF-shaped header (magic + version + record
+    # frames the dumb sniffers tolerate) followed by a long block of
+    # plausible Java string constants — env var names, datasource URL,
+    # and the canary AWS creds. Scanners that grep raw bytes harvest the
+    # canary; scanners that try to parse HPROF strictly drop the response,
+    # which is fine — the high-volume tools just grep.
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    # HPROF magic: "JAVA PROFILE 1.0.2\0" then a 4-byte ID size and a
+    # 8-byte timestamp. Real parsers care about the record frames after
+    # this; we skip those and put plaintext immediately, since byte-grep
+    # tools don't validate frame structure.
+    header = b"JAVA PROFILE 1.0.2\x00" + b"\x00\x00\x00\x08" + b"\x00\x00\x00\x00" * 2
+    payload_strings = (
+        "java.lang.System.getenv\n"
+        "java.util.HashMap$Node\n"
+        "spring.datasource.password\n"
+        "spring.datasource.url\n"
+        "AWS_ACCESS_KEY_ID\n"
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        "AWS_SECRET_ACCESS_KEY\n"
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        "AWS_SESSION_TOKEN\n"
+        f"AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "AWS_DEFAULT_REGION=us-east-1\n"
+        f"jdbc:postgresql://prod_rw:{db_password}@db.internal:5432/prod\n"
+        f"DB_PASSWORD={db_password}\n"
+        "javax.management.ObjectName\n"
+        "org.springframework.boot.actuate.endpoint.web.WebEndpointResponse\n"
+        "org.apache.tomcat.util.net.SocketWrapperBase\n"
+    ).encode("utf-8")
+    # Pad to a few KB so the response doesn't look like a 200-byte stub
+    # (real heapdumps are 50MB+; 8KB is enough to convince a content-length
+    # filter without bloating sensor egress).
+    return header + payload_strings + b"\x00" * (8192 - len(header) - len(payload_strings))
+
+
+def render_actuator_configprops(r: dict[str, object]) -> bytes:
+    # Spring Boot Actuator `/configprops` returns the resolved
+    # @ConfigurationProperties beans — every `@ConfigurationProperties`
+    # bean's prefix + properties values. On an unmasked actuator
+    # (`management.endpoint.configprops.show-values=ALWAYS` or 1.x) the
+    # raw `password` and `secret-key` values come back unredacted. The
+    # JSON shape mirrors the `/configprops` response on Spring Boot 2.5+
+    # (contexts → application → beans → <bean-name> → properties).
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    payload = {
+        "contexts": {
+            "application": {
+                "beans": {
+                    "spring.datasource-org.springframework.boot.autoconfigure.jdbc.DataSourceProperties": {
+                        "prefix": "spring.datasource",
+                        "properties": {
+                            "url": "jdbc:postgresql://db.internal:5432/prod",
+                            "username": "prod_rw",
+                            "password": db_password,
+                            "driverClassName": "org.postgresql.Driver",
+                        },
+                        "inputs": {
+                            "url": {"value": "jdbc:postgresql://db.internal:5432/prod"},
+                            "username": {"value": "prod_rw"},
+                            "password": {"value": db_password},
+                        },
+                    },
+                    "cloud.aws-org.springframework.cloud.aws.core.region.StaticRegionProvider": {
+                        "prefix": "cloud.aws.credentials",
+                        "properties": {
+                            "accessKey": aws.get("awsAccessKeyId", ""),
+                            "secretKey": aws.get("awsSecretAccessKey", ""),
+                            "sessionToken": aws.get("awsSessionToken", ""),
+                            "region": "us-east-1",
+                        },
+                        "inputs": {
+                            "accessKey": {
+                                "value": aws.get("awsAccessKeyId", ""),
+                                "origin": 'System Environment Property "AWS_ACCESS_KEY_ID"',
+                            },
+                            "secretKey": {
+                                "value": aws.get("awsSecretAccessKey", ""),
+                                "origin": 'System Environment Property "AWS_SECRET_ACCESS_KEY"',
+                            },
+                        },
+                    },
+                    "management.endpoints.web-org.springframework.boot.actuate.autoconfigure.endpoint.web.WebEndpointProperties": {
+                        "prefix": "management.endpoints.web",
+                        "properties": {
+                            "exposure": {"include": ["*"], "exclude": []},
+                            "basePath": "/actuator",
+                        },
+                    },
+                },
+            },
+        },
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def render_actuator_health(r: dict[str, object]) -> bytes:
+    # Spring Boot Actuator `/health` with `show-details=always` returns
+    # component-level health for db / diskSpace / redis / kafka /
+    # rabbitmq, including the JDBC URL on db.details.url. The URL on a
+    # leaky deployment is the user-info-bearing form
+    # `jdbc:postgresql://user:pass@host/db`, which is what a credential
+    # harvester is grepping for.
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    payload = {
+        "status": "UP",
+        "components": {
+            "db": {
+                "status": "UP",
+                "details": {
+                    "database": "PostgreSQL",
+                    "validationQuery": "isValid()",
+                    "url": f"jdbc:postgresql://prod_rw:{db_password}@db.internal:5432/prod",
+                },
+            },
+            "diskSpace": {
+                "status": "UP",
+                "details": {
+                    "total": 107374182400,
+                    "free": 73456328704,
+                    "threshold": 10485760,
+                    "exists": True,
+                },
+            },
+            "ping": {"status": "UP"},
+            "redis": {
+                "status": "UP",
+                "details": {
+                    "version": "7.2.4",
+                    "url": f"redis://:{_fake_db_password()}@cache.internal:6379/0",
+                },
+            },
+            "s3": {
+                "status": "UP",
+                "details": {
+                    "region": "us-east-1",
+                    "bucket": "internal-tools-artifacts",
+                    "accessKeyId": aws.get("awsAccessKeyId", ""),
+                },
+            },
+        },
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def render_actuator_mappings(r: dict[str, object]) -> bytes:
+    # Spring Boot Actuator `/mappings` lists every `@RequestMapping` and
+    # filter / handler. A scanner reading this looks for additional API
+    # surface (admin/internal endpoints) and webhook URLs that often
+    # carry secrets in the path or query (the AWS access key id is the
+    # canary credential that gets surfaced via webhook URLs in the
+    # response). Real responses are huge; we return a representative
+    # subset with the scanner-interesting fields populated.
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    payload = {
+        "contexts": {
+            "application": {
+                "mappings": {
+                    "dispatcherServlets": {
+                        "dispatcherServlet": [
+                            {
+                                "handler": "ResourceHttpRequestHandler [classpath:/static/]",
+                                "predicate": "/**",
+                                "details": None,
+                            },
+                            {
+                                "handler": "com.internal.tools.api.WebhookController#receive(WebhookEvent)",
+                                "predicate": f"{{POST /api/v1/webhook/{ak}/event}}",
+                                "details": {
+                                    "handlerMethod": {
+                                        "className": "com.internal.tools.api.WebhookController",
+                                        "name": "receive",
+                                        "descriptor": "(Lcom/internal/tools/api/WebhookEvent;)Lorg/springframework/http/ResponseEntity;",
+                                    },
+                                    "requestMappingConditions": {
+                                        "consumes": [{"mediaType": "application/json", "negated": False}],
+                                        "headers": [],
+                                        "methods": ["POST"],
+                                        "params": [],
+                                        "patterns": [f"/api/v1/webhook/{ak}/event"],
+                                        "produces": [],
+                                    },
+                                },
+                            },
+                            {
+                                "handler": "com.internal.tools.api.AdminController#listUsers()",
+                                "predicate": "{GET /api/v1/admin/users}",
+                                "details": {
+                                    "requestMappingConditions": {
+                                        "patterns": ["/api/v1/admin/users"],
+                                        "methods": ["GET"],
+                                    },
+                                },
+                            },
+                            {
+                                "handler": "org.springframework.boot.actuate.endpoint.web.servlet.WebMvcEndpointHandlerMapping",
+                                "predicate": "/actuator/**",
+                                "details": None,
+                            },
+                        ],
+                    },
+                    "servletFilters": [
+                        {
+                            "servletNameMappings": [],
+                            "urlPatternMappings": ["/*"],
+                            "name": "characterEncodingFilter",
+                            "className": "org.springframework.boot.web.servlet.filter.OrderedCharacterEncodingFilter",
+                        },
+                    ],
+                    "servlets": [
+                        {
+                            "mappings": ["/"],
+                            "name": "dispatcherServlet",
+                            "className": "org.springframework.web.servlet.DispatcherServlet",
+                        },
+                    ],
+                },
+            },
+        },
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def render_actuator_threaddump(r: dict[str, object]) -> bytes:
+    # Spring Boot Actuator `/threaddump` returns Java thread state for
+    # every live thread. Real thread names sometimes embed secrets when
+    # an SDK pre-fills authentication context onto a worker thread name
+    # (e.g. `s3-transfer-manager-worker-AKIA…-prod`). Harvesters grep
+    # the response body for `AKIA` patterns the same way they grep
+    # heapdumps.
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    payload = {
+        "threads": [
+            {
+                "threadName": "main",
+                "threadId": 1,
+                "blockedTime": -1,
+                "blockedCount": 0,
+                "waitedTime": -1,
+                "waitedCount": 0,
+                "lockName": None,
+                "lockOwnerId": -1,
+                "lockOwnerName": None,
+                "daemon": False,
+                "inNative": False,
+                "suspended": False,
+                "threadState": "RUNNABLE",
+                "priority": 5,
+                "stackTrace": [
+                    {
+                        "methodName": "park",
+                        "fileName": "Unsafe.java",
+                        "lineNumber": -2,
+                        "className": "jdk.internal.misc.Unsafe",
+                        "nativeMethod": True,
+                    },
+                    {
+                        "methodName": "run",
+                        "fileName": "ServerStartup.java",
+                        "lineNumber": 88,
+                        "className": "com.internal.tools.ServerStartup",
+                        "nativeMethod": False,
+                    },
+                ],
+                "lockedMonitors": [],
+                "lockedSynchronizers": [],
+            },
+            {
+                "threadName": f"s3-transfer-manager-worker-{ak}-prod",
+                "threadId": 47,
+                "blockedTime": -1,
+                "blockedCount": 12,
+                "waitedTime": -1,
+                "waitedCount": 184,
+                "daemon": True,
+                "threadState": "WAITING",
+                "priority": 5,
+                "stackTrace": [],
+                "lockedMonitors": [],
+                "lockedSynchronizers": [],
+            },
+            {
+                "threadName": "HikariPool-1 connection adder",
+                "threadId": 52,
+                "daemon": True,
+                "threadState": "TIMED_WAITING",
+                "priority": 5,
+                "stackTrace": [
+                    {
+                        "methodName": "connect",
+                        "fileName": "DataSource.java",
+                        "lineNumber": 142,
+                        "className": "com.zaxxer.hikari.pool.PoolBase",
+                        "nativeMethod": False,
+                    },
+                ],
+                "lockedMonitors": [
+                    {
+                        "className": "com.zaxxer.hikari.util.ConcurrentBag$IConcurrentBagEntry",
+                        "identityHashCode": 1730124152,
+                        "lockedStackDepth": 0,
+                        "lockedStackFrame": {
+                            "methodName": "borrow",
+                            "fileName": "ConcurrentBag.java",
+                            "lineNumber": 169,
+                            "className": "com.zaxxer.hikari.util.ConcurrentBag",
+                        },
+                    },
+                ],
+                "lockedSynchronizers": [],
+            },
+            {
+                "threadName": f"aws-sdk-credentials-refresher-{sk[:12] if sk else 'XXXXXXXXXXXX'}",
+                "threadId": 61,
+                "daemon": True,
+                "threadState": "TIMED_WAITING",
+                "priority": 5,
+                "stackTrace": [],
+                "lockedMonitors": [],
+                "lockedSynchronizers": [],
+            },
+        ],
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
 def render_phpinfo(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     ak = aws.get("awsAccessKeyId", "")
@@ -4767,6 +5107,72 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ),
         ("aws",),
         render_actuator_env_json,
+        "application/vnd.spring-boot.actuator.v3+json; charset=utf-8",
+    ),
+    # Spring Boot Actuator surface beyond /env. Each endpoint is grepped
+    # by the same broad-secrets fleets that hit /actuator/env: a 200 with
+    # the right JSON / HPROF shape passes the scanner's filter, the
+    # embedded canary credential gets harvested. Path aliases follow the
+    # `/manage`, `/management`, `/api/actuator` reverse-proxy shapes
+    # already covered by actuator-env.
+    CanaryTrap(
+        "actuator-heapdump",
+        (
+            "/actuator/heapdump",
+            "/manage/heapdump",
+            "/management/heapdump",
+            "/api/actuator/heapdump",
+        ),
+        ("aws",),
+        render_actuator_heapdump,
+        "application/octet-stream",
+    ),
+    CanaryTrap(
+        "actuator-configprops",
+        (
+            "/actuator/configprops",
+            "/manage/configprops",
+            "/management/configprops",
+            "/api/actuator/configprops",
+        ),
+        ("aws",),
+        render_actuator_configprops,
+        "application/vnd.spring-boot.actuator.v3+json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "actuator-health",
+        (
+            "/actuator/health",
+            "/manage/health",
+            "/management/health",
+            "/api/actuator/health",
+        ),
+        ("aws",),
+        render_actuator_health,
+        "application/vnd.spring-boot.actuator.v3+json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "actuator-mappings",
+        (
+            "/actuator/mappings",
+            "/manage/mappings",
+            "/management/mappings",
+            "/api/actuator/mappings",
+        ),
+        ("aws",),
+        render_actuator_mappings,
+        "application/vnd.spring-boot.actuator.v3+json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "actuator-threaddump",
+        (
+            "/actuator/threaddump",
+            "/manage/threaddump",
+            "/management/threaddump",
+            "/api/actuator/threaddump",
+        ),
+        ("aws",),
+        render_actuator_threaddump,
         "application/vnd.spring-boot.actuator.v3+json; charset=utf-8",
     ),
     CanaryTrap(

@@ -496,6 +496,23 @@ FAKE_TRACEBIT = {
     ("/manage/env", b'"activeProfiles"'),
     ("/management/env", b"applicationConfig"),
     ("/api/actuator/env", b"applicationConfig"),
+    # Spring Boot Actuator surface beyond /env — every endpoint emits
+    # the canary AWS access key id in a place a credential harvester
+    # would grep raw bytes for.
+    ("/actuator/heapdump", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/actuator/heapdump", b"JAVA PROFILE 1.0.2"),
+    ("/api/actuator/heapdump", b"AWS_SECRET_ACCESS_KEY="),
+    ("/manage/heapdump", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/actuator/configprops", b'"accessKey": "AKIAFAKEEXAMPLE01"'),
+    ("/actuator/configprops", b'"prefix": "spring.datasource"'),
+    ("/management/configprops", b'"accessKey": "AKIAFAKEEXAMPLE01"'),
+    ("/actuator/health", b'"status": "UP"'),
+    ("/actuator/health", b'"accessKeyId": "AKIAFAKEEXAMPLE01"'),
+    ("/api/actuator/health", b"jdbc:postgresql://prod_rw:"),
+    ("/actuator/mappings", b"AKIAFAKEEXAMPLE01"),
+    ("/actuator/mappings", b"dispatcherServlets"),
+    ("/actuator/threaddump", b"AKIAFAKEEXAMPLE01"),
+    ("/actuator/threaddump", b'"threadState"'),
     ("/application.properties", b"aws.access.key.id=AKIAFAKEEXAMPLE01"),
     ("/application.yml", b"access-key-id: AKIAFAKEEXAMPLE01"),
     ("/.env.production", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
@@ -721,6 +738,67 @@ def test_render_actuator_env_json_is_valid_and_per_hit_unique():
     body2 = tbenv.render_actuator_env_json(FAKE_TRACEBIT).decode("utf-8")
     pw2 = json.loads(body2)["propertySources"][2]["properties"]["spring.datasource.password"]["value"]
     assert pw1 != pw2
+
+
+def test_render_actuator_configprops_is_valid_and_per_hit_unique():
+    body1 = tbenv.render_actuator_configprops(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body1)
+    beans = payload["contexts"]["application"]["beans"]
+    ds = beans["spring.datasource-org.springframework.boot.autoconfigure.jdbc.DataSourceProperties"]
+    assert ds["prefix"] == "spring.datasource"
+    pw1 = ds["properties"]["password"]
+    assert pw1
+    aws_bean = beans["cloud.aws-org.springframework.cloud.aws.core.region.StaticRegionProvider"]
+    assert aws_bean["properties"]["accessKey"] == "AKIAFAKEEXAMPLE01"
+    body2 = tbenv.render_actuator_configprops(FAKE_TRACEBIT).decode("utf-8")
+    pw2 = json.loads(body2)["contexts"]["application"]["beans"][
+        "spring.datasource-org.springframework.boot.autoconfigure.jdbc.DataSourceProperties"
+    ]["properties"]["password"]
+    assert pw1 != pw2
+
+
+def test_render_actuator_health_is_valid_and_per_hit_unique():
+    body1 = tbenv.render_actuator_health(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body1)
+    assert payload["status"] == "UP"
+    db_url1 = payload["components"]["db"]["details"]["url"]
+    assert db_url1.startswith("jdbc:postgresql://prod_rw:")
+    redis_url1 = payload["components"]["redis"]["details"]["url"]
+    body2 = tbenv.render_actuator_health(FAKE_TRACEBIT).decode("utf-8")
+    p2 = json.loads(body2)
+    assert p2["components"]["db"]["details"]["url"] != db_url1
+    assert p2["components"]["redis"]["details"]["url"] != redis_url1
+
+
+def test_render_actuator_mappings_is_valid_json():
+    body = tbenv.render_actuator_mappings(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body)
+    handlers = payload["contexts"]["application"]["mappings"]["dispatcherServlets"]["dispatcherServlet"]
+    # Webhook handler embeds the canary access key id in the URL pattern.
+    assert any("AKIAFAKEEXAMPLE01" in h.get("predicate", "") for h in handlers)
+
+
+def test_render_actuator_threaddump_is_valid_json():
+    body = tbenv.render_actuator_threaddump(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body)
+    assert any(
+        "AKIAFAKEEXAMPLE01" in t.get("threadName", "")
+        for t in payload["threads"]
+    ), "at least one thread name must carry the canary access key id"
+    # Every thread MUST have the threadState field — scanners filter on shape.
+    assert all("threadState" in t for t in payload["threads"])
+
+
+def test_render_actuator_heapdump_carries_canary_in_raw_bytes():
+    body = tbenv.render_actuator_heapdump(FAKE_TRACEBIT)
+    # Heap dump harvesters grep raw bytes for AKIA / AWS_SECRET_ACCESS_KEY.
+    assert b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
+    assert b"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI" in body
+    # HPROF magic header so a content-sniffer accepts the response.
+    assert body.startswith(b"JAVA PROFILE 1.0.2\x00")
+    # Subsequent calls embed a different DB password (per-hit unique).
+    other = tbenv.render_actuator_heapdump(FAKE_TRACEBIT)
+    assert other != body
 
 
 def test_default_canary_types_includes_gitlab_username_password():
