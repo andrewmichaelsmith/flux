@@ -113,6 +113,16 @@ No Tracebit key required.
 | `HONEYPOT_WEBSHELL_BODY_READ_LIMIT` | `65536` | Max body bytes read off the wire. |
 | `HONEYPOT_WEBSHELL_BODY_DECODE_LIMIT` | `8192` | Max body bytes decoded for the log `bodyPreview`. |
 
+## Web-app form responder
+
+No Tracebit key required.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_WEBAPP_FORM_ENABLED` | on | Master switch. |
+| `HONEYPOT_WEBAPP_FORM_EXTRA_PATHS_CSV` | empty | Operator extras claimed in addition to the built-in path set; mapped to the generic `webapp-form-form` result tag (built-ins keep their per-group classification: `login`/`signup`/`checkout`/`contact`/`profile`). |
+| `HONEYPOT_WEBAPP_FORM_BODY_PREVIEW_LIMIT` | `400` | Bytes of POST body decoded into the `bodyPreview` log field. Full body sha256 is always recorded via the standard envelope. |
+
 ## Fake LLM-API endpoint
 
 No Tracebit key required.

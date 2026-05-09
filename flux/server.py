@@ -206,6 +206,87 @@ WEBSHELL_COMMAND_KEYS = (
 )
 WEBSHELL_COMMAND_HEADERS = ("X-Cmd", "X-Exec", "X-Command")
 
+# --- Fake web-application form responder ---------------------------------
+# Multi-operator scanner fleets started bursting POSTs against generic web-app
+# form paths in May 2026 — `/login`, `/signin`, `/signup`, `/checkout`,
+# `/contact`, `/dashboard`, `/profile`, `/auth`, `/subscribe`, `/newsletter`,
+# `/cart`, `/register`, `/settings`, `/admin` — alongside `.env` and `.git`
+# probes. POST bodies are HTML form-encoded with per-request unique field
+# values (no fixed payload), consistent with credential-stuffing or
+# form-fuzzing tooling. Default flux currently 404s every one of these and
+# the scanner walks away with nothing logged past the path. This trap
+# returns a plausible HTML form on GET (with a per-request hidden CSRF
+# token + session cookie so a follow-on POST looks credible) and a 302
+# redirect on POST (auth-failure shape: most scanners interpret a redirect
+# back to the form as "wrong credentials, try the next pair"), which
+# elicits the rest of the credential rotation. We log the form field names,
+# extracted username/email value (if any), and a body-preview / sha256 so
+# every POST is auditable.
+WEBAPP_FORM_ENABLED = _env_bool("HONEYPOT_WEBAPP_FORM_ENABLED")
+
+# Organised by intent so the result tag carries useful classification.
+# Each tuple: (result_suffix, paths). `_WEBAPP_FORM_DEFAULT_PATHS` is
+# flattened for env-override; the per-path-to-suffix map is built once
+# at import time.
+_WEBAPP_FORM_LOGIN_PATHS = (
+    "/login", "/signin", "/sign_in", "/sign-in", "/log-in", "/log_in",
+    "/auth", "/auth/login", "/auth/signin", "/auth/sign_in", "/auth/sign-in",
+    "/api/login", "/api/auth", "/api/signin", "/api/sign_in",
+    "/account/login", "/account/signin", "/user/login", "/users/login",
+    "/admin/login", "/admin/signin",
+)
+_WEBAPP_FORM_SIGNUP_PATHS = (
+    "/signup", "/sign_up", "/sign-up", "/register",
+    "/auth/signup", "/auth/sign_up", "/auth/sign-up", "/auth/register",
+    "/api/signup", "/api/sign_up", "/api/register",
+    "/account/register", "/account/signup", "/users/register", "/users/sign_up",
+)
+_WEBAPP_FORM_CHECKOUT_PATHS = (
+    "/checkout", "/cart", "/cart/checkout", "/api/checkout", "/api/cart",
+    "/order/checkout", "/orders/new",
+)
+_WEBAPP_FORM_CONTACT_PATHS = (
+    "/contact", "/contact-us", "/contact_us", "/api/contact",
+    "/subscribe", "/newsletter", "/api/subscribe", "/api/newsletter",
+)
+_WEBAPP_FORM_PROFILE_PATHS = (
+    "/profile", "/account", "/settings", "/dashboard", "/admin",
+    "/user/profile", "/users/profile", "/account/settings",
+    "/api/profile", "/api/account", "/api/settings",
+)
+_WEBAPP_FORM_DEFAULT_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("login",    _WEBAPP_FORM_LOGIN_PATHS),
+    ("signup",   _WEBAPP_FORM_SIGNUP_PATHS),
+    ("checkout", _WEBAPP_FORM_CHECKOUT_PATHS),
+    ("contact",  _WEBAPP_FORM_CONTACT_PATHS),
+    ("profile",  _WEBAPP_FORM_PROFILE_PATHS),
+)
+# Allow one operator override that just adds extra paths (mapped to the
+# generic `form` suffix) without losing the per-group classification of
+# the built-ins.
+_WEBAPP_FORM_EXTRA_PATHS = tuple(
+    p.strip().lower()
+    for p in (os.environ.get("HONEYPOT_WEBAPP_FORM_EXTRA_PATHS_CSV") or "").split(",")
+    if p.strip()
+)
+WEBAPP_FORM_PATH_SUFFIX: dict[str, str] = {}
+for _suffix, _paths in _WEBAPP_FORM_DEFAULT_GROUPS:
+    for _p in _paths:
+        WEBAPP_FORM_PATH_SUFFIX[_p.lower()] = _suffix
+for _p in _WEBAPP_FORM_EXTRA_PATHS:
+    WEBAPP_FORM_PATH_SUFFIX.setdefault(_p, "form")
+# Field names a credential-stuffing scanner is likely to populate. Parsed
+# both as the form's `name=` attribute (so it's easier for naive scanners
+# to bind) and as the body-side extraction list.
+WEBAPP_FORM_USERNAME_KEYS = (
+    "username", "user", "login", "email", "user_email", "userlogin",
+    "log", "uname",
+)
+WEBAPP_FORM_PASSWORD_KEYS = (
+    "password", "passwd", "pass", "pwd", "user_password", "credential",
+)
+WEBAPP_FORM_BODY_PREVIEW_LIMIT = max(int((os.environ.get("HONEYPOT_WEBAPP_FORM_BODY_PREVIEW_LIMIT") or "400").strip() or "400"), 64)
+
 # --- Fake LLM-API endpoint (Ollama / OpenAI / Anthropic-proxy shape) ---
 # Motivated by scanner fleets observed probing AI-inference endpoints
 # in April 2026 — Ollama-native paths, OpenAI-compatible paths, and
@@ -948,6 +1029,22 @@ def is_llm_endpoint_path(path: str) -> bool:
     if not LLM_ENDPOINT_ENABLED:
         return False
     return path.lower() in LLM_ENDPOINT_PATHS
+
+
+def is_webapp_form_path(path: str) -> bool:
+    if not WEBAPP_FORM_ENABLED:
+        return False
+    return _webapp_form_match(path) is not None
+
+
+def _webapp_form_match(path: str) -> str | None:
+    """Return the result-tag suffix for `path`, or None. Tolerates a
+    trailing slash so `/login` and `/login/` both match the same group."""
+    p = path.lower()
+    if p in WEBAPP_FORM_PATH_SUFFIX:
+        return WEBAPP_FORM_PATH_SUFFIX[p]
+    stripped = p.rstrip("/") or "/"
+    return WEBAPP_FORM_PATH_SUFFIX.get(stripped)
 
 
 def is_sonicwall_path(path: str) -> bool:
@@ -2294,6 +2391,127 @@ def render_sonicwall_tfa_success(session_id: str) -> bytes:
         },
     }
     return json.dumps(payload).encode("utf-8")
+
+
+# --- Web-app form responder renderer -------------------------------------
+def render_webapp_form_html(
+    *,
+    suffix: str,
+    path: str,
+    csrf_token: str,
+) -> bytes:
+    """Plausible HTML form for a generic web app. Posts back to the same
+    path so the credential-stuffing scanner's next request lands on the
+    same handler. Field names match the most common name= attributes seen
+    in the wild — `username`, `email`, `password` — so naive form-fillers
+    bind cleanly without needing to inspect the markup."""
+    if suffix == "signup":
+        title = "Create your account"
+        submit = "Sign up"
+        extra_field = (
+            '<label for="email">Email</label>'
+            '<input id="email" name="email" type="email" autocomplete="email" required />'
+        )
+    elif suffix == "checkout":
+        title = "Checkout"
+        submit = "Continue to payment"
+        extra_field = (
+            '<label for="email">Email</label>'
+            '<input id="email" name="email" type="email" autocomplete="email" required />'
+        )
+    elif suffix == "contact":
+        title = "Contact us"
+        submit = "Send"
+        extra_field = (
+            '<label for="email">Email</label>'
+            '<input id="email" name="email" type="email" autocomplete="email" required />'
+            '<label for="message">Message</label>'
+            '<textarea id="message" name="message" rows="4"></textarea>'
+        )
+    elif suffix == "profile":
+        title = "Account settings"
+        submit = "Save changes"
+        extra_field = (
+            '<label for="email">Email</label>'
+            '<input id="email" name="email" type="email" autocomplete="email" />'
+        )
+    else:  # login + form fallback
+        title = "Sign in"
+        submit = "Sign in"
+        extra_field = ""
+    safe_path = path.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    safe_token = csrf_token.replace("&", "&amp;").replace('"', "&quot;")
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+<main>
+<h1>{title}</h1>
+<form method="POST" action="{safe_path}" autocomplete="on">
+<input type="hidden" name="csrf_token" value="{safe_token}" />
+{extra_field}
+<label for="username">Username</label>
+<input id="username" name="username" type="text" autocomplete="username" required />
+<label for="password">Password</label>
+<input id="password" name="password" type="password" autocomplete="current-password" required />
+<button type="submit">{submit}</button>
+</form>
+</main>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def extract_webapp_form_creds(body: bytes, content_type: str) -> tuple[str, bool, bool, list[str]]:
+    """Pull (username, has_password, has_email, field_names) out of a form
+    body. Accepts both `application/x-www-form-urlencoded` (the dominant
+    shape from credential-stuffing tooling) and `application/json`
+    (occasional API-style POST). Username value is capped at 120 chars;
+    password value is never returned, only its presence."""
+    username = ""
+    has_password = False
+    has_email = False
+    field_names: list[str] = []
+    if not body:
+        return username, has_password, has_email, field_names
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    parsed: dict[str, list[str]] = {}
+    if ct in {"application/x-www-form-urlencoded", ""}:
+        parsed = parse_form_body(body, content_type)
+    elif ct == "application/json":
+        try:
+            obj = json.loads(body.decode("utf-8", errors="replace"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            obj = None
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, (str, int, float, bool)):
+                    parsed[str(k)] = [str(v)]
+    field_names = sorted({str(k) for k in parsed.keys()})[:32]
+    for key in WEBAPP_FORM_USERNAME_KEYS:
+        for candidate in (key, key.upper()):
+            values = parsed.get(candidate)
+            if values and values[0]:
+                username = str(values[0])[:120]
+                break
+        if username:
+            break
+    has_password = any(
+        bool((parsed.get(key) or parsed.get(key.upper()) or [""])[0])
+        for key in WEBAPP_FORM_PASSWORD_KEYS
+    )
+    has_email = any(
+        "@" in str((parsed.get(key) or parsed.get(key.upper()) or [""])[0])
+        for key in ("email", "user_email", "e_mail", "mail")
+    )
+    if not has_email and username and "@" in username:
+        has_email = True
+    return username, has_password, has_email, field_names
 
 
 def parse_cookies(cookie_header: str) -> dict[str, str]:
@@ -5733,6 +5951,101 @@ async def _handle_llm_endpoint(
     )
 
 
+async def _handle_webapp_form(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Generic web-app form responder. GET returns plausible HTML so the
+    scanner's next request lands a POST with credentials; POST returns a
+    302 back to the form (auth-failure shape) so the scanner walks
+    through its credential rotation. Both branches log the path/method
+    and — for POSTs — the extracted username, has-password / has-email
+    flags, the field-name list, and the body preview / sha256."""
+    method = request.method
+    suffix = _webapp_form_match(path) or "form"
+    result_tag = f"webapp-form-{suffix}"
+    content_type_req = request.headers.get("Content-Type", "")
+    cookie_header = request.headers.get("Cookie", "")
+    cookies = parse_cookies(cookie_header)
+    # Per-request unique token + session id — no fixed literal across the
+    # fleet (see flux design principle: every credential-shaped field is
+    # per-hit unique). Tokens here aren't credentials, but the cookie is
+    # the same shape a real session id would be, so apply the same rule.
+    csrf_token = uuid.uuid4().hex
+    session_id = uuid.uuid4().hex
+
+    base_log = {
+        **log_context,
+        "result": result_tag,
+        "webappFormPath": path,
+        "webappFormMethod": method,
+        "webappFormSuffix": suffix,
+    }
+
+    if method == "POST":
+        username, has_password, has_email, field_names = extract_webapp_form_creds(
+            request_body, content_type_req,
+        )
+        body_preview = ""
+        if request_body:
+            body_preview = request_body[:WEBAPP_FORM_BODY_PREVIEW_LIMIT].decode("utf-8", errors="replace")
+        # Auth-failure shape: 302 back to the form with `?error=1`. Most
+        # credential-stuffing tools interpret the redirect-to-login as
+        # "wrong password, try the next pair", which is exactly the
+        # follow-on signal we want to elicit.
+        location = f"{path}?error=1"
+        # Append a fake session cookie so the next request looks like the
+        # scanner is "in" enough to keep submitting; logged on subsequent
+        # hits via the inbound Cookie header.
+        log_entry = {
+            **base_log,
+            "status": 302,
+            "webappFormUsername": username,
+            "webappFormHasPassword": has_password,
+            "webappFormHasEmail": has_email,
+            "webappFormFieldNames": field_names,
+            "webappFormHadInboundSession": "session_id" in cookies,
+            "bytes": 0,
+            "contentType": content_type_req[:120],
+        }
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview
+        append_log(log_entry)
+        return web.Response(
+            status=302, body=b"",
+            headers={
+                "Location": location,
+                "Set-Cookie": f"session_id={session_id}; Path=/; HttpOnly; SameSite=Lax",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    # GET / HEAD — render the form so the scanner has a target to POST
+    # back to. HEAD gets the headers without the body (aiohttp handles
+    # the Content-Length on web.Response).
+    body = render_webapp_form_html(
+        suffix=suffix, path=path, csrf_token=csrf_token,
+    )
+    response_body = b"" if method == "HEAD" else body
+    log_entry = {
+        **base_log,
+        "status": 200,
+        "webappFormHadInboundSession": "session_id" in cookies,
+        "bytes": len(body),
+    }
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=response_body,
+        headers={
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
 async def _handle_sonicwall(
     request: web.Request,
     log_context: dict[str, object],
@@ -7365,6 +7678,12 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_body_rce_request(path, query_string, request_body):
         return await _handle_body_rce(request, log_context, path, query_string, request_body)
+
+    # Web-app form responder runs before the tarpit/fingerprint check so
+    # that paths in both lists (e.g. `/`) stay with tarpit; the form trap
+    # only matches its own concrete path set, never `/`.
+    if is_webapp_form_path(path):
+        return await _handle_webapp_form(request, log_context, path, request_body)
 
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)

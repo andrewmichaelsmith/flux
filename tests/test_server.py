@@ -392,6 +392,7 @@ def test_all_trap_families_default_on():
     assert tbenv.CONFLUENCE_ENABLED
     assert tbenv.NEXTJS_ENABLED
     assert tbenv.CMD_INJECTION_ENABLED
+    assert tbenv.WEBAPP_FORM_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -4431,3 +4432,234 @@ async def test_dispatch_routes_ai_toolchain_paths_to_traps(
     assert canary_substring.encode("utf-8") in body, f"{path} body missing {canary_substring}"
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == expected_result
+
+
+# --- Web-app form responder ----------------------------------------------
+
+
+def test_webapp_form_enabled_by_default():
+    assert tbenv.WEBAPP_FORM_ENABLED
+
+
+@pytest.mark.parametrize("path,suffix", [
+    ("/login", "login"),
+    ("/signin", "login"),
+    ("/sign_in", "login"),
+    ("/auth/login", "login"),
+    ("/api/login", "login"),
+    ("/admin/login", "login"),
+    ("/signup", "signup"),
+    ("/sign_up", "signup"),
+    ("/register", "signup"),
+    ("/auth/register", "signup"),
+    ("/checkout", "checkout"),
+    ("/cart", "checkout"),
+    ("/order/checkout", "checkout"),
+    ("/contact", "contact"),
+    ("/contact-us", "contact"),
+    ("/api/contact", "contact"),
+    ("/subscribe", "contact"),
+    ("/newsletter", "contact"),
+    ("/profile", "profile"),
+    ("/dashboard", "profile"),
+    ("/settings", "profile"),
+    ("/admin", "profile"),
+    ("/api/profile", "profile"),
+])
+def test_webapp_form_path_match_classifies_correctly(path, suffix):
+    assert tbenv.is_webapp_form_path(path), f"expected match: {path}"
+    assert tbenv._webapp_form_match(path) == suffix
+
+
+@pytest.mark.parametrize("path", [
+    # Trailing-slash tolerance
+    "/login/", "/signup/", "/checkout/", "/contact/", "/profile/",
+    # Case insensitivity
+    "/Login", "/CHECKOUT", "/Auth/Login",
+])
+def test_webapp_form_path_match_tolerates_slash_and_case(path):
+    assert tbenv.is_webapp_form_path(path), f"expected match: {path}"
+
+
+@pytest.mark.parametrize("path", [
+    # These belong to other handlers / shouldn't shadow form trap nor be claimed by it
+    "/.env", "/.git/config", "/wp-login.php",
+    # Generic non-form paths
+    "/", "/index.html", "/robots.txt", "/favicon.ico",
+    "/random-page", "/api/v4/user",
+    # Looks login-ish but isn't in the configured set
+    "/loginz", "/sign_inn", "/checkout-thank-you",
+])
+def test_webapp_form_path_non_match(path):
+    assert not tbenv.is_webapp_form_path(path), f"should not match: {path}"
+
+
+def test_webapp_form_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "WEBAPP_FORM_ENABLED", False)
+    assert not tbenv.is_webapp_form_path("/login")
+    assert not tbenv.is_webapp_form_path("/checkout")
+
+
+def test_webapp_form_extra_paths_get_form_suffix():
+    # Operator-supplied extras land under the generic `form` suffix.
+    # Built-ins keep their own classification (regression).
+    assert tbenv.WEBAPP_FORM_PATH_SUFFIX["/login"] == "login"
+    assert tbenv.WEBAPP_FORM_PATH_SUFFIX["/checkout"] == "checkout"
+
+
+def test_webapp_form_render_html_includes_username_and_password_fields():
+    body = tbenv.render_webapp_form_html(
+        suffix="login", path="/login", csrf_token="abc123",
+    )
+    assert b'name="username"' in body
+    assert b'name="password"' in body
+    assert b'name="csrf_token"' in body
+    assert b'value="abc123"' in body
+    assert b'action="/login"' in body
+
+
+def test_webapp_form_render_signup_includes_email_field():
+    body = tbenv.render_webapp_form_html(
+        suffix="signup", path="/signup", csrf_token="t",
+    )
+    assert b'name="email"' in body
+    assert b'name="username"' in body
+    assert b'name="password"' in body
+
+
+def test_webapp_form_render_escapes_path_query():
+    body = tbenv.render_webapp_form_html(
+        suffix="login", path='/login"><script>x</script>', csrf_token="t",
+    )
+    assert b"<script>" not in body
+    assert b"&lt;script&gt;" in body
+
+
+def test_webapp_form_extract_creds_from_urlencoded():
+    body = b"username=alice&password=hunter2&csrf_token=t"
+    user, has_pw, has_email, fields = tbenv.extract_webapp_form_creds(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert user == "alice"
+    assert has_pw is True
+    assert has_email is False
+    assert "username" in fields and "password" in fields
+
+
+def test_webapp_form_extract_creds_email_username():
+    body = b"email=bob%40example.com&password=p"
+    user, has_pw, has_email, fields = tbenv.extract_webapp_form_creds(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert user == "bob@example.com"
+    assert has_pw is True
+    assert has_email is True
+
+
+def test_webapp_form_extract_creds_no_password_does_not_invent_one():
+    body = b"username=carol"
+    user, has_pw, has_email, _fields = tbenv.extract_webapp_form_creds(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert user == "carol"
+    assert has_pw is False
+
+
+def test_webapp_form_extract_creds_from_json_body():
+    body = b'{"username":"dan","password":"x","email":"dan@e.com"}'
+    user, has_pw, has_email, fields = tbenv.extract_webapp_form_creds(
+        body, "application/json",
+    )
+    assert user == "dan"
+    assert has_pw is True
+    assert has_email is True
+    assert "email" in fields
+
+
+async def test_dispatch_get_login_returns_form_html(flux_client, monkeypatch):
+    resp = await flux_client.get(
+        "/login", headers={"X-Forwarded-For": "203.0.113.50"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/html")
+    body = await resp.read()
+    assert b'name="username"' in body
+    assert b'name="password"' in body
+    entries = _log_entries(flux_client.log_path)
+    assert len(entries) == 1
+    assert entries[0]["result"] == "webapp-form-login"
+    assert entries[0]["status"] == 200
+    assert entries[0]["clientIp"] == "203.0.113.50"
+
+
+async def test_dispatch_post_login_returns_302_and_logs_credentials(
+    flux_client, monkeypatch,
+):
+    resp = await flux_client.post(
+        "/login",
+        data="username=alice&password=hunter2",
+        headers={
+            "X-Forwarded-For": "203.0.113.51",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"].startswith("/login")
+    assert "session_id=" in resp.headers.get("Set-Cookie", "")
+    entries = _log_entries(flux_client.log_path)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["result"] == "webapp-form-login"
+    assert entry["status"] == 302
+    assert entry["webappFormUsername"] == "alice"
+    assert entry["webappFormHasPassword"] is True
+    assert entry["webappFormMethod"] == "POST"
+    # Body preview is recorded so the full form payload is auditable.
+    assert "username=alice" in entry.get("bodyPreview", "")
+
+
+async def test_dispatch_post_signup_classifies_signup_suffix(
+    flux_client, monkeypatch,
+):
+    resp = await flux_client.post(
+        "/signup",
+        data="email=eve@example.com&username=eve&password=x",
+        headers={
+            "X-Forwarded-For": "203.0.113.52",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "webapp-form-signup"
+    assert entry["webappFormHasEmail"] is True
+
+
+async def test_dispatch_webapp_form_disabled_returns_404(
+    flux_client, monkeypatch,
+):
+    monkeypatch.setattr(tbenv, "WEBAPP_FORM_ENABLED", False)
+    resp = await flux_client.get(
+        "/login", headers={"X-Forwarded-For": "203.0.113.53"},
+    )
+    assert resp.status == 404
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "not-handled"
+
+
+async def test_dispatch_webapp_form_does_not_shadow_canary_traps(
+    flux_client, monkeypatch,
+):
+    """`/.env` and `/.git/config` must keep going through their canary
+    handlers even when the form trap is enabled — the dispatch order is
+    canary-trap-first, form-second by intent."""
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    for path in ["/.env", "/.git/HEAD"]:
+        resp = await flux_client.get(
+            path, headers={"X-Forwarded-For": "203.0.113.54"},
+        )
+        # Without API_KEY canary handlers 404 — the form trap must not
+        # claim those paths and synthesize a 200 form on top.
+        assert resp.status == 404, f"unexpected status for {path}"
