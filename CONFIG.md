@@ -163,6 +163,40 @@ in the `/api/v2/cmdb/system/{status,global}` and
 `/api/v2/monitor/router/policy` envelopes are per-request unique
 (`uuid4().hex`). No fixed credential / serial literals.
 
+## Fake Citrix NetScaler / Gateway portal (CVE-2019-19781 / CVE-2023-3519 / CVE-2023-4966 / CVE-2022-27510 bait)
+
+No Tracebit key required.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_CITRIX_GATEWAY_ENABLED` | on | Master switch. |
+| `HONEYPOT_CITRIX_GATEWAY_PATHS_CSV` | *(built-in — `/vpn/index.html`, `/logon/LogonPoint/index.html`, `/vpn/js/rdx/core/lang/rdx_en.json.gz`, `/cgi/login`, `/p/u/doAuthentication.do`, `/Citrix/XenApp/auth/login.aspx`)* | Exact, case-insensitive. The Gateway / NetScaler ADC SSL VPN endpoints exploited by Shitrix (CVE-2019-19781) and CitrixBleed (CVE-2023-4966), plus the StoreFront / XenApp auth surface targeted by CVE-2022-27510 / CVE-2023-24486. |
+| `HONEYPOT_CITRIX_GATEWAY_VERSION` | `NS13.1: Build 49.13.nc` | NetScaler version banner embedded in the portal HTML comment. Pinned to a build inside the CVE-2023-4966 / CVE-2023-3519 vulnerable window so fingerprint scrapers ship the next-stage probe. |
+
+The `NSC_AAAC` cookie minted on `/cgi/login` and `/p/u/doAuthentication.do`
+is per-request unique (`uuid4().hex`); the cookie name matches the
+real NetScaler Gateway session cookie that CVE-2023-4966 ("CitrixBleed")
+leaks via heap memory, so any later request replaying a captured
+cookie is attributable to the issuance event in the trap log. The
+`citrixHasCmdInjection` flag fires on shell-meta indicators **and**
+on CVE-2019-19781 path-traversal patterns (`/../`, `%2f..`, `..%2f`).
+
+## Fake Microsoft RDWeb (RD Web Access)
+
+No Tracebit key required.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_RDWEB_ENABLED` | on | Master switch. |
+| `HONEYPOT_RDWEB_PATHS_CSV` | *(built-in — `/RDWeb`, `/RDWeb/`, `/RDWeb/Pages/`, `/RDWeb/Pages/en-US/login.aspx`, `/RDWeb/Pages/en-US/Default.aspx`)* | Exact, case-insensitive. The Server 2019 RD Web Access landing + login + post-auth resource list. |
+| `HONEYPOT_RDWEB_SERVER_BUILD` | `10.0.17763` | Windows Server build advertised in the RDWeb logon HTML footer. Server 2019 LTSC build matches the broad install base password-spraying scanners target. |
+
+The `__VIEWSTATE` value embedded in the login HTML and the
+`TSWAAuthHttpOnlyCookie` minted on `/RDWeb/Pages/en-US/login.aspx`
+POSTs are per-request unique (`uuid4().hex`). The trap responds with
+`Server: Microsoft-IIS/10.0` + `X-Powered-By: ASP.NET` so banner-grab
+fingerprint scrapers ship the credential POST.
+
 ## Fake ColdFusion admin / component browser
 
 No Tracebit key required.
