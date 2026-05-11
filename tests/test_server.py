@@ -128,6 +128,169 @@ def test_webshell_regex_rejects_benign_hidden_dirs():
         assert not tbenv.is_webshell_path(path), f"unexpected match: {path}"
 
 
+# --- File-upload trap (KCFinder / jquery.filer / blueimp jQuery-File-Upload) ---
+
+@pytest.mark.parametrize("path,family", [
+    # KCFinder — bare + arbitrary webroot prefix variants
+    ("/kcfinder/upload.php", "kcfinder"),
+    ("/kcfinder/browse.php", "kcfinder"),
+    ("/admin/ckeditor/plugins/kcfinder/upload.php", "kcfinder"),
+    ("/admin/ckeditor/kcfinder/browse.php", "kcfinder"),
+    ("/admin/core/kcfinder/upload.php", "kcfinder"),
+    ("/admin/js/kcfinder/upload.php", "kcfinder"),
+    ("/app/webroot/kcfinder/upload.php", "kcfinder"),
+    ("/app/webroot/js/kcfinder/upload.php", "kcfinder"),
+    ("/asset/kcfinder/upload.php", "kcfinder"),
+    ("/asset/plugins/kcfinder/browse.php", "kcfinder"),
+    ("/assets/kcfinder/browse.php", "kcfinder"),
+    ("/assets/js/kcfinder/upload.php", "kcfinder"),
+    ("/assets/plugins/kcfinder/upload.php", "kcfinder"),
+    ("/ckeditor/kcfinder/upload.php", "kcfinder"),
+    ("/components/kcfinder/upload.php", "kcfinder"),
+    ("/core/scripts/kcfinder/upload.php", "kcfinder"),
+    ("/core/scripts/wysiwyg/kcfinder/upload.php", "kcfinder"),
+    ("/js/kcfinder/upload.php", "kcfinder"),
+    ("/jquery/kcfinder/upload.php", "kcfinder"),
+    ("/plugins/kcfinder/browse.php", "kcfinder"),
+    ("/KCFinder/Upload.php", "kcfinder"),  # case-insensitive
+    # jquery.filer
+    ("/jquery.filer/php/readme.txt", "jquery-filer"),
+    ("/jquery.filer/php/upload.php", "jquery-filer"),
+    ("/assets/plugins/jquery.filer/php/readme.txt", "jquery-filer"),
+    ("/public/assets/plugins/jquery.filer/php/upload.php", "jquery-filer"),
+    ("/JQUERY.FILER/PHP/upload.php", "jquery-filer"),
+    # Blueimp jQuery-File-Upload
+    ("/jquery-file-upload/server/php/", "blueimp-jquery-file-upload"),
+    ("/jquery-file-upload/server/php", "blueimp-jquery-file-upload"),
+    ("/static/lib/jquery-file-upload/server/php/", "blueimp-jquery-file-upload"),
+    ("/assets/global/plugins/jquery-file-upload/server/php/", "blueimp-jquery-file-upload"),
+])
+def test_is_file_upload_path_matches(path, family):
+    assert tbenv.is_file_upload_path(path), f"unexpected miss: {path}"
+    assert tbenv._file_upload_family(path) == family
+
+
+@pytest.mark.parametrize("path", [
+    # Looks-like-but-isn't (no leaf file)
+    "/kcfinder/",
+    "/kcfinder",
+    "/jquery.filer/",
+    "/jquery.filer/php/",
+    # Other static files in the same dirs we don't want to claim
+    "/kcfinder/themes/oxygen/style.css",
+    "/kcfinder/js/kcfinder.js",
+    "/jquery.filer/css/style.css",
+    # The webshell trap and the body-RCE trap own these paths
+    "/upload.php",
+    "/shell.php",
+    "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+    # Webapp-form / canary traps own these
+    "/login",
+    "/.env",
+    "/.aws/credentials",
+])
+def test_is_file_upload_path_rejects(path):
+    assert not tbenv.is_file_upload_path(path), f"unexpected match: {path}"
+
+
+def test_is_file_upload_path_disabled_when_env_off(monkeypatch):
+    monkeypatch.setattr(tbenv, "FILE_UPLOAD_ENABLED", False)
+    assert not tbenv.is_file_upload_path("/kcfinder/upload.php")
+    assert not tbenv.is_file_upload_path("/jquery.filer/php/upload.php")
+
+
+def test_extract_multipart_parts_pulls_filename_and_php_shell():
+    boundary = "----WebKitFormBoundaryABC123"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="upload[]"; filename="shell.php"\r\n'
+        "Content-Type: application/x-php\r\n"
+        "\r\n"
+        "<?php system($_GET['cmd']); ?>\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+    names, filenames, content_types, has_php_shell = tbenv.extract_multipart_parts(
+        body, f"multipart/form-data; boundary={boundary}", 16,
+    )
+    assert names == ["upload[]"]
+    assert filenames == ["shell.php"]
+    assert content_types == ["application/x-php"]
+    assert has_php_shell is True
+
+
+def test_extract_multipart_parts_ignores_empty_filename():
+    """A plain text field (no filename=) should land in `names` but not `filenames`."""
+    boundary = "BNDRY"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="csrf_token"\r\n'
+        "\r\n"
+        "abc123\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename=""\r\n'
+        "Content-Type: application/octet-stream\r\n"
+        "\r\n"
+        "\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+    names, filenames, _, has_php_shell = tbenv.extract_multipart_parts(
+        body, f"multipart/form-data; boundary={boundary}", 16,
+    )
+    assert "csrf_token" in names
+    assert "file" in names
+    assert filenames == []  # empty filename="" doesn't count as an uploaded file
+    assert has_php_shell is False
+
+
+def test_extract_multipart_parts_handles_non_multipart():
+    assert tbenv.extract_multipart_parts(b"plain text", "text/plain", 16) == ([], [], [], False)
+    assert tbenv.extract_multipart_parts(b"", "multipart/form-data; boundary=x", 16) == ([], [], [], False)
+
+
+def test_extract_multipart_parts_caps_at_max():
+    boundary = "B"
+    pieces = []
+    for i in range(5):
+        pieces.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="f{i}"\r\n'
+            "\r\n"
+            f"v{i}\r\n"
+        )
+    pieces.append(f"--{boundary}--\r\n")
+    body = "".join(pieces).encode("utf-8")
+    names, _, _, _ = tbenv.extract_multipart_parts(
+        body, f"multipart/form-data; boundary={boundary}", 2,
+    )
+    assert names == ["f0", "f1"]
+
+
+def test_render_kcfinder_browse_html_carries_upload_form():
+    html = tbenv.render_kcfinder_browse_html()
+    assert b"KCFinder" in html
+    assert b'enctype="multipart/form-data"' in html
+    assert b'name="upload[]"' in html
+
+
+def test_render_jquery_filer_readme_has_expected_marker():
+    body = tbenv.render_jquery_filer_readme()
+    assert b"jQuery.filer" in body
+    assert b"php/upload.php" in body
+
+
+def test_render_jquery_filer_upload_response_emits_json():
+    body = tbenv.render_jquery_filer_upload_response(["evil.php", "ok.txt"])
+    obj = json.loads(body)
+    assert obj["OK"] == 1
+    assert {f["name"] for f in obj["files"]} == {"evil.php", "ok.txt"}
+
+
+def test_render_kcfinder_upload_response_one_line_per_filename():
+    body = tbenv.render_kcfinder_upload_response(["a.php", "b.png"])
+    lines = body.decode("utf-8").splitlines()
+    assert lines == ["/a.php", "/b.png"]
+
+
 def test_parse_cookies_basic():
     result = tbenv.parse_cookies("sid=abc; cmd=id; _hp_tid=xyz")
     assert result == {"sid": "abc", "cmd": "id", "_hp_tid": "xyz"}
@@ -379,6 +542,7 @@ def test_all_trap_families_default_on():
         "quota burn and the dispatch still requires TRACEBIT_API_KEY."
     )
     assert tbenv.WEBSHELL_ENABLED
+    assert tbenv.FILE_UPLOAD_ENABLED
     assert tbenv.LLM_ENDPOINT_ENABLED
     assert tbenv.SONICWALL_ENABLED
     assert tbenv.CISCO_WEBVPN_ENABLED
@@ -462,6 +626,19 @@ FAKE_TRACEBIT = {
 @pytest.mark.parametrize("path,needle", [
     ("/.aws/credentials", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
     ("/.aws/config", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    # `.boto` is the AWS Python SDK / `gsutil` legacy config; same canary in
+    # the `[Credentials]` section as `.aws/credentials`. Includes a per-profile
+    # `[profile prod]` section that also carries the canary, so a per-section
+    # grep still picks it up.
+    ("/.boto", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    ("/.boto", b"[profile prod]"),
+    ("/.boto3", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    ("/root/.boto", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    ("/home/.boto", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    # `.amplifyrc` carries `accessKeyId` / `secretAccessKey` in JSON. Field-keyed
+    # harvesters look for the camelCase keys, so place the canary there.
+    ("/.amplifyrc", b'"accessKeyId": "AKIAFAKEEXAMPLE01"'),
+    ("/.amplifyrc", b'"secretAccessKey":'),
     ("/.pgpass", b":deploybot42:p@ssCanaryValue"),
     ("/.claude/.credentials.json", b'"accessToken": "AKIAFAKEEXAMPLE01"'),
     ("/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),

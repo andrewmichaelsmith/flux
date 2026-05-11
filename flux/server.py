@@ -206,6 +206,65 @@ WEBSHELL_COMMAND_KEYS = (
 )
 WEBSHELL_COMMAND_HEADERS = ("X-Cmd", "X-Exec", "X-Command")
 
+# --- File-upload responder (KCFinder / jquery.filer / blueimp jQuery File Upload) ---
+# Scanners that look for legacy PHP file-upload libraries walk a long list
+# of webroot prefix variants — `/kcfinder/upload.php`,
+# `/admin/ckeditor/plugins/kcfinder/upload.php`, `/assets/plugins/kcfinder/`,
+# `/jquery-file-upload/server/php/`, `/assets/plugins/jquery.filer/php/`,
+# etc. — looking for an endpoint that will accept an arbitrary `<?php`
+# upload. The corresponding CVEs are long-standing arbitrary file upload
+# bugs (KCFinder ≤ 3.20 CVE-2018-15706, jquery.filer pre-1.3.5 SDK
+# vulnerabilities, Blueimp jQuery-File-Upload < 9.22.1 CVE-2018-9206).
+# Default-on like webshell: the trap is cheap, logs are cheap, the
+# value is the POST body. The handler returns a plausible "ready"
+# response on GET and a plausible "uploaded" response on POST so the
+# scanner sends its actual exploit body; we capture multipart filenames
+# + content-types + a body preview + a flag for embedded `<?php` markers.
+FILE_UPLOAD_ENABLED = _env_bool("HONEYPOT_FILE_UPLOAD_ENABLED")
+# Both matchers tolerate arbitrary leading directory prefixes so a single
+# trap covers every observed `/<prefix>/(kcfinder|jquery.filer|...)/...`
+# webroot variant without an enumeration list.
+_FILE_UPLOAD_KCFINDER_RE = re.compile(
+    r"^(?:/[^/]+)*/kcfinder/(?:upload|browse|kcfinder)\.php$",
+    re.IGNORECASE,
+)
+_FILE_UPLOAD_JQFILER_RE = re.compile(
+    r"^(?:/[^/]+)*/jquery\.filer/(?:php/)?(?:upload\.php|readme\.txt|index\.html)$",
+    re.IGNORECASE,
+)
+# Blueimp jQuery File Upload — the historical `server/php/` directory is
+# the actual upload handler. Trailing slash is what the scanners send.
+_FILE_UPLOAD_BLUEIMP_RE = re.compile(
+    r"^(?:/[^/]+)*/jquery-file-upload/server/php/?$",
+    re.IGNORECASE,
+)
+FILE_UPLOAD_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_FILE_UPLOAD_BODY_DECODE_LIMIT") or "8192").strip() or "8192"),
+    512,
+)
+# Cap the number of multipart parts we'll bother enumerating; long-tail
+# multipart bodies past this point are still hashed via bodySha256 but
+# don't get per-part fields in the log line.
+FILE_UPLOAD_MAX_PARTS = max(
+    int((os.environ.get("HONEYPOT_FILE_UPLOAD_MAX_PARTS") or "16").strip() or "16"),
+    1,
+)
+# Indicators that a multipart part is a PHP shell payload — match on the
+# raw part bytes (case-insensitive). Presence flips
+# `fileUploadHasPhpShell` for fast triage; the body itself is hashed and
+# (capped) decoded into `bodyPreview` regardless.
+_FILE_UPLOAD_PHP_SHELL_INDICATORS = (
+    b"<?php",
+    b"<?=",
+    b"<%@",
+    b"eval(",
+    b"system(",
+    b"passthru(",
+    b"shell_exec(",
+    b"proc_open(",
+    b"`",
+)
+
 # --- Fake web-application form responder ---------------------------------
 # Multi-operator scanner fleets started bursting POSTs against generic web-app
 # form paths in May 2026 — `/login`, `/signin`, `/signup`, `/checkout`,
@@ -1095,6 +1154,30 @@ def is_llm_endpoint_path(path: str) -> bool:
     if not LLM_ENDPOINT_ENABLED:
         return False
     return path.lower() in LLM_ENDPOINT_PATHS
+
+
+def _file_upload_family(path: str) -> str:
+    """Return the file-upload family for `path`, or '' if no match.
+
+    Families: 'kcfinder', 'jquery-filer', 'blueimp-jquery-file-upload'.
+    Match is case-insensitive on the lowercased path. The matchers tolerate
+    arbitrary leading directory prefixes so a single trap covers every
+    observed webroot-prefix variant without an enumeration list.
+    """
+    p = path.lower()
+    if _FILE_UPLOAD_KCFINDER_RE.match(p):
+        return "kcfinder"
+    if _FILE_UPLOAD_JQFILER_RE.match(p):
+        return "jquery-filer"
+    if _FILE_UPLOAD_BLUEIMP_RE.match(p):
+        return "blueimp-jquery-file-upload"
+    return ""
+
+
+def is_file_upload_path(path: str) -> bool:
+    if not FILE_UPLOAD_ENABLED:
+        return False
+    return bool(_file_upload_family(path))
 
 
 def is_webapp_form_path(path: str) -> bool:
@@ -2809,6 +2892,109 @@ def render_webapp_form_html(
     return body.encode("utf-8")
 
 
+# Multipart Content-Disposition header tokens used by file-upload trap.
+# Tokens we care about: name="..." and filename="..." (or unquoted). Match
+# is anchored to the raw bytes of a multipart part and is permissive about
+# quoting because exploit clients vary.
+_MULTIPART_NAME_RE = re.compile(
+    rb'(?i)name\s*=\s*(?:"([^"]*)"|([^;\r\n]+))',
+)
+_MULTIPART_FILENAME_RE = re.compile(
+    rb'(?i)filename\s*=\s*(?:"([^"]*)"|([^;\r\n]+))',
+)
+_MULTIPART_CONTENT_TYPE_RE = re.compile(
+    rb'(?im)^\s*Content-Type\s*:\s*([^\r\n;]+)',
+)
+
+
+def extract_multipart_parts(
+    body: bytes,
+    content_type: str,
+    max_parts: int,
+) -> tuple[list[str], list[str], list[str], bool]:
+    """Parse a `multipart/form-data` body well enough to extract:
+
+    - field names (`name="..."`)
+    - uploaded filenames (`filename="..."` — empty/absent means a plain field, not a file)
+    - per-part Content-Type values
+    - whether any part contains a PHP-shell indicator
+
+    Returns ``(names, filenames, content_types, has_php_shell)``.
+
+    Stops at `max_parts` parts. Stdlib-only: no `email.parser` dependency
+    on the wire-shape, since exploit clients commonly emit slightly
+    malformed multipart bodies that `email` rejects. We split on the
+    boundary token from the Content-Type header and read the
+    per-part header block via regex on the raw bytes.
+    """
+    if not body:
+        return [], [], [], False
+    ct_raw = content_type or ""
+    ct_low = ct_raw.lower()
+    if "multipart/form-data" not in ct_low or "boundary=" not in ct_low:
+        return [], [], [], False
+    # Find the boundary in the original-case header — boundary values are
+    # case-sensitive, so we must not lowercase before extraction.
+    boundary_start = ct_low.index("boundary=") + len("boundary=")
+    boundary = ct_raw[boundary_start:].split(";", 1)[0].strip()
+    # RFC 7578 permits a quoted boundary; strip surrounding quotes if present.
+    if boundary.startswith('"') and boundary.endswith('"') and len(boundary) >= 2:
+        boundary = boundary[1:-1]
+    if not boundary:
+        return [], [], [], False
+    sep = b"--" + boundary.encode("latin-1", errors="replace")
+    raw_parts = body.split(sep)
+    # First element is the preamble (usually empty), last is the epilogue or
+    # `--\r\n` end marker — neither is a real part.
+    names: list[str] = []
+    filenames: list[str] = []
+    content_types: list[str] = []
+    has_php_shell = False
+    for chunk in raw_parts[1:1 + max_parts]:
+        if not chunk or chunk[:2] == b"--":
+            # Either the epilogue or the closing `--` after the final boundary.
+            continue
+        # Each part begins with CRLF (per RFC) — strip the leading newline so
+        # the header regexes can match from the start. Tolerate LF-only.
+        if chunk[:2] == b"\r\n":
+            chunk = chunk[2:]
+        elif chunk[:1] == b"\n":
+            chunk = chunk[1:]
+        header_end = chunk.find(b"\r\n\r\n")
+        if header_end == -1:
+            header_end = chunk.find(b"\n\n")
+            if header_end == -1:
+                # Malformed part — record its presence but skip extraction.
+                continue
+            part_headers = chunk[:header_end]
+            part_body = chunk[header_end + 2:]
+        else:
+            part_headers = chunk[:header_end]
+            part_body = chunk[header_end + 4:]
+        m_name = _MULTIPART_NAME_RE.search(part_headers)
+        if m_name:
+            name_bytes = (m_name.group(1) or m_name.group(2) or b"").strip()
+            names.append(name_bytes.decode("utf-8", errors="replace")[:120])
+        m_filename = _MULTIPART_FILENAME_RE.search(part_headers)
+        if m_filename:
+            fn_bytes = (m_filename.group(1) or m_filename.group(2) or b"").strip()
+            # An empty filename="" means "no file submitted for this field" —
+            # we still record the field name above but skip the filename list.
+            if fn_bytes:
+                filenames.append(fn_bytes.decode("utf-8", errors="replace")[:240])
+        m_ct = _MULTIPART_CONTENT_TYPE_RE.search(part_headers)
+        if m_ct:
+            ct_value = m_ct.group(1).strip()
+            content_types.append(ct_value.decode("latin-1", errors="replace")[:120])
+        if not has_php_shell:
+            lowered_body = part_body.lower()
+            for needle in _FILE_UPLOAD_PHP_SHELL_INDICATORS:
+                if needle in lowered_body:
+                    has_php_shell = True
+                    break
+    return names, filenames, content_types, has_php_shell
+
+
 def extract_webapp_form_creds(body: bytes, content_type: str) -> tuple[str, bool, bool, list[str]]:
     """Pull (username, has_password, has_email, field_names) out of a form
     body. Accepts both `application/x-www-form-urlencoded` (the dominant
@@ -2959,6 +3145,106 @@ def render_webshell_page(command: str = "", output: str = "") -> bytes:
         "</body></html>\n"
     )
     return html.encode("utf-8")
+
+
+def render_kcfinder_browse_html() -> bytes:
+    """Plausible KCFinder file-browser landing page. Two goals: (1) pass
+    presence-detection scanners that grep for `KCFinder` / `kcfinder.js`
+    in the response body, and (2) carry an `<input type="file" name="upload[]">`
+    so the scanner's next move is a multipart POST to `upload.php` — which
+    is where we actually capture the payload."""
+    return (
+        b"<!doctype html>\n"
+        b"<html lang=\"en\"><head>\n"
+        b"<meta charset=\"utf-8\">\n"
+        b"<title>KCFinder File Browser</title>\n"
+        b"<link rel=\"stylesheet\" href=\"themes/oxygen/style.css\">\n"
+        b"<script src=\"js/kcfinder.js\"></script>\n"
+        b"</head>\n"
+        b"<body class=\"kcfinder\">\n"
+        b"<div id=\"toolbar\">\n"
+        b"<button id=\"upload\">Upload</button>\n"
+        b"<button id=\"refresh\">Refresh</button>\n"
+        b"</div>\n"
+        b"<form id=\"upload-form\" method=\"POST\" action=\"upload.php\" enctype=\"multipart/form-data\">\n"
+        b"<input type=\"file\" name=\"upload[]\" multiple>\n"
+        b"<input type=\"submit\" value=\"Upload\">\n"
+        b"</form>\n"
+        b"<div id=\"files\"></div>\n"
+        b"</body></html>\n"
+    )
+
+
+def render_kcfinder_upload_response(filenames: list[str]) -> bytes:
+    """KCFinder's `upload.php` returns one line per uploaded file, with a
+    leading `/` for accepted uploads. Real-world scanners parse the first
+    character to decide success. We claim success on every part: the next
+    request the scanner makes is the actual webshell hit, which lands on
+    `/<filename>` (404 in our world) but the multipart body is already
+    logged by then."""
+    if not filenames:
+        return b""
+    # Cap how many names we echo back to avoid amplifying an oversized
+    # multipart body into an oversized response.
+    return ("\n".join(f"/{name}" for name in filenames[:32]) + "\n").encode("utf-8")
+
+
+def render_jquery_filer_readme() -> bytes:
+    """Plausible jquery.filer README — presence-detection scanners fetch
+    this exact file before sending the upload POST. Body matches the
+    shape of the real README so a content-grep test passes."""
+    return (
+        b"jQuery.filer\n"
+        b"============\n"
+        b"\n"
+        b"jQuery.filer is a simple HTML5 file uploader, a tool for client-side\n"
+        b"file management, with multiple file selection, drag and drop support,\n"
+        b"image previews, progress bars and image thumbnails.\n"
+        b"\n"
+        b"Server-side: php/upload.php (PHP-based form-data handler).\n"
+        b"\n"
+        b"License: MIT\n"
+    )
+
+
+def render_jquery_filer_upload_response(filenames: list[str]) -> bytes:
+    """jquery.filer expects JSON in the shape ``{"OK": 1, "files": [...]}``
+    on success. Each file entry mirrors the input filename and reports a
+    plausible size + URL so the scanner accepts the upload as complete."""
+    if not filenames:
+        return b'{"OK":0,"err":"no file","files":[]}\n'
+    files = [
+        {
+            "name": fn,
+            "size": secrets.randbelow(900_000) + 1024,
+            "type": "application/octet-stream",
+            "file": f"./uploads/{fn}",
+            "id": secrets.token_hex(8),
+        }
+        for fn in filenames[:32]
+    ]
+    return (json.dumps({"OK": 1, "files": files}) + "\n").encode("utf-8")
+
+
+def render_blueimp_upload_response(filenames: list[str]) -> bytes:
+    """Blueimp jQuery-File-Upload server reference implementation returns
+    JSON in the shape ``{"files": [{"name": "...", "size": N, "url": "...",
+    "thumbnailUrl": "...", "deleteUrl": "...", "deleteType": "DELETE"}, ...]}``.
+    On a GET to `server/php/` it lists already-uploaded files; we return
+    an empty list so the scanner thinks it found a fresh installation."""
+    files = [
+        {
+            "name": fn,
+            "size": secrets.randbelow(900_000) + 1024,
+            "type": "application/octet-stream",
+            "url": f"server/php/files/{fn}",
+            "thumbnailUrl": "",
+            "deleteUrl": f"server/php/?file={fn}",
+            "deleteType": "DELETE",
+        }
+        for fn in filenames[:32]
+    ]
+    return (json.dumps({"files": files}) + "\n").encode("utf-8")
 
 
 def _parse_chain_params(query: str) -> tuple[str, int]:
@@ -5392,6 +5678,69 @@ def render_baseten_yaml(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_boto_config(r: dict[str, object]) -> bytes:
+    """`~/.boto` — INI-style config for the AWS Python SDK
+    (`boto`/`boto3`/`gsutil`). The `[Credentials]` section carries
+    `aws_access_key_id` and `aws_secret_access_key`; some projects also
+    keep per-profile sections (`[profile prod]`). Embed the canary AWS
+    keys in both shapes so a field-keyed harvester picks them up either
+    way."""
+    aws = _aws(r)
+    return (
+        "[Credentials]\n"
+        f"aws_access_key_id = {aws.get('awsAccessKeyId', '')}\n"
+        f"aws_secret_access_key = {aws.get('awsSecretAccessKey', '')}\n"
+        f"aws_session_token = {aws.get('awsSessionToken', '')}\n"
+        "\n"
+        "[Boto]\n"
+        "http_socket_timeout = 60\n"
+        "metadata_service_timeout = 5\n"
+        "metadata_service_num_attempts = 3\n"
+        "\n"
+        "[s3]\n"
+        "host = s3.amazonaws.com\n"
+        "\n"
+        "[profile prod]\n"
+        f"aws_access_key_id = {aws.get('awsAccessKeyId', '')}\n"
+        f"aws_secret_access_key = {aws.get('awsSecretAccessKey', '')}\n"
+        "region = us-east-1\n"
+    ).encode("utf-8")
+
+
+def render_amplifyrc_json(r: dict[str, object]) -> bytes:
+    """`.amplifyrc` is an AWS Amplify CLI project config that some teams
+    accidentally commit. Real shape varies by Amplify version, but the
+    field that matters is the `providers.awscloudformation` block —
+    when `useProfile` is false, the long-form key + secret end up here
+    directly. Field-name-keyed harvesters look for `accessKeyId` /
+    `secretAccessKey`, which is where we put the canary."""
+    aws = _aws(r)
+    body = {
+        "projectName": "internal-app",
+        "appId": "d2example1234",
+        "envName": "prod",
+        "defaultEditor": "code",
+        "frontend": {
+            "framework": "react",
+            "config": {
+                "SourceDir": "src",
+                "DistributionDir": "build",
+            },
+        },
+        "providers": {
+            "awscloudformation": {
+                "configLevel": "project",
+                "useProfile": False,
+                "profileName": "default",
+                "accessKeyId": aws.get("awsAccessKeyId", ""),
+                "secretAccessKey": aws.get("awsSecretAccessKey", ""),
+                "region": "us-east-1",
+            },
+        },
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
 @dataclass(frozen=True)
 class CanaryTrap:
     name: str                      # log tag, e.g. "aws-credentials-file"
@@ -5434,6 +5783,36 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_aws_config_ini,
         "text/plain; charset=utf-8",
+    ),
+    # `~/.boto` — AWS Python SDK / `gsutil` legacy config file. Carries
+    # `aws_access_key_id` / `aws_secret_access_key` in plaintext INI;
+    # field-keyed scanners hit this alongside `.aws/credentials`.
+    # Webroot-prefix variants (`/root/.boto`, `/home/.boto`) mirror the
+    # ssh-private-key / docker-config patterns. `/.boto3` is the same
+    # file under a Python-3-flavoured filename some teams (incorrectly)
+    # adopted; scanner dictionaries enumerate both.
+    CanaryTrap(
+        "boto-config",
+        (
+            "/.boto",
+            "/.boto3",
+            "/root/.boto",
+            "/home/.boto",
+        ),
+        ("aws",),
+        render_boto_config,
+        "text/plain; charset=utf-8",
+    ),
+    # AWS Amplify CLI project config. Some Amplify versions stash
+    # `accessKeyId` / `secretAccessKey` directly in
+    # `providers.awscloudformation` when `useProfile=false`, so a
+    # committed `.amplifyrc` is a one-shot AWS credential leak.
+    CanaryTrap(
+        "amplifyrc",
+        ("/.amplifyrc",),
+        ("aws",),
+        render_amplifyrc_json,
+        "application/json; charset=utf-8",
     ),
     CanaryTrap(
         "terraform-tfstate",
@@ -7652,6 +8031,100 @@ async def _handle_webshell(
     )
 
 
+async def _handle_file_upload(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Respond to KCFinder / jquery.filer / blueimp file-upload probe paths.
+
+    GET → return a presence-detection-friendly response per family.
+    POST → parse multipart parts (filenames, content-types, php-shell
+    indicator) and return a plausible "uploaded" envelope so the scanner
+    sends its next request (e.g. fetching the uploaded shell via GET).
+    All multipart bytes are already covered by the request envelope's
+    bodySha256; this handler adds per-part fields for triage.
+    """
+    family = _file_upload_family(path)
+    method = request.method
+    content_type = request.headers.get("Content-Type", "")
+    names, filenames, part_content_types, has_php_shell = (
+        ([], [], [], False)
+        if method in {"GET", "HEAD"}
+        else extract_multipart_parts(request_body, content_type, FILE_UPLOAD_MAX_PARTS)
+    )
+    body_preview = ""
+    if request_body:
+        # Decoded preview is best-effort — multipart bytes are mostly text
+        # in the parts we care about (filenames, php source), and the
+        # `replace` errors handler keeps the field safe to JSON-encode.
+        body_preview = request_body[:FILE_UPLOAD_BODY_DECODE_LIMIT].decode(
+            "utf-8", errors="replace",
+        )
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": "file-upload-attempt" if method == "POST" else "file-upload-probe",
+        "fileUploadFamily": family,
+        "fileUploadPath": path,
+        "fileUploadMethod": method,
+        "fileUploadHasMultipart": "multipart/form-data" in content_type.lower(),
+        "fileUploadPartCount": len(names),
+        "fileUploadFieldNames": sorted(set(names))[:32],
+        "fileUploadFilenames": filenames[:32],
+        "fileUploadPartContentTypes": sorted(set(part_content_types))[:32],
+        "fileUploadHasPhpShell": has_php_shell,
+        "contentType": content_type[:120],
+    }
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview
+    append_log(log_entry)
+
+    # Build per-family response. HEAD shares the GET response shape so
+    # the Content-Type advertised is correct; aiohttp strips the body.
+    body: bytes
+    response_content_type: str
+    if family == "kcfinder":
+        if method == "POST":
+            body = render_kcfinder_upload_response(filenames or ["upload.txt"])
+            response_content_type = "text/plain; charset=utf-8"
+        elif "browse" in path.lower() or "kcfinder.php" in path.lower():
+            body = render_kcfinder_browse_html()
+            response_content_type = "text/html; charset=utf-8"
+        else:
+            # GET to upload.php → return an "ok, ready to receive" page that
+            # still references the upload form, so the scanner POSTs next.
+            body = render_kcfinder_browse_html()
+            response_content_type = "text/html; charset=utf-8"
+    elif family == "jquery-filer":
+        if method == "POST":
+            body = render_jquery_filer_upload_response(filenames)
+            response_content_type = "application/json; charset=utf-8"
+        elif path.lower().endswith("readme.txt"):
+            body = render_jquery_filer_readme()
+            response_content_type = "text/plain; charset=utf-8"
+        else:
+            # GET on /<prefix>/jquery.filer/php/upload.php → JSON empty-OK
+            # so scanners that probe with GET-before-POST see a 200.
+            body = b'{"OK":1,"files":[]}\n'
+            response_content_type = "application/json; charset=utf-8"
+    else:
+        # blueimp-jquery-file-upload — server/php/ enumerates already-uploaded
+        # files on GET (we return an empty list) and accepts POST uploads.
+        body = render_blueimp_upload_response(filenames if method == "POST" else [])
+        response_content_type = "application/json; charset=utf-8"
+
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": response_content_type,
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_cmd_injection(
     request: web.Request,
     log_context: dict[str, object],
@@ -8139,6 +8612,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_webshell_path(path):
         return await _handle_webshell(request, log_context, path, query_string, request_body)
 
+    if is_file_upload_path(path):
+        return await _handle_file_upload(request, log_context, path, request_body)
+
     if is_llm_endpoint_path(path):
         return await _handle_llm_endpoint(request, log_context, path, request_body)
 
@@ -8259,6 +8735,8 @@ def main() -> int:
         active.append("tarpit")
     if WEBSHELL_ENABLED:
         active.append("webshell")
+    if FILE_UPLOAD_ENABLED:
+        active.append("file-upload")
     if LLM_ENDPOINT_ENABLED:
         active.append("llm-endpoint")
     if SONICWALL_ENABLED:

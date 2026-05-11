@@ -85,6 +85,106 @@ async def test_integration_webshell_roundtrip(live_server, monkeypatch):
     assert any(e["result"] == "webshell-command" for e in entries)
 
 
+async def test_integration_file_upload_roundtrip(live_server, monkeypatch):
+    """Real-socket POST of a multipart body with an embedded `<?php` payload
+    against `/<prefix>/kcfinder/upload.php`. The handler should parse the
+    filename and the php-shell indicator out of the multipart body, log the
+    `file-upload-attempt` event with those fields, and return a plausible
+    KCFinder-shaped success line so a scanner sends its next request."""
+    monkeypatch.setattr(tbenv, "FILE_UPLOAD_ENABLED", True)
+    base, log_path = live_server
+    boundary = "----WebKitFormBoundaryFLUX1234"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="upload[]"; filename="shell.php"\r\n'
+        "Content-Type: application/x-php\r\n"
+        "\r\n"
+        "<?php system($_GET['cmd']); ?>\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base}/admin/ckeditor/plugins/kcfinder/upload.php",
+            headers={
+                "X-Forwarded-For": "203.0.113.30",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            data=body,
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/plain")
+            response_body = await resp.read()
+            # KCFinder's upload.php returns one line per file with a leading `/`.
+            assert b"/shell.php" in response_body
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    matches = [e for e in entries if e.get("result") == "file-upload-attempt"]
+    assert len(matches) == 1, entries
+    entry = matches[0]
+    assert entry["fileUploadFamily"] == "kcfinder"
+    assert entry["fileUploadPath"] == "/admin/ckeditor/plugins/kcfinder/upload.php"
+    assert entry["fileUploadMethod"] == "POST"
+    assert entry["fileUploadHasMultipart"] is True
+    assert entry["fileUploadFilenames"] == ["shell.php"]
+    assert entry["fileUploadHasPhpShell"] is True
+    assert "upload[]" in entry["fileUploadFieldNames"]
+
+
+async def test_integration_file_upload_get_jquery_filer_readme(live_server, monkeypatch):
+    """GET on a jquery.filer readme path returns plausible readme text and
+    logs `file-upload-probe`."""
+    monkeypatch.setattr(tbenv, "FILE_UPLOAD_ENABLED", True)
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/assets/plugins/jquery.filer/php/readme.txt",
+            headers={"X-Forwarded-For": "203.0.113.31"},
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/plain")
+            body = await resp.read()
+            assert b"jQuery.filer" in body
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    matches = [e for e in entries if e.get("result") == "file-upload-probe"]
+    assert len(matches) == 1
+    assert matches[0]["fileUploadFamily"] == "jquery-filer"
+    assert matches[0]["fileUploadHasPhpShell"] is False
+
+
+async def test_integration_boto_canary_serves_aws_creds(live_server):
+    """The new `.boto` canary trap returns an INI body with the canary AWS
+    keys in both `[Credentials]` and `[profile prod]` sections."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/.boto",
+            headers={"X-Forwarded-For": "203.0.113.32"},
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/plain")
+            body = await resp.read()
+            assert b"[Credentials]" in body
+            assert b"AKIAFAKEINTEG01" in body
+            assert b"[profile prod]" in body
+
+
+async def test_integration_amplifyrc_canary_serves_aws_creds(live_server):
+    """The new `.amplifyrc` canary trap returns JSON with the canary AWS keys
+    in `providers.awscloudformation`."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/.amplifyrc",
+            headers={"X-Forwarded-For": "203.0.113.33"},
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("application/json")
+            body = await resp.read()
+            obj = json.loads(body)
+            assert obj["providers"]["awscloudformation"]["accessKeyId"] == "AKIAFAKEINTEG01"
+
+
 async def test_integration_aws_credentials_file(live_server):
     """Canary trap over the wire, real headers come back including Content-Type."""
     base, log_path = live_server

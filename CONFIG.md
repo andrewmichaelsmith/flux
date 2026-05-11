@@ -113,6 +113,16 @@ No Tracebit key required.
 | `HONEYPOT_WEBSHELL_BODY_READ_LIMIT` | `65536` | Max body bytes read off the wire. |
 | `HONEYPOT_WEBSHELL_BODY_DECODE_LIMIT` | `8192` | Max body bytes decoded for the log `bodyPreview`. |
 
+## Fake file-upload responder
+
+No Tracebit key required.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_FILE_UPLOAD_ENABLED` | on | Master switch. Covers KCFinder, jquery.filer, and Blueimp jQuery-File-Upload. |
+| `HONEYPOT_FILE_UPLOAD_BODY_DECODE_LIMIT` | `8192` | Max body bytes decoded for the log `bodyPreview`. Full body sha256 is always recorded via the standard envelope. |
+| `HONEYPOT_FILE_UPLOAD_MAX_PARTS` | `16` | Multipart parts enumerated per request (cap on `fileUploadFieldNames` / `fileUploadFilenames` / `fileUploadPartContentTypes`). |
+
 ## Web-app form responder
 
 No Tracebit key required.
