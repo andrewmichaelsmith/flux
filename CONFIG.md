@@ -238,6 +238,20 @@ callback hostname (`oast.me`, `oast.fun`, `interact.sh`, `dnslog.cn`,
 hostname recurring across sensors is a strong attribution signal
 regardless of source IP rotation.
 
+### Fake SAP NetWeaver Visual Composer MetadataUploader
+
+No Tracebit key required.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_SAP_METADATAUPLOADER_ENABLED` | on | Master switch. Covers `/developmentserver/metadatauploader` (CVE-2025-31324 unauth file-upload + CVE-2017-9844 XXE) under the bare, `/irj/`, `/nwa/`, and `/sap/` webroot prefixes. |
+| `HONEYPOT_SAP_METADATAUPLOADER_BODY_DECODE_LIMIT` | `8192` | Max bytes of the request body decoded into `bodyPreview` and scanned for the JSP / XXE / cmd-injection indicator flags. The full body is still hashed via `bodySha256`. |
+
+The handler always advertises `Server: SAP NetWeaver Application Server / ABAP (7.50)`
+on responses — pinned to a build in the CVE-2025-31324 public-disclosure
+window so scanners deciding whether to ship the upload body don't bail
+on a patched banner.
+
 ## Bind address / port
 
 Flux listens on `127.0.0.1:18081` (aiohttp). To change, edit

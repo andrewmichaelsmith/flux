@@ -815,6 +815,50 @@ def _confluence_has_ognl(path: str, query: str, body_preview: str) -> bool:
     return any(needle in haystack for needle in _CONFLUENCE_OGNL_INDICATORS)
 
 
+# --- Fake SAP NetWeaver Visual Composer MetadataUploader ---------------
+# `/developmentserver/metadatauploader` is the Visual Composer endpoint
+# scanners walk to fingerprint SAP NetWeaver Application Server Java and
+# (per the public CVE-2025-31324 disclosure window) drop a JSP webshell
+# via unauthenticated multipart upload. Sister CVE-2017-9844 (XXE in the
+# same servlet path) and CVE-2020-6287 (RECON) probes hit the same prefix.
+# Real NetWeaver returns a small WebDynpro / SAP-formatted error envelope
+# on bare GET and a "200 OK" plaintext receipt on successful POST upload;
+# returning a plausible response on both keeps scanners from bailing on
+# fingerprint and captures the upload payload (filename, content-type,
+# embedded JSP / xpath / cmd indicators) for triage.
+SAP_METADATAUPLOADER_ENABLED = _env_bool("HONEYPOT_SAP_METADATAUPLOADER_ENABLED")
+# Body decode cap mirrors the file-upload trap — keeps log rows compact
+# while still surfacing enough payload for the JSP / XXE / cmd-injection
+# indicator flags.
+SAP_METADATAUPLOADER_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_SAP_METADATAUPLOADER_BODY_DECODE_LIMIT") or "8192").strip() or "8192"),
+    512,
+)
+# JSP / shell payload indicators on the multipart body — flips
+# `sapMetadataUploaderHasJspShell` for fast triage. Matched on the raw
+# request bytes (case-insensitive); the body itself is still hashed and
+# previewed in `bodyPreview` regardless.
+_SAP_METADATAUPLOADER_SHELL_INDICATORS = (
+    b"<%@",                           # JSP page directive
+    b"<jsp:",                         # JSP action tag
+    b"runtime.getruntime",            # java.lang.Runtime.exec()
+    b"processbuilder",                # alt RCE pivot
+    b"java.lang.runtime",
+    b"shell_exec",
+    b"<?php",                         # mistargeted PHP shell — still log
+    b"<?xml",                         # XXE / CVE-2017-9844 shape
+)
+# XXE indicators on the body — XML external entity declarations land here
+# on CVE-2017-9844 probes. Separate flag so triage can sort JSP-shell
+# uploads from XML-injection probes.
+_SAP_METADATAUPLOADER_XXE_INDICATORS = (
+    b"<!doctype",
+    b"<!entity",
+    b"system \"",
+    b"system '",
+)
+
+
 # --- Fake Next.js application + SSJS-injection probe responder ----------
 # Probes seen in the wild send a base64-encoded JS payload via `?cmd=...`
 # against Next.js conventional routes. The decoded body is an
@@ -1509,6 +1553,26 @@ def is_confluence_path(path: str) -> bool:
         # generic and would steal traffic from other web apps.
         return p.endswith(".action") or "createpage-entervariables" in p or "doenterpagevariables" in p
     return False
+
+
+def is_sap_metadatauploader_path(path: str) -> bool:
+    """Match the SAP NetWeaver Visual Composer MetadataUploader servlet.
+
+    Real deployments expose it at `/developmentserver/metadatauploader`.
+    Some reverse-proxy layouts deploy NetWeaver under a webroot prefix —
+    cover the bare path plus the `/irj/` (Enterprise Portal) and `/nwa/`
+    (NetWeaver Administrator) prefixes scanner dictionaries enumerate.
+    Case-insensitive; trailing slash variants both match.
+    """
+    if not SAP_METADATAUPLOADER_ENABLED:
+        return False
+    p = path.lower().rstrip("/")
+    return p in {
+        "/developmentserver/metadatauploader",
+        "/irj/developmentserver/metadatauploader",
+        "/nwa/developmentserver/metadatauploader",
+        "/sap/developmentserver/metadatauploader",
+    }
 
 
 def extract_sonicwall_username(body: bytes, content_type: str) -> str:
@@ -2761,6 +2825,37 @@ def render_confluence_editor_preload_html(version: str) -> bytes:
         f'<div class="editor-preload-container" data-version="{version}">'
         f'<div class="content-body"></div>'
         f'</div>'
+    )
+    return body.encode("utf-8")
+
+
+def render_sap_metadatauploader_get_error() -> bytes:
+    """Bare GET to the Visual Composer servlet — real NetWeaver returns a
+    small SAP-formatted error envelope (the servlet only accepts POST in
+    production). Mirror that shape so scanners that probe with GET-before-POST
+    proceed to send the upload payload."""
+    body = (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<sap:Error xmlns:sap="urn:sap-com:document:sap:rfc:functions">\n'
+        b'  <code>METADATA_UPLOAD_NO_REQUEST</code>\n'
+        b'  <message>No multipart request body received.</message>\n'
+        b'  <severity>ERROR</severity>\n'
+        b'</sap:Error>\n'
+    )
+    return body
+
+
+def render_sap_metadatauploader_post_ok(filename: str) -> bytes:
+    """Successful POST to the Visual Composer servlet — real NetWeaver
+    returns a plaintext receipt with the stored filename. Echoing the
+    uploaded filename in the response is what most scanners look for as
+    a "shell installed" success indicator; that's enough for them to
+    follow up with a GET request to the would-be shell URL, which our
+    access log still captures even though no file actually exists."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:120] or "metadata.xml"
+    body = (
+        f"OK: stored {safe} in /usr/sap/CE1/J00/j2ee/cluster/apps/sap.com/"
+        f"tc~lm~ctc~util/servlet_jsp/tc~lm~ctc~util/root/{safe}\n"
     )
     return body.encode("utf-8")
 
@@ -7901,6 +7996,99 @@ def render_nextjs_static_chunk() -> bytes:
     return body.encode("utf-8")
 
 
+async def _handle_sap_metadatauploader(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake SAP NetWeaver Visual Composer MetadataUploader (CVE-2025-31324
+    / CVE-2017-9844 bait).
+
+    GET → small SAP-formatted error envelope (real NetWeaver returns the
+    same shape when invoked without a multipart body).
+    POST → parse multipart parts, log filename/content-type/payload
+    indicators, return the "OK: stored …" plaintext receipt scanners look
+    for as a "shell installed" success marker. The handler does not
+    actually store anything; the follow-up GET to the supposed shell URL
+    still hits flux's path classifier and lands in the access log.
+    """
+    method = request.method
+    content_type = request.headers.get("Content-Type", "")
+    names: list[str] = []
+    filenames: list[str] = []
+    part_content_types: list[str] = []
+    has_php_shell = False  # reused multipart helper flag; named _php for legacy
+    if method not in {"GET", "HEAD"}:
+        names, filenames, part_content_types, has_php_shell = extract_multipart_parts(
+            request_body, content_type, FILE_UPLOAD_MAX_PARTS,
+        )
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:SAP_METADATAUPLOADER_BODY_DECODE_LIMIT].decode(
+            "utf-8", errors="replace",
+        )
+
+    lower_body = request_body[:SAP_METADATAUPLOADER_BODY_DECODE_LIMIT].lower() if request_body else b""
+    has_jsp_shell = any(needle in lower_body for needle in _SAP_METADATAUPLOADER_SHELL_INDICATORS)
+    has_xxe = any(needle in lower_body for needle in _SAP_METADATAUPLOADER_XXE_INDICATORS)
+
+    if method in {"GET", "HEAD"}:
+        result_tag = "sap-metadatauploader-probe"
+    elif filenames:
+        result_tag = "sap-metadatauploader-upload"
+    else:
+        # POST with no multipart filename — typically a CVE-2017-9844 XXE
+        # or a malformed exploit. Distinguish so triage can sort the two.
+        result_tag = "sap-metadatauploader-noupload"
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "sapMetadataUploaderPath": path,
+        "sapMetadataUploaderMethod": method,
+        "sapMetadataUploaderHasMultipart": "multipart/form-data" in content_type.lower(),
+        "sapMetadataUploaderPartCount": len(names),
+        "sapMetadataUploaderFieldNames": sorted(set(names))[:32],
+        "sapMetadataUploaderFilenames": filenames[:32],
+        "sapMetadataUploaderPartContentTypes": sorted(set(part_content_types))[:32],
+        "sapMetadataUploaderHasJspShell": has_jsp_shell or has_php_shell,
+        "sapMetadataUploaderHasXxe": has_xxe,
+        "contentType": content_type[:120],
+    }
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview[:400]
+    append_log(log_entry)
+
+    headers = {
+        # Banner pinned to a build in the CVE-2025-31324 public-disclosure
+        # window — scanners deciding whether to ship the upload body don't
+        # bail on a patched banner.
+        "Server": "SAP NetWeaver Application Server / ABAP (7.50)",
+        "Cache-Control": "no-store",
+    }
+
+    if method in {"GET", "HEAD"}:
+        return web.Response(
+            status=200,
+            body=render_sap_metadatauploader_get_error(),
+            headers={**headers, "Content-Type": "application/xml; charset=utf-8"},
+        )
+
+    # POST — return the "OK: stored …" receipt with the (first) uploaded
+    # filename echoed back. The receipt path mirrors the documented SAP
+    # `j2ee/cluster/apps` layout; scanners parse it to know which URL to
+    # GET next for shell execution.
+    receipt = render_sap_metadatauploader_post_ok(filenames[0] if filenames else "metadata.xml")
+    return web.Response(
+        status=200,
+        body=receipt,
+        headers={**headers, "Content-Type": "text/plain; charset=utf-8"},
+    )
+
+
 async def _handle_nextjs(
     request: web.Request,
     log_context: dict[str, object],
@@ -8654,6 +8842,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_confluence_path(path):
         return await _handle_confluence(request, log_context, path, request_body)
 
+    if is_sap_metadatauploader_path(path):
+        return await _handle_sap_metadatauploader(request, log_context, path, request_body)
+
     if is_nextjs_path(path):
         return await _handle_nextjs(request, log_context, path, query_string, request_body)
 
@@ -8763,6 +8954,8 @@ def main() -> int:
         active.append("coldfusion")
     if CONFLUENCE_ENABLED:
         active.append("confluence")
+    if SAP_METADATAUPLOADER_ENABLED:
+        active.append("sap-metadatauploader")
     if NEXTJS_ENABLED:
         active.append("nextjs")
     if CMD_INJECTION_ENABLED:
