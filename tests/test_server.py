@@ -3780,6 +3780,74 @@ def test_fake_git_credentials_leaf_embeds_gitlab_canary():
     assert "@gitlab.canary.example" in body
 
 
+# --- /.git plumbing files a real repo always ships (COMMIT_EDITMSG, ---
+# --- ORIG_HEAD, FETCH_HEAD, alternate refs, remote-tracking refs) ---
+
+
+def test_fake_git_repo_ships_commit_editmsg_orig_head_fetch_head():
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    # COMMIT_EDITMSG holds the last commit message (newline-terminated).
+    assert files["/.git/commit_editmsg"].decode("utf-8") == (
+        tbenv.FAKE_GIT_COMMIT_MESSAGE + "\n"
+    )
+    # ORIG_HEAD points at the same commit as the live ref.
+    assert files["/.git/orig_head"].decode("utf-8") == meta["commitSha"] + "\n"
+    # FETCH_HEAD records the commit + remote-branch annotation. The double-tab
+    # is the canonical empty middle column git emits for the ref we asked for.
+    fetch_head = files["/.git/fetch_head"].decode("utf-8")
+    assert fetch_head.startswith(meta["commitSha"] + "\t\tbranch 'main' of ")
+    assert fetch_head.endswith("\n")
+
+
+def test_fake_git_repo_serves_master_alias_and_remote_tracking_refs():
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    sha = meta["commitSha"]
+    # `master` co-located as an alias of `main` — both branch names get
+    # enumerated by scanners, so both must resolve.
+    assert files["/.git/refs/heads/master"].decode("utf-8") == sha + "\n"
+    # Remote-tracking refs: HEAD is symbolic, leaf refs hold the commit.
+    assert files["/.git/refs/remotes/origin/head"] == b"ref: refs/remotes/origin/main\n"
+    assert files["/.git/refs/remotes/origin/main"].decode("utf-8") == sha + "\n"
+    assert files["/.git/refs/remotes/origin/master"].decode("utf-8") == sha + "\n"
+    # Matching reflogs so a scanner that walks logs/refs/* sees consistent
+    # state with the refs themselves.
+    for key in (
+        "/.git/logs/refs/heads/master",
+        "/.git/logs/refs/remotes/origin/head",
+        "/.git/logs/refs/remotes/origin/main",
+        "/.git/logs/refs/remotes/origin/master",
+    ):
+        body = files[key].decode("utf-8")
+        assert sha in body, key
+
+
+def test_fake_git_repo_ships_all_fourteen_sample_hooks():
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, _meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    # Every name in the canonical hook set lands at a `.sample` path with a
+    # non-trivial shell-shaped body. Returning 404 on any one of these is a
+    # cheap fingerprint for "this is a hand-rolled fake repo".
+    assert len(tbenv._FAKE_GIT_HOOK_NAMES) == 14
+    for hook_name in tbenv._FAKE_GIT_HOOK_NAMES:
+        body = files[f"/.git/hooks/{hook_name}.sample"]
+        assert body.startswith(b"#!/bin/sh\n"), hook_name
+        assert hook_name.encode("utf-8") in body, hook_name
+        # Defensive: the body must not regress to a one-line stub.
+        assert body.count(b"\n") >= 5, hook_name
+
+
+def test_fake_git_hook_body_is_not_verbatim_git_template():
+    # We deliberately do *not* ship git's GPL-licensed template bodies —
+    # they would force GPL on Flux. The stub must be our own short prose.
+    body = tbenv._fake_git_hook_body("pre-commit").decode("utf-8")
+    assert "Redistribution" not in body
+    assert "Linus Torvalds" not in body
+    # Sanity: the standard git template phrases never appear.
+    assert "An example hook script to verify what is about to be committed" not in body
+
+
 # --- _close_http_session lifecycle ---
 
 

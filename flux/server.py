@@ -3735,6 +3735,53 @@ def _git_tree_entry(mode: str, name: str, sha_hex: str) -> bytes:
     return mode.encode("ascii") + b" " + name.encode("utf-8") + b"\x00" + bytes.fromhex(sha_hex)
 
 
+# Canonical 14 hook sample names a `git init`-fresh repo ships under
+# `.git/hooks/`. Scanners enumerate these as a fingerprint check — a real
+# repo always has them, a hand-rolled fake usually does not. A 404 on
+# `.git/hooks/pre-commit.sample` against an otherwise-plausible /.git/HEAD
+# is a strong "this isn't real" tell, so we serve a non-empty body for
+# every name.
+_FAKE_GIT_HOOK_NAMES: tuple[str, ...] = (
+    "applypatch-msg",
+    "commit-msg",
+    "fsmonitor-watchman",
+    "post-update",
+    "pre-applypatch",
+    "pre-commit",
+    "pre-merge-commit",
+    "pre-push",
+    "pre-rebase",
+    "pre-receive",
+    "prepare-commit-msg",
+    "push-to-checkout",
+    "sendemail-validate",
+    "update",
+)
+
+
+def _fake_git_hook_body(name: str) -> bytes:
+    """Plausible-shaped `.sample` hook body.
+
+    Deliberately a short generic shell stub rather than git's verbatim
+    GPL-licensed template, so we don't redistribute GPL content inside
+    Flux. Scanners that hash-match against git's exact bodies will spot
+    the difference; the much more common check ("does this file exist
+    and look hook-shaped?") still passes.
+    """
+    return (
+        f"#!/bin/sh\n"
+        f"#\n"
+        f"# An example hook script for `{name}`.\n"
+        f"# To enable, rename this file by removing the `.sample` suffix\n"
+        f"# and make it executable.\n"
+        f"#\n"
+        f"# To bypass any hook, pass `--no-verify` to the relevant\n"
+        f"# `git` invocation.\n"
+        f"\n"
+        f"exit 0\n"
+    ).encode("utf-8")
+
+
 def _format_secrets_yaml(tracebit_response: dict[str, object]) -> str:
     aws = tracebit_response.get("aws") if isinstance(tracebit_response, dict) else None
     if not isinstance(aws, dict):
@@ -3871,6 +3918,15 @@ def _build_fake_repo(
     # on the same response. Real git uses mixed-case filenames on disk, but
     # the on-wire paths are what matter for a dumb-HTTP clone — and no
     # harvester relies on HTTP paths being case-sensitive.
+    # FETCH_HEAD shape: `<sha>\t\tbranch '<name>' of <remote>` (note the
+    # double-tab — `git fetch` writes an empty middle field for the "for-merge"
+    # column when the ref was the requested one).
+    fetch_head_remote = (
+        FAKE_GIT_REMOTE_URL
+        if FAKE_GIT_REMOTE_URL
+        else f"git@{FAKE_GIT_REMOTE_HOST}:{FAKE_GIT_REMOTE_PATH}"
+    )
+    fetch_head_line = f"{commit_sha}\t\tbranch 'main' of {fetch_head_remote}\n"
     files: dict[str, bytes] = {
         "/.git/head": b"ref: refs/heads/main\n",
         "/.git/config": config_text.encode("utf-8"),
@@ -3886,7 +3942,25 @@ def _build_fake_repo(
             "# pack-refs with: peeled fully-peeled sorted \n"
             f"{commit_sha} refs/heads/main\n"
         ).encode("utf-8"),
+        # Plumbing files that ship with any `git init`-fresh repo. Scanners
+        # check for these to verify a /.git/ is real — returning 404 on
+        # /.git/COMMIT_EDITMSG, /.git/ORIG_HEAD, /.git/FETCH_HEAD against
+        # an otherwise-plausible /.git/HEAD is a strong "this is a honeypot"
+        # tell. Keys are lowercased to match extract_git_path() output.
+        "/.git/commit_editmsg": (FAKE_GIT_COMMIT_MESSAGE + "\n").encode("utf-8"),
+        "/.git/orig_head": f"{commit_sha}\n".encode("utf-8"),
+        "/.git/fetch_head": fetch_head_line.encode("utf-8"),
         "/.git/refs/heads/main": f"{commit_sha}\n".encode("utf-8"),
+        # `master` as a co-located alias for `main`: many repos still have
+        # both branches, and scanners enumerate the canonical default-branch
+        # names. Pointing master at the same commit costs nothing.
+        "/.git/refs/heads/master": f"{commit_sha}\n".encode("utf-8"),
+        # Remote-tracking refs — a freshly-cloned repo always has these. The
+        # `refs/remotes/origin/HEAD` symbolic ref points at the default
+        # branch; the leaf refs hold the same commit as the local branch.
+        "/.git/refs/remotes/origin/head": b"ref: refs/remotes/origin/main\n",
+        "/.git/refs/remotes/origin/main": f"{commit_sha}\n".encode("utf-8"),
+        "/.git/refs/remotes/origin/master": f"{commit_sha}\n".encode("utf-8"),
         "/.git/info/refs": f"{commit_sha}\trefs/heads/main\n".encode("utf-8"),
         "/.git/info/exclude": (
             "# git ls-files --others --exclude-from=.git/info/exclude\n"
@@ -3894,6 +3968,10 @@ def _build_fake_repo(
         ).encode("utf-8"),
         "/.git/logs/head": reflog_line.encode("utf-8"),
         "/.git/logs/refs/heads/main": reflog_line.encode("utf-8"),
+        "/.git/logs/refs/heads/master": reflog_line.encode("utf-8"),
+        "/.git/logs/refs/remotes/origin/head": reflog_line.encode("utf-8"),
+        "/.git/logs/refs/remotes/origin/main": reflog_line.encode("utf-8"),
+        "/.git/logs/refs/remotes/origin/master": reflog_line.encode("utf-8"),
         "/.git/objects/info/packs": b"",
         # Loose-object paths are already lowercase (hex). No case fold needed.
         obj_path(commit_sha): commit_blob,
@@ -3903,6 +3981,8 @@ def _build_fake_repo(
         obj_path(readme_sha): readme_blob,
         obj_path(env_example_sha): env_example_blob,
     }
+    for hook_name in _FAKE_GIT_HOOK_NAMES:
+        files[f"/.git/hooks/{hook_name}.sample"] = _fake_git_hook_body(hook_name)
     meta: dict[str, object] = {
         "commitSha": commit_sha,
         "rootTreeSha": root_tree_sha,
