@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import string
 import sys
 import time
 import uuid
@@ -4225,6 +4226,42 @@ def render_pgpass(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+# Bcrypt-output alphabet: A-Za-z0-9./ (per the OpenBSD bcrypt encoding).
+# We never compute a real bcrypt — scanners can't reverse the hash anyway,
+# and the credentials they replay are the *usernames*. The hash is shaped
+# so format-aware parsers (e.g. apache's htpasswd -v, Python's passlib)
+# accept the line without erroring out.
+_BCRYPT_ALPHABET = string.ascii_letters + string.digits + "./"
+
+
+def _fake_bcrypt_hash() -> str:
+    # `$2y$10$` + 22-char salt + 31-char hash = bcrypt shape ($2y is the
+    # Apache/PHP variant; $2b is the canonical OpenBSD variant — scanners
+    # accept both).
+    salt = "".join(secrets.choice(_BCRYPT_ALPHABET) for _ in range(22))
+    digest = "".join(secrets.choice(_BCRYPT_ALPHABET) for _ in range(31))
+    return f"$2y$10${salt}{digest}"
+
+
+def render_htpasswd(r: dict[str, object]) -> bytes:
+    # Apache `.htpasswd` format: `username:hash` lines, hash is one of
+    # bcrypt (`$2y$10$...`), apr1 (`$apr1$...$...`), SHA (`{SHA}...`), or
+    # crypt (DES, 13 chars). Modern deployments default to bcrypt.
+    # Per-hit hashes prevent the file from becoming a fleet-wide
+    # fingerprint; the canary value is the *username* — scanners that
+    # crack the hash and replay the credential pair against the issuer's
+    # tracking surface fire the alert.
+    creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    canary_user = str(creds.get("username", "") or "deploy")
+    return (
+        f"{canary_user}:{_fake_bcrypt_hash()}\n"
+        f"admin:{_fake_bcrypt_hash()}\n"
+        f"backup:{_fake_bcrypt_hash()}\n"
+    ).encode("utf-8")
+
+
 def render_claude_credentials_json(r: dict[str, object]) -> bytes:
     # Claude Code stores its OAuth tokens at `~/.claude/.credentials.json`.
     # Scanner dictionaries added this path in April 2026 shortly after
@@ -5929,6 +5966,20 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("/.pgpass",),
         ("gitlab-username-password",),
         render_pgpass,
+        "text/plain; charset=utf-8",
+    ),
+    # Apache `.htpasswd` — basic-auth credential file. Scanner dictionaries
+    # enumerate this alongside `.env`, `.git/config`, and other web-root
+    # secrets leaks. Returning a plausible `username:$2y$10$...` line set
+    # keeps the probe alive; the canary value is the *username* (cracked
+    # bcrypt hash + replay against the issuer's tracking surface fires the
+    # alert). Per-hit synthetic hash so the file isn't a fleet-wide
+    # fingerprint.
+    CanaryTrap(
+        "htpasswd",
+        ("/.htpasswd",),
+        ("gitlab-username-password",),
+        render_htpasswd,
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(

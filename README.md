@@ -143,6 +143,7 @@ case-insensitive exact matches.
 | AWS Amplify CLI project config | `/.amplifyrc` | `aws` | `amplifyrc` |
 | Terraform tfstate (JSON) — [docs](./docs/terraform-tfstate.md) | `/.terraform/terraform.tfstate`, `/terraform.tfstate`, `/terraform.tfstate.backup` | `aws` | `terraform-tfstate` |
 | Postgres pgpass | `/.pgpass` | `gitlab-username-password` | `pgpass` |
+| Apache `.htpasswd` — [docs](./docs/htpasswd-canary.md) | `/.htpasswd` | `gitlab-username-password` | `htpasswd` |
 | WordPress config | `/wp-config.php` plus editor-leftover suffix variants (`.bak`, `.save`, `.swp`, `.swo`, `.old`, `.orig`, `.txt`, `~`, `::$DATA`) and short/relocation forms (`/wp-config.bak`, `/wp-config.old`, `/wp-config.txt`, `/wp-config-backup.php`, `/backup/wp-config.php`); also matches the observed double-encoded `.bak` form | `aws` | `wp-config` |
 | SQL dump | `/backup.sql`, `/db.sql`, `/dump.sql`, `/database.sql`, `/backup/db.sql`, `/sql/backup.sql` | `aws` | `sql-dump` |
 | Generic JSON config | `/config.json`, `/settings.json`, `/credentials.json`, `/secrets.json` | `aws` | `config-json` |

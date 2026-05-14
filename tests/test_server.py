@@ -643,6 +643,13 @@ FAKE_TRACEBIT = {
     ("/.amplifyrc", b'"accessKeyId": "AKIAFAKEEXAMPLE01"'),
     ("/.amplifyrc", b'"secretAccessKey":'),
     ("/.pgpass", b":deploybot42:p@ssCanaryValue"),
+    # `.htpasswd` lines are `username:hash` — the canary value is the
+    # username (`deploybot42`); the hash is per-hit bcrypt-shaped (not a
+    # real bcrypt — see `_fake_bcrypt_hash`) so the file isn't a
+    # fleet-wide fingerprint.
+    ("/.htpasswd", b"deploybot42:$2y$10$"),
+    ("/.htpasswd", b"admin:$2y$10$"),
+    ("/.htpasswd", b"backup:$2y$10$"),
     ("/.claude/.credentials.json", b'"accessToken": "AKIAFAKEEXAMPLE01"'),
     ("/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/wp-config.php.old", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
@@ -819,6 +826,40 @@ def test_node_deps_lockfiles_have_per_hit_unique_integrity(path):
     body_2 = trap.render(FAKE_TRACEBIT)
     assert b"sha512-" in body_1, f"{path!r} should embed sha512- integrity hashes"
     assert body_1 != body_2, f"{path!r} renders identically across calls — integrity not randomized"
+
+
+def test_htpasswd_renders_bcrypt_shape_with_canary_username():
+    body = tbenv.render_htpasswd(FAKE_TRACEBIT).decode("utf-8")
+    lines = body.strip().splitlines()
+    assert len(lines) == 3
+    users = [ln.split(":", 1)[0] for ln in lines]
+    assert users == ["deploybot42", "admin", "backup"]
+    for ln in lines:
+        user, hash_ = ln.split(":", 1)
+        # `$2y$10$` prefix + 53 chars (22 salt + 31 digest) = 60 total
+        assert hash_.startswith("$2y$10$"), f"hash for {user!r} not bcrypt-shaped: {hash_!r}"
+        assert len(hash_) == 60, f"hash for {user!r} wrong length: {len(hash_)}"
+
+
+def test_htpasswd_hash_is_per_hit_unique():
+    # Two consecutive renders must produce different hashes — a fleet-wide
+    # fixed `$2y$10$...` literal would turn the file into a single
+    # fingerprint across every sensor, the same regression that hit
+    # wp-config / phpinfo / .env.production in April 2026.
+    body_1 = tbenv.render_htpasswd(FAKE_TRACEBIT)
+    body_2 = tbenv.render_htpasswd(FAKE_TRACEBIT)
+    assert body_1 != body_2, "htpasswd hashes are not per-hit unique"
+
+
+def test_htpasswd_falls_back_to_default_username_when_tracebit_missing():
+    # Canary issuance can fail (quota / network); fall back to the same
+    # generic `deploy` user as `.pgpass` rather than an empty username
+    # that would make the line parse-invalid.
+    body = tbenv.render_htpasswd({}).decode("utf-8")
+    first_line = body.splitlines()[0]
+    user, hash_ = first_line.split(":", 1)
+    assert user == "deploy"
+    assert hash_.startswith("$2y$10$")
 
 
 def test_node_deps_canary_password_falls_back_to_synthetic_when_tracebit_missing():
