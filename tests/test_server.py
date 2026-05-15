@@ -851,6 +851,111 @@ def test_htpasswd_hash_is_per_hit_unique():
     assert body_1 != body_2, "htpasswd hashes are not per-hit unique"
 
 
+def test_render_bash_history_embeds_canary_export_block():
+    body = tbenv.render_bash_history(FAKE_TRACEBIT).decode("utf-8")
+    assert "export AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
+    assert "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    assert "export AWS_SESSION_TOKEN=FwoGZXIvYXdzEXAMPLEFAKE=" in body
+    # The believability hinge: the canary export trio is followed by an
+    # `aws ...` invocation, so harvesters that parse for "command after
+    # export" still pick the canary up.
+    assert "aws sts get-caller-identity" in body
+    assert "aws s3 cp" in body
+
+
+def test_render_bash_history_is_per_hit_unique():
+    # Two adjacent renders must differ — the renderer randomizes a
+    # short commit SHA, a PR number, an SSH jump port, an S3 object
+    # key, and the DB password. A fixed body would let scanners
+    # cross-sensor fingerprint our fleet.
+    body1 = tbenv.render_bash_history(FAKE_TRACEBIT)
+    body2 = tbenv.render_bash_history(FAKE_TRACEBIT)
+    assert body1 != body2
+
+
+def test_render_bash_history_does_not_embed_fixed_db_password():
+    # Same fleet-fingerprint regression that hit wp-config/application.yml
+    # in April 2026 — plaintext DB-password literals must stay per-hit
+    # synthetic.
+    body1 = tbenv.render_bash_history(FAKE_TRACEBIT).decode("utf-8")
+    body2 = tbenv.render_bash_history(FAKE_TRACEBIT).decode("utf-8")
+    for fingerprint in ("h6T!9pq2Wz@LmRnV", "h6T!9pq2Wz"):
+        assert fingerprint not in body1
+    # The two psql/mysql lines carry a per-hit password. Pull them and
+    # confirm they differ across renders.
+    def _pw(body: str) -> str:
+        for line in body.splitlines():
+            if "PGPASSWORD='" in line:
+                return line.split("PGPASSWORD='", 1)[1].split("'", 1)[0]
+        raise AssertionError("no PGPASSWORD line")
+    assert _pw(body1) != _pw(body2)
+
+
+def test_render_zsh_history_uses_extended_history_prefix():
+    body = tbenv.render_zsh_history(FAKE_TRACEBIT).decode("utf-8")
+    lines = [ln for ln in body.splitlines() if ln]
+    assert lines, "zsh history body must not be empty"
+    # `: <unix_ts>:<elapsed>;<cmd>` is the zsh EXTENDED_HISTORY shape.
+    for ln in lines:
+        assert ln.startswith(": "), f"line lacks zsh extended-history prefix: {ln!r}"
+        head, _, cmd = ln.partition(";")
+        assert cmd, f"line missing command after ';': {ln!r}"
+        ts_str, _, elapsed_str = head[2:].partition(":")
+        assert ts_str.isdigit() and elapsed_str.isdigit(), f"non-numeric ts/elapsed: {ln!r}"
+    # Canary export trio is present in command form.
+    assert "export AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
+    assert "aws s3" in body
+
+
+def test_render_zsh_history_is_per_hit_unique():
+    # Per-hit timestamps + db password mean two renders must differ.
+    body1 = tbenv.render_zsh_history(FAKE_TRACEBIT)
+    body2 = tbenv.render_zsh_history(FAKE_TRACEBIT)
+    assert body1 != body2
+
+
+@pytest.mark.parametrize("path", [
+    "/.bash_history",
+    "/root/.bash_history",
+    "/home/ubuntu/.bash_history",
+    "/home/ec2-user/.bash_history",
+    "/home/node/.bash_history",
+    "/@fs/root/.bash_history",
+    "/@fs/home/node/.bash_history",
+])
+async def test_dispatch_routes_bash_history_variants_to_trap(flux_client, monkeypatch, path):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.42"})
+    assert resp.status == 200
+    assert resp.headers["Content-Type"] == "text/plain; charset=utf-8"
+    body = await resp.read()
+    assert b"export AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "bash-history"
+
+
+@pytest.mark.parametrize("path", [
+    "/.zsh_history",
+    "/root/.zsh_history",
+    "/home/node/.zsh_history",
+    "/@fs/root/.zsh_history",
+])
+async def test_dispatch_routes_zsh_history_variants_to_trap(flux_client, monkeypatch, path):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.43"})
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"export AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "zsh-history"
+
+
 def test_htpasswd_falls_back_to_default_username_when_tracebit_missing():
     # Canary issuance can fail (quota / network); fall back to the same
     # generic `deploy` user as `.pgpass` rather than an empty username

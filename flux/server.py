@@ -4700,6 +4700,134 @@ def render_env_production(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_bash_history(r: dict[str, object]) -> bytes:
+    # Synthetic `~/.bash_history` — the goal is to look like a real
+    # operator's recent session captured by sloppy shell history settings
+    # (`HISTFILE` left on, no `set +o history` around credential paste).
+    # Scanners that harvest this file run grep over it for
+    # `AWS_ACCESS_KEY_ID`, `password`, `export `, `ssh -i`, `curl -H`, etc.
+    # The canary AWS triple lives in a plausible "credential-paste"
+    # cluster; the surrounding lines are realistic noise. Per-hit-unique
+    # bits (db password, commit SHA, PR number, port number, fake S3 key
+    # path) keep the rendered body from acting as a fleet-wide
+    # fingerprint.
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    short_sha = secrets.token_hex(4)
+    pr_number = secrets.randbelow(900) + 100
+    ssh_jump_port = 30000 + secrets.randbelow(5000)
+    rand_uploads_key = secrets.token_hex(8)
+    lines = [
+        "cd /var/www/app",
+        "git pull",
+        "git status",
+        "ls -la",
+        "vim app/config/settings.py",
+        f"git checkout -b hotfix/INFRA-{pr_number}",
+        "git diff",
+        "git add -p",
+        f'git commit -m "hotfix: rotate s3 uploader creds (INFRA-{pr_number})"',
+        "git push origin HEAD",
+        "docker compose ps",
+        "docker compose logs -f web | tail -200",
+        "docker compose restart web",
+        "df -h",
+        "free -m",
+        "htop",
+        "sudo systemctl status nginx",
+        "sudo tail -n 200 /var/log/nginx/access.log",
+        "ssh deploy@app-prod-01.internal -p 22",
+        f"ssh -i ~/.ssh/id_ed25519 -p {ssh_jump_port} deploy@bastion.internal",
+        "scp dump.sql.gz deploy@app-prod-01.internal:/tmp/",
+        f"psql -U prod_rw -h db.internal -d prod -c 'select count(*) from users;'",
+        f"PGPASSWORD='{db_password}' psql -U prod_rw -h db.internal -d prod",
+        f'mysql -uroot -p"{db_password}" -h db.internal prod -e "show tables;"',
+        "redis-cli -h cache.internal ping",
+        "kubectl get pods -n prod",
+        "kubectl logs -n prod deploy/web --tail=200",
+        "kubectl exec -it -n prod deploy/web -- /bin/sh",
+        "# ---- rotating uploader creds, paste from 1pw ----",
+        f"export AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}",
+        f"export AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}",
+        f"export AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}",
+        "export AWS_DEFAULT_REGION=us-east-1",
+        "aws sts get-caller-identity",
+        "aws s3 ls",
+        "aws s3 ls s3://prod-uploads/",
+        f"aws s3 cp s3://prod-uploads/{rand_uploads_key}.tar.gz /tmp/",
+        f"tar -xzf /tmp/{rand_uploads_key}.tar.gz -C /tmp/restore/",
+        "aws s3 cp /tmp/restore/manifest.json s3://prod-uploads/manifests/",
+        f"aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com",
+        "history -c",
+        "clear",
+        "exit",
+        "ls",
+        "cat README.md",
+        f"git log --oneline -n 20 | head -3   # tip {short_sha}",
+        "make deploy",
+        "make logs",
+        "uptime",
+        "who",
+        "exit",
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def render_zsh_history(r: dict[str, object]) -> bytes:
+    # zsh extended-history line shape is ``: <unix_ts>:<elapsed>;<cmd>``
+    # with `setopt EXTENDED_HISTORY`. Scanners harvesting `.zsh_history`
+    # parse with the same grep patterns as `.bash_history`, but the
+    # timestamp prefix is a useful "scanner saw a real zsh history" tell
+    # for whoever's reading our trap logs. Same canary placement;
+    # per-hit-unique timestamps and elapsed times.
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    # Anchor the timestamps within the last ~2 days, in increasing order
+    # (the way EXTENDED_HISTORY actually writes them). Real bash-history
+    # files don't carry timestamps unless HISTTIMEFORMAT is set; zsh's
+    # native format makes for a useful sibling trap.
+    base_ts = int(time.time()) - 86400 * 2 - secrets.randbelow(43200)
+    plain_cmds = [
+        "cd ~/code/app",
+        "git status",
+        "vim app/handlers.py",
+        "yarn install",
+        "yarn test --coverage",
+        "git diff --stat",
+        "ssh prod-01",
+        "kubectl get pods -n prod",
+        "aws sts get-caller-identity",
+        "aws s3 ls s3://prod-uploads/",
+        "aws s3 cp ./build.tar.gz s3://prod-uploads/builds/",
+        f"PGPASSWORD='{db_password}' psql -U prod_rw -h db.internal -d prod",
+        "history",
+        "exit",
+    ]
+    out_lines: list[str] = []
+    # Drop the canary export trio right before the `aws ...` commands so
+    # the harvester's grep over `AWS_ACCESS_KEY_ID|export ` lights up.
+    canary_trio = [
+        f"export AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}",
+        f"export AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}",
+        f"export AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}",
+    ]
+    sequence: list[str] = []
+    inserted = False
+    for cmd in plain_cmds:
+        if not inserted and cmd.startswith("aws "):
+            sequence.extend(canary_trio)
+            inserted = True
+        sequence.append(cmd)
+    if not inserted:
+        sequence.extend(canary_trio)
+    ts = base_ts
+    for cmd in sequence:
+        elapsed = secrets.randbelow(8)
+        out_lines.append(f": {ts}:{elapsed};{cmd}")
+        ts += 1 + secrets.randbelow(120)
+    return ("\n".join(out_lines) + "\n").encode("utf-8")
+
+
 def render_env_vault(r: dict[str, object]) -> bytes:
     # `.env.vault` is the dotenv-vault file format: per-environment
     # encrypted ciphertext entries that need a `DOTENV_KEY` decryption
@@ -6354,6 +6482,66 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ),
         ("aws",),
         render_env_production,
+        "text/plain; charset=utf-8",
+    ),
+    # `~/.bash_history` — shell-history harvest. Scanner dictionaries
+    # walk every plausible home-dir webroot leak (`/root/.bash_history`,
+    # `/home/<user>/.bash_history`) plus Vite dev-server path-traversal
+    # variants (`/@fs/root/.bash_history`, `/@fs/home/node/.bash_history`)
+    # that exploit Vite's `@fs/` arbitrary-file-read primitive. The body
+    # is a synthetic recent-shell session where the operator pasted
+    # `export AWS_ACCESS_KEY_ID=...` mid-session and `aws s3 cp ...` ran
+    # afterwards — a credible "history captured during a credential
+    # paste" shape. Per-hit random PR number / commit SHA / DB password
+    # / S3 object key prevent the body becoming a cross-sensor
+    # fingerprint.
+    CanaryTrap(
+        "bash-history",
+        (
+            "/.bash_history",
+            # Webroot-prefix variants — common scanner pattern, mirrors
+            # the ssh-private-key / docker-config trap families.
+            "/root/.bash_history",
+            "/home/.bash_history",
+            "/home/ubuntu/.bash_history",
+            "/home/ec2-user/.bash_history",
+            "/home/admin/.bash_history",
+            "/home/node/.bash_history",
+            "/home/www-data/.bash_history",
+            "/home/deploy/.bash_history",
+            # Vite dev-server `@fs/` arbitrary-file-read primitive. The
+            # `/@fs/<absolute-path>` shape is Vite's filesystem
+            # passthrough; scanners that already probe `/@vite/env`
+            # often follow up with `/@fs/root/.bash_history` etc.
+            "/@fs/root/.bash_history",
+            "/@fs/home/.bash_history",
+            "/@fs/home/ubuntu/.bash_history",
+            "/@fs/home/ec2-user/.bash_history",
+            "/@fs/home/node/.bash_history",
+        ),
+        ("aws",),
+        render_bash_history,
+        "text/plain; charset=utf-8",
+    ),
+    # `~/.zsh_history` sibling — same canary placement, but written in
+    # zsh's `EXTENDED_HISTORY` `: <ts>:<elapsed>;<cmd>` format. A
+    # harvester that filters on the bash shape rejects this; one
+    # parsing for the zsh-specific prefix accepts it. Per-hit random
+    # timestamps + DB password keep the body unique.
+    CanaryTrap(
+        "zsh-history",
+        (
+            "/.zsh_history",
+            "/root/.zsh_history",
+            "/home/.zsh_history",
+            "/home/ubuntu/.zsh_history",
+            "/home/ec2-user/.zsh_history",
+            "/home/node/.zsh_history",
+            "/@fs/root/.zsh_history",
+            "/@fs/home/node/.zsh_history",
+        ),
+        ("aws",),
+        render_zsh_history,
         "text/plain; charset=utf-8",
     ),
     # `.env.vault` is the dotenv-vault file format. The renderer
