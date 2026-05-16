@@ -6471,14 +6471,57 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     CanaryTrap(
         "env-production",
         (
+            # The canonical production / prod / live triple — the names
+            # scanners and operators agree mean "the file with real
+            # secrets in it".
             "/.env.production",
             "/.env.prod",
             "/.env.live",
-            # Webroot-prefix `.env` variants observed against new
-            # path families. Same render shape — a scanner harvesting
-            # `<dir>/.env` is after the same kind of plaintext
-            # secret block a `.env.production` leak would expose.
+            # Dev/test/staging/ci sibling files. Scanner dictionaries
+            # walk the full set, so a 200 on `.env.production` and a 404
+            # on `.env.local` / `.env.dev` is itself a fingerprint of a
+            # hand-rolled fake. Same render shape on every variant — a
+            # harvester greps for `AWS_ACCESS_KEY_ID=` and walks away
+            # with the canary regardless of which sibling it hit.
+            "/.env.local",
+            "/.env.dev",
+            "/.env.development",
+            "/.env.development.local",
+            "/.env.test",
+            "/.env.test.local",
+            "/.env.staging",
+            "/.env.example",
+            "/.env.example.local",
+            "/.env.ci",
+            "/.env.save",
+            "/.env.private",
+            "/.env.docker",
+            "/.env.override",
+            "/.env2",
+            # Underscore-separated backup variants used by the
+            # off-the-shelf "EnvChecker"-shaped dictionaries that hit
+            # the bare-dotfile + every common rotation-name in one
+            # sweep. Without these, a scanner with this dictionary
+            # collects 1 canary (`/.env`) instead of 6.
+            "/.env_bak",
+            "/.env_old",
+            "/.env_orig",
+            "/.env_priv",
+            "/.env_example",
+            # `/.environ` (no separator at all) is a niche but
+            # recurring entry in newer harvester dictionaries.
+            "/.environ",
+            # Webroot-prefix `.env` variants — scanners walking the
+            # `/<app-root>/.env` pattern. `/mailer/.env` was the
+            # original prefix; `/opt/.env` and the FHS-canonical app
+            # roots (`/srv`, `/var/www`, `/app`) extend the same
+            # shape. Same render — every harvester greps for the
+            # canary triple regardless of where the file lives.
             "/mailer/.env",
+            "/opt/.env",
+            "/srv/.env",
+            "/var/www/.env",
+            "/app/.env",
         ),
         ("aws",),
         render_env_production,
