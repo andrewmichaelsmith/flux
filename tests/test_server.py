@@ -560,6 +560,7 @@ def test_all_trap_families_default_on():
     assert tbenv.NEXTJS_ENABLED
     assert tbenv.CMD_INJECTION_ENABLED
     assert tbenv.WEBAPP_FORM_ENABLED
+    assert tbenv.OPENAPI_SWAGGER_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -5550,3 +5551,239 @@ async def test_dispatch_webapp_form_does_not_shadow_canary_traps(
         # Without API_KEY canary handlers 404 — the form trap must not
         # claim those paths and synthesize a 200 form on top.
         assert resp.status == 404, f"unexpected status for {path}"
+
+
+# --- OpenAPI / Swagger trap ---
+
+
+def test_openapi_swagger_enabled_by_default():
+    """Trap is cheap; default-on like every other family."""
+    assert tbenv.OPENAPI_SWAGGER_ENABLED
+
+
+@pytest.mark.parametrize("path,kind", [
+    # SpringDoc / Swashbuckle / drf-yasg / NSwag JSON variants
+    ("/swagger.json", "spec-json"),
+    ("/swagger/v1/swagger.json", "spec-json"),
+    ("/swagger/v2/swagger.json", "spec-json"),
+    ("/swagger/v3/swagger.json", "spec-json"),
+    ("/swagger/swagger.json", "spec-json"),
+    ("/api-docs", "spec-json"),
+    ("/api-docs/", "spec-json"),
+    ("/api-docs.json", "spec-json"),
+    ("/api-docs/swagger.json", "spec-json"),
+    ("/v2/api-docs", "spec-json"),
+    ("/v3/api-docs", "spec-json"),
+    ("/openapi.json", "spec-json"),
+    ("/openapi", "spec-json"),
+    ("/api/v1/openapi.json", "spec-json"),
+    # YAML variants
+    ("/openapi.yaml", "spec-yaml"),
+    ("/openapi.yml", "spec-yaml"),
+    ("/swagger.yaml", "spec-yaml"),
+    # UI bootstrap HTML variants
+    ("/swagger-ui.html", "ui-html"),
+    ("/swagger-ui/", "ui-html"),
+    ("/swagger-ui/index.html", "ui-html"),
+    ("/swagger/index.html", "ui-html"),
+    ("/swagger/swagger-ui.html", "ui-html"),
+    ("/webjars/swagger-ui/index.html", "ui-html"),
+    ("/api/docs", "ui-html"),
+    ("/docs", "ui-html"),
+    ("/redoc", "ui-html"),
+    ("/redoc.html", "ui-html"),
+])
+def test_openapi_swagger_path_classification(path, kind):
+    assert tbenv.openapi_swagger_kind(path) == kind, f"{path} should map to {kind}"
+    assert tbenv.is_openapi_swagger_path(path)
+
+
+def test_openapi_swagger_path_case_insensitive():
+    assert tbenv.openapi_swagger_kind("/Swagger.JSON") == "spec-json"
+    assert tbenv.openapi_swagger_kind("/V3/API-DOCS") == "spec-json"
+    assert tbenv.openapi_swagger_kind("/SWAGGER-UI.HTML") == "ui-html"
+
+
+@pytest.mark.parametrize("path", [
+    "/",
+    "/swagger",
+    "/api",
+    "/v1/api-docs",
+    "/v4/api-docs",
+    "/openapi.txt",
+    "/swagger-uix.html",
+    "/redoc/foo",
+    "/.env",
+    "/.git/config",
+])
+def test_openapi_swagger_non_match(path):
+    assert tbenv.openapi_swagger_kind(path) == ""
+    assert not tbenv.is_openapi_swagger_path(path)
+
+
+def test_openapi_swagger_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "OPENAPI_SWAGGER_ENABLED", False)
+    assert not tbenv.is_openapi_swagger_path("/swagger.json")
+    assert not tbenv.is_openapi_swagger_path("/v3/api-docs")
+
+
+def test_render_openapi_spec_embeds_canary_in_three_slots():
+    """The fake spec must place the canary in `securitySchemes`,
+    `servers.variables`, and `info.description` so a credential scraper
+    that extracts any of those slots gets a replay-fireable key."""
+    body = tbenv.render_openapi_spec(FAKE_TRACEBIT, "api.example.com")
+    payload = json.loads(body)
+    access_key = FAKE_TRACEBIT["aws"]["awsAccessKeyId"]
+    secret_key = FAKE_TRACEBIT["aws"]["awsSecretAccessKey"]
+    # description
+    assert access_key in payload["info"]["description"]
+    # securitySchemes
+    schemes = payload["components"]["securitySchemes"]
+    assert schemes["bearerAuth"]["x-example"] == access_key
+    assert schemes["apiKeyAuth"]["x-example"] == access_key
+    # servers.variables
+    assert payload["servers"][0]["variables"]["adminApiKey"]["default"] == secret_key
+
+
+def test_render_openapi_spec_yaml_includes_canary():
+    """YAML rendering must keep the canary access key reachable by a
+    plain-text `grep AKIA…` (the substring scrapers run)."""
+    body = tbenv.render_openapi_spec(FAKE_TRACEBIT, "api.example.com", yaml=True)
+    text = body.decode("utf-8")
+    assert FAKE_TRACEBIT["aws"]["awsAccessKeyId"] in text
+    assert FAKE_TRACEBIT["aws"]["awsSecretAccessKey"] in text
+    assert "openapi:" in text
+
+
+def test_render_openapi_spec_advertises_followup_paths():
+    """The spec advertises endpoints that route into other traps so
+    follow-up enumeration walks our handler set, not a 404 wall."""
+    body = tbenv.render_openapi_spec(FAKE_TRACEBIT, "api.example.com")
+    payload = json.loads(body)
+    paths = set(payload["paths"].keys())
+    assert "/auth/login" in paths
+    assert "/admin/config" in paths
+    assert "/actuator/env" in paths
+
+
+def test_render_swagger_ui_html_points_at_spec_url():
+    body = tbenv.render_swagger_ui_html("api.example.com")
+    text = body.decode("utf-8")
+    assert "/swagger.json" in text
+    assert "SwaggerUIBundle" in text
+
+
+def test_render_redoc_html_points_at_openapi_json():
+    body = tbenv.render_redoc_html("api.example.com")
+    text = body.decode("utf-8")
+    assert "/openapi.json" in text
+    assert "redoc" in text.lower()
+
+
+@pytest.mark.parametrize("path", [
+    "/swagger.json",
+    "/v3/api-docs",
+    "/openapi.json",
+])
+async def test_dispatch_routes_openapi_json_to_trap(flux_client, monkeypatch, path):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.71"})
+    assert resp.status == 200
+    assert "application/json" in resp.headers["Content-Type"]
+    body = await resp.read()
+    payload = json.loads(body)
+    assert payload["openapi"].startswith("3.")
+    # Canary access key is reachable in the response body
+    assert FAKE_TRACEBIT["aws"]["awsAccessKeyId"].encode() in body
+    entries = _log_entries(flux_client.log_path)
+    last = entries[-1]
+    assert last["result"] == "openapi-spec-json-issued"
+    assert last["swaggerKind"] == "spec-json"
+    assert last["canaryStatus"] == "issued"
+    assert "aws" in last["canaryTypes"]
+
+
+async def test_dispatch_routes_openapi_yaml_to_trap(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(
+        "/openapi.yaml", headers={"X-Forwarded-For": "203.0.113.72"},
+    )
+    assert resp.status == 200
+    assert "yaml" in resp.headers["Content-Type"]
+    body = await resp.read()
+    assert FAKE_TRACEBIT["aws"]["awsAccessKeyId"].encode() in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "openapi-spec-yaml-issued"
+
+
+async def test_dispatch_routes_swagger_ui_to_trap(flux_client, monkeypatch):
+    """UI bootstrap path returns Swagger UI HTML without needing a canary —
+    the canary lands when the scanner follows the embedded /swagger.json
+    link."""
+    resp = await flux_client.get(
+        "/swagger-ui.html", headers={"X-Forwarded-For": "203.0.113.73"},
+    )
+    assert resp.status == 200
+    assert "text/html" in resp.headers["Content-Type"]
+    body = await resp.read()
+    assert b"SwaggerUIBundle" in body
+    assert b"/swagger.json" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "openapi-swagger-ui-html"
+    assert entries[-1]["swaggerKind"] == "ui-html"
+
+
+async def test_dispatch_routes_redoc_to_trap(flux_client, monkeypatch):
+    resp = await flux_client.get(
+        "/redoc", headers={"X-Forwarded-For": "203.0.113.74"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"redoc" in body.lower()
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "openapi-redoc-html"
+
+
+async def test_dispatch_openapi_swagger_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "OPENAPI_SWAGGER_ENABLED", False)
+    resp = await flux_client.get(
+        "/swagger.json", headers={"X-Forwarded-For": "203.0.113.75"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+async def test_dispatch_openapi_without_api_key_returns_skeleton(
+    flux_client, monkeypatch,
+):
+    """Without TRACEBIT_API_KEY we still serve a plausible (but credential-
+    free) spec so nginx-visible probes don't see a 404 — a 404 wall is
+    cheaper for a scanner to fingerprint than a credential-free spec is
+    valuable to an attacker."""
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    resp = await flux_client.get(
+        "/swagger.json", headers={"X-Forwarded-For": "203.0.113.76"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    payload = json.loads(body)
+    assert payload["openapi"].startswith("3.")
+    # No AKIA-shaped key in the skeleton
+    assert b"AKIA" not in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "openapi-spec-json-skeleton"
+
+
+async def test_dispatch_openapi_does_not_shadow_other_traps(
+    flux_client, monkeypatch,
+):
+    """The openapi-swagger path set is disjoint from other trap path sets —
+    `/.env`, `/.git/config`, `/login`, `/v1/models` must keep routing to
+    their own handlers."""
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    for path in ["/.env", "/.git/config", "/v1/models"]:
+        kind = tbenv.openapi_swagger_kind(path)
+        assert kind == "", f"{path} unexpectedly matched as {kind}"

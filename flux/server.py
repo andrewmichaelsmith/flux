@@ -1073,6 +1073,66 @@ CMD_INJECTION_PATHS = {
 CMD_INJECTION_COMMAND_KEYS = ("cmd", "command", "exec", "c")
 
 
+# Fake OpenAPI / Swagger spec responder. Scanners enumerate a large set of
+# canonical SpringDoc / FastAPI / Swashbuckle / drf-yasg / NSwag locations
+# looking for an unauth OpenAPI spec; a real spec leaks endpoint inventory,
+# auth schemes, and any developer-stamped example credentials. We return a
+# plausible OpenAPI 3.0 document whose `securitySchemes` examples and
+# `servers[].variables` defaults carry a per-request Tracebit AWS canary
+# so a scraper that extracts dev-staging creds and replays them fires
+# Tracebit. UI bootstrap paths (`/swagger-ui.html`, `/redoc`, …) return a
+# stub HTML page that points at the JSON spec so the second probe lands.
+OPENAPI_SWAGGER_ENABLED = _env_bool("HONEYPOT_OPENAPI_SWAGGER_ENABLED")
+_OPENAPI_SWAGGER_JSON_PATHS = frozenset({
+    "/swagger.json",
+    "/swagger/swagger.json",
+    "/swagger/v1/swagger.json",
+    "/swagger/v2/swagger.json",
+    "/swagger/v3/swagger.json",
+    "/api/swagger.json",
+    "/api/swagger",
+    "/api-docs",
+    "/api-docs/",
+    "/api-docs.json",
+    "/api-docs/swagger.json",
+    "/api/api-docs",
+    "/v2/api-docs",
+    "/v3/api-docs",
+    "/openapi.json",
+    "/openapi",
+    "/api/openapi.json",
+    "/api/v1/openapi.json",
+    "/docs/openapi.json",
+})
+_OPENAPI_SWAGGER_YAML_PATHS = frozenset({
+    "/openapi.yaml",
+    "/openapi.yml",
+    "/swagger.yaml",
+    "/swagger.yml",
+})
+_OPENAPI_SWAGGER_UI_PATHS = frozenset({
+    "/swagger-ui.html",
+    "/swagger-ui/",
+    "/swagger-ui/index.html",
+    "/swagger/index.html",
+    "/swagger/swagger-ui.html",
+    "/swagger/ui/index.html",
+    "/swagger/ui",
+    "/webjars/swagger-ui/index.html",
+    "/webjars/swagger-ui/swagger-ui.html",
+    "/api/swagger-ui",
+    "/api/swagger-ui/",
+    "/api/swagger-ui/index.html",
+    "/api/docs",
+    "/api/docs/",
+    "/docs",
+    "/docs/",
+    "/redoc",
+    "/redoc/",
+    "/redoc.html",
+})
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
@@ -1336,6 +1396,28 @@ def is_phpunit_eval_path(path: str) -> bool:
         return False
     p = path.lower()
     return p.endswith("/eval-stdin.php") and "phpunit" in p
+
+
+def openapi_swagger_kind(path: str) -> str:
+    """Return 'spec-json' / 'spec-yaml' / 'ui-html' / '' for `path`.
+
+    Empty string means the path doesn't match. Lowercased for
+    case-insensitive matching against the constant sets above.
+    """
+    p = path.lower()
+    if p in _OPENAPI_SWAGGER_JSON_PATHS:
+        return "spec-json"
+    if p in _OPENAPI_SWAGGER_YAML_PATHS:
+        return "spec-yaml"
+    if p in _OPENAPI_SWAGGER_UI_PATHS:
+        return "ui-html"
+    return ""
+
+
+def is_openapi_swagger_path(path: str) -> bool:
+    if not OPENAPI_SWAGGER_ENABLED:
+        return False
+    return bool(openapi_swagger_kind(path))
 
 
 def is_apache_cgi_shell_path(path: str, body: bytes = b"") -> bool:
@@ -4136,6 +4218,257 @@ def render_aws_credentials_ini(r: dict[str, object]) -> bytes:
         f"aws_secret_access_key = {aws.get('awsSecretAccessKey', '')}\n"
         f"aws_session_token = {aws.get('awsSessionToken', '')}\n"
         "region = us-east-1\n"
+    ).encode("utf-8")
+
+
+def render_openapi_spec(
+    r: dict[str, object],
+    host: str,
+    *,
+    yaml: bool = False,
+) -> bytes:
+    """Plausible OpenAPI 3.0.3 document with the canary embedded in places
+    a credential-scraping bot reliably grabs:
+
+      - `components.securitySchemes.bearerAuth.x-example` — bearer token
+        examples are scraped by every `openapi-credential-extractor`-class
+        tool. We park the AWS access key here as a "dev bearer".
+      - `servers[0].variables.adminApiKey.default` — server-variable
+        defaults are scraped because Swagger UI dropdowns autocomplete
+        them; the AWS secret key lands here.
+      - `info.description` — many enumerators do a plain-text key=value
+        sweep of the description for `AKIA…` patterns. Same access key
+        repeated so substring matches inside markdown find it.
+
+    All three slots point at the same Tracebit issuance. The fake `paths`
+    surface advertises plausible admin/auth endpoints so a follow-up
+    enumeration walks our handler set (login, /actuator/env, /admin/config).
+    `yaml=True` returns the same content as YAML for `/openapi.yaml`."""
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "")
+    secret_key = aws.get("awsSecretAccessKey", "")
+    safe_host = (host or "api.example.com").split(":", 1)[0] or "api.example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "api.example.com"
+    spec: dict[str, object] = {
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Internal Platform API",
+            "version": "1.4.2",
+            "description": (
+                "Internal REST surface for the platform. Staging access "
+                f"uses the bearer token `{access_key}` (rotates "
+                "monthly via the deploy pipeline). Production keys are "
+                "issued via SSO."
+            ),
+            "contact": {"name": "Platform Team", "email": "platform@" + safe_host},
+        },
+        "servers": [
+            {
+                "url": "https://{host}/api/v1",
+                "description": "Production API",
+                "variables": {
+                    "host": {"default": safe_host},
+                    "adminApiKey": {
+                        "default": secret_key,
+                        "description": "Admin API key (development default)",
+                    },
+                },
+            },
+            {
+                "url": "https://staging." + safe_host + "/api/v1",
+                "description": "Staging API",
+            },
+        ],
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "bearerFormat": "JWT",
+                    "x-example": access_key,
+                },
+                "apiKeyAuth": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-Api-Key",
+                    "x-example": access_key,
+                },
+                "basicAuth": {"type": "http", "scheme": "basic"},
+            },
+        },
+        "security": [{"bearerAuth": []}],
+        "paths": {
+            "/auth/login": {
+                "post": {
+                    "summary": "Authenticate a user",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "username": {"type": "string"},
+                                        "password": {"type": "string"},
+                                    },
+                                    "required": ["username", "password"],
+                                },
+                            },
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "OK — returns bearer token"},
+                        "401": {"description": "Invalid credentials"},
+                    },
+                },
+            },
+            "/auth/token": {
+                "post": {
+                    "summary": "Exchange refresh token",
+                    "security": [{"bearerAuth": []}],
+                    "responses": {"200": {"description": "OK"}},
+                },
+            },
+            "/admin/users": {
+                "get": {
+                    "summary": "List users (admin)",
+                    "security": [{"bearerAuth": []}],
+                    "responses": {
+                        "200": {"description": "OK"},
+                        "403": {"description": "Forbidden"},
+                    },
+                },
+            },
+            "/admin/config": {
+                "get": {
+                    "summary": "Fetch runtime configuration",
+                    "security": [{"bearerAuth": []}],
+                    "responses": {"200": {"description": "OK"}},
+                },
+            },
+            "/actuator/env": {
+                "get": {
+                    "summary": "Spring Boot Actuator env dump",
+                    "responses": {"200": {"description": "OK"}},
+                },
+            },
+            "/healthz": {
+                "get": {
+                    "summary": "Health probe",
+                    "responses": {"200": {"description": "OK"}},
+                },
+            },
+        },
+    }
+    if yaml:
+        return _openapi_spec_to_yaml(spec).encode("utf-8")
+    return json.dumps(spec, indent=2).encode("utf-8")
+
+
+def _openapi_spec_to_yaml(spec: dict[str, object]) -> str:
+    """Tiny stdlib-only JSON→YAML rendering of the spec dict. Good enough
+    for a credential-scraper to grep the `AKIA…` substring out — full PyYAML
+    semantics aren't required and bringing PyYAML in for one renderer would
+    break flux's stdlib-only invariant."""
+    def emit(value: object, indent: int = 0) -> list[str]:
+        pad = "  " * indent
+        out: list[str] = []
+        if isinstance(value, dict):
+            if not value:
+                return ["{}"]
+            for k, v in value.items():
+                key = str(k)
+                if isinstance(v, (dict, list)) and v:
+                    out.append(f"{pad}{key}:")
+                    nested = emit(v, indent + 1)
+                    out.extend(nested)
+                else:
+                    rendered = _yaml_scalar(v)
+                    out.append(f"{pad}{key}: {rendered}")
+            return out
+        if isinstance(value, list):
+            if not value:
+                return [f"{pad}[]"]
+            for item in value:
+                if isinstance(item, (dict, list)) and item:
+                    nested = emit(item, indent + 1)
+                    if nested:
+                        nested[0] = f"{pad}- " + nested[0].lstrip()
+                        out.extend(nested)
+                else:
+                    out.append(f"{pad}- {_yaml_scalar(item)}")
+            return out
+        return [f"{pad}{_yaml_scalar(value)}"]
+    return "\n".join(emit(spec)) + "\n"
+
+
+def _yaml_scalar(v: object) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if v is None:
+        return "null"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = str(v)
+    if any(c in s for c in ":#\n\"'{}[],&*!|>%@`"):
+        return json.dumps(s)
+    return s
+
+
+def render_swagger_ui_html(host: str, spec_url: str = "/swagger.json") -> bytes:
+    """Stock Swagger UI bootstrap. References /swagger.json so a scanner
+    that fetches the UI then follows the spec lands on `_handle_openapi_swagger`
+    again with `spec-json` and receives the canary-bearing document."""
+    safe_host = (host or "").split(":", 1)[0]
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host)
+    title_host = safe_host or "API"
+    return (
+        "<!DOCTYPE html>\n"
+        "<html lang=\"en\">\n"
+        "<head>\n"
+        "  <meta charset=\"UTF-8\">\n"
+        f"  <title>Swagger UI — {title_host}</title>\n"
+        "  <link rel=\"stylesheet\" type=\"text/css\" "
+        "href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\">\n"
+        "</head>\n"
+        "<body>\n"
+        "  <div id=\"swagger-ui\"></div>\n"
+        "  <script src=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js\"></script>\n"
+        "  <script>\n"
+        "    window.onload = function() {\n"
+        "      window.ui = SwaggerUIBundle({\n"
+        f"        url: \"{spec_url}\",\n"
+        "        dom_id: \"#swagger-ui\",\n"
+        "        deepLinking: true,\n"
+        "        presets: [SwaggerUIBundle.presets.apis],\n"
+        "        layout: \"BaseLayout\"\n"
+        "      });\n"
+        "    };\n"
+        "  </script>\n"
+        "</body>\n"
+        "</html>\n"
+    ).encode("utf-8")
+
+
+def render_redoc_html(host: str, spec_url: str = "/openapi.json") -> bytes:
+    """ReDoc bootstrap variant — same role as Swagger UI but the alternative
+    renderer scanners check when Swagger UI 404s. Points at /openapi.json."""
+    safe_host = (host or "").split(":", 1)[0]
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host)
+    title_host = safe_host or "API"
+    return (
+        "<!DOCTYPE html>\n"
+        "<html>\n"
+        "<head>\n"
+        "  <meta charset=\"utf-8\">\n"
+        f"  <title>API Documentation — {title_host}</title>\n"
+        "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "</head>\n"
+        "<body>\n"
+        f"  <redoc spec-url=\"{spec_url}\"></redoc>\n"
+        "  <script src=\"https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js\"></script>\n"
+        "</body>\n"
+        "</html>\n"
     ).encode("utf-8")
 
 
@@ -7129,6 +7462,114 @@ async def _handle_llm_endpoint(
     )
 
 
+async def _handle_openapi_swagger(
+    request: web.Request,
+    log_context: dict[str, object],
+    request_id: str,
+    path: str,
+) -> web.Response:
+    """Serve a fake OpenAPI/Swagger surface.
+
+    JSON/YAML spec paths return an OpenAPI 3.0.3 document with a Tracebit
+    AWS canary embedded in three credential-shaped fields. UI bootstrap
+    paths (`/swagger-ui.html`, `/redoc`, …) return a stub HTML page that
+    references the spec URL so the scanner's second probe lands on the
+    canary-bearing JSON. Keyless deployments fall through to a credential-
+    free skeleton instead of an upstream error — better to look alive than
+    to tell the scanner to skip us."""
+    kind = openapi_swagger_kind(path)
+    method = request.method
+    client_ip = str(log_context.get("clientIp", ""))
+    host = str(log_context.get("host", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+    auth_header = request.headers.get("Authorization", "")
+    api_key_header = (
+        request.headers.get("X-Api-Key", "")
+        or request.headers.get("x-api-key", "")
+    )
+    has_auth = bool(auth_header) or bool(api_key_header)
+
+    log_extra: dict[str, object] = {
+        "swaggerPath": path,
+        "swaggerKind": kind,
+        "swaggerMethod": method,
+        "swaggerHasAuth": has_auth,
+    }
+    if auth_header:
+        log_extra["swaggerAuthScheme"] = auth_header.split(" ", 1)[0].lower()
+
+    if kind in {"spec-json", "spec-yaml"}:
+        # Canary issuance is per-IP cached at TTL, so a scanner fanning out
+        # across `/swagger.json` + `/v3/api-docs` + `/openapi.json` gets one
+        # canary, not N.
+        tracebit_response: dict[str, object] | None = None
+        canary_status = ""
+        if API_KEY:
+            tracebit_response = await _get_or_issue_canary(
+                ("aws",), client_ip, request_id, host, user_agent, path, proto,
+            )
+            if tracebit_response is None:
+                canary_status = "issue-failed"
+
+        if tracebit_response is not None:
+            body = render_openapi_spec(
+                tracebit_response, host, yaml=(kind == "spec-yaml"),
+            )
+            result_tag = (
+                "openapi-spec-yaml-issued"
+                if kind == "spec-yaml" else "openapi-spec-json-issued"
+            )
+            canary_status = "issued"
+            content_type = (
+                "application/yaml; charset=utf-8"
+                if kind == "spec-yaml" else "application/json; charset=utf-8"
+            )
+        else:
+            # No canary available — emit a credential-free skeleton so
+            # nginx-visible "this host serves a spec" probes still pass.
+            # Empty servers + paths sections keep us from advertising fake
+            # admin endpoints without a canary backing the spec.
+            skeleton = {
+                "openapi": "3.0.3",
+                "info": {"title": "API", "version": "1.0.0"},
+                "paths": {},
+            }
+            body = json.dumps(skeleton, indent=2).encode("utf-8")
+            result_tag = (
+                "openapi-spec-yaml-skeleton"
+                if kind == "spec-yaml" else "openapi-spec-json-skeleton"
+            )
+            content_type = (
+                "application/yaml; charset=utf-8"
+                if kind == "spec-yaml" else "application/json; charset=utf-8"
+            )
+
+        log_entry = {**log_context, "status": 200, "result": result_tag, **log_extra, "bytes": len(body)}
+        if canary_status:
+            log_entry["canaryStatus"] = canary_status
+        if tracebit_response is not None:
+            log_entry["canaryTypes"] = [k for k, v in tracebit_response.items() if v]
+        append_log(log_entry)
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": content_type, "Cache-Control": "no-store"},
+        )
+
+    # ui-html
+    if path.lower().startswith("/redoc"):
+        body = render_redoc_html(host)
+        result_tag = "openapi-redoc-html"
+    else:
+        body = render_swagger_ui_html(host)
+        result_tag = "openapi-swagger-ui-html"
+    append_log({**log_context, "status": 200, "result": result_tag, **log_extra, "bytes": len(body)})
+    return web.Response(
+        status=200, body=body,
+        headers={"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"},
+    )
+
+
 async def _handle_webapp_form(
     request: web.Request,
     log_context: dict[str, object],
@@ -9167,6 +9608,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_llm_endpoint_path(path):
         return await _handle_llm_endpoint(request, log_context, path, request_body)
+
+    if is_openapi_swagger_path(path):
+        return await _handle_openapi_swagger(request, log_context, request_id, path)
 
     if is_sonicwall_path(path):
         return await _handle_sonicwall(request, log_context, path, request_body)
