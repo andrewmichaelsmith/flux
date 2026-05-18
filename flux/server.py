@@ -860,6 +860,107 @@ _SAP_METADATAUPLOADER_XXE_INDICATORS = (
 )
 
 
+# --- Fake Drupal user-registration / settings.php trap (Drupalgeddon2) ---
+# Two probe families against the Drupal 8/9 attack surface:
+#
+#   1. `/user/register?element_parents=account/mail/%23value&ajax_form=1
+#      &_wrapper_format=drupal_ajax` — the CVE-2018-7600 ("Drupalgeddon2")
+#      unauthenticated-RCE shape. A real Drupal endpoint that accepts the
+#      AJAX form upload renders an HTML+JSON response; we mimic the GET
+#      registration form, accept the POST, and log the full
+#      `element_parents` / `mail[#post_render]` chain so the OGNL-style
+#      PHP-render payload lands in the access log.
+#
+#   2. `/sites/default/settings.php` (+ `.bak` / `.swp` / `~` / `%00` /
+#      `%20` / `default.settings.php`) — sloppy-deploy harvest of the
+#      Drupal config file with plaintext DB creds + S3 backup creds.
+#      A real `settings.php` carries `$databases['default']['default']`
+#      arrays plus the `$settings['hash_salt']` line scanners grep for;
+#      we ship the same shape with a per-hit DB password and a Tracebit
+#      AWS canary in the S3-backup comment block.
+DRUPAL_ENABLED = _env_bool("HONEYPOT_DRUPAL_ENABLED")
+DRUPAL_VERSION = (os.environ.get("HONEYPOT_DRUPAL_VERSION") or "9.5.11").strip()
+DRUPAL_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_DRUPAL_BODY_DECODE_LIMIT") or "8192").strip() or "8192"),
+    512,
+)
+# CVE-2018-7600 ("Drupalgeddon2") payload indicators. Real exploits POST a
+# form-encoded body with `mail[#post_render][]=passthru` or
+# `mail[#markup]=<cmd>` plus an `element_parents=account/mail/%23value` /
+# `ajax_form=1` / `_wrapper_format=drupal_ajax` query string. Match on
+# the raw bytes (case-insensitive) — flips `drupalHasDrupalgeddon2`.
+_DRUPAL_DRUPALGEDDON2_INDICATORS = (
+    b"#post_render",
+    b"#markup",
+    b"#type",
+    b"#lazy_builder",
+    b"#pre_render",
+    b"element_parents=",
+    b"_wrapper_format=drupal_ajax",
+    b"ajax_form=1",
+)
+# Generic shell-command-execution indicators inside the payload —
+# distinct from the Drupalgeddon2 shape so triage can sort "Drupal probe"
+# (fingerprint only) from "actual RCE attempt". Many CVE-2018-7600 bodies
+# embed these as the `#post_render` callback target.
+_DRUPAL_RCE_PAYLOAD_INDICATORS = (
+    b"passthru",
+    b"system(",
+    b"exec(",
+    b"shell_exec",
+    b"phpinfo",
+    b"file_get_contents",
+    b"file_put_contents",
+    b"base64_decode",
+    b"assert(",
+    b"eval(",
+)
+
+
+# --- Fake Spring Cloud Gateway Actuator extension (CVE-2022-22947) -------
+# `/actuator/gateway/routes` is the route-management surface for Spring
+# Cloud Gateway 3.0.x / 3.1.0. CVE-2022-22947 (Spring4Shell-adjacent) is
+# the SpEL-injection chain through this endpoint:
+#
+#   POST /actuator/gateway/routes/{id}  — register a malicious route
+#       whose filter args contain `#{T(java.lang.Runtime).getRuntime()
+#       .exec("id")}`; the SpEL fires when the gateway compiles the
+#       filter.
+#   POST /actuator/gateway/refresh      — force the route table to
+#       reload (triggers the SpEL evaluation if it hasn't fired).
+#   GET  /actuator/gateway/routes/{id}  — read back the route, which
+#       echoes the command output to the scanner.
+#   DELETE /actuator/gateway/routes/{id} — clean-up after exploitation.
+#
+# Flux mimics all four endpoints: GET lists return a small fake route
+# table with an embedded AWS canary in the `metadata.adminApiKey`
+# slot; POST captures the SpEL body and returns 201 Created; DELETE
+# / refresh return 200 OK. The handler flips
+# `springGatewayHasSpel` whenever the body or query contains
+# `#{` / `T(` / `getRuntime` / `ProcessBuilder` indicators.
+SPRING_GATEWAY_ENABLED = _env_bool("HONEYPOT_SPRING_GATEWAY_ENABLED")
+SPRING_GATEWAY_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_SPRING_GATEWAY_BODY_DECODE_LIMIT") or "8192").strip() or "8192"),
+    512,
+)
+# SpEL / Java-reflection indicators on the body or query — flips
+# `springGatewayHasSpel` for fast triage. Real CVE-2022-22947 payloads
+# always include at least `#{T(` or `T(java.lang.Runtime)`; we match on
+# the broader set to catch obfuscation variants and follow-on probes.
+_SPRING_GATEWAY_SPEL_INDICATORS = (
+    b"#{",
+    b"${",
+    b"t(java.lang",
+    b"t(java.io",
+    b"t(java.util",
+    b"getruntime",
+    b"processbuilder",
+    b"runtime.exec",
+    b"reflectiveoperation",
+    b"new java.",
+)
+
+
 # --- Fake Next.js application + SSJS-injection probe responder ----------
 # Probes seen in the wild send a base64-encoded JS payload via `?cmd=...`
 # against Next.js conventional routes. The decoded body is an
@@ -1656,6 +1757,70 @@ def is_sap_metadatauploader_path(path: str) -> bool:
         "/nwa/developmentserver/metadatauploader",
         "/sap/developmentserver/metadatauploader",
     }
+
+
+def is_drupal_path(path: str) -> bool:
+    """Match `/user/register` — the CVE-2018-7600 ("Drupalgeddon2")
+    trigger path.
+
+    The full exploit URL is `/user/register?element_parents=account/mail
+    /%23value&ajax_form=1&_wrapper_format=drupal_ajax` — the routing
+    decision lives in the query string, not the path, so we match on
+    the bare path and let the handler parse the query/body for the
+    Drupalgeddon2 indicator set.
+
+    We deliberately do NOT match `/user/login` or `/user/password`
+    even though Drupal exposes them. Those paths already route to
+    the generic web-app form responder (`/user/login` is in
+    `_WEBAPP_FORM_LOGIN_PATHS`), which has tested credential capture.
+    Stealing them here would replace good behaviour with thinner
+    behaviour and break the existing webapp-form-login result tag.
+
+    Settings.php and friends are served as CanaryTrap entries (exact
+    path lookup, not handler dispatch), so they're not in this set.
+    """
+    if not DRUPAL_ENABLED:
+        return False
+    p = path.lower().rstrip("/")
+    return p in {
+        "/user/register",
+        # Sub-path registration used in some Drupal 8/9 deployments
+        # that route through the legacy `?q=` query parameter.
+        "/?q=user/register",
+        # Webroot-prefix variants — Drupal-under-subpath deployments.
+        "/drupal/user/register",
+        "/cms/user/register",
+    }
+
+
+def is_spring_gateway_path(path: str) -> bool:
+    """Match the Spring Cloud Gateway Actuator surface targeted by
+    CVE-2022-22947 (SpEL-injection RCE through route filter args).
+
+    The vulnerable endpoints are `/actuator/gateway/routes`,
+    `/actuator/gateway/routes/{id}` (route registration / read /
+    delete), `/actuator/gateway/refresh` (force route-table reload),
+    and the supporting read-only `/globalfilters` / `/routefilters` /
+    `/routepredicates` endpoints. Real deployments also expose these
+    under the `/manage`, `/management`, and `/api/actuator`
+    reverse-proxy aliases that the existing `actuator-env` trap covers,
+    so we mirror that prefix set.
+
+    Routing by prefix because `/routes/{id}` is a per-request id.
+    """
+    if not SPRING_GATEWAY_ENABLED:
+        return False
+    p = path.lower().rstrip("/")
+    prefixes = (
+        "/actuator/gateway",
+        "/manage/gateway",
+        "/management/gateway",
+        "/api/actuator/gateway",
+    )
+    for prefix in prefixes:
+        if p == prefix or p.startswith(prefix + "/"):
+            return True
+    return False
 
 
 def extract_sonicwall_username(body: bytes, content_type: str) -> str:
@@ -2941,6 +3106,215 @@ def render_sap_metadatauploader_post_ok(filename: str) -> bytes:
         f"tc~lm~ctc~util/servlet_jsp/tc~lm~ctc~util/root/{safe}\n"
     )
     return body.encode("utf-8")
+
+
+def render_drupal_user_register_html(version: str, form_build_id: str, form_token: str) -> bytes:
+    """Drupal 8/9 user registration form. The CVE-2018-7600 trigger flow
+    requires `form_build_id` and `form_token` values in a GET response so
+    the AJAX POST that follows is accepted by the form-handling layer.
+    Per-hit values prevent the page becoming a cross-sensor fingerprint.
+
+    The page advertises a `Generator` meta tag with the configured
+    Drupal version so scanners can fingerprint the build and decide
+    whether to ship the Drupalgeddon2 payload."""
+    safe_version = re.sub(r"[^0-9.]", "", version)[:24] or "9.5.11"
+    return (
+        b'<!DOCTYPE html>\n'
+        b'<html lang="en" dir="ltr">\n'
+        b'<head>\n'
+        b'<meta charset="utf-8" />\n'
+        b'<meta name="Generator" content="Drupal ' + safe_version.encode("ascii") + b' (https://www.drupal.org)" />\n'
+        b'<title>Create new account | Site</title>\n'
+        b'<link rel="canonical" href="/user/register" />\n'
+        b'</head>\n'
+        b'<body class="path-user page-user-register">\n'
+        b'<div class="region region-content">\n'
+        b'<h1 class="page-title">Create new account</h1>\n'
+        b'<form action="/user/register" method="post" id="user-register-form" '
+        b'accept-charset="UTF-8" class="user-register-form">\n'
+        b'<div class="js-form-item form-item js-form-type-email form-type-email">\n'
+        b'<label for="edit-mail" class="js-form-required form-required">Email address</label>\n'
+        b'<input type="email" id="edit-mail" name="mail" value="" size="60" maxlength="254" '
+        b'class="form-email required" required="required" aria-required="true" />\n'
+        b'</div>\n'
+        b'<div class="js-form-item form-item js-form-type-textfield form-type-textfield">\n'
+        b'<label for="edit-name" class="js-form-required form-required">Username</label>\n'
+        b'<input type="text" id="edit-name" name="name" value="" size="60" maxlength="60" '
+        b'class="username form-text required" required="required" aria-required="true" />\n'
+        b'</div>\n'
+        b'<input data-drupal-selector="edit-form-build-id" type="hidden" name="form_build_id" '
+        b'value="' + form_build_id.encode("ascii") + b'" />\n'
+        b'<input data-drupal-selector="edit-form-token" type="hidden" name="form_token" '
+        b'value="' + form_token.encode("ascii") + b'" />\n'
+        b'<input data-drupal-selector="edit-form-id" type="hidden" name="form_id" '
+        b'value="user_register_form" />\n'
+        b'<div class="form-actions js-form-wrapper form-wrapper">\n'
+        b'<input type="submit" id="edit-submit" name="op" value="Create new account" '
+        b'class="button button--primary js-form-submit form-submit" />\n'
+        b'</div>\n'
+        b'</form>\n'
+        b'</div>\n'
+        b'</body>\n'
+        b'</html>\n'
+    )
+
+
+def render_drupal_ajax_response() -> bytes:
+    """Drupal AJAX form submissions return a JSON array of `command`
+    objects (insert / replace / settings / data). A real Drupalgeddon2
+    POST that the form pipeline accepts produces a minimal-valid AJAX
+    envelope; mirroring it keeps scanners from bailing on a malformed
+    response. We deliberately do NOT echo any submitted form field —
+    flux's response body must not ship attacker-controlled tokens that
+    a downstream log pipeline might re-render unsafely."""
+    payload = [
+        {
+            "command": "insert",
+            "method": "replaceWith",
+            "selector": "#user-register-form",
+            "data": "<div class=\"messages messages--status\">"
+                    "Further instructions have been sent to your email address.</div>",
+            "settings": None,
+        },
+    ]
+    return (json.dumps(payload) + "\n").encode("utf-8")
+
+
+def render_drupal_settings_php(r: dict[str, object]) -> bytes:
+    """Drupal 8/9 `sites/default/settings.php`. Real installations carry
+    `$databases['default']['default']` arrays with plaintext DB creds,
+    plus `$settings['hash_salt']` and `$config_directories` lines that
+    scanners grep for as fingerprint markers. The S3-backup block at
+    the bottom ships a Tracebit AWS canary; the DB password is per-hit
+    synthetic (no fixed literals)."""
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    hash_salt = secrets.token_urlsafe(43)
+    config_sync_dir = secrets.token_hex(20)
+    return (
+        "<?php\n"
+        "/**\n"
+        " * @file\n"
+        " * Drupal site-specific configuration file.\n"
+        " */\n"
+        "\n"
+        "$databases['default']['default'] = [\n"
+        "  'database' => 'drupal_prod',\n"
+        "  'username' => 'drupal_app',\n"
+        f"  'password' => '{db_password}',\n"
+        "  'prefix' => '',\n"
+        "  'host' => 'db.internal',\n"
+        "  'port' => '3306',\n"
+        "  'namespace' => 'Drupal\\\\Core\\\\Database\\\\Driver\\\\mysql',\n"
+        "  'driver' => 'mysql',\n"
+        "];\n"
+        "\n"
+        f"$settings['hash_salt'] = '{hash_salt}';\n"
+        "$settings['update_free_access'] = FALSE;\n"
+        "$settings['file_public_path'] = 'sites/default/files';\n"
+        f"$settings['config_sync_directory'] = 'sites/default/files/config_{config_sync_dir}/sync';\n"
+        "$settings['trusted_host_patterns'] = ['^.+$'];\n"
+        "\n"
+        "// S3 backup credentials — rotated nightly by ops/backup-cron.\n"
+        "// Replay against AWS STS for verification before rotation.\n"
+        f"$config['s3fs.settings']['access_key'] = '{aws.get('awsAccessKeyId', '')}';\n"
+        f"$config['s3fs.settings']['secret_key'] = '{aws.get('awsSecretAccessKey', '')}';\n"
+        f"$config['s3fs.settings']['session_token'] = '{aws.get('awsSessionToken', '')}';\n"
+        "$config['s3fs.settings']['region'] = 'us-east-1';\n"
+        "$config['s3fs.settings']['bucket'] = 'drupal-backups-prod';\n"
+        "\n"
+        "if (file_exists($app_root . '/' . $site_path . '/settings.local.php')) {\n"
+        "  include $app_root . '/' . $site_path . '/settings.local.php';\n"
+        "}\n"
+    ).encode("utf-8")
+
+
+def render_spring_gateway_routes_get(r: dict[str, object]) -> bytes:
+    """Spring Cloud Gateway `/actuator/gateway/routes` returns the
+    current route list. Real responses are a JSON array of objects
+    keyed by `route_id`, with `predicate` + `filters` + `uri` +
+    `metadata` fields. We ship a small fake table whose `metadata`
+    slot includes a Tracebit AWS access-key id — a credential
+    harvester that greps the response body for `AKIA` walks away with
+    a replay-fireable key. The `/admin-internal/**` route hints at
+    further admin surface for the scanner to probe."""
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    payload = [
+        {
+            "route_id": "admin-internal-proxy",
+            "route_definition": {
+                "id": "admin-internal-proxy",
+                "predicates": [
+                    {"name": "Path", "args": {"_genkey_0": "/admin-internal/**"}},
+                ],
+                "filters": [
+                    {"name": "AddRequestHeader", "args": {
+                        "name": "X-Admin-Api-Key",
+                        "value": ak,
+                    }},
+                ],
+                "uri": "http://admin.internal:8080",
+                "order": 0,
+                "metadata": {
+                    "adminApiKey": ak,
+                    "adminApiSecret": sk,
+                },
+            },
+            "order": 0,
+        },
+        {
+            "route_id": "public-static-proxy",
+            "route_definition": {
+                "id": "public-static-proxy",
+                "predicates": [
+                    {"name": "Path", "args": {"_genkey_0": "/static/**"}},
+                ],
+                "filters": [],
+                "uri": "http://static.internal:8080",
+                "order": 10,
+                "metadata": {},
+            },
+            "order": 10,
+        },
+    ]
+    return (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+
+
+def render_spring_gateway_route_created(route_id: str) -> bytes:
+    """Successful POST to `/actuator/gateway/routes/{id}` — real Spring
+    Cloud Gateway returns 201 Created with an empty body. Some
+    deployments emit a JSON envelope confirming the route id; ship that
+    shape so scanners that parse the response know which `/refresh`
+    call to issue next. Sanitise the echoed id to prevent attacker
+    bytes from landing in flux's response."""
+    safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", route_id)[:120] or "route"
+    return (json.dumps({"id": safe_id, "status": "created"}) + "\n").encode("utf-8")
+
+
+def render_spring_gateway_refresh_ok() -> bytes:
+    """`POST /actuator/gateway/refresh` returns an empty body with a
+    200 OK on real Spring Cloud Gateway. Empty body is the documented
+    shape; scanners checking for refresh success look at the status
+    code, not the body."""
+    return b""
+
+
+def render_spring_gateway_global_filters() -> bytes:
+    """`GET /actuator/gateway/globalfilters` returns the configured
+    GlobalFilter chain with order. Plausible default values from a
+    stock Spring Cloud Gateway 3.1.x install — keeps scanners chasing
+    the routes endpoint instead of bailing on a 404."""
+    payload = {
+        "org.springframework.cloud.gateway.filter.ForwardRoutingFilter@1": 2147483647,
+        "org.springframework.cloud.gateway.filter.NettyRoutingFilter@1": 2147483646,
+        "org.springframework.cloud.gateway.filter.ForwardPathFilter@1": 0,
+        "org.springframework.cloud.gateway.filter.RouteToRequestUrlFilter@1": 10000,
+        "org.springframework.cloud.gateway.filter.LoadBalancerClientFilter@1": 10100,
+        "org.springframework.cloud.gateway.filter.WebsocketRoutingFilter@1": 2147483646,
+    }
+    return (json.dumps(payload, indent=2) + "\n").encode("utf-8")
 
 
 def render_sonicwall_is_sslvpn_enabled() -> bytes:
@@ -6523,6 +6897,57 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_htpasswd,
         "text/plain; charset=utf-8",
     ),
+    # `sites/default/settings.php` — Drupal 8/9 site-config file with
+    # plaintext DB creds and (in many real deployments) an S3-backup
+    # credential block. Scanner dictionaries walk the same backup/swap
+    # suffix variants as wp-config plus the `default.settings.php`
+    # template Drupal ships unconfigured. A scanner that GETs any of
+    # these (or any of the webroot-prefix variants reverse proxies
+    # expose under `/sites/...`) gets a fully-shaped Drupal config
+    # with a per-hit DB password and a Tracebit AWS canary in the
+    # `s3fs.settings` block.
+    CanaryTrap(
+        "drupal-settings-php",
+        (
+            "/sites/default/settings.php",
+            # Editor-/admin-leftover suffix variants. Same shape as
+            # wp-config — these survive sloppy deploys and interrupted
+            # edits, and scanner dictionaries walk every plausible one.
+            "/sites/default/settings.php.bak",
+            "/sites/default/settings.php.save",
+            "/sites/default/settings.php.swp",
+            "/sites/default/settings.php.swo",
+            "/sites/default/settings.php.old",
+            "/sites/default/settings.php.orig",
+            "/sites/default/settings.php.txt",
+            "/sites/default/settings.php~",
+            "/sites/default/settings.bak",
+            "/sites/default/settings.old",
+            "/sites/default/settings.txt",
+            # Null-byte / space truncation variants. PHP's old
+            # `is_file()` behaviour stopped at `%00` and some scanner
+            # dictionaries probe `%00` / `%20` suffixes to find servers
+            # that mis-normalise them. Decoded paths land here.
+            "/sites/default/settings.php\x00",
+            "/sites/default/settings.php ",
+            # Drupal ships `default.settings.php` (the template) at the
+            # same path. A sloppy deploy that left the template in place
+            # leaks the same shape; scanners check both filenames.
+            "/sites/default/default.settings.php",
+            # Per-site directory variants — Drupal multisite layouts
+            # use `/sites/<sitename>/settings.php`. Cover the two most
+            # common conventional names.
+            "/sites/all/settings.php",
+            # Webroot-prefix variants — `/drupal/` and `/cms/` are the
+            # two reverse-proxy layouts scanner dictionaries enumerate
+            # most often for Drupal-under-subpath installs.
+            "/drupal/sites/default/settings.php",
+            "/cms/sites/default/settings.php",
+        ),
+        ("aws",),
+        render_drupal_settings_php,
+        "application/x-php; charset=utf-8",
+    ),
     CanaryTrap(
         "wp-config",
         (
@@ -8892,6 +9317,287 @@ async def _handle_sap_metadatauploader(
     )
 
 
+async def _handle_drupal(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake Drupal 8/9 `/user/register` endpoint with CVE-2018-7600
+    payload capture.
+
+    GET `/user/register` → minimal Drupal user-registration HTML with
+    per-request `form_build_id` and `form_token` values (so a
+    follow-up POST passes the framework-level form-cache lookup in a
+    real installation).
+    POST `/user/register` → Drupal AJAX-form JSON envelope; captures
+    the full body (Drupalgeddon2 `mail[#post_render]` / `element_parents`
+    chain) and flags `drupalHasDrupalgeddon2` + `drupalHasRcePayload`
+    for triage.
+    """
+    method = request.method
+    query_lower = (query_string or "").lower().encode("latin-1", errors="replace")
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:DRUPAL_BODY_DECODE_LIMIT].decode(
+            "utf-8", errors="replace",
+        )
+    lower_body = request_body[:DRUPAL_BODY_DECODE_LIMIT].lower() if request_body else b""
+
+    has_drupalgeddon2 = any(
+        needle in query_lower or needle in lower_body
+        for needle in _DRUPAL_DRUPALGEDDON2_INDICATORS
+    )
+    has_rce_payload = any(needle in lower_body for needle in _DRUPAL_RCE_PAYLOAD_INDICATORS)
+
+    # Result tag picks the most specific applicable shape.
+    if method in {"POST", "PUT"}:
+        if has_drupalgeddon2 and has_rce_payload:
+            result_tag = "drupal-user-register-rce-attempt"
+        elif has_drupalgeddon2:
+            result_tag = "drupal-user-register-drupalgeddon2"
+        else:
+            result_tag = "drupal-user-register-post"
+    else:
+        result_tag = "drupal-user-register-probe"
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "drupalPath": path,
+        "drupalMethod": method,
+        "drupalHasDrupalgeddon2": has_drupalgeddon2,
+        "drupalHasRcePayload": has_rce_payload,
+    }
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview[:400]
+    if query_string:
+        log_entry["queryPreview"] = query_string[:400]
+    append_log(log_entry)
+
+    headers = {
+        # The X-Generator response header is the Drupal fingerprint
+        # scanners grep when a meta tag would be filtered by an
+        # upstream proxy. Mirror Drupal's default banner.
+        "X-Generator": f"Drupal {DRUPAL_VERSION} (https://www.drupal.org)",
+        "Cache-Control": "no-store, private",
+    }
+
+    if method in {"POST", "PUT"}:
+        body = render_drupal_ajax_response()
+        return web.Response(
+            status=200,
+            body=body,
+            headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+        )
+
+    form_build_id = "form-" + secrets.token_urlsafe(20)
+    form_token = secrets.token_urlsafe(32)
+    body = render_drupal_user_register_html(
+        DRUPAL_VERSION, form_build_id, form_token,
+    )
+    return web.Response(
+        status=200,
+        body=body,
+        headers={**headers, "Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+async def _handle_spring_gateway(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake Spring Cloud Gateway Actuator surface (CVE-2022-22947 bait).
+
+    GET  `/actuator/gateway/routes`                → fake routes list
+        with embedded AWS canary in route metadata.
+    GET  `/actuator/gateway/routes/{id}`           → individual route
+        echo (same canary content).
+    POST `/actuator/gateway/routes/{id}`           → accept SpEL-laden
+        body, capture it, return 201 Created.
+    POST `/actuator/gateway/refresh`               → 200 OK empty body.
+    DELETE `/actuator/gateway/routes/{id}`         → 200 OK.
+    GET  `/actuator/gateway/globalfilters`         → fake filter chain.
+    GET  `/actuator/gateway/routefilters`          → empty filter set.
+    GET  `/actuator/gateway/routepredicates`       → empty predicate set.
+
+    The canary requirement gates the `tracebit_response` injection at
+    dispatch time (handler is only reached when `API_KEY` is set —
+    matches the `actuator-env` CanaryTrap behaviour).
+    """
+    method = request.method
+    lpath = path.lower().rstrip("/")
+    query_lower = (query_string or "").lower().encode("latin-1", errors="replace")
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:SPRING_GATEWAY_BODY_DECODE_LIMIT].decode(
+            "utf-8", errors="replace",
+        )
+    lower_body = request_body[:SPRING_GATEWAY_BODY_DECODE_LIMIT].lower() if request_body else b""
+
+    has_spel = any(
+        needle in query_lower or needle in lower_body
+        for needle in _SPRING_GATEWAY_SPEL_INDICATORS
+    )
+
+    # Identify which Spring Cloud Gateway sub-endpoint this is.
+    is_refresh = lpath.endswith("/gateway/refresh")
+    is_globalfilters = lpath.endswith("/gateway/globalfilters")
+    is_routefilters = lpath.endswith("/gateway/routefilters")
+    is_routepredicates = lpath.endswith("/gateway/routepredicates")
+    is_routes_root = (
+        lpath.endswith("/gateway/routes")
+        and not (
+            is_refresh or is_globalfilters or is_routefilters or is_routepredicates
+        )
+    )
+    # `/gateway/routes/{id}` — id is everything after the last `routes/`
+    # segment. Empty id = routes_root.
+    route_id = ""
+    if "/gateway/routes/" in lpath:
+        route_id = lpath.rsplit("/gateway/routes/", 1)[-1]
+
+    headers = {
+        # Pin a banner inside the CVE-2022-22947 public-disclosure window —
+        # Spring Cloud Gateway 3.1.0 is the canonical vulnerable build.
+        "Server": "Spring Cloud Gateway/3.1.0",
+        "Cache-Control": "no-store",
+    }
+
+    if method in {"POST", "PUT"} and route_id:
+        result_tag = (
+            "spring-gateway-spel-rce-attempt" if has_spel
+            else "spring-gateway-route-add"
+        )
+        body = render_spring_gateway_route_created(route_id)
+        log_entry: dict[str, object] = {
+            **log_context,
+            "status": 201,
+            "result": result_tag,
+            "springGatewayPath": path,
+            "springGatewayMethod": method,
+            "springGatewayRouteId": route_id[:120],
+            "springGatewayHasSpel": has_spel,
+        }
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview[:400]
+        append_log(log_entry)
+        return web.Response(
+            status=201,
+            body=body,
+            headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if method == "DELETE" and route_id:
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "spring-gateway-route-delete",
+            "springGatewayPath": path,
+            "springGatewayMethod": method,
+            "springGatewayRouteId": route_id[:120],
+            "springGatewayHasSpel": False,
+        })
+        return web.Response(
+            status=200, body=b"",
+            headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if is_refresh:
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "spring-gateway-refresh",
+            "springGatewayPath": path,
+            "springGatewayMethod": method,
+            "springGatewayHasSpel": has_spel,
+        })
+        return web.Response(
+            status=200, body=render_spring_gateway_refresh_ok(),
+            headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if is_globalfilters:
+        body = render_spring_gateway_global_filters()
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "spring-gateway-globalfilters",
+            "springGatewayPath": path,
+            "springGatewayMethod": method,
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if is_routefilters or is_routepredicates:
+        # Empty arrays are the real response for stock deployments.
+        tag = "spring-gateway-routefilters" if is_routefilters else "spring-gateway-routepredicates"
+        append_log({
+            **log_context, "status": 200, "result": tag,
+            "springGatewayPath": path, "springGatewayMethod": method,
+        })
+        return web.Response(
+            status=200, body=b"{}\n",
+            headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+        )
+
+    # GET /actuator/gateway/routes — the credential-leak endpoint. Needs
+    # a Tracebit AWS canary to embed in the response. Match the
+    # CanaryTrap issuance pattern.
+    if is_routes_root or route_id:
+        # Issue a per-request canary; falls back to a "no canary" envelope
+        # if Tracebit is unreachable so we still capture a probe.
+        request_id = str(log_context.get("requestId", ""))
+        client_ip = str(log_context.get("clientIp", ""))
+        host = str(log_context.get("host", ""))
+        user_agent = str(log_context.get("userAgent", ""))
+        proto = str(log_context.get("protocol", "http"))
+        tb = await _get_or_issue_canary(
+            ("aws",), client_ip, request_id, host, user_agent, path, proto,
+        )
+        if tb is None:
+            # Without a canary, return the routes list with empty AWS
+            # values; the probe still lands in the log.
+            tb = {"aws": {"awsAccessKeyId": "", "awsSecretAccessKey": "", "awsSessionToken": ""}}
+        body = render_spring_gateway_routes_get(tb)
+        tag = "spring-gateway-routes-list" if is_routes_root else "spring-gateway-route-get"
+        log_entry = {
+            **log_context,
+            "status": 200,
+            "result": tag,
+            "springGatewayPath": path,
+            "springGatewayMethod": method,
+            "springGatewayRouteId": route_id[:120],
+            "canaryTypes": [k for k, v in tb.items() if v],
+            "bytes": len(body),
+        }
+        append_log(log_entry)
+        return web.Response(
+            status=200, body=body,
+            headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+        )
+
+    # Anything else under /actuator/gateway/* — log + 404.
+    append_log({
+        **log_context, "status": 404, "result": "spring-gateway-unknown",
+        "springGatewayPath": path, "springGatewayMethod": method,
+    })
+    return web.Response(
+        status=404, body=b"{}\n",
+        headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+    )
+
+
 async def _handle_nextjs(
     request: web.Request,
     log_context: dict[str, object],
@@ -9651,6 +10357,14 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_sap_metadatauploader_path(path):
         return await _handle_sap_metadatauploader(request, log_context, path, request_body)
 
+    if is_drupal_path(path):
+        return await _handle_drupal(request, log_context, path, query_string, request_body)
+
+    if API_KEY and is_spring_gateway_path(path):
+        return await _handle_spring_gateway(
+            request, log_context, path, query_string, request_body,
+        )
+
     if is_nextjs_path(path):
         return await _handle_nextjs(request, log_context, path, query_string, request_body)
 
@@ -9762,6 +10476,10 @@ def main() -> int:
         active.append("confluence")
     if SAP_METADATAUPLOADER_ENABLED:
         active.append("sap-metadatauploader")
+    if DRUPAL_ENABLED:
+        active.append("drupal")
+    if SPRING_GATEWAY_ENABLED and API_KEY:
+        active.append("spring-gateway")
     if NEXTJS_ENABLED:
         active.append("nextjs")
     if CMD_INJECTION_ENABLED:

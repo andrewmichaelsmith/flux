@@ -252,6 +252,31 @@ on responses — pinned to a build in the CVE-2025-31324 public-disclosure
 window so scanners deciding whether to ship the upload body don't bail
 on a patched banner.
 
+### Fake Drupal user-registration + settings.php
+
+Settings.php canary requires `TRACEBIT_API_KEY`; the
+`/user/register` handler runs keyless.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_DRUPAL_ENABLED` | on | Master switch. Covers `/user/register` (CVE-2018-7600 Drupalgeddon2) handler + the `/sites/default/settings.php` CanaryTrap family. |
+| `HONEYPOT_DRUPAL_VERSION` | `9.5.11` | Version string emitted in the `X-Generator` response header and `<meta>` tag. Drupal-specific scanners check this to decide whether to ship the Drupalgeddon2 payload. |
+| `HONEYPOT_DRUPAL_BODY_DECODE_LIMIT` | `8192` | Max bytes of the request body decoded into `bodyPreview` and scanned for the Drupalgeddon2 / PHP-exec indicator flags. The full body is still hashed via `bodySha256`. |
+
+### Fake Spring Cloud Gateway Actuator extension
+
+Requires `TRACEBIT_API_KEY` — the route-list response embeds an AWS
+canary in the `metadata.adminApiKey` slot.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_SPRING_GATEWAY_ENABLED` | on | Master switch. Covers `/actuator/gateway/{routes,routes/{id},refresh,globalfilters,routefilters,routepredicates}` plus the `/manage`, `/management`, `/api/actuator` reverse-proxy aliases that the existing `actuator-env` trap already serves (CVE-2022-22947 SpEL-injection bait). |
+| `HONEYPOT_SPRING_GATEWAY_BODY_DECODE_LIMIT` | `8192` | Max bytes of the request body decoded into `bodyPreview` and scanned for the SpEL indicator set. The full body is still hashed via `bodySha256`. |
+
+The handler always advertises `Server: Spring Cloud Gateway/3.1.0` —
+pinned inside the CVE-2022-22947 public-disclosure window so scanners
+deciding whether to ship the SpEL body don't bail on a patched banner.
+
 ## Bind address / port
 
 Flux listens on `127.0.0.1:18081` (aiohttp). To change, edit

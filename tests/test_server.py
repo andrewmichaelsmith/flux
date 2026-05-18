@@ -561,6 +561,8 @@ def test_all_trap_families_default_on():
     assert tbenv.CMD_INJECTION_ENABLED
     assert tbenv.WEBAPP_FORM_ENABLED
     assert tbenv.OPENAPI_SWAGGER_ENABLED
+    assert tbenv.DRUPAL_ENABLED
+    assert tbenv.SPRING_GATEWAY_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -4413,7 +4415,327 @@ def test_sap_metadatauploader_xxe_indicators():
         )
 
 
-def test_render_confluence_editor_preload_html_shape():
+# --- Drupal trap (CVE-2018-7600 Drupalgeddon2 + settings.php canary) ---
+
+
+def test_drupal_enabled_by_default():
+    assert tbenv.DRUPAL_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/user/register",
+    "/user/register/",
+    "/User/Register",
+    "/?q=user/register",
+    "/drupal/user/register",
+    "/cms/user/register",
+])
+def test_drupal_matches_observed_register_probes(path):
+    assert tbenv.is_drupal_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    # `/user/login` stays with the generic webapp-form responder.
+    "/user/login",
+    "/user/password",
+    "/users/register",
+    "/register",
+    "/.env",
+    "/user",
+    "/user/register/extra",
+])
+def test_drupal_non_match(path):
+    assert not tbenv.is_drupal_path(path)
+
+
+def test_drupal_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "DRUPAL_ENABLED", False)
+    assert not tbenv.is_drupal_path("/user/register")
+
+
+def test_drupal_does_not_steal_user_login_from_webapp_form():
+    """`/user/login` must continue to route to the generic
+    web-app form responder — it has tested credential capture and
+    we should not regress the result tag by stealing the path."""
+    assert not tbenv.is_drupal_path("/user/login"), (
+        "Drupal handler must not match /user/login — that path is "
+        "owned by the generic webapp-form responder."
+    )
+    assert tbenv.is_webapp_form_path("/user/login"), (
+        "/user/login must remain a webapp-form path."
+    )
+
+
+def test_drupal_drupalgeddon2_indicators_query():
+    """A real Drupalgeddon2 exploit URL embeds these in the query
+    string; the triage flag should fire on every one."""
+    for needle in (
+        b"element_parents=account/mail/%23value",
+        b"_wrapper_format=drupal_ajax",
+        b"ajax_form=1",
+        b"mail[#post_render][]=passthru",
+        b"mail[#markup]=id",
+    ):
+        assert any(
+            ind in needle.lower() for ind in tbenv._DRUPAL_DRUPALGEDDON2_INDICATORS
+        )
+
+
+def test_drupal_rce_payload_indicators():
+    """Drupalgeddon2 bodies usually pair a render-array indicator
+    with a PHP exec primitive. Both flags fire so triage can sort
+    fingerprint hits from RCE attempts."""
+    for needle in (
+        b"passthru('id')",
+        b"system('whoami')",
+        b"shell_exec('cat /etc/passwd')",
+        b"phpinfo();",
+        b"base64_decode('...')",
+    ):
+        assert any(
+            ind in needle.lower() for ind in tbenv._DRUPAL_RCE_PAYLOAD_INDICATORS
+        )
+
+
+def test_render_drupal_user_register_html_shape():
+    body = tbenv.render_drupal_user_register_html(
+        "9.5.11", "form-build-XYZ", "form-token-ABC",
+    ).decode("utf-8")
+    assert 'Generator' in body
+    assert 'Drupal 9.5.11' in body
+    assert 'user-register-form' in body
+    assert 'form-build-XYZ' in body
+    assert 'form-token-ABC' in body
+    assert 'name="mail"' in body
+    assert 'name="form_token"' in body
+
+
+def test_render_drupal_user_register_html_version_sanitised():
+    """A version string with shell metas / HTML must not bleed into
+    the rendered body — flux's own response must never ship
+    attacker-controlled tokens that downstream pipelines could
+    re-render unsafely."""
+    body = tbenv.render_drupal_user_register_html(
+        "9.5.11<script>alert(1)</script>", "fb", "ft",
+    ).decode("utf-8")
+    assert "<script>" not in body
+    assert "alert(1)" not in body
+
+
+def test_render_drupal_ajax_response_is_valid_json():
+    import json as _json
+    body = tbenv.render_drupal_ajax_response().decode("utf-8")
+    parsed = _json.loads(body)
+    assert isinstance(parsed, list)
+    assert parsed[0]["command"] == "insert"
+    assert parsed[0]["method"] == "replaceWith"
+
+
+def test_render_drupal_settings_php_includes_per_hit_db_password():
+    """Per-hit synthetic DB password — never a fixed literal across
+    sensors. Two back-to-back renders must produce different
+    passwords."""
+    aws = {"aws": {
+        "awsAccessKeyId": "AKIAEXAMPLE",
+        "awsSecretAccessKey": "SECRETEXAMPLE",
+        "awsSessionToken": "TOKENEXAMPLE",
+    }}
+    a = tbenv.render_drupal_settings_php(aws).decode("utf-8")
+    b = tbenv.render_drupal_settings_php(aws).decode("utf-8")
+    # Both contain the canary creds
+    assert "AKIAEXAMPLE" in a
+    assert "AKIAEXAMPLE" in b
+    # Both look like Drupal settings.php
+    assert "$databases['default']['default']" in a
+    assert "$settings['hash_salt']" in a
+    # DB password is per-hit unique
+    import re as _re
+    m_a = _re.search(r"'password' => '([^']+)'", a)
+    m_b = _re.search(r"'password' => '([^']+)'", b)
+    assert m_a and m_b
+    assert m_a.group(1) != m_b.group(1), (
+        "DB password must be per-hit unique — two consecutive renders "
+        "produced the same value, which is a fleet-wide fingerprint."
+    )
+
+
+def test_drupal_settings_php_is_a_canary_trap():
+    assert "/sites/default/settings.php" in tbenv._TRAP_BY_PATH
+    assert "/sites/default/settings.php.bak" in tbenv._TRAP_BY_PATH
+    assert "/sites/default/default.settings.php" in tbenv._TRAP_BY_PATH
+    assert "/drupal/sites/default/settings.php" in tbenv._TRAP_BY_PATH
+
+
+async def test_dispatch_drupal_register_get_returns_form(flux_client):
+    resp = await flux_client.get(
+        "/user/register",
+        headers={"X-Forwarded-For": "203.0.113.50", "Host": "drupal.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "user-register-form" in text
+    assert "Drupal" in text
+    assert resp.headers.get("X-Generator", "").startswith("Drupal")
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "drupal-user-register-probe"
+    assert entry["drupalPath"] == "/user/register"
+    assert entry["drupalHasDrupalgeddon2"] is False
+
+
+async def test_dispatch_drupal_register_post_drupalgeddon2_logs_flags(flux_client):
+    """Real CVE-2018-7600 shape: query-string element_parents + body
+    with mail[#post_render]=passthru and the cmd as #markup."""
+    body = (
+        b"mail%5B%23post_render%5D%5B%5D=passthru"
+        b"&mail%5B%23markup%5D=id"
+        b"&mail%5B%23type%5D=markup"
+        b"&form_id=user_register_form"
+    )
+    resp = await flux_client.post(
+        "/user/register?element_parents=account/mail/%23value"
+        "&ajax_form=1&_wrapper_format=drupal_ajax",
+        data=body,
+        headers={
+            "X-Forwarded-For": "203.0.113.51",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "drupal-user-register-rce-attempt"
+    assert entry["drupalHasDrupalgeddon2"] is True
+    assert entry["drupalHasRcePayload"] is True
+    assert "bodyPreview" in entry
+    assert "queryPreview" in entry
+
+
+async def test_dispatch_drupal_register_post_drupalgeddon2_no_rce_payload(flux_client):
+    """Drupalgeddon2-shape query but no PHP exec primitive in body —
+    triage should fire the drupalgeddon2 tag but not the rce-attempt one."""
+    resp = await flux_client.post(
+        "/user/register?element_parents=account/mail/%23value&ajax_form=1",
+        data=b"mail=test%40example.com&name=test",
+        headers={
+            "X-Forwarded-For": "203.0.113.52",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "drupal-user-register-drupalgeddon2"
+    assert entry["drupalHasDrupalgeddon2"] is True
+    assert entry["drupalHasRcePayload"] is False
+
+
+async def test_dispatch_drupal_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "DRUPAL_ENABLED", False)
+    resp = await flux_client.get(
+        "/user/register", headers={"X-Forwarded-For": "203.0.113.53"},
+    )
+    # Falls through to webapp-form? No — `/user/register` (singular) isn't
+    # in webapp-form's path set, so it should land in not-handled.
+    assert resp.status == 404
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "not-handled"
+
+
+# --- Spring Cloud Gateway extension (CVE-2022-22947) ---
+
+
+def test_spring_gateway_enabled_by_default():
+    assert tbenv.SPRING_GATEWAY_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/actuator/gateway/routes",
+    "/actuator/gateway/routes/",
+    "/actuator/gateway/routes/foo",
+    "/actuator/gateway/refresh",
+    "/actuator/gateway/globalfilters",
+    "/actuator/gateway/routefilters",
+    "/actuator/gateway/routepredicates",
+    "/Actuator/Gateway/Routes",  # case-insensitive
+    # Reverse-proxy aliases that already host the rest of the
+    # actuator-env trap surface.
+    "/manage/gateway/routes",
+    "/management/gateway/routes",
+    "/api/actuator/gateway/routes",
+])
+def test_spring_gateway_matches_observed_probes(path):
+    assert tbenv.is_spring_gateway_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    "/",
+    "/.env",
+    "/actuator/env",  # the existing CanaryTrap — must not be stolen
+    "/actuator/heapdump",
+    "/actuator/mappings",
+    "/gateway",
+    "/api/gateway",
+])
+def test_spring_gateway_non_match(path):
+    assert not tbenv.is_spring_gateway_path(path)
+
+
+def test_spring_gateway_does_not_steal_actuator_env():
+    """`/actuator/env` is already an actuator-env CanaryTrap — the new
+    spring-gateway handler must not shadow it."""
+    assert not tbenv.is_spring_gateway_path("/actuator/env")
+    assert "/actuator/env" in tbenv._TRAP_BY_PATH
+
+
+def test_spring_gateway_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "SPRING_GATEWAY_ENABLED", False)
+    assert not tbenv.is_spring_gateway_path("/actuator/gateway/routes")
+
+
+def test_spring_gateway_spel_indicators_match_real_payloads():
+    """CVE-2022-22947 SpEL payloads always include `#{T(...)` or
+    `T(java.lang.Runtime).getRuntime().exec(...)`; the triage flag
+    should fire on every variant."""
+    for needle in (
+        b'#{T(java.lang.Runtime).getRuntime().exec("id")}',
+        b'#{T(java.io.BufferedReader)}',
+        b'new java.lang.ProcessBuilder("sh","-c","cmd")',
+        b'java.lang.Runtime.getRuntime().exec("id")',
+        b'${T(java.lang.Runtime).getRuntime()}',
+    ):
+        assert any(
+            ind in needle.lower() for ind in tbenv._SPRING_GATEWAY_SPEL_INDICATORS
+        )
+
+
+def test_render_spring_gateway_routes_get_embeds_canary():
+    """The fake routes list must embed the per-request AWS canary
+    in the `metadata.adminApiKey` slot — that's where a credential
+    harvester greps for `AKIA` patterns."""
+    import json as _json
+    aws = {"aws": {
+        "awsAccessKeyId": "AKIAEXAMPLE12345",
+        "awsSecretAccessKey": "secretexample/long",
+        "awsSessionToken": "",
+    }}
+    body = tbenv.render_spring_gateway_routes_get(aws).decode("utf-8")
+    parsed = _json.loads(body)
+    assert isinstance(parsed, list)
+    # First route must carry the canary in its metadata
+    md = parsed[0]["route_definition"]["metadata"]
+    assert md["adminApiKey"] == "AKIAEXAMPLE12345"
+    assert md["adminApiSecret"] == "secretexample/long"
+
+
+def test_render_spring_gateway_route_created_sanitises_id():
+    """A route id with shell metacharacters / path traversal must be
+    sanitised before being echoed back."""
+    body = tbenv.render_spring_gateway_route_created(
+        "../../../etc/passwd; rm -rf /",
+    ).decode("utf-8")
+    assert "rm -rf" not in body
+    assert "../" not in body
+    assert ";" not in body
+    assert "etc_passwd" in body or "etc" in body
     body = tbenv.render_confluence_editor_preload_html("7.18.1").decode("utf-8")
     assert "editor-preload-container" in body
     assert "7.18.1" in body
