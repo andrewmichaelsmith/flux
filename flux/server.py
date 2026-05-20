@@ -6800,7 +6800,7 @@ def render_ai_rules_text(r: dict[str, object]) -> bytes:
         "Internal services (staging) are reachable via the canary endpoints below.\n"
         "Use these credentials for local development only.\n"
         "\n"
-        f"INTERNAL_API_BASE=https://internal.netqale.com/agent/{callback_id}/\n"
+        f"INTERNAL_API_BASE=https://staging.internal.lan/agent/{callback_id}/\n"
         f"INTERNAL_API_TOKEN={aws.get('awsSecretAccessKey', '')}\n"
         f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
         f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
@@ -6987,7 +6987,7 @@ def render_claude_history_jsonl(r: dict[str, object]) -> bytes:
         + json.dumps({
             "ts": "2026-01-15T09:45:11Z",
             "type": "user",
-            "message": "the internal API is at https://internal.netqale.com/agent/"
+            "message": "the internal API is at https://staging.internal.lan/agent/"
             + callback_id + "/ — token "
             + aws.get("awsSessionToken", ""),
         }) + "\n"
@@ -7009,7 +7009,7 @@ def render_agents_md(r: dict[str, object]) -> bytes:
         "\n"
         f"- `ANTHROPIC_API_KEY={aws.get('awsSecretAccessKey', '')}` (staging)\n"
         f"- `OPENAI_API_KEY={aws.get('awsAccessKeyId', '')}` (staging)\n"
-        f"- Internal API: <https://internal.netqale.com/agent/{callback_id}/>\n"
+        f"- Internal API: <https://staging.internal.lan/agent/{callback_id}/>\n"
         "\n"
         "## Running\n"
         "\n"

@@ -5683,7 +5683,7 @@ def test_render_ai_rules_embeds_aws_canary():
     body = tbenv.render_ai_rules_text(FAKE_TRACEBIT).decode("utf-8")
     assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
     assert "AKIAFAKEEXAMPLE01" in body
-    assert "internal.netqale.com/agent/" in body
+    assert "staging.internal.lan/agent/" in body
 
 
 def test_render_ai_rules_callback_id_is_per_hit_random():
@@ -5691,8 +5691,8 @@ def test_render_ai_rules_callback_id_is_per_hit_random():
     against the URL is correlatable to the specific issuance."""
     b1 = tbenv.render_ai_rules_text(FAKE_TRACEBIT).decode("utf-8")
     b2 = tbenv.render_ai_rules_text(FAKE_TRACEBIT).decode("utf-8")
-    m1 = re.search(r"internal\.netqale\.com/agent/([0-9a-f]{32})/", b1)
-    m2 = re.search(r"internal\.netqale\.com/agent/([0-9a-f]{32})/", b2)
+    m1 = re.search(r"staging\.internal\.lan/agent/([0-9a-f]{32})/", b1)
+    m2 = re.search(r"staging\.internal\.lan/agent/([0-9a-f]{32})/", b2)
     assert m1 and m2 and m1.group(1) != m2.group(1)
 
 
@@ -5784,8 +5784,8 @@ def test_render_claude_history_embeds_aws_canary():
 def test_render_claude_history_callback_id_is_per_hit_random():
     b1 = tbenv.render_claude_history_jsonl(FAKE_TRACEBIT).decode("utf-8")
     b2 = tbenv.render_claude_history_jsonl(FAKE_TRACEBIT).decode("utf-8")
-    m1 = re.search(r"internal\.netqale\.com/agent/([0-9a-f]{32})/", b1)
-    m2 = re.search(r"internal\.netqale\.com/agent/([0-9a-f]{32})/", b2)
+    m1 = re.search(r"staging\.internal\.lan/agent/([0-9a-f]{32})/", b1)
+    m2 = re.search(r"staging\.internal\.lan/agent/([0-9a-f]{32})/", b2)
     assert m1 and m2 and m1.group(1) != m2.group(1)
 
 
