@@ -37,7 +37,7 @@ for the canaries: free tier, sign up and drop the key in the env var.
 | Fake `/.env` canary issuer | Mints a per-request Tracebit Community canary and returns it as a `.env`-style payload | yes |
 | Fake `/.git/` repository | Serves a loose-object git tree whose `config/secrets.yml` embeds a canary AND whose `.git/config` `[remote "origin"] url` embeds the same canary as HTTP Basic userinfo — so scrapers that only fetch `.git/config` (without cloning) still walk away with a live canary. Matches `<prefix>/.git/*` (apps deployed at subpaths) and is case-insensitive on the `.git` segment; ships a minimal-valid `/.git/index` (DIRC header) so `git-dumper`-style tools don't bail on a missing index. Per-IP cached so fan-out sees a consistent tree | yes |
 | Canary file traps | Plausible file-format responses for `/wp-config.php`, `/backup.sql`, `/id_rsa`, `/.aws/credentials`, `/api/v4/user`, `/users/sign_in`, `/actuator/env`, `/.vscode/sftp.json`, GCP service-account JSON variants (`/.config/gcloud/application_default_credentials.json`, `/firebase-adminsdk.json`, …), CI/CD config files, Terraform tfstate (`/.terraform/terraform.tfstate`, `/terraform.tfstate(.backup)` — [docs](./docs/terraform-tfstate.md)), … — full table [below](#canary-file-trap-table) | yes |
-| AI-credential-file canaries | AI editor / coding-assistant configs (`/.claude/settings.json`, `/.cline/{settings,mcp_settings}.json`, `/.continue/config.json`, `/.cursor/mcp.json`, `/.aider.conf.yml`, `/.sourcegraph/cody.json`, `/.config/open-interpreter/config.yaml`, …) plus AI infrastructure / proxy configs (`/litellm_config.yaml`, `/langsmith.env`, `/.huggingface/token`, `/.streamlit/secrets.toml`, `/baseten.yaml`, generic MCP configs, `/.bito/`, `/.codeium/`, `/.roost/`, `/cohere_config.json`, …) — listed in the same table; broken out in the footnote because Tracebit has no LLM canary type yet | yes |
+| AI-credential-file canaries | AI editor / coding-assistant configs (`/.claude/{settings,settings.local,config,history.jsonl,.credentials,CLAUDE.md}`, `/.claude.json`, `/.codex/auth.json`, `/.gemini/{oauth_creds,settings}.json`, `/.cline/{settings,mcp_settings}.json`, `/.continue/config.json`, `/.cursor/mcp.json`, `/.cursor/User/globalStorage/state.vscdb`, `/.cursorrules`, `/.windsurfrules`, `/.clinerules`, `/.aider.conf.yml`, `/.sourcegraph/cody.json`, `/.config/open-interpreter/config.yaml`, `/AGENTS.md`, …) plus per-vendor LLM API-key files (`/.anthropic/api_key`, `/.dashscope/api_key`, `/.deepseek/config.json`, `/.kimi/`, `/.moonshot/settings.json`) plus AI infrastructure / proxy configs (`/litellm_config.yaml`, `/langsmith.env`, `/.huggingface/token`, `/.streamlit/secrets.toml`, `/baseten.yaml`, generic MCP configs, `/.bito/`, `/.codeium/`, `/.roost/`, `/cohere_config.json`, …) and niche coding-agent tooling (`/.openclaw/`, `/root/.config/opencode/`, `/root/.config/vastai/`, `/root/.nerve/`, `/root/.spawnrc`, `/root/.config/moltbook/`) — listed in the same table; broken out in the footnote because Tracebit has no LLM canary type yet | yes |
 | Fake webshell | Plausible File Manager on known `*.php` shell probe paths plus shell-jacking regex families (`/.well-known/<name>.php`, `/.trash<N>/*`, `/.tmb/`, `/.dj/`, `/.alf/`, …); simulates `id` / `whoami` / `uname -a` / `cat /etc/passwd` on follow-up commands — [docs](./docs/fake-webshell.md) | no |
 | Fake file-upload responder | Prefix-tolerant matchers for the legacy PHP file-upload libraries scanners walk (`<prefix>/kcfinder/upload.php`, `<prefix>/jquery.filer/php/upload.php`, `<prefix>/jquery-file-upload/server/php/`); GET returns presence-detection-friendly HTML/JSON/README, POST parses multipart parts and returns the per-family "uploaded OK" envelope. Logs `fileUploadFamily` / filenames / per-part content-types / `fileUploadHasPhpShell` so payload-bearing uploads are easy to triage. (CVE-2018-15706 / CVE-2018-9206 bait) — [docs](./docs/fake-file-upload.md) | no |
 | Modular tarpit + fingerprinting | Slow-drip response plus six fingerprinting modules (cookie, ETag, redirect chain, variable drip, Content-Length mismatch, DNS callback); fires on `.env` variants and on configurable first-contact paths (`/`, `/index.html`, `/robots.txt`, …) | no |
@@ -199,6 +199,25 @@ case-insensitive exact matches.
 | Anthropic flat config | `/anthropic.json` | `aws` (†) | `anthropic-config-flat` |
 | Generic AI provider config | `/cohere_config.json`, `/tabnine_config.json`, `/.bito/config.json`, `/.codeium/config.json`, `/.roost/config.json`, `/pinecone_config.json`, `/.lobechat/config.json`, `/chatgpt-next-web.json` | `aws` (†) | `ai-provider-config` |
 | Baseten model deploy config | `/baseten.yaml` | `aws` (†) | `baseten-config` |
+| OpenAI Codex CLI auth | `/.codex/auth.json`, `/root/.codex/auth.json` | `aws` (†) | `codex-auth` |
+| Gemini CLI OAuth creds | `/.gemini/oauth_creds.json`, `/root/.gemini/oauth_creds.json` | `aws` (†) | `gemini-oauth-creds` |
+| Gemini CLI settings | `/.gemini/settings.json`, `/root/.gemini/settings.json` | `aws` (†) | `gemini-settings` |
+| AI-IDE workspace rules | `/.cursorrules`, `/.clinerules`, `/.windsurfrules` | `aws` (†) | `ai-ide-rules` |
+| Cursor IDE state DB | `/.cursor/User/globalStorage/state.vscdb` | `aws` (†) | `cursor-state-vscdb` |
+| DashScope plain api_key | `/.dashscope/api_key` | `aws` (†) | `dashscope-api-key` |
+| Anthropic plain api_key | `/.anthropic/api_key` | `aws` (†) | `anthropic-api-key` |
+| DeepSeek config | `/.deepseek/config.json` | `aws` (†) | `deepseek-config` |
+| Kimi / Moonshot credentials | `/.kimi/credentials/kimi-code.json`, `/.kimi/kimi-code.json`, `/.moonshot/settings.json` | `aws` (†) | `kimi-credentials` |
+| OpenClaw config | `/.openclaw/openclaw.json`, `/root/.openclaw/openclaw.json` | `aws` (†) | `openclaw-config` |
+| OpenCode config | `/root/.config/opencode/config.json` | `aws` (†) | `opencode-config` |
+| vast.ai credentials | `/root/.config/vastai/credentials.json` | `aws` (†) | `vastai-credentials` |
+| Nerve agent config | `/root/.nerve/config.yaml` | `aws` (†) | `nerve-config` |
+| Spawn CLI rc | `/root/.spawnrc` | `aws` (†) | `spawnrc` |
+| MoltBook credentials | `/root/.config/moltbook/credentials.json` | `aws` (†) | `moltbook-credentials` |
+| Claude Code top-level config | `/.claude.json`, `/root/.claude.json`, `/.claude/config.json`, `/.claude/settings.local.json` | `aws` (†) | `claude-config` |
+| Claude Code history | `/.claude/history.jsonl` | `aws` (†) | `claude-history` |
+| Root-home Claude credentials | `/root/.claude/.credentials.json` | `aws` (†) | `claude-credentials-root` |
+| Agent instruction files | `/AGENTS.md`, `/.claude/CLAUDE.md`, `/root/.claude/CLAUDE.md` | `aws` (†) | `agents-md` |
 
 `/users/sign_in` returns the cookie canary as `Set-Cookie:
 _gitlab_session=<value>`. `/api/v4/user` embeds the username/password

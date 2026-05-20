@@ -6725,6 +6725,301 @@ def render_baseten_yaml(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+# --- AI-IDE credential dictionary expansion (May 2026) -------------------
+#
+# Scanner dictionaries spotted in mid-May 2026 broadened further to cover
+# current-generation AI-IDE CLIs (OpenAI Codex, Google Gemini CLI), per-
+# vendor LLM API-key files (DashScope, DeepSeek, Moonshot/Kimi), and a
+# long tail of niche coding-assistant configs (OpenClaw, OpenCode,
+# vast.ai, Nerve, Spawn, MoltBook). Two-IP coordinated 116-path sweeps
+# observed; renderers below ship the same AWS Tracebit canary dressed in
+# each tool's documented config shape — same caveat as the earlier
+# expansion: a key-format-filtering harvester drops the value as
+# obviously-fake, a field-name harvester (`api_key`, `OPENAI_API_KEY`,
+# `access_token`) still serializes and ships, tripping the AWS canary on
+# replay. The probe is the primary intel either way.
+
+
+def render_codex_auth_json(r: dict[str, object]) -> bytes:
+    # OpenAI Codex CLI `~/.codex/auth.json`. The real file holds an
+    # OPENAI_API_KEY plus the OAuth id/access/refresh-token triple from
+    # the device-code flow Codex CLI uses for ChatGPT-account sign-in.
+    aws = _aws(r)
+    return json.dumps({
+        "OPENAI_API_KEY": aws.get("awsAccessKeyId", ""),
+        "tokens": {
+            "id_token": aws.get("awsSessionToken", ""),
+            "access_token": aws.get("awsAccessKeyId", ""),
+            "refresh_token": aws.get("awsSecretAccessKey", ""),
+            "account_id": "user-canary",
+        },
+        "last_refresh": "2026-01-01T00:00:00.000Z",
+    }, indent=2).encode("utf-8")
+
+
+def render_gemini_oauth_creds_json(r: dict[str, object]) -> bytes:
+    # Google Gemini CLI `~/.gemini/oauth_creds.json`. Stores Google OAuth
+    # refresh + access tokens after `gemini auth`. Standard
+    # google-auth-library JSON shape.
+    aws = _aws(r)
+    return json.dumps({
+        "access_token": aws.get("awsAccessKeyId", ""),
+        "refresh_token": aws.get("awsSecretAccessKey", ""),
+        "scope": "https://www.googleapis.com/auth/cloud-platform openid",
+        "token_type": "Bearer",
+        "id_token": aws.get("awsSessionToken", ""),
+        "expiry_date": 4102444800000,
+    }, indent=2).encode("utf-8")
+
+
+def render_gemini_settings_json(r: dict[str, object]) -> bytes:
+    # Google Gemini CLI `~/.gemini/settings.json` — model + provider
+    # config; some workflows put the API key here directly.
+    aws = _aws(r)
+    return json.dumps({
+        "model": "gemini-2.0-flash-exp",
+        "apiKey": aws.get("awsSecretAccessKey", ""),
+        "GOOGLE_API_KEY": aws.get("awsAccessKeyId", ""),
+        "selectedAuthType": "oauth-personal",
+        "theme": "Default",
+    }, indent=2).encode("utf-8")
+
+
+def render_ai_rules_text(r: dict[str, object]) -> bytes:
+    # `.cursorrules` / `.windsurfrules` / `.clinerules` — plain-text
+    # instruction files attached to the IDE workspace. The interesting
+    # thing for a scanner is that operators routinely paste API keys and
+    # internal URLs into these to "let the agent reach our staging".
+    # Per-hit canary URL embeds a uuid we can correlate to the probe.
+    aws = _aws(r)
+    callback_id = uuid.uuid4().hex
+    return (
+        "# Project agent rules\n"
+        "\n"
+        "Always run pytest before suggesting code changes.\n"
+        "Internal services (staging) are reachable via the canary endpoints below.\n"
+        "Use these credentials for local development only.\n"
+        "\n"
+        f"INTERNAL_API_BASE=https://internal.netqale.com/agent/{callback_id}/\n"
+        f"INTERNAL_API_TOKEN={aws.get('awsSecretAccessKey', '')}\n"
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        "\n"
+        "Prefer the staging Postgres over the production one.\n"
+    ).encode("utf-8")
+
+
+def render_cursor_state_vscdb(r: dict[str, object]) -> bytes:
+    # Cursor IDE persists workspace state — including the OAuth session
+    # blob, recent API keys, and per-tab context — at
+    # `~/.cursor/User/globalStorage/state.vscdb`. The file is a real
+    # SQLite database (vscode keeps a `cursor-data.ItemTable` k/v table).
+    # A `cat`-and-exfil scanner ships the raw bytes; a sqlite-aware
+    # scanner opens it and grep'es the table — both paths walk away
+    # with the canary tokens. We use `sqlite3.Connection.serialize()`
+    # (Python 3.11+) to produce a byte-identical-shape db without I/O.
+    import sqlite3
+    aws = _aws(r)
+    conn = sqlite3.connect(":memory:")
+    try:
+        c = conn.cursor()
+        c.execute("CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)")
+        rows = [
+            ("cursor.composer.apiKey", aws.get("awsAccessKeyId", "")),
+            ("cursor.session.accessToken", aws.get("awsSecretAccessKey", "")),
+            ("cursor.session.refreshToken", aws.get("awsSessionToken", "")),
+            ("anthropic.apiKey", aws.get("awsSecretAccessKey", "")),
+            ("openai.apiKey", aws.get("awsAccessKeyId", "")),
+        ]
+        c.executemany("INSERT INTO ItemTable(key, value) VALUES (?, ?)", rows)
+        conn.commit()
+        return bytes(conn.serialize())
+    finally:
+        conn.close()
+
+
+def render_plain_canary_api_key(r: dict[str, object]) -> bytes:
+    # Plain-text-only files like `/.anthropic/api_key` and
+    # `/.dashscope/api_key` — single line, no newline, just the key.
+    # Most "is there a key here?" scanners just cat-and-exfil; the
+    # canary value is the whole file.
+    aws = _aws(r)
+    return aws.get("awsAccessKeyId", "").encode("utf-8")
+
+
+def render_deepseek_config_json(r: dict[str, object]) -> bytes:
+    # DeepSeek CLI / SDK config — provider key + base URL.
+    aws = _aws(r)
+    return json.dumps({
+        "api_key": aws.get("awsSecretAccessKey", ""),
+        "DEEPSEEK_API_KEY": aws.get("awsAccessKeyId", ""),
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-coder",
+    }, indent=2).encode("utf-8")
+
+
+def render_kimi_credentials_json(r: dict[str, object]) -> bytes:
+    # Moonshot / Kimi / `kimi-code` credentials file — provider key +
+    # optional OAuth refresh token for the kimi-code CLI.
+    aws = _aws(r)
+    return json.dumps({
+        "api_key": aws.get("awsSecretAccessKey", ""),
+        "MOONSHOT_API_KEY": aws.get("awsAccessKeyId", ""),
+        "refresh_token": aws.get("awsSessionToken", ""),
+        "base_url": "https://api.moonshot.cn/v1",
+        "model": "moonshot-v1-32k",
+    }, indent=2).encode("utf-8")
+
+
+def render_openclaw_json(r: dict[str, object]) -> bytes:
+    # OpenClaw config — provider api_key + workspace env.
+    aws = _aws(r)
+    return json.dumps({
+        "apiKey": aws.get("awsSecretAccessKey", ""),
+        "OPENAI_API_KEY": aws.get("awsAccessKeyId", ""),
+        "ANTHROPIC_API_KEY": aws.get("awsSecretAccessKey", ""),
+        "provider": "anthropic",
+        "model": "claude-3-5-sonnet-20241022",
+        "workspace": "/srv/app",
+    }, indent=2).encode("utf-8")
+
+
+def render_opencode_config_json(r: dict[str, object]) -> bytes:
+    # OpenCode CLI `~/.config/opencode/config.json` — provider keys.
+    aws = _aws(r)
+    return json.dumps({
+        "provider": {
+            "anthropic": {"api_key": aws.get("awsSecretAccessKey", "")},
+            "openai": {"api_key": aws.get("awsAccessKeyId", "")},
+        },
+        "model": "anthropic/claude-3-5-sonnet-20241022",
+        "autoshare": False,
+    }, indent=2).encode("utf-8")
+
+
+def render_vastai_credentials_json(r: dict[str, object]) -> bytes:
+    # vast.ai CLI — GPU rental. Stores an API key with billing access.
+    aws = _aws(r)
+    return json.dumps({
+        "api_key": aws.get("awsAccessKeyId", ""),
+        "api_secret": aws.get("awsSecretAccessKey", ""),
+        "user_id": 421337,
+        "base_url": "https://console.vast.ai/api/v0",
+    }, indent=2).encode("utf-8")
+
+
+def render_nerve_config_yaml(r: dict[str, object]) -> bytes:
+    # Nerve agent runtime `~/.nerve/config.yaml` — provider + key.
+    aws = _aws(r)
+    return (
+        "generator: anthropic\n"
+        f"anthropic_api_key: {aws.get('awsSecretAccessKey', '')}\n"
+        f"openai_api_key: {aws.get('awsAccessKeyId', '')}\n"
+        "model: claude-3-5-sonnet-20241022\n"
+        "max_steps: 50\n"
+        "log_level: info\n"
+    ).encode("utf-8")
+
+
+def render_spawnrc(r: dict[str, object]) -> bytes:
+    # Spawn CLI `.spawnrc` — env-var-style.
+    aws = _aws(r)
+    return (
+        f"SPAWN_API_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"OPENAI_API_KEY={aws.get('awsAccessKeyId', '')}\n"
+        f"ANTHROPIC_API_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        "SPAWN_MODEL=claude-3-5-sonnet-20241022\n"
+        "SPAWN_AUTO_RUN=false\n"
+    ).encode("utf-8")
+
+
+def render_moltbook_credentials_json(r: dict[str, object]) -> bytes:
+    # MoltBook agent credentials.
+    aws = _aws(r)
+    return json.dumps({
+        "api_key": aws.get("awsSecretAccessKey", ""),
+        "access_token": aws.get("awsAccessKeyId", ""),
+        "refresh_token": aws.get("awsSessionToken", ""),
+        "model": "claude-3-5-sonnet-20241022",
+    }, indent=2).encode("utf-8")
+
+
+def render_claude_config_json(r: dict[str, object]) -> bytes:
+    # Claude Code top-level `~/.claude.json` / `~/.claude/config.json` /
+    # `~/.claude/settings.local.json`. Real fields include `numStartups`,
+    # `installMethod`, plus a `customApiKeyResponses` block where some
+    # users persist non-OAuth provider keys.
+    aws = _aws(r)
+    return json.dumps({
+        "numStartups": 42,
+        "installMethod": "npm",
+        "autoUpdates": True,
+        "theme": "dark",
+        "customApiKeyResponses": {
+            "apiKeyHelper": "/usr/local/bin/anthropic-api-key-helper",
+        },
+        "primaryApiKey": aws.get("awsSecretAccessKey", ""),
+        "anthropicApiKey": aws.get("awsAccessKeyId", ""),
+        "env": {
+            "ANTHROPIC_API_KEY": aws.get("awsSecretAccessKey", ""),
+            "AWS_ACCESS_KEY_ID": aws.get("awsAccessKeyId", ""),
+            "AWS_SECRET_ACCESS_KEY": aws.get("awsSecretAccessKey", ""),
+        },
+    }, indent=2).encode("utf-8")
+
+
+def render_claude_history_jsonl(r: dict[str, object]) -> bytes:
+    # Claude Code `~/.claude/history.jsonl` — one JSON object per line,
+    # most recent user messages. A scanner that opens this hoping for
+    # "leaked prompt context" is looking for keys + URLs embedded in
+    # prior shell sessions; we ship two plausible-looking lines with
+    # the canary inline.
+    aws = _aws(r)
+    callback_id = uuid.uuid4().hex
+    return (
+        json.dumps({
+            "ts": "2026-01-15T09:42:00Z",
+            "type": "user",
+            "message": "deploy the staging worker — env vars are AWS_ACCESS_KEY_ID="
+            + aws.get("awsAccessKeyId", "")
+            + " AWS_SECRET_ACCESS_KEY=" + aws.get("awsSecretAccessKey", ""),
+        }) + "\n"
+        + json.dumps({
+            "ts": "2026-01-15T09:45:11Z",
+            "type": "user",
+            "message": "the internal API is at https://internal.netqale.com/agent/"
+            + callback_id + "/ — token "
+            + aws.get("awsSessionToken", ""),
+        }) + "\n"
+    ).encode("utf-8")
+
+
+def render_agents_md(r: dict[str, object]) -> bytes:
+    # `AGENTS.md` / `.claude/CLAUDE.md` — agent instruction file. Real
+    # repos commit these; the operator-side gotcha is people pasting
+    # internal URLs and provider keys into them.
+    aws = _aws(r)
+    callback_id = uuid.uuid4().hex
+    return (
+        "# Agent instructions\n"
+        "\n"
+        "This repository is wired up for an internal coding agent.\n"
+        "\n"
+        "## Credentials\n"
+        "\n"
+        f"- `ANTHROPIC_API_KEY={aws.get('awsSecretAccessKey', '')}` (staging)\n"
+        f"- `OPENAI_API_KEY={aws.get('awsAccessKeyId', '')}` (staging)\n"
+        f"- Internal API: <https://internal.netqale.com/agent/{callback_id}/>\n"
+        "\n"
+        "## Running\n"
+        "\n"
+        "```bash\n"
+        "pytest -q\n"
+        "make deploy-staging\n"
+        "```\n"
+    ).encode("utf-8")
+
+
 def render_boto_config(r: dict[str, object]) -> bytes:
     """`~/.boto` — INI-style config for the AWS Python SDK
     (`boto`/`boto3`/`gsutil`). The `[Credentials]` section carries
@@ -7737,6 +8032,154 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_baseten_yaml,
         "application/x-yaml; charset=utf-8",
+    ),
+    # AI-IDE credential dictionary expansion (May 2026). See comment block
+    # above `render_codex_auth_json` for context.
+    CanaryTrap(
+        "codex-auth",
+        ("/.codex/auth.json", "/root/.codex/auth.json"),
+        ("aws",),
+        render_codex_auth_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "gemini-oauth-creds",
+        ("/.gemini/oauth_creds.json", "/root/.gemini/oauth_creds.json"),
+        ("aws",),
+        render_gemini_oauth_creds_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "gemini-settings",
+        ("/.gemini/settings.json", "/root/.gemini/settings.json"),
+        ("aws",),
+        render_gemini_settings_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "ai-ide-rules",
+        ("/.cursorrules", "/.clinerules", "/.windsurfrules"),
+        ("aws",),
+        render_ai_rules_text,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "cursor-state-vscdb",
+        ("/.cursor/user/globalstorage/state.vscdb",),
+        ("aws",),
+        render_cursor_state_vscdb,
+        "application/octet-stream",
+    ),
+    CanaryTrap(
+        "dashscope-api-key",
+        ("/.dashscope/api_key",),
+        ("aws",),
+        render_plain_canary_api_key,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "anthropic-api-key",
+        ("/.anthropic/api_key",),
+        ("aws",),
+        render_plain_canary_api_key,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "deepseek-config",
+        ("/.deepseek/config.json",),
+        ("aws",),
+        render_deepseek_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "kimi-credentials",
+        (
+            "/.kimi/credentials/kimi-code.json",
+            "/.kimi/kimi-code.json",
+            "/.moonshot/settings.json",
+        ),
+        ("aws",),
+        render_kimi_credentials_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "openclaw-config",
+        ("/.openclaw/openclaw.json", "/root/.openclaw/openclaw.json"),
+        ("aws",),
+        render_openclaw_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "opencode-config",
+        ("/root/.config/opencode/config.json",),
+        ("aws",),
+        render_opencode_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "vastai-credentials",
+        ("/root/.config/vastai/credentials.json",),
+        ("aws",),
+        render_vastai_credentials_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "nerve-config",
+        ("/root/.nerve/config.yaml",),
+        ("aws",),
+        render_nerve_config_yaml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "spawnrc",
+        ("/root/.spawnrc",),
+        ("aws",),
+        render_spawnrc,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "moltbook-credentials",
+        ("/root/.config/moltbook/credentials.json",),
+        ("aws",),
+        render_moltbook_credentials_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "claude-config",
+        (
+            "/.claude.json",
+            "/root/.claude.json",
+            "/.claude/config.json",
+            "/.claude/settings.local.json",
+        ),
+        ("aws",),
+        render_claude_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "claude-history",
+        ("/.claude/history.jsonl",),
+        ("aws",),
+        render_claude_history_jsonl,
+        "application/x-ndjson; charset=utf-8",
+    ),
+    CanaryTrap(
+        "claude-credentials-root",
+        ("/root/.claude/.credentials.json",),
+        ("aws",),
+        render_claude_credentials_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "agents-md",
+        (
+            "/agents.md",
+            "/.claude/claude.md",
+            "/root/.claude/claude.md",
+        ),
+        ("aws",),
+        render_agents_md,
+        "text/markdown; charset=utf-8",
     ),
 )
 

@@ -5611,6 +5611,231 @@ def test_render_baseten_yaml_embeds_aws_canary():
     assert "api_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
 
 
+# --- AI-IDE credential dictionary expansion (May 2026) ---
+
+
+def test_ai_ide_credential_paths_registered():
+    """May 2026 116-path AI-IDE credential dictionary: every observed path
+    routes to a canary trap."""
+    expected = {
+        "/.codex/auth.json": "codex-auth",
+        "/root/.codex/auth.json": "codex-auth",
+        "/.gemini/oauth_creds.json": "gemini-oauth-creds",
+        "/root/.gemini/oauth_creds.json": "gemini-oauth-creds",
+        "/.gemini/settings.json": "gemini-settings",
+        "/root/.gemini/settings.json": "gemini-settings",
+        "/.cursorrules": "ai-ide-rules",
+        "/.clinerules": "ai-ide-rules",
+        "/.windsurfrules": "ai-ide-rules",
+        "/.cursor/User/globalStorage/state.vscdb": "cursor-state-vscdb",
+        "/.dashscope/api_key": "dashscope-api-key",
+        "/.anthropic/api_key": "anthropic-api-key",
+        "/.deepseek/config.json": "deepseek-config",
+        "/.kimi/credentials/kimi-code.json": "kimi-credentials",
+        "/.kimi/kimi-code.json": "kimi-credentials",
+        "/.moonshot/settings.json": "kimi-credentials",
+        "/.openclaw/openclaw.json": "openclaw-config",
+        "/root/.openclaw/openclaw.json": "openclaw-config",
+        "/root/.config/opencode/config.json": "opencode-config",
+        "/root/.config/vastai/credentials.json": "vastai-credentials",
+        "/root/.nerve/config.yaml": "nerve-config",
+        "/root/.spawnrc": "spawnrc",
+        "/root/.config/moltbook/credentials.json": "moltbook-credentials",
+        "/.claude.json": "claude-config",
+        "/root/.claude.json": "claude-config",
+        "/.claude/config.json": "claude-config",
+        "/.claude/settings.local.json": "claude-config",
+        "/.claude/history.jsonl": "claude-history",
+        "/root/.claude/.credentials.json": "claude-credentials-root",
+        "/AGENTS.md": "agents-md",
+        "/.claude/CLAUDE.md": "agents-md",
+        "/root/.claude/CLAUDE.md": "agents-md",
+    }
+    for path, name in expected.items():
+        trap = tbenv.find_canary_trap(path)
+        assert trap is not None, f"missing trap for {path}"
+        assert trap.name == name, f"{path} mapped to {trap.name}, expected {name}"
+
+
+def test_render_codex_auth_embeds_aws_canary():
+    body = tbenv.render_codex_auth_json(FAKE_TRACEBIT)
+    payload = json.loads(body)
+    assert payload["OPENAI_API_KEY"] == "AKIAFAKEEXAMPLE01"
+    assert payload["tokens"]["refresh_token"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+def test_render_gemini_oauth_creds_embeds_aws_canary():
+    body = tbenv.render_gemini_oauth_creds_json(FAKE_TRACEBIT)
+    payload = json.loads(body)
+    assert payload["access_token"] == "AKIAFAKEEXAMPLE01"
+    assert payload["refresh_token"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["token_type"] == "Bearer"
+
+
+def test_render_gemini_settings_embeds_aws_canary():
+    body = tbenv.render_gemini_settings_json(FAKE_TRACEBIT)
+    payload = json.loads(body)
+    assert payload["apiKey"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["GOOGLE_API_KEY"] == "AKIAFAKEEXAMPLE01"
+
+
+def test_render_ai_rules_embeds_aws_canary():
+    body = tbenv.render_ai_rules_text(FAKE_TRACEBIT).decode("utf-8")
+    assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    assert "AKIAFAKEEXAMPLE01" in body
+    assert "internal.netqale.com/agent/" in body
+
+
+def test_render_ai_rules_callback_id_is_per_hit_random():
+    """The internal-API callback URL must be a per-hit uuid so a replay
+    against the URL is correlatable to the specific issuance."""
+    b1 = tbenv.render_ai_rules_text(FAKE_TRACEBIT).decode("utf-8")
+    b2 = tbenv.render_ai_rules_text(FAKE_TRACEBIT).decode("utf-8")
+    m1 = re.search(r"internal\.netqale\.com/agent/([0-9a-f]{32})/", b1)
+    m2 = re.search(r"internal\.netqale\.com/agent/([0-9a-f]{32})/", b2)
+    assert m1 and m2 and m1.group(1) != m2.group(1)
+
+
+def test_render_cursor_state_vscdb_is_real_sqlite_with_canary():
+    import sqlite3
+    import tempfile
+    body = tbenv.render_cursor_state_vscdb(FAKE_TRACEBIT)
+    assert body.startswith(b"SQLite format 3\x00"), "must look like a real SQLite db"
+    with tempfile.NamedTemporaryFile(suffix=".vscdb") as fp:
+        fp.write(body)
+        fp.flush()
+        conn = sqlite3.connect(fp.name)
+        try:
+            rows = dict(conn.execute("SELECT key, value FROM ItemTable").fetchall())
+        finally:
+            conn.close()
+    assert rows["cursor.composer.apiKey"] == "AKIAFAKEEXAMPLE01"
+    assert rows["anthropic.apiKey"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+def test_render_plain_canary_api_key_is_aws_key_string():
+    body = tbenv.render_plain_canary_api_key(FAKE_TRACEBIT)
+    assert body == b"AKIAFAKEEXAMPLE01"
+
+
+def test_render_deepseek_config_embeds_aws_canary():
+    payload = json.loads(tbenv.render_deepseek_config_json(FAKE_TRACEBIT))
+    assert payload["api_key"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["DEEPSEEK_API_KEY"] == "AKIAFAKEEXAMPLE01"
+
+
+def test_render_kimi_credentials_embeds_aws_canary():
+    payload = json.loads(tbenv.render_kimi_credentials_json(FAKE_TRACEBIT))
+    assert payload["api_key"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["MOONSHOT_API_KEY"] == "AKIAFAKEEXAMPLE01"
+
+
+def test_render_openclaw_embeds_aws_canary():
+    payload = json.loads(tbenv.render_openclaw_json(FAKE_TRACEBIT))
+    assert payload["apiKey"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["OPENAI_API_KEY"] == "AKIAFAKEEXAMPLE01"
+
+
+def test_render_opencode_config_embeds_aws_canary():
+    payload = json.loads(tbenv.render_opencode_config_json(FAKE_TRACEBIT))
+    assert payload["provider"]["anthropic"]["api_key"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["provider"]["openai"]["api_key"] == "AKIAFAKEEXAMPLE01"
+
+
+def test_render_vastai_credentials_embeds_aws_canary():
+    payload = json.loads(tbenv.render_vastai_credentials_json(FAKE_TRACEBIT))
+    assert payload["api_key"] == "AKIAFAKEEXAMPLE01"
+    assert payload["api_secret"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+def test_render_nerve_config_embeds_aws_canary():
+    body = tbenv.render_nerve_config_yaml(FAKE_TRACEBIT).decode("utf-8")
+    assert "anthropic_api_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    assert "openai_api_key: AKIAFAKEEXAMPLE01" in body
+
+
+def test_render_spawnrc_embeds_aws_canary():
+    body = tbenv.render_spawnrc(FAKE_TRACEBIT).decode("utf-8")
+    assert "SPAWN_API_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    assert "OPENAI_API_KEY=AKIAFAKEEXAMPLE01" in body
+
+
+def test_render_moltbook_credentials_embeds_aws_canary():
+    payload = json.loads(tbenv.render_moltbook_credentials_json(FAKE_TRACEBIT))
+    assert payload["api_key"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+def test_render_claude_config_embeds_aws_canary():
+    payload = json.loads(tbenv.render_claude_config_json(FAKE_TRACEBIT))
+    assert payload["primaryApiKey"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["anthropicApiKey"] == "AKIAFAKEEXAMPLE01"
+    assert payload["env"]["ANTHROPIC_API_KEY"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+def test_render_claude_history_embeds_aws_canary():
+    body = tbenv.render_claude_history_jsonl(FAKE_TRACEBIT).decode("utf-8")
+    lines = [json.loads(l) for l in body.strip().split("\n")]
+    assert len(lines) == 2
+    joined = " ".join(l["message"] for l in lines)
+    assert "AKIAFAKEEXAMPLE01" in joined
+    assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in joined
+
+
+def test_render_claude_history_callback_id_is_per_hit_random():
+    b1 = tbenv.render_claude_history_jsonl(FAKE_TRACEBIT).decode("utf-8")
+    b2 = tbenv.render_claude_history_jsonl(FAKE_TRACEBIT).decode("utf-8")
+    m1 = re.search(r"internal\.netqale\.com/agent/([0-9a-f]{32})/", b1)
+    m2 = re.search(r"internal\.netqale\.com/agent/([0-9a-f]{32})/", b2)
+    assert m1 and m2 and m1.group(1) != m2.group(1)
+
+
+def test_render_agents_md_embeds_aws_canary():
+    body = tbenv.render_agents_md(FAKE_TRACEBIT).decode("utf-8")
+    assert "ANTHROPIC_API_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    assert "OPENAI_API_KEY=AKIAFAKEEXAMPLE01" in body
+
+
+@pytest.mark.parametrize("path,expected_result,canary_substring", [
+    ("/.codex/auth.json", "codex-auth", "AKIAFAKEEXAMPLE01"),
+    ("/root/.codex/auth.json", "codex-auth", "AKIAFAKEEXAMPLE01"),
+    ("/.gemini/oauth_creds.json", "gemini-oauth-creds", "wJalrXUtnFEMI"),
+    ("/.gemini/settings.json", "gemini-settings", "wJalrXUtnFEMI"),
+    ("/.cursorrules", "ai-ide-rules", "AKIAFAKEEXAMPLE01"),
+    ("/.windsurfrules", "ai-ide-rules", "AKIAFAKEEXAMPLE01"),
+    ("/.clinerules", "ai-ide-rules", "AKIAFAKEEXAMPLE01"),
+    ("/.dashscope/api_key", "dashscope-api-key", "AKIAFAKEEXAMPLE01"),
+    ("/.anthropic/api_key", "anthropic-api-key", "AKIAFAKEEXAMPLE01"),
+    ("/.deepseek/config.json", "deepseek-config", "AKIAFAKEEXAMPLE01"),
+    ("/.kimi/credentials/kimi-code.json", "kimi-credentials", "wJalrXUtnFEMI"),
+    ("/.moonshot/settings.json", "kimi-credentials", "wJalrXUtnFEMI"),
+    ("/.openclaw/openclaw.json", "openclaw-config", "wJalrXUtnFEMI"),
+    ("/root/.config/opencode/config.json", "opencode-config", "wJalrXUtnFEMI"),
+    ("/root/.config/vastai/credentials.json", "vastai-credentials", "AKIAFAKEEXAMPLE01"),
+    ("/root/.nerve/config.yaml", "nerve-config", "wJalrXUtnFEMI"),
+    ("/root/.spawnrc", "spawnrc", "wJalrXUtnFEMI"),
+    ("/root/.config/moltbook/credentials.json", "moltbook-credentials", "wJalrXUtnFEMI"),
+    ("/.claude.json", "claude-config", "wJalrXUtnFEMI"),
+    ("/.claude/config.json", "claude-config", "wJalrXUtnFEMI"),
+    ("/.claude/settings.local.json", "claude-config", "wJalrXUtnFEMI"),
+    ("/.claude/history.jsonl", "claude-history", "AKIAFAKEEXAMPLE01"),
+    ("/root/.claude/.credentials.json", "claude-credentials-root", "AKIAFAKEEXAMPLE01"),
+    ("/AGENTS.md", "agents-md", "AKIAFAKEEXAMPLE01"),
+    ("/.claude/CLAUDE.md", "agents-md", "AKIAFAKEEXAMPLE01"),
+])
+async def test_dispatch_routes_ai_ide_paths_to_traps(
+    flux_client, monkeypatch, path, expected_result, canary_substring,
+):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.94"})
+    assert resp.status == 200, f"expected 200 for {path}"
+    body = await resp.read()
+    assert canary_substring.encode("utf-8") in body, f"{path} body missing {canary_substring}"
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == expected_result
+
+
 @pytest.mark.parametrize("path,expected_result,canary_substring", [
     ("/.claude/settings.json", "claude-settings", "AKIAFAKEEXAMPLE01"),
     ("/.cline/settings.json", "cline-settings", "AKIAFAKEEXAMPLE01"),
