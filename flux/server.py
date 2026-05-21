@@ -3,15 +3,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import bz2
+import gzip
 import hashlib
+import io
 import json
+import lzma
 import os
 import re
 import secrets
 import string
 import sys
+import tarfile
 import time
 import uuid
+import zipfile
 import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1232,6 +1238,82 @@ _OPENAPI_SWAGGER_UI_PATHS = frozenset({
     "/redoc/",
     "/redoc.html",
 })
+
+
+# --- Backup-archive canary trap ----------------------------------------
+# Scanner dictionaries enumerate the cross product `<base>.<ext>` of a
+# 60+-name base list and ~15 compressed-archive extensions hunting for
+# misplaced backups in the webroot. Newer scanners also synthesise
+# filenames from the target's resolved IP (`/65.20.84.180.tar.gz`,
+# `/84.180.tar.gz`, `/84.tar.gz`) and from current/recent year + month
+# (`/2026.tar.gz`, `/202603.zip`). Every hit currently 404s — this
+# trap matches the pattern and serves a real gzip/zip/tar containing
+# a fake `.env` + SQL dump with embedded Tracebit AWS canary creds,
+# so any harvester that grep-fetches the body walks away with a
+# replay-fireable canary.
+BACKUP_ARCHIVE_ENABLED = _env_bool("HONEYPOT_BACKUP_ARCHIVE_ENABLED")
+
+_BACKUP_ARCHIVE_BASES = frozenset({
+    "admin", "api", "app", "application", "archive", "archives", "back",
+    "backend", "backup", "backup1", "backup2", "backup_db", "backup_full",
+    "backups", "bak", "bd", "build", "client", "code", "config", "configs",
+    "content", "current", "data", "database", "databases", "db", "db1",
+    "db2", "db_backup", "db_dump", "dev", "dist", "django", "drupal",
+    "dump", "dumps", "env", ".env", "export", "exports", "files", "flask",
+    "frontend", "full", "full_backup", "home", "htdocs", "joomla",
+    "laravel", "magento", "media", "mysqldump", "new", "node_modules",
+    "old", "opt", "pg_dump", "pre-prod", "preprod", "private", "prod",
+    "production", "public", "public_html", "rails", "release", "releases",
+    "root", "secrets", "server", "site", "site_backup", "sites", "source",
+    "src", "stage", "staging", "storage", "symfony", "temp", "test",
+    "tmp", "uploads", "user", "users", "var", "web", "website",
+    "website-backup", "website_backup", "wordpress", "wp", "wp-admin",
+    "wp-backup", "wp-content", "wp-includes", "www", "www-backup",
+})
+
+# Longest-first so we strip `.tar.gz` before `.gz` when peeling the
+# extension off a path like `/backup.tar.gz`.
+_BACKUP_ARCHIVE_EXTS = (
+    "tar.gz", "tar.bz2", "tar.xz", "sql.gz", "sql.bz2",
+    "tgz", "tbz2", "txz",
+    "tar", "sql",
+    "gz", "bz2", "xz",
+    "zip", "7z", "rar", "zst",
+)
+_BACKUP_ARCHIVE_STEM_RE = re.compile(r"^[A-Za-z0-9._\-]{1,80}$")
+_BACKUP_ARCHIVE_IP_STEM_RE = re.compile(r"^(?:\d{1,3}\.){0,3}\d{1,3}$")
+_BACKUP_ARCHIVE_DATE_STEM_RE = re.compile(r"^(?:19|20)\d{2}(?:\d{2}){0,2}$")
+
+
+def _backup_archive_match(path: str) -> str:
+    """Return the lowercase extension family (e.g. 'tar.gz', 'zip') if
+    `path` matches a backup-archive shape, else ''. The matcher accepts
+    three stem shapes: a known dictionary base name, an IP-octet chain
+    (`84`, `84.180`, `65.20.84.180`), or a year / yearmonth / yearmonthday."""
+    if not BACKUP_ARCHIVE_ENABLED:
+        return ""
+    if not path.startswith("/") or path.count("/") != 1:
+        return ""
+    lowered = path[1:].lower()
+    if not lowered:
+        return ""
+    for ext in _BACKUP_ARCHIVE_EXTS:
+        if lowered.endswith("." + ext):
+            stem = lowered[: -(len(ext) + 1)]
+            if not stem or not _BACKUP_ARCHIVE_STEM_RE.match(stem):
+                continue
+            if stem in _BACKUP_ARCHIVE_BASES:
+                return ext
+            if _BACKUP_ARCHIVE_IP_STEM_RE.match(stem):
+                return ext
+            if _BACKUP_ARCHIVE_DATE_STEM_RE.match(stem):
+                return ext
+            return ""
+    return ""
+
+
+def is_backup_archive_path(path: str) -> bool:
+    return bool(_backup_archive_match(path))
 
 
 def utc_now() -> str:
@@ -5625,6 +5707,228 @@ def render_pprof_dump(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_procfile(r: dict[str, object]) -> bytes:
+    """Heroku `Procfile` — process declaration. Real Procfiles don't
+    normally carry secrets, but a sloppy commit pattern is to inline
+    env values into the start command (`web: AWS_ACCESS_KEY_ID=... gunicorn …`);
+    leading comments also routinely carry stash-style config-var
+    rotations. Both shapes carry the canary AWS triple."""
+    aws = _aws(r)
+    return (
+        "# Production config-vars staged before promotion to Heroku:\n"
+        f"#   AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"#   AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"#   AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "#   AWS_REGION=us-east-1\n"
+        "web: gunicorn app.wsgi --bind 0.0.0.0:$PORT --workers 3\n"
+        "worker: celery -A app worker --loglevel=info\n"
+        "release: alembic upgrade head\n"
+        "scheduler: celery -A app beat --loglevel=info\n"
+    ).encode("utf-8")
+
+
+def render_heroku_yml(r: dict[str, object]) -> bytes:
+    """Heroku `heroku.yml` — Heroku-build (container-stack) manifest.
+    The `config:` blocks under `setup.config` and `build.config` carry
+    real env values in many real deployments; the AWS canary triple
+    lands there."""
+    aws = _aws(r)
+    return (
+        "setup:\n"
+        "  addons:\n"
+        "    - plan: heroku-postgresql:standard-0\n"
+        "    - plan: heroku-redis:premium-0\n"
+        "  config:\n"
+        "    AWS_REGION: us-east-1\n"
+        f"    AWS_ACCESS_KEY_ID: {aws.get('awsAccessKeyId', '')}\n"
+        f"    AWS_SECRET_ACCESS_KEY: {aws.get('awsSecretAccessKey', '')}\n"
+        f"    AWS_SESSION_TOKEN: {aws.get('awsSessionToken', '')}\n"
+        "build:\n"
+        "  docker:\n"
+        "    web: Dockerfile\n"
+        "    worker: Dockerfile.worker\n"
+        "  config:\n"
+        f"    AWS_ACCESS_KEY_ID: {aws.get('awsAccessKeyId', '')}\n"
+        f"    AWS_SECRET_ACCESS_KEY: {aws.get('awsSecretAccessKey', '')}\n"
+        "    S3_BUCKET: prod-uploads\n"
+        "run:\n"
+        "  web: gunicorn app.wsgi\n"
+        "  worker: celery -A app worker\n"
+    ).encode("utf-8")
+
+
+def render_heroku_app_json(r: dict[str, object]) -> bytes:
+    """Heroku `app.json` — app metadata + buildpacks + env declaration.
+    The `env.<NAME>.value` slot is the canonical place real deployments
+    bake credentials when they don't want to use the Heroku UI for
+    config-vars (review apps + Heroku-button deploys both surface this
+    way)."""
+    aws = _aws(r)
+    return json.dumps({
+        "name": "internal-tools",
+        "description": "Internal tools deploy",
+        "repository": "https://github.com/internal-tools/app",
+        "keywords": ["python", "flask", "internal"],
+        "addons": ["heroku-postgresql:standard-0", "heroku-redis:premium-0"],
+        "buildpacks": [{"url": "heroku/python"}],
+        "stack": "heroku-22",
+        "env": {
+            "AWS_ACCESS_KEY_ID": {
+                "description": "S3 backup creds",
+                "value": aws.get("awsAccessKeyId", ""),
+            },
+            "AWS_SECRET_ACCESS_KEY": {
+                "description": "S3 backup creds",
+                "value": aws.get("awsSecretAccessKey", ""),
+                "required": True,
+            },
+            "AWS_SESSION_TOKEN": {
+                "value": aws.get("awsSessionToken", ""),
+            },
+            "AWS_REGION": {"value": "us-east-1"},
+            "DATABASE_URL": {"required": True},
+            "SECRET_KEY_BASE": {"generator": "secret"},
+        },
+        "scripts": {"postdeploy": "alembic upgrade head"},
+    }, indent=2).encode("utf-8")
+
+
+def render_appsettings_json(r: dict[str, object]) -> bytes:
+    """.NET Core `appsettings.json` — config + ConnectionStrings.
+    The `ConnectionStrings.DefaultConnection` slot holds plaintext
+    DB creds in many real deployments; the AWS canary lives in a
+    flat `AWS` block at the root (a common ASP.NET Core convention
+    when bridging to S3 via the AWS SDK for .NET)."""
+    aws = _aws(r)
+    db_pw = _fake_db_password()
+    azure_key = base64.b64encode(secrets.token_bytes(64)).decode("ascii")
+    return json.dumps({
+        "Logging": {
+            "LogLevel": {
+                "Default": "Information",
+                "Microsoft.AspNetCore": "Warning",
+                "Microsoft.EntityFrameworkCore": "Warning",
+            },
+        },
+        "AllowedHosts": "*",
+        "ConnectionStrings": {
+            "DefaultConnection": (
+                f"Server=db.internal;Database=prod;User Id=appuser;"
+                f"Password={db_pw};Trusted_Connection=False;MultipleActiveResultSets=true"
+            ),
+            "AzureBlobStorage": (
+                f"DefaultEndpointsProtocol=https;AccountName=prodstorage;"
+                f"AccountKey={azure_key};EndpointSuffix=core.windows.net"
+            ),
+        },
+        "AWS": {
+            "Region": "us-east-1",
+            "AccessKey": aws.get("awsAccessKeyId", ""),
+            "SecretKey": aws.get("awsSecretAccessKey", ""),
+            "SessionToken": aws.get("awsSessionToken", ""),
+            "BucketName": "prod-backups",
+        },
+        "Jwt": {
+            "Issuer": "internal-tools",
+            "Audience": "internal-tools",
+            "Key": base64.b64encode(secrets.token_bytes(48)).decode("ascii"),
+        },
+    }, indent=2).encode("utf-8")
+
+
+def render_iis_web_config(r: dict[str, object]) -> bytes:
+    """IIS `web.config` — XML config carrying `connectionStrings` and
+    `appSettings` for ASP.NET / ASP.NET Core hosts. The
+    `<appSettings><add key="AWS_..." value="..."/>` block is where
+    real deployments park S3 / SQS / SES credentials when the AWS SDK
+    is configured via App.config."""
+    aws = _aws(r)
+    db_pw = _fake_db_password()
+    machine_key = base64.b16encode(secrets.token_bytes(32)).decode("ascii")
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<configuration>\n'
+        '  <connectionStrings>\n'
+        f'    <add name="DefaultConnection" providerName="System.Data.SqlClient"\n'
+        f'         connectionString="Server=db.internal;Database=prod;User Id=appuser;Password={db_pw};Trusted_Connection=False" />\n'
+        '  </connectionStrings>\n'
+        '  <appSettings>\n'
+        f'    <add key="AWS_ACCESS_KEY_ID" value="{aws.get("awsAccessKeyId", "")}" />\n'
+        f'    <add key="AWS_SECRET_ACCESS_KEY" value="{aws.get("awsSecretAccessKey", "")}" />\n'
+        f'    <add key="AWS_SESSION_TOKEN" value="{aws.get("awsSessionToken", "")}" />\n'
+        '    <add key="AWS_REGION" value="us-east-1" />\n'
+        '    <add key="S3Bucket" value="prod-backups" />\n'
+        '  </appSettings>\n'
+        '  <system.web>\n'
+        f'    <machineKey validationKey="{machine_key}" decryptionKey="{machine_key[:48]}"\n'
+        '                validation="HMACSHA256" decryption="AES" />\n'
+        '    <authentication mode="Forms" />\n'
+        '  </system.web>\n'
+        '  <system.webServer>\n'
+        '    <handlers>\n'
+        '      <add name="aspNetCore" path="*" verb="*" modules="AspNetCoreModuleV2"\n'
+        '           resourceType="Unspecified" />\n'
+        '    </handlers>\n'
+        '    <aspNetCore processPath="dotnet" arguments=".\\app.dll"\n'
+        '                stdoutLogEnabled="false" hostingModel="inprocess" />\n'
+        '  </system.webServer>\n'
+        '</configuration>\n'
+    ).encode("utf-8")
+
+
+def render_composer_auth_json(r: dict[str, object]) -> bytes:
+    """PHP Composer `auth.json` — `http-basic`, `github-oauth`,
+    `gitlab-token`, `bearer` credential blocks. Every credential
+    field is the gitlab-username-password canary, so a replay
+    against the canary's hosted gitlab URL fires the alert."""
+    creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    username = str(creds.get("username", "") or "deploy")
+    password = str(creds.get("password", "") or "")
+    return json.dumps({
+        "http-basic": {
+            "gitlab.com": {"username": username, "password": password},
+            "repo.packagist.com": {"username": "internal-tools", "password": password},
+            "nexus.internal": {"username": "ci-deploy", "password": password},
+        },
+        "github-oauth": {"github.com": password},
+        "gitlab-token": {"gitlab.com": password},
+        "bearer": {"private-packagist.example.com": password},
+    }, indent=2).encode("utf-8")
+
+
+def render_dockerfile(r: dict[str, object]) -> bytes:
+    """`Dockerfile` source — scanner targets it because half of all
+    "creds-in-Dockerfile" leaks are `ENV AWS_ACCESS_KEY_ID=...` /
+    `ARG AWS_SECRET_ACCESS_KEY=...` lines committed by accident.
+    The canary lives in both an ARG default and an ENV assignment so
+    the harvester that parses either form gets it."""
+    aws = _aws(r)
+    return (
+        "FROM python:3.11-slim\n"
+        "\n"
+        "WORKDIR /app\n"
+        "\n"
+        "# Build-time AWS creds for the artifact pull. Move to runtime\n"
+        "# config once the CD pipeline stops baking them in (INFRA-412).\n"
+        f"ARG AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"ARG AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"ENV AWS_ACCESS_KEY_ID=${{AWS_ACCESS_KEY_ID}}\n"
+        f"ENV AWS_SECRET_ACCESS_KEY=${{AWS_SECRET_ACCESS_KEY}}\n"
+        f"ENV AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "ENV AWS_REGION=us-east-1\n"
+        "\n"
+        "COPY requirements.txt .\n"
+        "RUN pip install --no-cache-dir -r requirements.txt\n"
+        "\n"
+        "COPY . .\n"
+        "\n"
+        "EXPOSE 8000\n"
+        'CMD ["gunicorn", "app.wsgi", "--bind", "0.0.0.0:8000"]\n'
+    ).encode("utf-8")
+
+
 def render_actuator_env_json(r: dict[str, object]) -> bytes:
     # Spring Boot Actuator `/env` response shape: activeProfiles + a list of
     # propertySources, each holding `properties: {<key>: {value, origin?}}`.
@@ -7873,6 +8177,87 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_gitlab_sign_in,
         "text/html; charset=utf-8",
         extra_headers=_gitlab_cookie_header,
+    ),
+    # Heroku / .NET / IIS / PHP-Composer / Docker source-file canary
+    # set. Each file currently falls through to default 404; access
+    # logs show steady demand from multiple actor populations
+    # (config-leak harvesters + the terraform-state-hunter family
+    # that added Heroku-shaped paths to its dictionary). Scanner
+    # dictionaries grep for `AWS_ACCESS_KEY_ID=` / `accessKey:` etc;
+    # we land the canary in every one of those slots.
+    CanaryTrap(
+        "procfile",
+        ("/procfile",),
+        ("aws",),
+        render_procfile,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "heroku-yml",
+        ("/heroku.yml", "/heroku.yaml"),
+        ("aws",),
+        render_heroku_yml,
+        "application/yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "heroku-app-json",
+        ("/app.json",),
+        ("aws",),
+        render_heroku_app_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "appsettings-json",
+        (
+            "/appsettings.json",
+            "/appsettings.production.json",
+            "/appsettings.development.json",
+            "/appsettings.staging.json",
+            "/appsettings.local.json",
+        ),
+        ("aws",),
+        render_appsettings_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "iis-web-config",
+        (
+            "/web.config",
+            # Webroot-prefix variants. Real IIS scanner dictionaries
+            # walk the file at `/<app-root>/Web.config` too.
+            "/web.config.bak",
+            "/web.config.old",
+            "/web.config.orig",
+            "/web.config.save",
+        ),
+        ("aws",),
+        render_iis_web_config,
+        "application/xml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "composer-auth-json",
+        ("/auth.json",),
+        ("gitlab-username-password",),
+        render_composer_auth_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "dockerfile",
+        (
+            "/dockerfile",
+            "/dockerfile.prod",
+            "/dockerfile.production",
+            "/dockerfile.dev",
+            "/dockerfile.development",
+            "/dockerfile.local",
+            "/dockerfile.staging",
+            "/dockerfile.worker",
+            "/dockerfile.build",
+            "/containerfile",
+        ),
+        ("aws",),
+        render_dockerfile,
+        "text/plain; charset=utf-8",
     ),
     # AI credential config files. See the big comment above
     # render_openai_config_json for the "this probably doesn't make sense
@@ -10433,6 +10818,143 @@ async def _send_canary_trap(
     return response
 
 
+def _build_backup_archive_body(r: dict[str, object], ext_family: str) -> tuple[bytes, str]:
+    """Build the response body for a backup-archive trap hit.
+
+    Returns (body_bytes, content_type). The body is a real archive in
+    the matching format (gzip / zip / tar / bzip2 / xz) containing a
+    fake `.env` + SQL dump with the Tracebit AWS canary embedded.
+    For formats with no stdlib creator (`.7z`, `.rar`, `.zst`) we
+    serve a tar.gz body under the claimed Content-Type — credential
+    harvesters typically grep raw bytes for `AWS_ACCESS_KEY_ID=`
+    and replay the canary regardless of whether they could actually
+    extract the archive.
+    """
+    aws = _aws(r)
+    db_pw = _fake_db_password()
+    env_body = (
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        f"AWS_DEFAULT_REGION=us-east-1\n"
+        f"S3_BUCKET=prod-backups\n"
+        f"DB_HOST=db.internal\n"
+        f"DB_USER=appuser\n"
+        f"DB_NAME=prod\n"
+        f"DB_PASSWORD={db_pw}\n"
+    ).encode("utf-8")
+    sql_body = (
+        f"-- MySQL dump 10.13  Distrib 8.0.35, for Linux (x86_64)\n"
+        f"-- Host: db.internal    Database: prod\n"
+        f"--\n"
+        f"-- S3 backup creds (rotate via Vault; see INFRA-412):\n"
+        f"--   AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"--   AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"--   AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        f"--\n"
+        f"LOCK TABLES `users` WRITE;\n"
+        f"INSERT INTO `users` VALUES (1,'admin','admin@internal.lan');\n"
+        f"INSERT INTO `users` VALUES (2,'deploy','deploy@internal.lan');\n"
+        f"UNLOCK TABLES;\n"
+    ).encode("utf-8")
+
+    members = ((".env", env_body), ("backup.sql", sql_body))
+
+    def _make_tar(mode: str) -> bytes:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode=mode) as t:
+            for name, content in members:
+                ti = tarfile.TarInfo(name=name)
+                ti.size = len(content)
+                t.addfile(ti, io.BytesIO(content))
+        return buf.getvalue()
+
+    if ext_family == "zip":
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for name, content in members:
+                z.writestr(name, content)
+        return buf.getvalue(), "application/zip"
+    if ext_family in ("tar.gz", "tgz"):
+        return _make_tar("w:gz"), "application/gzip"
+    if ext_family in ("tar.bz2", "tbz2"):
+        return _make_tar("w:bz2"), "application/x-bzip2"
+    if ext_family in ("tar.xz", "txz"):
+        return _make_tar("w:xz"), "application/x-xz"
+    if ext_family == "tar":
+        return _make_tar("w"), "application/x-tar"
+    if ext_family == "sql.gz":
+        return gzip.compress(sql_body), "application/gzip"
+    if ext_family == "sql.bz2":
+        return bz2.compress(sql_body), "application/x-bzip2"
+    if ext_family == "sql":
+        return sql_body, "application/sql; charset=utf-8"
+    if ext_family == "gz":
+        return gzip.compress(env_body), "application/gzip"
+    if ext_family == "bz2":
+        return bz2.compress(env_body), "application/x-bzip2"
+    if ext_family == "xz":
+        return lzma.compress(env_body), "application/x-xz"
+    if ext_family == "7z":
+        return _make_tar("w:gz"), "application/x-7z-compressed"
+    if ext_family == "rar":
+        return _make_tar("w:gz"), "application/x-rar-compressed"
+    if ext_family == "zst":
+        return _make_tar("w:gz"), "application/zstd"
+    return _make_tar("w:gz"), "application/gzip"
+
+
+async def _send_backup_archive(
+    request: web.Request,
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.Response:
+    """Backup-archive canary trap. Dispatch is gated on `API_KEY` and
+    `BACKUP_ARCHIVE_ENABLED`; pattern match runs first via
+    `is_backup_archive_path`."""
+    ext_family = _backup_archive_match(path)
+    tracebit_response = await _get_or_issue_canary(
+        ("aws",), client_ip, request_id, host, user_agent, path, proto,
+    )
+    if tracebit_response is None:
+        append_log({**log_context, "status": 502, "result": "backup-archive-error"})
+        return web.Response(
+            status=502, body=b"upstream credential issue failed\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+    try:
+        body, content_type = _build_backup_archive_body(tracebit_response, ext_family)
+    except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
+        append_log({
+            **log_context, "status": 502, "result": "backup-archive-render-error",
+            "error": str(exc)[:400],
+        })
+        return web.Response(
+            status=502, body=b"render error\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+    response = web.Response(status=200, body=body)
+    response.headers["Content-Type"] = content_type
+    response.headers["Cache-Control"] = "no-store"
+    filename = path.lstrip("/").replace('"', '')
+    if filename:
+        response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": "backup-archive",
+        "archiveExt": ext_family,
+        "canaryTypes": [k for k, v in tracebit_response.items() if v],
+        "bytes": len(body),
+    })
+    return response
+
+
 async def _send_fake_git(
     request: web.Request,
     request_id: str,
@@ -10846,6 +11368,16 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 request, trap, request_id, path, client_ip, host, user_agent, proto, log_context,
             )
 
+    # Backup-archive pattern trap runs after exact-path canary lookup so
+    # that explicit entries (e.g. `/backup.sql` -> sql-dump trap) keep
+    # their dedicated renderer. Anything matching the broader
+    # `<base>.<ext>` shape (including IP-octet / date synthesis stems)
+    # lands here.
+    if API_KEY and BACKUP_ARCHIVE_ENABLED and is_backup_archive_path(path):
+        return await _send_backup_archive(
+            request, request_id, path, client_ip, host, user_agent, proto, log_context,
+        )
+
     if path != "/.env" or not API_KEY:
         append_log({**log_context, "status": 404, "result": "not-handled"})
         return web.Response(
@@ -10880,6 +11412,8 @@ def main() -> int:
             active.append("fake-git")
         if CANARY_TRAPS_ENABLED:
             active.append("canary-file-traps")
+        if BACKUP_ARCHIVE_ENABLED:
+            active.append("backup-archive")
     else:
         print(
             "flux: TRACEBIT_API_KEY unset — /.env, /.git/*, and canary file traps disabled (all 404)",

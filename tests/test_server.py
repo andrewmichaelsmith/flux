@@ -563,6 +563,7 @@ def test_all_trap_families_default_on():
     assert tbenv.OPENAPI_SWAGGER_ENABLED
     assert tbenv.DRUPAL_ENABLED
     assert tbenv.SPRING_GATEWAY_ENABLED
+    assert tbenv.BACKUP_ARCHIVE_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -6334,3 +6335,303 @@ async def test_dispatch_openapi_does_not_shadow_other_traps(
     for path in ["/.env", "/.git/config", "/v1/models"]:
         kind = tbenv.openapi_swagger_kind(path)
         assert kind == "", f"{path} unexpectedly matched as {kind}"
+
+
+# --- Backup-archive canary trap ---
+
+
+def test_backup_archive_enabled_by_default():
+    assert tbenv.BACKUP_ARCHIVE_ENABLED
+
+
+@pytest.mark.parametrize("path,ext", [
+    # Standard dictionary base names.
+    ("/backup.zip", "zip"),
+    ("/backup.tar.gz", "tar.gz"),
+    ("/database.zip", "zip"),
+    ("/db.sql.gz", "sql.gz"),
+    ("/www.tar.gz", "tar.gz"),
+    ("/site.tar.gz", "tar.gz"),
+    ("/wordpress.zip", "zip"),
+    ("/wp-content.tar.gz", "tar.gz"),
+    ("/public_html.tar.gz", "tar.gz"),
+    ("/htdocs.zip", "zip"),
+    ("/.env.zip", "zip"),
+    ("/secrets.tar.gz", "tar.gz"),
+    ("/full_backup.tar.bz2", "tar.bz2"),
+    ("/archive.7z", "7z"),
+    ("/backup.rar", "rar"),
+    ("/db.tar.xz", "tar.xz"),
+    ("/code.tgz", "tgz"),
+    # IP-octet / numeric synthesis shapes — the novel scanner-side
+    # filename generation observed in May 2026.
+    ("/65.20.84.180.tar.gz", "tar.gz"),
+    ("/84.180.tar.gz", "tar.gz"),
+    ("/84.tar.gz", "tar.gz"),
+    ("/65.20.84.180.zip", "zip"),
+    ("/84.180.sql.gz", "sql.gz"),
+    # Year / yearmonth / yearmonthday synthesis shapes.
+    ("/2026.tar.gz", "tar.gz"),
+    ("/2025.zip", "zip"),
+    ("/202603.tar.gz", "tar.gz"),
+    ("/20260310.zip", "zip"),
+])
+def test_is_backup_archive_path_matches(path, ext):
+    assert tbenv.is_backup_archive_path(path), f"expected match: {path}"
+    assert tbenv._backup_archive_match(path) == ext
+
+
+@pytest.mark.parametrize("path", [
+    # Non-archive extensions.
+    "/backup.php",
+    "/backup.html",
+    "/backup",
+    "/database",
+    # Unknown base names without IP / date shape.
+    "/randomgarbage.tar.gz",
+    "/x.zip",
+    "/qzzzzzzzzz.7z",
+    # Empty / weird shapes.
+    "/.tar.gz",
+    "/",
+    "//backup.zip",  # double-slash isn't accepted by the regex
+])
+def test_is_backup_archive_path_non_match(path):
+    assert not tbenv.is_backup_archive_path(path), f"unexpected match: {path}"
+
+
+def test_is_backup_archive_path_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "BACKUP_ARCHIVE_ENABLED", False)
+    assert not tbenv.is_backup_archive_path("/backup.tar.gz")
+
+
+def test_build_backup_archive_body_zip_is_valid_zip():
+    body, ct = tbenv._build_backup_archive_body(FAKE_TRACEBIT, "zip")
+    assert ct == "application/zip"
+    import io as _io, zipfile as _zf
+    with _zf.ZipFile(_io.BytesIO(body)) as z:
+        names = z.namelist()
+        assert ".env" in names
+        assert "backup.sql" in names
+        env_content = z.read(".env")
+        assert b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in env_content
+        assert b"AWS_SECRET_ACCESS_KEY=" in env_content
+
+
+def test_build_backup_archive_body_tar_gz_is_valid_tar_gz():
+    body, ct = tbenv._build_backup_archive_body(FAKE_TRACEBIT, "tar.gz")
+    assert ct == "application/gzip"
+    import io as _io, tarfile as _tf
+    with _tf.open(fileobj=_io.BytesIO(body), mode="r:gz") as t:
+        names = t.getnames()
+        assert ".env" in names
+        assert "backup.sql" in names
+        env_member = t.extractfile(".env")
+        assert env_member is not None
+        env_content = env_member.read()
+        assert b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in env_content
+
+
+def test_build_backup_archive_body_sql_gz_is_gzipped_sql():
+    body, ct = tbenv._build_backup_archive_body(FAKE_TRACEBIT, "sql.gz")
+    assert ct == "application/gzip"
+    import gzip as _gz
+    plain = _gz.decompress(body)
+    assert b"-- MySQL dump" in plain
+    assert b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in plain
+
+
+@pytest.mark.parametrize("ext_family", [
+    "tar.gz", "tar.bz2", "tar.xz", "tar", "tgz",
+    "sql.gz", "sql.bz2", "sql", "gz", "bz2", "xz",
+    "zip", "7z", "rar", "zst",
+])
+def test_build_backup_archive_body_embeds_canary(ext_family):
+    """Across every supported extension family, the rendered body must
+    contain the canary AWS access key id when decoded with the
+    appropriate codec. Harvesters that grep raw bytes still find it
+    for `.7z` / `.rar` / `.zst` (we serve tar.gz under the claimed
+    Content-Type for those)."""
+    body, ct = tbenv._build_backup_archive_body(FAKE_TRACEBIT, ext_family)
+    assert isinstance(body, bytes) and len(body) > 0
+    # Decode if we can; otherwise grep raw bytes.
+    if ext_family == "zip":
+        import io as _io, zipfile as _zf
+        with _zf.ZipFile(_io.BytesIO(body)) as z:
+            assert b"AKIAFAKEEXAMPLE01" in z.read(".env")
+    elif ext_family in ("tar.gz", "tgz", "7z", "rar", "zst"):
+        import io as _io, tarfile as _tf
+        with _tf.open(fileobj=_io.BytesIO(body), mode="r:gz") as t:
+            env_m = t.extractfile(".env")
+            assert env_m is not None
+            assert b"AKIAFAKEEXAMPLE01" in env_m.read()
+    elif ext_family in ("tar.bz2", "tbz2"):
+        import io as _io, tarfile as _tf
+        with _tf.open(fileobj=_io.BytesIO(body), mode="r:bz2") as t:
+            assert b"AKIAFAKEEXAMPLE01" in t.extractfile(".env").read()
+    elif ext_family in ("tar.xz", "txz"):
+        import io as _io, tarfile as _tf
+        with _tf.open(fileobj=_io.BytesIO(body), mode="r:xz") as t:
+            assert b"AKIAFAKEEXAMPLE01" in t.extractfile(".env").read()
+    elif ext_family == "tar":
+        import io as _io, tarfile as _tf
+        with _tf.open(fileobj=_io.BytesIO(body), mode="r:") as t:
+            assert b"AKIAFAKEEXAMPLE01" in t.extractfile(".env").read()
+    elif ext_family == "sql.gz":
+        import gzip as _gz
+        assert b"AKIAFAKEEXAMPLE01" in _gz.decompress(body)
+    elif ext_family == "sql.bz2":
+        import bz2 as _bz2
+        assert b"AKIAFAKEEXAMPLE01" in _bz2.decompress(body)
+    elif ext_family == "sql":
+        assert b"AKIAFAKEEXAMPLE01" in body
+    elif ext_family == "gz":
+        import gzip as _gz
+        assert b"AKIAFAKEEXAMPLE01" in _gz.decompress(body)
+    elif ext_family == "bz2":
+        import bz2 as _bz2
+        assert b"AKIAFAKEEXAMPLE01" in _bz2.decompress(body)
+    elif ext_family == "xz":
+        import lzma as _lzma
+        assert b"AKIAFAKEEXAMPLE01" in _lzma.decompress(body)
+
+
+def test_build_backup_archive_body_per_hit_db_password_is_unique():
+    """The fake DB password embedded in the .sql / .env body must
+    differ between renders so the archive isn't a fleet-wide
+    fingerprint."""
+    body_a, _ = tbenv._build_backup_archive_body(FAKE_TRACEBIT, "zip")
+    body_b, _ = tbenv._build_backup_archive_body(FAKE_TRACEBIT, "zip")
+    assert body_a != body_b, "two backup-archive renders identical — DB password not random"
+
+
+@pytest.mark.parametrize("path,ext_family,expected_ct", [
+    ("/backup.zip", "zip", "application/zip"),
+    ("/database.tar.gz", "tar.gz", "application/gzip"),
+    ("/db.sql.gz", "sql.gz", "application/gzip"),
+    ("/full_backup.tar.bz2", "tar.bz2", "application/x-bzip2"),
+    ("/archive.7z", "7z", "application/x-7z-compressed"),
+    ("/65.20.84.180.tar.gz", "tar.gz", "application/gzip"),
+    ("/2026.zip", "zip", "application/zip"),
+])
+async def test_dispatch_routes_backup_archive_to_trap(
+    flux_client, monkeypatch, path, ext_family, expected_ct,
+):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "BACKUP_ARCHIVE_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.50"})
+    assert resp.status == 200
+    assert resp.headers["Content-Type"] == expected_ct
+    assert resp.headers["Cache-Control"] == "no-store"
+    assert "Content-Disposition" in resp.headers
+    body = await resp.read()
+    assert len(body) > 0
+    # AKIA literal should be reachable somewhere in the bytes for
+    # archive formats we can actually decode without going via the
+    # codec (raw .sql, .zip central-dir comment, tar header bytes
+    # — for compressed formats it's encoded so we don't grep raw).
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "backup-archive"
+    assert entries[-1]["archiveExt"] == ext_family
+
+
+async def test_dispatch_backup_archive_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "BACKUP_ARCHIVE_ENABLED", False)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get("/backup.tar.gz", headers={"X-Forwarded-For": "203.0.113.51"})
+    assert resp.status == 404
+
+
+async def test_dispatch_backup_archive_without_api_key_returns_404(flux_client, monkeypatch):
+    """No TRACEBIT_API_KEY → the trap stays silent (consistent with
+    `/.env` / fake-git behaviour)."""
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    monkeypatch.setattr(tbenv, "BACKUP_ARCHIVE_ENABLED", True)
+    resp = await flux_client.get("/backup.tar.gz", headers={"X-Forwarded-For": "203.0.113.52"})
+    assert resp.status == 404
+
+
+async def test_dispatch_backup_archive_does_not_shadow_exact_canary_paths(
+    flux_client, monkeypatch,
+):
+    """`/backup.sql` is the existing sql-dump CanaryTrap exact-path
+    entry; the backup-archive pattern matcher must run AFTER the
+    canary-trap lookup so that path still routes to sql-dump (not
+    the pattern handler's `sql` family)."""
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "BACKUP_ARCHIVE_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get("/backup.sql", headers={"X-Forwarded-For": "203.0.113.53"})
+    assert resp.status == 200
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "sql-dump"  # not "backup-archive"
+
+
+# --- Heroku / .NET / IIS / Composer / Dockerfile canary traps ---
+
+
+@pytest.mark.parametrize("path,needle", [
+    ("/procfile", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/heroku.yml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
+    ("/heroku.yaml", b"AWS_ACCESS_KEY_ID: AKIAFAKEEXAMPLE01"),
+    ("/app.json", b'"value": "AKIAFAKEEXAMPLE01"'),
+    ("/appsettings.json", b'"AccessKey": "AKIAFAKEEXAMPLE01"'),
+    ("/appsettings.production.json", b'"AccessKey": "AKIAFAKEEXAMPLE01"'),
+    ("/appsettings.development.json", b'"AccessKey": "AKIAFAKEEXAMPLE01"'),
+    ("/appsettings.staging.json", b'"AccessKey": "AKIAFAKEEXAMPLE01"'),
+    ("/web.config", b'value="AKIAFAKEEXAMPLE01"'),
+    ("/web.config.bak", b'value="AKIAFAKEEXAMPLE01"'),
+    ("/auth.json", b'"username": "deploybot42"'),
+    ("/auth.json", b'"password": "p@ssCanaryValue"'),
+    ("/dockerfile", b"ARG AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/dockerfile.prod", b"ARG AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/containerfile", b"ARG AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+])
+def test_heroku_tier_renderers_embed_canary(path, needle):
+    trap = tbenv._TRAP_BY_PATH[path]
+    body = trap.render(FAKE_TRACEBIT)
+    assert needle in body, f"expected {needle!r} in rendered {path}; got {body[:300]!r}"
+
+
+@pytest.mark.parametrize("path", [
+    "/appsettings.json",
+    "/web.config",
+])
+def test_heroku_tier_renderers_emit_per_hit_db_password(path):
+    """The DB password / machine key in these renderers must vary per
+    render so two sensors don't ship the same bytes."""
+    trap = tbenv._TRAP_BY_PATH[path]
+    body_1 = trap.render(FAKE_TRACEBIT)
+    body_2 = trap.render(FAKE_TRACEBIT)
+    assert body_1 != body_2, f"{path} renders identically — DB password / key not randomized"
+
+
+@pytest.mark.parametrize("path,expected_result", [
+    ("/Procfile", "procfile"),
+    ("/heroku.yml", "heroku-yml"),
+    ("/app.json", "heroku-app-json"),
+    ("/appsettings.json", "appsettings-json"),
+    ("/AppSettings.json", "appsettings-json"),  # case-insensitive
+    ("/Web.config", "iis-web-config"),
+    ("/auth.json", "composer-auth-json"),
+    ("/Dockerfile", "dockerfile"),
+    ("/Dockerfile.prod", "dockerfile"),
+])
+async def test_dispatch_routes_heroku_tier_paths_to_trap(
+    flux_client, monkeypatch, path, expected_result,
+):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.60"})
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"AKIAFAKEEXAMPLE01" in body or b"deploybot42" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == expected_result
