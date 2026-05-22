@@ -815,6 +815,39 @@ FAKE_TRACEBIT = {
     ("/.openai/config.json", b'"api_key": "AKIAFAKEEXAMPLE01"'),
     ("/.anthropic/config.json", b'"auth_token": "AKIAFAKEEXAMPLE01"'),
     ("/.cursor/mcp.json", b'"GITHUB_PERSONAL_ACCESS_TOKEN": "AKIAFAKEEXAMPLE01"'),
+    # Symfony dev-mode profiler — AWS canary in $_ENV, Symfony-flavored
+    # `APP_SECRET`/`DATABASE_URL`/`MAILER_DSN` next to it so a
+    # field-keyed harvester picks the canary regardless of which env
+    # var it grepped for.
+    ("/_profiler/phpinfo", b"AKIAFAKEEXAMPLE01"),
+    ("/_profiler/phpinfo", b"APP_SECRET"),
+    ("/_profiler/phpinfo", b"DATABASE_URL"),
+    ("/_profiler/phpinfo.php", b"AKIAFAKEEXAMPLE01"),
+    ("/app_dev.php/_profiler/phpinfo", b"AKIAFAKEEXAMPLE01"),
+    ("/app_dev.php/_profiler/phpinfo.php", b"AKIAFAKEEXAMPLE01"),
+    ("/symfony/_profiler/phpinfo", b"AKIAFAKEEXAMPLE01"),
+    ("/frontend_dev.php/_profiler/phpinfo", b"AKIAFAKEEXAMPLE01"),
+    # Symfony `parameters.yml` — YAML body has the canary in both
+    # `aws_*` keys and the `_profiler/open` endpoint reuses the
+    # renderer.
+    ("/parameters.yml", b"aws_access_key_id: 'AKIAFAKEEXAMPLE01'"),
+    ("/parameters.yml", b"database_password:"),
+    ("/parameters.yml", b"mailer_password:"),
+    ("/config/parameters.yml", b"aws_access_key_id: 'AKIAFAKEEXAMPLE01'"),
+    ("/app/config/parameters.yml", b"aws_access_key_id: 'AKIAFAKEEXAMPLE01'"),
+    ("/_profiler/open", b"aws_access_key_id: 'AKIAFAKEEXAMPLE01'"),
+    ("/app_dev.php/_profiler/open", b"aws_access_key_id: 'AKIAFAKEEXAMPLE01'"),
+    # Yii2 debug toolbar config panel — canary in `$_ENV` table and
+    # `components.db.*` rows.
+    ("/debug/default/view", b"AKIAFAKEEXAMPLE01"),
+    ("/debug/default/view", b"db.dsn"),
+    ("/debug/default/view", b"mailer.transport.password"),
+    ("/debug/default/view.html", b"AKIAFAKEEXAMPLE01"),
+    ("/web/debug/default/view", b"AKIAFAKEEXAMPLE01"),
+    ("/frontend/web/debug/default/view", b"AKIAFAKEEXAMPLE01"),
+    ("/backend/web/debug/default/view", b"AKIAFAKEEXAMPLE01"),
+    ("/sapi/debug/default/view", b"AKIAFAKEEXAMPLE01"),
+    ("/debug/default/db-explain", b"AKIAFAKEEXAMPLE01"),
 ])
 def test_canary_trap_renderers_embed_canary(path, needle):
     trap = tbenv._TRAP_BY_PATH[path]
@@ -837,6 +870,15 @@ def test_canary_trap_renderers_embed_canary(path, needle):
     "/jenkinsfile",
     "/bitbucket-pipelines.yml",
     "/appveyor.yml",
+    # Framework dev-mode debug surfaces also use per-hit synthetic DB /
+    # mailer passwords — assert no fixed literal sneaks back in.
+    "/_profiler/phpinfo",
+    "/app_dev.php/_profiler/phpinfo",
+    "/parameters.yml",
+    "/app/config/parameters.yml",
+    "/_profiler/open",
+    "/debug/default/view",
+    "/frontend/web/debug/default/view",
 ])
 def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
     # Regression: the ``h6T!9pq2Wz@LmRnV`` / ``prod_rw`` DB-password literal

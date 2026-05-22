@@ -7353,6 +7353,154 @@ def render_boto_config(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_symfony_profiler_phpinfo(r: dict[str, object]) -> bytes:
+    """Symfony Web Profiler phpinfo() page served by dev-mode scanners
+    hitting `/_profiler/phpinfo`, `/app_dev.php/_profiler/phpinfo`, and
+    siblings. Closer in shape to vanilla phpinfo than the Symfony toolbar
+    chrome — that's what credential-harvester scanners actually grep —
+    but with the Symfony env-var triple (`APP_SECRET`, `DATABASE_URL`,
+    `MAILER_DSN`) added on top of the standard AWS / DB block since
+    those are the variables a profiler-leak would expose first."""
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    db_password = _fake_db_password()
+    app_secret = secrets.token_hex(16)
+    mailer_password = _fake_db_password()
+    return (
+        "<!DOCTYPE html>\n"
+        "<html><head><title>phpinfo()</title>\n"
+        "<style>body{background:#fff;color:#000;font-family:sans-serif}"
+        "table{border-collapse:collapse;width:80%;margin:1em auto}"
+        "th,td{border:1px solid #000;padding:4px 8px}"
+        "h1{background:#9999cc;text-align:center}"
+        "h2{background:#ccccff;margin-top:2em}</style></head><body>\n"
+        "<h1>PHP Version 8.2.15</h1>\n"
+        "<h2>Symfony</h2>\n"
+        "<table>\n"
+        "<tr><th>Symfony version</th><td>6.4.7</td></tr>\n"
+        "<tr><th>Environment</th><td>dev</td></tr>\n"
+        "<tr><th>Debug</th><td>true</td></tr>\n"
+        "<tr><th>Token</th><td>" + secrets.token_hex(4) + "</td></tr>\n"
+        "</table>\n"
+        "<h2>Environment</h2>\n"
+        "<table>\n"
+        "<tr><th>Variable</th><th>Value</th></tr>\n"
+        f"<tr><td>APP_ENV</td><td>dev</td></tr>\n"
+        f"<tr><td>APP_DEBUG</td><td>1</td></tr>\n"
+        f"<tr><td>APP_SECRET</td><td>{app_secret}</td></tr>\n"
+        f"<tr><td>DATABASE_URL</td><td>mysql://prod_rw:{db_password}@db.internal:3306/prod?serverVersion=8.0</td></tr>\n"
+        f"<tr><td>MAILER_DSN</td><td>smtp://apikey:{mailer_password}@smtp.sendgrid.net:587</td></tr>\n"
+        f"<tr><td>AWS_ACCESS_KEY_ID</td><td>{ak}</td></tr>\n"
+        f"<tr><td>AWS_SECRET_ACCESS_KEY</td><td>{sk}</td></tr>\n"
+        f"<tr><td>AWS_SESSION_TOKEN</td><td>{st}</td></tr>\n"
+        "<tr><td>AWS_DEFAULT_REGION</td><td>us-east-1</td></tr>\n"
+        "<tr><td>S3_BUCKET</td><td>prod-uploads</td></tr>\n"
+        "</table>\n"
+        "<h2>Loaded Modules</h2>\n"
+        "<p>core, date, libxml, openssl, pcre, sqlite3, zlib, ctype, curl, "
+        "dom, fileinfo, filter, hash, iconv, json, mbstring, SPL, session, "
+        "pdo_mysql, mysqlnd, intl, opcache, redis</p>\n"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
+def render_symfony_parameters_yml(r: dict[str, object]) -> bytes:
+    """Symfony legacy `app/config/parameters.yml` shape — DB / mailer /
+    AWS creds in YAML form. Also returned as the body of
+    `/_profiler/open` since that dev-mode endpoint reads arbitrary files
+    when `file=app/config/parameters.yml` (or any similar) is supplied,
+    and the YAML body grep-matches the same harvester patterns
+    regardless of which `file=` value the scanner asked for."""
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    mailer_password = _fake_db_password()
+    app_secret = secrets.token_hex(16)
+    return (
+        "# This file is auto-generated during the composer install\n"
+        "parameters:\n"
+        "    database_driver: pdo_mysql\n"
+        "    database_host: db.internal\n"
+        "    database_port: 3306\n"
+        "    database_name: prod\n"
+        "    database_user: prod_rw\n"
+        f"    database_password: '{db_password}'\n"
+        "    mailer_transport: smtp\n"
+        "    mailer_host: smtp.sendgrid.net\n"
+        "    mailer_port: 587\n"
+        "    mailer_user: apikey\n"
+        f"    mailer_password: '{mailer_password}'\n"
+        f"    secret: '{app_secret}'\n"
+        "    locale: en\n"
+        f"    aws_access_key_id: '{aws.get('awsAccessKeyId', '')}'\n"
+        f"    aws_secret_access_key: '{aws.get('awsSecretAccessKey', '')}'\n"
+        f"    aws_session_token: '{aws.get('awsSessionToken', '')}'\n"
+        "    aws_default_region: us-east-1\n"
+        "    aws_s3_bucket: prod-uploads\n"
+    ).encode("utf-8")
+
+
+def render_yii2_debug_view(r: dict[str, object]) -> bytes:
+    """Yii2 debugger ConfigPanel view — HTML page mimicking the
+    `?panel=config` rendering that the dev-mode `yii\\debug\\Module`
+    serves. Embeds the AWS canary in the `$_ENV` table and the per-hit
+    DB / mailer passwords in the `components.*` config rows so a
+    harvester grepping for `AWS_ACCESS_KEY_ID` / `db.password` finds
+    both. Same body is returned for `?panel=db`, `?panel=request`,
+    etc. — credential-grepping scanners don't differentiate."""
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    db_password = _fake_db_password()
+    mailer_password = _fake_db_password()
+    tag = secrets.token_hex(4)
+    return (
+        "<!DOCTYPE html><html><head><title>Yii Debugger / Configuration</title>"
+        "<style>body{font-family:sans-serif;margin:0;padding:0;background:#fff;color:#000}"
+        ".yii-debug-toolbar{background:#1a1a1a;color:#eee;padding:6px 12px;font-size:12px}"
+        ".panel{padding:1em 2em}"
+        "h2{border-bottom:1px solid #ccc;padding:.4em 0;margin-top:1.5em}"
+        "table{border-collapse:collapse;width:100%}"
+        "th,td{padding:4px 8px;border:1px solid #ddd;text-align:left;font-family:monospace;font-size:12px}"
+        "th{background:#f5f5f5}"
+        "</style></head>"
+        f"<body><div class=\"yii-debug-toolbar\">Yii Debugger &mdash; tag {tag}</div>"
+        "<div class=\"panel\">"
+        "<h2>Application Configuration</h2>"
+        "<table>"
+        "<tr><th>Yii Version</th><td>2.0.49</td></tr>"
+        "<tr><th>Application Name</th><td>My Application</td></tr>"
+        "<tr><th>Environment</th><td>dev</td></tr>"
+        "<tr><th>Debug</th><td>YES</td></tr>"
+        "<tr><th>PHP Version</th><td>8.2.15</td></tr>"
+        "</table>"
+        "<h2>$_ENV</h2>"
+        "<table>"
+        f"<tr><th>AWS_ACCESS_KEY_ID</th><td>{ak}</td></tr>"
+        f"<tr><th>AWS_SECRET_ACCESS_KEY</th><td>{sk}</td></tr>"
+        f"<tr><th>AWS_SESSION_TOKEN</th><td>{st}</td></tr>"
+        "<tr><th>AWS_DEFAULT_REGION</th><td>us-east-1</td></tr>"
+        "<tr><th>S3_BUCKET</th><td>prod-uploads</td></tr>"
+        "</table>"
+        "<h2>components</h2>"
+        "<table>"
+        "<tr><th>db.class</th><td>yii\\db\\Connection</td></tr>"
+        "<tr><th>db.dsn</th><td>mysql:host=db.internal;dbname=prod;charset=utf8mb4</td></tr>"
+        "<tr><th>db.username</th><td>prod_rw</td></tr>"
+        f"<tr><th>db.password</th><td>{db_password}</td></tr>"
+        "<tr><th>mailer.class</th><td>yii\\swiftmailer\\Mailer</td></tr>"
+        "<tr><th>mailer.transport.class</th><td>Swift_SmtpTransport</td></tr>"
+        "<tr><th>mailer.transport.host</th><td>smtp.sendgrid.net</td></tr>"
+        "<tr><th>mailer.transport.port</th><td>587</td></tr>"
+        "<tr><th>mailer.transport.username</th><td>apikey</td></tr>"
+        f"<tr><th>mailer.transport.password</th><td>{mailer_password}</td></tr>"
+        "</table>"
+        "</div></body></html>"
+    ).encode("utf-8")
+
+
 def render_amplifyrc_json(r: dict[str, object]) -> bytes:
     """`.amplifyrc` is an AWS Amplify CLI project config that some teams
     accidentally commit. Real shape varies by Amplify version, but the
@@ -8565,6 +8713,70 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_agents_md,
         "text/markdown; charset=utf-8",
+    ),
+    CanaryTrap(
+        "symfony-profiler-phpinfo",
+        (
+            # Symfony Web Profiler phpinfo() leak — dev mode left on. Each
+            # entry corresponds to a real-world rewrite-rule placement
+            # (`/_profiler/...`, `/app_dev.php/_profiler/...`, etc.).
+            "/_profiler/phpinfo",
+            "/_profiler/phpinfo.php",
+            "/_profiler/phpinfo/",
+            "/app_dev.php/_profiler/phpinfo",
+            "/app_dev.php/_profiler/phpinfo.php",
+            "/app_dev.php/_profiler/phpinfo/",
+            "/symfony/_profiler/phpinfo",
+            "/symfony/_profiler/phpinfo.php",
+            "/frontend_dev.php/_profiler/phpinfo",
+            "/frontend_dev.php/_profiler/phpinfo.php",
+        ),
+        ("aws",),
+        render_symfony_profiler_phpinfo,
+        "text/html; charset=utf-8",
+    ),
+    CanaryTrap(
+        "symfony-parameters-yml",
+        (
+            # Direct file leak — Symfony 2.x / 3.x legacy
+            # `parameters.yml` left in the webroot.
+            "/parameters.yml",
+            "/config/parameters.yml",
+            "/app/config/parameters.yml",
+            # Dev-mode `_profiler/open` endpoint — reads any local file
+            # via `?file=`. Scanners targeting it almost always pass
+            # `file=app/config/parameters.yml` (or similar). The body
+            # is the same YAML regardless of the `?file=` value since
+            # credential harvesters grep raw bytes for
+            # `aws_access_key_id` / `database_password`.
+            "/_profiler/open",
+            "/app_dev.php/_profiler/open",
+            "/symfony/_profiler/open",
+            "/frontend_dev.php/_profiler/open",
+        ),
+        ("aws",),
+        render_symfony_parameters_yml,
+        "text/yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "yii2-debug-view",
+        (
+            # Yii2 `yii\debug\Module` debug toolbar — dev mode only,
+            # exposes the entire app config including DB and mailer
+            # creds. Each path is a real-world Yii2 install layout
+            # (basic vs advanced templates have different web roots).
+            "/debug/default/view",
+            "/debug/default/view.html",
+            "/debug/default/view/",
+            "/web/debug/default/view",
+            "/frontend/web/debug/default/view",
+            "/backend/web/debug/default/view",
+            "/sapi/debug/default/view",
+            "/debug/default/db-explain",
+        ),
+        ("aws",),
+        render_yii2_debug_view,
+        "text/html; charset=utf-8",
     ),
 )
 
