@@ -12,6 +12,7 @@ these endpoints are looking for that disclosure.
 | Symfony Web Profiler phpinfo() | `/_profiler/phpinfo`, `.php`, plus `/app_dev.php/_profiler/...`, `/symfony/_profiler/...`, `/frontend_dev.php/_profiler/...` variants | `aws` | `symfony-profiler-phpinfo` |
 | Symfony parameters.yml / profiler/open | `/parameters.yml`, `/config/parameters.yml`, `/app/config/parameters.yml`; `/_profiler/open`, `/app_dev.php/_profiler/open`, `/symfony/_profiler/open`, `/frontend_dev.php/_profiler/open` | `aws` | `symfony-parameters-yml` |
 | Yii2 debug toolbar config panel | `/debug/default/view`, `.html`, plus `/web/...`, `/frontend/web/...`, `/backend/web/...`, `/sapi/...` variants; `/debug/default/db-explain` | `aws` | `yii2-debug-view` |
+| Django debug toolbar | `/__debug__/render_panel/`, `/__debug__/`, `/__debug__/sql_select/`, `/__debug__/sql_explain/`, `/__debug__/sql_profile/`, `/__debug__/template_source/` | `aws` | `django-debug-toolbar` |
 
 All paths are case-insensitive exact matches (CanaryTrap shape) — the
 canary trap dispatcher matches the path-only piece, so any
@@ -37,6 +38,13 @@ slot a real dev-mode leak would expose it from:
   carrying per-hit synthetic DB and SMTP passwords. The same body is
   returned for `?panel=config`, `?panel=db`, etc. — credential
   grepping scanners don't differentiate the panel type.
+- **Django debug toolbar** — HTML page mimicking the
+  `django-debug-toolbar` SettingsPanel: `SECRET_KEY` (per-hit unique),
+  `DATABASE_URL` (per-hit DB password), plus `$_ENV` with the AWS
+  canary triple. The same body is returned for `?panel_id=SettingsPanel`,
+  `?panel_id=TemplatePanel`, etc. — the `panel_id` query suffix is
+  ignored since credential-grepping scanners target the path, not the
+  panel type.
 
 ## Why
 

@@ -564,6 +564,7 @@ def test_all_trap_families_default_on():
     assert tbenv.DRUPAL_ENABLED
     assert tbenv.SPRING_GATEWAY_ENABLED
     assert tbenv.BACKUP_ARCHIVE_ENABLED
+    assert tbenv.WP_LOGIN_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -6677,3 +6678,219 @@ async def test_dispatch_routes_heroku_tier_paths_to_trap(
     assert b"AKIAFAKEEXAMPLE01" in body or b"deploybot42" in body
     entries = _log_entries(flux_client.log_path)
     assert entries[-1]["result"] == expected_result
+
+
+# --- WordPress wp-login canary ---
+
+
+def test_wp_login_enabled_by_default():
+    assert tbenv.WP_LOGIN_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/wp-login.php",
+    "/wp-login.PHP",
+])
+def test_wp_login_path_match(path):
+    assert tbenv.is_wp_login_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    "/wp-login.php.bak", "/login", "/wp-login", "/.env",
+])
+def test_wp_login_path_no_match(path):
+    assert not tbenv.is_wp_login_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    "/wp-admin/",
+    "/wp-admin/index.php",
+    "/wp-admin/admin.php",
+    "/wp-admin/profile.php",
+    "/wp-admin/admin-ajax.php",
+    "/wp-admin/install.php",
+])
+def test_wp_admin_path_match(path):
+    assert tbenv.is_wp_admin_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    "/wp-admin", "/wp-admin/css/colors.css", "/login",
+])
+def test_wp_admin_path_no_match(path):
+    assert not tbenv.is_wp_admin_path(path)
+
+
+def test_wp_login_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "WP_LOGIN_ENABLED", False)
+    assert not tbenv.is_wp_login_path("/wp-login.php")
+    assert not tbenv.is_wp_admin_path("/wp-admin/index.php")
+
+
+def test_wp_login_render_html_includes_nonce_and_form_fields():
+    body = tbenv.render_wp_login_html(nonce="abc123", redirect_to="/wp-admin/")
+    assert b'name="_wpnonce"' in body
+    assert b'value="abc123"' in body
+    assert b'name="log"' in body
+    assert b'name="pwd"' in body
+    assert b'name="testcookie"' in body
+    assert b'name="wp-submit"' in body
+    assert b'action="/wp-login.php"' in body
+    assert b'name="redirect_to"' in body
+
+
+def test_wp_login_render_escapes_nonce():
+    body = tbenv.render_wp_login_html(nonce='"><script>x', redirect_to="/wp-admin/")
+    assert b"<script>" not in body
+    assert b"&quot;" in body
+
+
+def test_wp_login_nonce_store_and_check():
+    tbenv._WP_LOGIN_NONCE_CACHE.clear()
+    tbenv._wp_login_nonce_store("10.0.0.1", "nonce1")
+    assert tbenv._wp_login_nonce_check("10.0.0.1", "nonce1")
+    assert not tbenv._wp_login_nonce_check("10.0.0.1", "wrong")
+    assert not tbenv._wp_login_nonce_check("10.0.0.2", "nonce1")
+    tbenv._WP_LOGIN_NONCE_CACHE.clear()
+
+
+def test_wp_login_extract_creds():
+    body = b"log=admin&pwd=hunter2&_wpnonce=abc123&testcookie=1&redirect_to=/wp-admin/&wp-submit=Log+In"
+    result = tbenv.extract_wp_login_creds(body, "application/x-www-form-urlencoded")
+    assert result["log"] == "admin"
+    assert result["hasPwd"] == "true"
+    assert result["_wpnonce"] == "abc123"
+    assert result["testcookie"] == "1"
+    assert result["redirect_to"] == "/wp-admin/"
+    assert "pwd" not in result
+
+
+async def test_dispatch_get_wp_login_returns_login_page(flux_client, monkeypatch):
+    resp = await flux_client.get(
+        "/wp-login.php", headers={"X-Forwarded-For": "203.0.113.70"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/html")
+    body = await resp.read()
+    assert b'name="log"' in body
+    assert b'name="_wpnonce"' in body
+    entries = _log_entries(flux_client.log_path)
+    assert len(entries) == 1
+    assert entries[0]["result"] == "wp-login-probe"
+    assert entries[0]["status"] == 200
+    assert "wpLoginNonceIssued" in entries[0]
+
+
+async def test_dispatch_post_wp_login_captures_credentials(flux_client, monkeypatch):
+    resp = await flux_client.get(
+        "/wp-login.php", headers={"X-Forwarded-For": "203.0.113.71"},
+    )
+    assert resp.status == 200
+    entries = _log_entries(flux_client.log_path)
+    nonce = entries[-1]["wpLoginNonceIssued"]
+
+    resp = await flux_client.post(
+        "/wp-login.php",
+        data=f"log=admin&pwd=secret&_wpnonce={nonce}&testcookie=1",
+        headers={
+            "X-Forwarded-For": "203.0.113.71",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": "wordpress_test_cookie=WP+Cookie+check",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/wp-login.php?reauth=1"
+    entries = _log_entries(flux_client.log_path)
+    post_entry = entries[-1]
+    assert post_entry["result"] == "wp-login-credentials"
+    assert post_entry["wpLoginUsername"] == "admin"
+    assert post_entry["wpLoginHasPwd"] is True
+    assert post_entry["wpLoginNonceMatch"] is True
+    assert post_entry["wpLoginTestcookiePresent"] is True
+
+
+async def test_dispatch_post_wp_login_without_nonce_echo(flux_client, monkeypatch):
+    resp = await flux_client.post(
+        "/wp-login.php",
+        data="log=bob&pwd=pass123",
+        headers={
+            "X-Forwarded-For": "203.0.113.72",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    entries = _log_entries(flux_client.log_path)
+    post_entry = entries[-1]
+    assert post_entry["result"] == "wp-login-credentials"
+    assert post_entry["wpLoginUsername"] == "bob"
+    assert post_entry["wpLoginNonceMatch"] is False
+    assert post_entry["wpLoginTestcookiePresent"] is False
+
+
+async def test_dispatch_get_wp_admin_redirects_to_login(flux_client, monkeypatch):
+    resp = await flux_client.get(
+        "/wp-admin/index.php",
+        headers={"X-Forwarded-For": "203.0.113.73"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert "/wp-login.php?" in resp.headers["Location"]
+    assert "redirect_to=" in resp.headers["Location"]
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "wp-admin-redirect"
+
+
+async def test_dispatch_wp_login_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "WP_LOGIN_ENABLED", False)
+    resp = await flux_client.get(
+        "/wp-login.php", headers={"X-Forwarded-For": "203.0.113.74"},
+    )
+    assert resp.status == 404
+
+
+# --- Django debug-toolbar canary ---
+
+
+@pytest.mark.parametrize("path,expected_result", [
+    ("/__debug__/render_panel/", "django-debug-toolbar"),
+    ("/__debug__/render_panel", "django-debug-toolbar"),
+    ("/__debug__/", "django-debug-toolbar"),
+    ("/__debug__/sql_select/", "django-debug-toolbar"),
+    ("/__debug__/sql_explain/", "django-debug-toolbar"),
+    ("/__debug__/sql_profile/", "django-debug-toolbar"),
+    ("/__debug__/template_source/", "django-debug-toolbar"),
+])
+async def test_dispatch_routes_django_debug_toolbar_paths(
+    flux_client, monkeypatch, path, expected_result,
+):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.80"})
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"AKIAFAKEEXAMPLE01" in body
+    assert b"Django Debug Toolbar" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == expected_result
+
+
+def test_django_debug_toolbar_renderer_includes_secret_key_and_env():
+    body = tbenv.render_django_debug_toolbar(FAKE_TRACEBIT)
+    assert b"SECRET_KEY" in body
+    assert b"AWS_ACCESS_KEY_ID" in body
+    assert b"DATABASE_URL" in body
+    assert b"AKIAFAKEEXAMPLE01" in body
+
+
+def test_django_debug_toolbar_renderer_per_hit_unique_secret_key():
+    body1 = tbenv.render_django_debug_toolbar(FAKE_TRACEBIT)
+    body2 = tbenv.render_django_debug_toolbar(FAKE_TRACEBIT)
+    import re as _re
+    sk1 = _re.search(rb"SECRET_KEY</td><td>'([^']+)'", body1)
+    sk2 = _re.search(rb"SECRET_KEY</td><td>'([^']+)'", body2)
+    assert sk1 and sk2
+    assert sk1.group(1) != sk2.group(1)

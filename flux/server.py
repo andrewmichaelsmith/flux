@@ -353,6 +353,26 @@ WEBAPP_FORM_PASSWORD_KEYS = (
 )
 WEBAPP_FORM_BODY_PREVIEW_LIMIT = max(int((os.environ.get("HONEYPOT_WEBAPP_FORM_BODY_PREVIEW_LIMIT") or "400").strip() or "400"), 64)
 
+# --- Fake WordPress wp-login.php canary -----------------------------------
+# WordPress credential-stuffing scanners hit /wp-login.php with a GET-then-
+# POST pattern: GET to harvest _wpnonce + testcookie, POST with credentials.
+# Returning a realistic login form with a per-hit unique _wpnonce lets us
+# attribute the follow-up POST by whether it echoes the nonce (sophisticated
+# tool that parses the GET) or blind-POSTs without it (naive tool).
+WP_LOGIN_ENABLED = _env_bool("HONEYPOT_WP_LOGIN_ENABLED")
+WP_LOGIN_BODY_PREVIEW_LIMIT = max(int((os.environ.get("HONEYPOT_WP_LOGIN_BODY_PREVIEW_LIMIT") or "400").strip() or "400"), 64)
+WP_LOGIN_NONCE_CACHE_TTL = max(int((os.environ.get("HONEYPOT_WP_LOGIN_NONCE_CACHE_TTL") or "3600").strip() or "3600"), 60)
+WP_LOGIN_NONCE_CACHE_MAX = max(int((os.environ.get("HONEYPOT_WP_LOGIN_NONCE_CACHE_MAX") or "1024").strip() or "1024"), 16)
+WP_LOGIN_PATHS: set[str] = {"/wp-login.php"}
+WP_LOGIN_ADMIN_PATHS: set[str] = {
+    "/wp-admin/",
+    "/wp-admin/index.php",
+    "/wp-admin/admin.php",
+    "/wp-admin/profile.php",
+    "/wp-admin/admin-ajax.php",
+    "/wp-admin/install.php",
+}
+
 # --- Fake LLM-API endpoint (Ollama / OpenAI / Anthropic-proxy shape) ---
 # Motivated by scanner fleets observed probing AI-inference endpoints
 # in April 2026 — Ollama-native paths, OpenAI-compatible paths, and
@@ -1482,6 +1502,18 @@ def _webapp_form_match(path: str) -> str | None:
         return WEBAPP_FORM_PATH_SUFFIX[p]
     stripped = p.rstrip("/") or "/"
     return WEBAPP_FORM_PATH_SUFFIX.get(stripped)
+
+
+def is_wp_login_path(path: str) -> bool:
+    if not WP_LOGIN_ENABLED:
+        return False
+    return path.lower() in WP_LOGIN_PATHS
+
+
+def is_wp_admin_path(path: str) -> bool:
+    if not WP_LOGIN_ENABLED:
+        return False
+    return path.lower() in WP_LOGIN_ADMIN_PATHS
 
 
 def is_sonicwall_path(path: str) -> bool:
@@ -3524,6 +3556,89 @@ def render_webapp_form_html(
 </html>
 """
     return body.encode("utf-8")
+
+
+# --- WordPress wp-login.php canary renderer + nonce cache -----------------
+
+_WP_LOGIN_NONCE_CACHE: dict[str, tuple[float, set[str]]] = {}
+
+
+def _wp_login_nonce_store(client_ip: str, nonce: str) -> None:
+    now = time.monotonic()
+    entry = _WP_LOGIN_NONCE_CACHE.get(client_ip)
+    if entry and entry[0] > now:
+        entry[1].add(nonce)
+        if len(entry[1]) > 32:
+            entry[1].pop()
+    else:
+        _WP_LOGIN_NONCE_CACHE[client_ip] = (now + WP_LOGIN_NONCE_CACHE_TTL, {nonce})
+    if len(_WP_LOGIN_NONCE_CACHE) > WP_LOGIN_NONCE_CACHE_MAX:
+        expired = [k for k, v in _WP_LOGIN_NONCE_CACHE.items() if v[0] <= now]
+        for k in expired:
+            del _WP_LOGIN_NONCE_CACHE[k]
+        if len(_WP_LOGIN_NONCE_CACHE) > WP_LOGIN_NONCE_CACHE_MAX:
+            oldest_key = min(_WP_LOGIN_NONCE_CACHE, key=lambda k: _WP_LOGIN_NONCE_CACHE[k][0])
+            del _WP_LOGIN_NONCE_CACHE[oldest_key]
+
+
+def _wp_login_nonce_check(client_ip: str, nonce: str) -> bool:
+    now = time.monotonic()
+    entry = _WP_LOGIN_NONCE_CACHE.get(client_ip)
+    if not entry or entry[0] <= now:
+        return False
+    return nonce in entry[1]
+
+
+def render_wp_login_html(*, nonce: str, redirect_to: str) -> bytes:
+    safe_nonce = nonce.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    safe_redirect = redirect_to.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    body = f"""<!DOCTYPE html>
+<html lang="en-US">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+<title>Log In &lsaquo; WordPress</title>
+<meta name="robots" content="max-image-preview:large, noindex, noarchive" />
+<meta name="viewport" content="width=device-width" />
+</head>
+<body class="login login-action-login wp-core-ui">
+<div id="login">
+<h1><a href="https://wordpress.org/">Powered by WordPress</a></h1>
+<form name="loginform" id="loginform" action="/wp-login.php" method="post">
+<p>
+<label for="user_login">Username or Email Address</label>
+<input type="text" name="log" id="user_login" class="input" value="" size="20" autocapitalize="off" autocomplete="username" required="required" />
+</p>
+<p>
+<label for="user_pass">Password</label>
+<input type="password" name="pwd" id="user_pass" class="input" value="" size="20" autocomplete="current-password" spellcheck="false" required="required" />
+</p>
+<p class="forgetmenot"><input name="rememberme" type="checkbox" id="rememberme" value="forever" /> <label for="rememberme">Remember Me</label></p>
+<p class="submit">
+<input type="submit" name="wp-submit" id="wp-submit" class="button button-primary button-large" value="Log In" />
+<input type="hidden" name="redirect_to" value="{safe_redirect}" />
+<input type="hidden" name="testcookie" value="1" />
+<input type="hidden" name="_wpnonce" value="{safe_nonce}" />
+</p>
+</form>
+<p id="nav"><a href="/wp-login.php?action=lostpassword">Lost your password?</a></p>
+</div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def extract_wp_login_creds(body: bytes, content_type: str) -> dict[str, str]:
+    parsed = parse_form_body(body, content_type)
+    result: dict[str, str] = {}
+    for key in ("log", "pwd", "wp-submit", "redirect_to", "testcookie", "_wpnonce", "rememberme"):
+        values = parsed.get(key)
+        if values and values[0]:
+            if key == "pwd":
+                result["hasPwd"] = "true"
+            else:
+                result[key] = values[0][:200]
+    return result
 
 
 # Multipart Content-Disposition header tokens used by file-upload trap.
@@ -7501,6 +7616,50 @@ def render_yii2_debug_view(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_django_debug_toolbar(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    db_password = _fake_db_password()
+    secret_key = secrets.token_hex(25)
+    return (
+        "<!DOCTYPE html><html><head><title>Django Debug Toolbar - Settings</title>"
+        "<style>body{font-family:sans-serif;margin:0;padding:0;background:#fff;color:#333}"
+        "#djdt{background:#1c1c1c;color:#eee;padding:6px 12px;font-size:12px}"
+        ".djdt-panel{padding:1em 2em}"
+        "h3{border-bottom:1px solid #ccc;padding:.4em 0;margin-top:1.5em}"
+        "table{border-collapse:collapse;width:100%}"
+        "th,td{padding:4px 8px;border:1px solid #ddd;text-align:left;font-family:monospace;font-size:12px}"
+        "th{background:#f0f0f0;font-weight:bold}"
+        "</style></head>"
+        "<body><div id=\"djdt\">Django Debug Toolbar</div>"
+        "<div class=\"djdt-panel\">"
+        "<h3>Settings</h3>"
+        "<table>"
+        "<tr><th>Setting</th><th>Value</th></tr>"
+        "<tr><td>DEBUG</td><td>True</td></tr>"
+        f"<tr><td>SECRET_KEY</td><td>'{secret_key}'</td></tr>"
+        f"<tr><td>DATABASE_URL</td><td>postgres://prod_rw:{db_password}@db.internal:5432/prod</td></tr>"
+        "<tr><td>ALLOWED_HOSTS</td><td>['*']</td></tr>"
+        "<tr><td>INSTALLED_APPS</td><td>['django.contrib.admin', 'django.contrib.auth', "
+        "'django.contrib.contenttypes', 'django.contrib.sessions', "
+        "'debug_toolbar', 'rest_framework', 'app']</td></tr>"
+        "</table>"
+        "<h3>Environment Variables</h3>"
+        "<table>"
+        "<tr><th>Variable</th><th>Value</th></tr>"
+        f"<tr><td>AWS_ACCESS_KEY_ID</td><td>{ak}</td></tr>"
+        f"<tr><td>AWS_SECRET_ACCESS_KEY</td><td>{sk}</td></tr>"
+        f"<tr><td>AWS_SESSION_TOKEN</td><td>{st}</td></tr>"
+        "<tr><td>AWS_DEFAULT_REGION</td><td>us-east-1</td></tr>"
+        "<tr><td>S3_BUCKET</td><td>prod-uploads</td></tr>"
+        "<tr><td>DJANGO_SETTINGS_MODULE</td><td>config.settings</td></tr>"
+        "</table>"
+        "</div></body></html>\n"
+    ).encode("utf-8")
+
+
 def render_amplifyrc_json(r: dict[str, object]) -> bytes:
     """`.amplifyrc` is an AWS Amplify CLI project config that some teams
     accidentally commit. Real shape varies by Amplify version, but the
@@ -8778,6 +8937,21 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_yii2_debug_view,
         "text/html; charset=utf-8",
     ),
+    CanaryTrap(
+        "django-debug-toolbar",
+        (
+            "/__debug__/render_panel/",
+            "/__debug__/render_panel",
+            "/__debug__/",
+            "/__debug__/sql_select/",
+            "/__debug__/sql_explain/",
+            "/__debug__/sql_profile/",
+            "/__debug__/template_source/",
+        ),
+        ("aws",),
+        render_django_debug_toolbar,
+        "text/html; charset=utf-8",
+    ),
 )
 
 _TRAP_BY_PATH: dict[str, CanaryTrap] = {}
@@ -9126,6 +9300,96 @@ async def _handle_webapp_form(
             "Content-Type": "text/html; charset=utf-8",
             "Cache-Control": "no-store",
             "Content-Length": str(len(body)),
+        },
+    )
+
+
+async def _handle_wp_login(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    method = request.method
+    content_type_req = request.headers.get("Content-Type", "")
+    cookie_header = request.headers.get("Cookie", "")
+    cookies = parse_cookies(cookie_header)
+    client_ip = str(log_context["clientIp"])
+    nonce = uuid.uuid4().hex[:10]
+
+    if method == "POST":
+        fields = extract_wp_login_creds(request_body, content_type_req)
+        submitted_nonce = fields.get("_wpnonce", "")
+        nonce_match = _wp_login_nonce_check(client_ip, submitted_nonce) if submitted_nonce else False
+        body_preview = ""
+        if request_body:
+            body_preview = request_body[:WP_LOGIN_BODY_PREVIEW_LIMIT].decode("utf-8", errors="replace")
+        log_entry = {
+            **log_context,
+            "result": "wp-login-credentials",
+            "status": 302,
+            "wpLoginUsername": fields.get("log", ""),
+            "wpLoginHasPwd": fields.get("hasPwd", "") == "true",
+            "wpLoginNonceSubmitted": submitted_nonce[:32],
+            "wpLoginNonceMatch": nonce_match,
+            "wpLoginTestcookiePresent": "wordpress_test_cookie" in cookies,
+            "wpLoginRedirectTo": fields.get("redirect_to", "")[:200],
+            "bytes": 0,
+            "contentType": content_type_req[:120],
+        }
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview
+        append_log(log_entry)
+        session_id = uuid.uuid4().hex
+        return web.Response(
+            status=302, body=b"",
+            headers={
+                "Location": "/wp-login.php?reauth=1",
+                "Set-Cookie": f"wordpress_test_cookie=WP+Cookie+check; Path=/; HttpOnly; SameSite=Lax",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    redirect_to = "/wp-admin/"
+    body = render_wp_login_html(nonce=nonce, redirect_to=redirect_to)
+    _wp_login_nonce_store(client_ip, nonce)
+    response_body = b"" if method == "HEAD" else body
+    log_entry = {
+        **log_context,
+        "result": "wp-login-probe",
+        "status": 200,
+        "wpLoginNonceIssued": nonce,
+        "bytes": len(body),
+    }
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=response_body,
+        headers={
+            "Content-Type": "text/html; charset=utf-8",
+            "Set-Cookie": f"wordpress_test_cookie=WP+Cookie+check; Path=/; HttpOnly; SameSite=Lax",
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
+async def _handle_wp_admin_redirect(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    append_log({
+        **log_context,
+        "result": "wp-admin-redirect",
+        "status": 302,
+        "bytes": 0,
+    })
+    encoded_path = quote(path, safe="")
+    return web.Response(
+        status=302, body=b"",
+        headers={
+            "Location": f"/wp-login.php?redirect_to={encoded_path}&reauth=1",
+            "Cache-Control": "no-store",
         },
     )
 
@@ -11556,6 +11820,12 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_body_rce_request(path, query_string, request_body):
         return await _handle_body_rce(request, log_context, path, query_string, request_body)
 
+    if is_wp_login_path(path):
+        return await _handle_wp_login(request, log_context, path, request_body)
+
+    if is_wp_admin_path(path):
+        return await _handle_wp_admin_redirect(request, log_context, path)
+
     # Web-app form responder runs before the tarpit/fingerprint check so
     # that paths in both lists (e.g. `/`) stay with tarpit; the form trap
     # only matches its own concrete path set, never `/`.
@@ -11675,6 +11945,8 @@ def main() -> int:
         active.append("cmd-injection")
     if WEBAPP_FORM_ENABLED:
         active.append("webapp-form")
+    if WP_LOGIN_ENABLED:
+        active.append("wp-login")
     print(
         f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
         file=sys.stderr,
