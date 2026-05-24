@@ -5194,6 +5194,292 @@ def render_terraform_tfstate(r: dict[str, object]) -> bytes:
     return (json.dumps(state, indent=2) + "\n").encode("utf-8")
 
 
+# ---- Niche cloud-provider credential files --------------------------------
+# A growing population of credential-scanner tools enumerates config files
+# for smaller cloud providers alongside mainstream AWS/GCP/Azure paths.
+# Each renderer below produces a format-accurate file with the Tracebit
+# AWS canary embedded in the field a credential-extractor would grab.
+
+
+def render_oci_config(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "[DEFAULT]\n"
+        "user=ocid1.user.oc1..aaaaaaaaexample\n"
+        "fingerprint=ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89\n"
+        f"key_file=~/.oci/oci_api_key.pem\n"
+        "tenancy=ocid1.tenancy.oc1..aaaaaaaaexample\n"
+        "region=us-ashburn-1\n"
+        f"pass_phrase={aws.get('awsSecretAccessKey', '')}\n"
+    ).encode("utf-8")
+
+
+def render_oci_api_key_pem(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    tag = aws.get("awsAccessKeyId", "") + aws.get("awsSecretAccessKey", "")
+    fake_b64 = base64.b64encode(tag.encode() + secrets.token_bytes(128)).decode()
+    lines = [fake_b64[i:i + 64] for i in range(0, len(fake_b64), 64)]
+    return (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        + "\n".join(lines) + "\n"
+        "-----END RSA PRIVATE KEY-----\n"
+    ).encode("utf-8")
+
+
+def render_hcloud_toml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "active_context = \"prod\"\n"
+        "\n"
+        "[[contexts]]\n"
+        "name = \"prod\"\n"
+        f"token = \"{aws.get('awsSecretAccessKey', '')}\"\n"
+    ).encode("utf-8")
+
+
+def render_civo_json(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return json.dumps({
+        "apikeys": {
+            "prod": {
+                "key": aws.get("awsSecretAccessKey", ""),
+                "name": "prod",
+            },
+        },
+        "meta": {
+            "current_api_key": "prod",
+            "default_region": "LON1",
+        },
+    }, indent=2).encode("utf-8")
+
+
+def render_exoscale_toml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "defaultaccount = \"prod\"\n"
+        "\n"
+        "[[accounts]]\n"
+        "account = \"prod\"\n"
+        "endpoint = \"https://api.exoscale.com/v1\"\n"
+        "environment = \"api\"\n"
+        f"key = \"{aws.get('awsAccessKeyId', '')}\"\n"
+        f"secret = \"{aws.get('awsSecretAccessKey', '')}\"\n"
+    ).encode("utf-8")
+
+
+def render_scaleway_config_yaml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        f"access_key: {aws.get('awsAccessKeyId', '')}\n"
+        f"secret_key: {aws.get('awsSecretAccessKey', '')}\n"
+        "default_organization_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n"
+        "default_project_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n"
+        "default_region: fr-par\n"
+        "default_zone: fr-par-1\n"
+    ).encode("utf-8")
+
+
+def render_fly_auth_yml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        f"access_token: {aws.get('awsSecretAccessKey', '')}\n"
+    ).encode("utf-8")
+
+
+def render_ovh_conf(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "[default]\n"
+        "endpoint=ovh-eu\n"
+        f"application_key={aws.get('awsAccessKeyId', '')}\n"
+        f"application_secret={aws.get('awsSecretAccessKey', '')}\n"
+        f"consumer_key={aws.get('awsSessionToken', '')}\n"
+    ).encode("utf-8")
+
+
+def render_openstack_clouds_yaml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "clouds:\n"
+        "  prod:\n"
+        "    auth:\n"
+        "      auth_url: https://identity.api.example.com/v3\n"
+        f"      application_credential_id: {aws.get('awsAccessKeyId', '')}\n"
+        f"      application_credential_secret: {aws.get('awsSecretAccessKey', '')}\n"
+        "    region_name: RegionOne\n"
+        "    interface: public\n"
+        "    identity_api_version: 3\n"
+        "    auth_type: v3applicationcredential\n"
+    ).encode("utf-8")
+
+
+def render_terraform_credentials_tfrc_json(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return json.dumps({
+        "credentials": {
+            "app.terraform.io": {
+                "token": aws.get("awsSecretAccessKey", ""),
+            },
+        },
+    }, indent=2).encode("utf-8")
+
+
+def render_pulumi_credentials_json(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return json.dumps({
+        "current": "https://api.pulumi.com",
+        "accessTokens": {
+            "https://api.pulumi.com": aws.get("awsSecretAccessKey", ""),
+        },
+        "accounts": {
+            "https://api.pulumi.com": {
+                "accessToken": aws.get("awsSecretAccessKey", ""),
+                "username": "deploy",
+                "lastValidatedAt": "2025-01-15T00:00:00Z",
+            },
+        },
+    }, indent=2).encode("utf-8")
+
+
+def render_doctl_config_yaml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        f"access-token: {aws.get('awsSecretAccessKey', '')}\n"
+        "context: default\n"
+        "output: text\n"
+    ).encode("utf-8")
+
+
+def render_linode_cli(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "[DEFAULT]\n"
+        "default-user = deploy\n"
+        "\n"
+        "[deploy]\n"
+        f"token = {aws.get('awsSecretAccessKey', '')}\n"
+        "region = us-east\n"
+        "type = g6-standard-2\n"
+        "image = linode/ubuntu22.04\n"
+    ).encode("utf-8")
+
+
+def render_terraformrc(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "credentials \"app.terraform.io\" {\n"
+        f"  token = \"{aws.get('awsSecretAccessKey', '')}\"\n"
+        "}\n"
+    ).encode("utf-8")
+
+
+def render_s3cfg(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "[default]\n"
+        f"access_key = {aws.get('awsAccessKeyId', '')}\n"
+        f"secret_key = {aws.get('awsSecretAccessKey', '')}\n"
+        "host_base = s3.amazonaws.com\n"
+        "host_bucket = %(bucket)s.s3.amazonaws.com\n"
+        "use_https = True\n"
+    ).encode("utf-8")
+
+
+def render_passwd_s3fs(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        f"{aws.get('awsAccessKeyId', '')}:{aws.get('awsSecretAccessKey', '')}\n"
+    ).encode("utf-8")
+
+
+def render_cargo_credentials(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "[registry]\n"
+        f"token = \"{aws.get('awsSecretAccessKey', '')}\"\n"
+    ).encode("utf-8")
+
+
+def render_gem_credentials(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "---\n"
+        f":rubygems_api_key: {aws.get('awsSecretAccessKey', '')}\n"
+    ).encode("utf-8")
+
+
+def render_gh_hosts_yml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "github.com:\n"
+        f"  oauth_token: {aws.get('awsSecretAccessKey', '')}\n"
+        "  user: deploy\n"
+        "  git_protocol: https\n"
+    ).encode("utf-8")
+
+
+def render_1password_config(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return json.dumps({
+        "latest_signin": "my.1password.com",
+        "accounts": [
+            {
+                "shorthand": "my",
+                "url": "https://my.1password.com",
+                "email": "deploy@example.com",
+                "accountKey": aws.get("awsSecretAccessKey", ""),
+                "userUUID": str(uuid.uuid4()),
+            },
+        ],
+    }, indent=2).encode("utf-8")
+
+
+def render_cloudflared_config_yml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        f"tunnel: {uuid.uuid4()}\n"
+        f"credentials-file: /etc/cloudflared/{uuid.uuid4()}.json\n"
+        f"secret: {aws.get('awsSecretAccessKey', '')}\n"
+        "ingress:\n"
+        "  - hostname: app.example.com\n"
+        "    service: http://localhost:8080\n"
+        "  - service: http_status:404\n"
+    ).encode("utf-8")
+
+
+def render_wireguard_conf(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    fake_key = base64.b64encode(secrets.token_bytes(32)).decode()
+    return (
+        "[Interface]\n"
+        f"PrivateKey = {fake_key}\n"
+        "Address = 10.0.0.2/24\n"
+        "DNS = 1.1.1.1\n"
+        "\n"
+        "[Peer]\n"
+        f"PublicKey = {base64.b64encode(secrets.token_bytes(32)).decode()}\n"
+        f"PresharedKey = {aws.get('awsSecretAccessKey', '')}\n"
+        "Endpoint = vpn.example.com:51820\n"
+        "AllowedIPs = 0.0.0.0/0\n"
+    ).encode("utf-8")
+
+
+def render_headscale_config_yaml(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    return (
+        "server_url: https://headscale.example.com\n"
+        f"private_key: {aws.get('awsSecretAccessKey', '')}\n"
+        "noise:\n"
+        f"  private_key: {_fake_db_password()}\n"
+        "ip_prefixes:\n"
+        "  - 100.64.0.0/10\n"
+        "derp:\n"
+        "  urls:\n"
+        "    - https://controlplane.tailscale.com/derpmap/default\n"
+        "  auto_update_enabled: true\n"
+    ).encode("utf-8")
+
+
 def render_pgpass(r: dict[str, object]) -> bytes:
     # Postgres `.pgpass` format: one line per entry, colon-separated
     # hostname:port:database:username:password. libpq reads this file if it
@@ -8951,6 +9237,231 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_django_debug_toolbar,
         "text/html; charset=utf-8",
+    ),
+    # ---- Niche cloud-provider credential files ----------------------------
+    # Scanners probing AWS/GCP/Azure also enumerate smaller-provider CLI
+    # config files. Each entry below emits a format-accurate config with
+    # the Tracebit AWS canary in the field a credential extractor grabs.
+    CanaryTrap(
+        "oci-config",
+        ("/.oci/config",),
+        ("aws",),
+        render_oci_config,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "oci-api-key-pem",
+        ("/.oci/oci_api_key.pem",),
+        ("aws",),
+        render_oci_api_key_pem,
+        "application/x-pem-file; charset=utf-8",
+    ),
+    CanaryTrap(
+        "hcloud-cli",
+        (
+            "/.config/hcloud/cli.toml",
+            "/.hcloud.toml",
+            "/hcloud.yml",
+            "/root/.config/hcloud/cli.toml",
+            "/home/ubuntu/.config/hcloud/cli.toml",
+        ),
+        ("aws",),
+        render_hcloud_toml,
+        "application/toml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "civo-cli",
+        (
+            "/.config/civo/civo.json",
+            "/root/.config/civo/civo.json",
+        ),
+        ("aws",),
+        render_civo_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "exoscale-cli",
+        (
+            "/.config/exoscale/exoscale.toml",
+            "/root/.config/exoscale/exoscale.toml",
+        ),
+        ("aws",),
+        render_exoscale_toml,
+        "application/toml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "scaleway-cli",
+        (
+            "/.config/scw/config.yaml",
+            "/.config/scaleway/config.yaml",
+            "/root/.config/scw/config.yaml",
+        ),
+        ("aws",),
+        render_scaleway_config_yaml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "fly-cli",
+        (
+            "/.fly/auth.yml",
+            "/.config/fly/config.yml",
+        ),
+        ("aws",),
+        render_fly_auth_yml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "ovh-conf",
+        (
+            "/.ovh.conf",
+            "/root/.ovh.conf",
+            "/home/ubuntu/.ovh.conf",
+        ),
+        ("aws",),
+        render_ovh_conf,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "openstack-clouds-yaml",
+        (
+            "/.config/openstack/clouds.yaml",
+            "/clouds.yaml",
+            "/root/.config/openstack/clouds.yaml",
+        ),
+        ("aws",),
+        render_openstack_clouds_yaml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "terraform-credentials-tfrc",
+        (
+            "/.terraform.d/credentials.tfrc.json",
+            "/root/.terraform.d/credentials.tfrc.json",
+        ),
+        ("aws",),
+        render_terraform_credentials_tfrc_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "terraformrc",
+        (
+            "/.terraformrc",
+            "/root/.terraformrc",
+        ),
+        ("aws",),
+        render_terraformrc,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "pulumi-credentials",
+        (
+            "/.pulumi/credentials.json",
+            "/root/.pulumi/credentials.json",
+        ),
+        ("aws",),
+        render_pulumi_credentials_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "doctl-config",
+        (
+            "/.config/doctl/config.yaml",
+            "/root/.config/doctl/config.yaml",
+        ),
+        ("aws",),
+        render_doctl_config_yaml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "linode-cli",
+        (
+            "/.linode-cli",
+            "/root/.linode-cli",
+        ),
+        ("aws",),
+        render_linode_cli,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "s3cfg",
+        (
+            "/.s3cfg",
+            "/root/.s3cfg",
+        ),
+        ("aws",),
+        render_s3cfg,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "passwd-s3fs",
+        (
+            "/.passwd-s3fs",
+            "/root/.passwd-s3fs",
+        ),
+        ("aws",),
+        render_passwd_s3fs,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "cargo-credentials",
+        ("/.cargo/credentials",),
+        ("aws",),
+        render_cargo_credentials,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "gem-credentials",
+        ("/.gem/credentials",),
+        ("aws",),
+        render_gem_credentials,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "gh-hosts-yml",
+        (
+            "/.config/gh/hosts.yml",
+            "/root/.config/gh/hosts.yml",
+        ),
+        ("aws",),
+        render_gh_hosts_yml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "1password-config",
+        (
+            "/.config/op/config",
+            "/root/.config/op/config",
+        ),
+        ("aws",),
+        render_1password_config,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "cloudflared-config",
+        (
+            "/etc/cloudflared/config.yml",
+            "/etc/cloudflared/cert.pem",
+        ),
+        ("aws",),
+        render_cloudflared_config_yml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "wireguard-conf",
+        ("/etc/wireguard/wg0.conf",),
+        ("aws",),
+        render_wireguard_conf,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "headscale-config",
+        (
+            "/etc/headscale/config.yaml",
+            "/etc/headscale/private.key",
+        ),
+        ("aws",),
+        render_headscale_config_yaml,
+        "application/x-yaml; charset=utf-8",
     ),
 )
 
