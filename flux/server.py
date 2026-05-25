@@ -5890,6 +5890,80 @@ def render_env_production(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def _fake_mail_api_key(service: str) -> str:
+    if service == "sendgrid":
+        return f"SG.{secrets.token_urlsafe(22)}.{secrets.token_urlsafe(43)}"
+    if service == "postmark":
+        return f"{secrets.token_hex(16)}-{secrets.token_hex(16)}"
+    if service == "mailjet":
+        return secrets.token_hex(16)
+    if service == "brevo":
+        return f"xkeysib-{secrets.token_hex(32)}-{secrets.token_urlsafe(16)}"
+    if service == "mailgun":
+        return f"key-{secrets.token_hex(16)}"
+    return secrets.token_urlsafe(32)
+
+
+_MAIL_SERVICE_PATH_MAP: dict[str, tuple[str, str, str, str]] = {
+    "/sendgrid/.env":  ("sendgrid",  "SENDGRID_API_KEY",        "smtp.sendgrid.net",  "apikey"),
+    "/postmark/.env":  ("postmark",  "POSTMARK_SERVER_TOKEN",   "smtp.postmarkapp.com", ""),
+    "/mailjet/.env":   ("mailjet",   "MJ_APIKEY_PUBLIC",        "in-v3.mailjet.com",  ""),
+    "/brevo/.env":     ("brevo",     "BREVO_API_KEY",           "smtp-relay.brevo.com", ""),
+    "/mailgun/.env":   ("mailgun",   "MAILGUN_API_KEY",         "smtp.mailgun.org",   ""),
+    "/mailing/.env":   ("sendgrid",  "SENDGRID_API_KEY",        "smtp.sendgrid.net",  "apikey"),
+    "/mail/.env":      ("sendgrid",  "SENDGRID_API_KEY",        "smtp.sendgrid.net",  "apikey"),
+    "/mailserver/.env": ("postmark", "POSTMARK_SERVER_TOKEN",   "smtp.postmarkapp.com", ""),
+}
+
+
+def _render_mail_service_env_for(path: str) -> "Callable[[dict[str, object]], bytes]":
+    def _render(r: dict[str, object]) -> bytes:
+        return render_mail_service_env(r, path=path)
+    return _render
+
+
+def render_mail_service_env(r: dict[str, object], *, path: str = "") -> bytes:
+    svc, key_name, smtp_host, smtp_user = _MAIL_SERVICE_PATH_MAP.get(
+        path.lower(), ("sendgrid", "SENDGRID_API_KEY", "smtp.sendgrid.net", "apikey"),
+    )
+    aws = _aws(r)
+    api_key = _fake_mail_api_key(svc)
+    db_password = _fake_db_password()
+    smtp_password = _fake_mail_api_key(svc)
+    lines = [
+        f"# {svc} mailer config — do not commit (INFRA-314)",
+        "NODE_ENV=production",
+        "",
+        f"# {svc.title()} credentials",
+        f"{key_name}={api_key}",
+    ]
+    if svc == "mailjet":
+        lines.append(f"MJ_APIKEY_PRIVATE={secrets.token_hex(16)}")
+    if svc == "mailgun":
+        lines.append(f"MAILGUN_DOMAIN=mg.internal-apps.com")
+    lines += [
+        "",
+        f"SMTP_HOST={smtp_host}",
+        "SMTP_PORT=587",
+    ]
+    if smtp_user:
+        lines.append(f"SMTP_USER={smtp_user}")
+    lines.append(f"SMTP_PASSWORD={smtp_password}")
+    lines += [
+        "",
+        "# AWS (S3 attachments + SES fallback)",
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}",
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}",
+        f"AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}",
+        "AWS_REGION=us-east-1",
+        "S3_BUCKET=prod-mail-attachments",
+        "",
+        f"DATABASE_URL=postgresql://mailer_rw:{db_password}@db.internal:5432/mailer_prod",
+        "",
+    ]
+    return "\n".join(lines).encode("utf-8")
+
+
 def render_bash_history(r: dict[str, object]) -> bytes:
     # Synthetic `~/.bash_history` — the goal is to look like a real
     # operator's recent session captured by sloppy shell history settings
@@ -8476,6 +8550,16 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_env_production,
         "text/plain; charset=utf-8",
+    ),
+    *(
+        CanaryTrap(
+            "mail-service-env",
+            (p,),
+            ("aws",),
+            _render_mail_service_env_for(p),
+            "text/plain; charset=utf-8",
+        )
+        for p in _MAIL_SERVICE_PATH_MAP
     ),
     # `~/.bash_history` — shell-history harvest. Scanner dictionaries
     # walk every plausible home-dir webroot leak (`/root/.bash_history`,

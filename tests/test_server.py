@@ -606,6 +606,14 @@ def test_tarpit_enabled_by_default():
     "/srv/.env",
     "/var/www/.env",
     "/app/.env",
+    "/sendgrid/.env",
+    "/postmark/.env",
+    "/mailjet/.env",
+    "/brevo/.env",
+    "/mailgun/.env",
+    "/mailing/.env",
+    "/mail/.env",
+    "/mailserver/.env",
 ])
 def test_canary_trap_paths_do_not_match_tarpit(path):
     assert path.lower() in tbenv._TRAP_BY_PATH, (
@@ -881,6 +889,22 @@ FAKE_TRACEBIT = {
     ("/etc/cloudflared/config.yml", b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
     ("/etc/wireguard/wg0.conf", b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
     ("/etc/headscale/config.yaml", b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+    # Mail-service .env traps — AWS canary embedded alongside service-specific keys
+    ("/sendgrid/.env", b"AKIAFAKEEXAMPLE01"),
+    ("/sendgrid/.env", b"SENDGRID_API_KEY=SG."),
+    ("/postmark/.env", b"AKIAFAKEEXAMPLE01"),
+    ("/postmark/.env", b"POSTMARK_SERVER_TOKEN="),
+    ("/mailjet/.env", b"AKIAFAKEEXAMPLE01"),
+    ("/mailjet/.env", b"MJ_APIKEY_PUBLIC="),
+    ("/mailjet/.env", b"MJ_APIKEY_PRIVATE="),
+    ("/brevo/.env", b"AKIAFAKEEXAMPLE01"),
+    ("/brevo/.env", b"BREVO_API_KEY=xkeysib-"),
+    ("/mailgun/.env", b"AKIAFAKEEXAMPLE01"),
+    ("/mailgun/.env", b"MAILGUN_API_KEY=key-"),
+    ("/mailgun/.env", b"MAILGUN_DOMAIN="),
+    ("/mailing/.env", b"AKIAFAKEEXAMPLE01"),
+    ("/mail/.env", b"AKIAFAKEEXAMPLE01"),
+    ("/mailserver/.env", b"AKIAFAKEEXAMPLE01"),
 ])
 def test_canary_trap_renderers_embed_canary(path, needle):
     trap = tbenv._TRAP_BY_PATH[path]
@@ -912,6 +936,14 @@ def test_canary_trap_renderers_embed_canary(path, needle):
     "/_profiler/open",
     "/debug/default/view",
     "/frontend/web/debug/default/view",
+    "/sendgrid/.env",
+    "/postmark/.env",
+    "/mailjet/.env",
+    "/brevo/.env",
+    "/mailgun/.env",
+    "/mailing/.env",
+    "/mail/.env",
+    "/mailserver/.env",
 ])
 def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
     # Regression: the ``h6T!9pq2Wz@LmRnV`` / ``prod_rw`` DB-password literal
@@ -932,6 +964,33 @@ def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
     # rendered bodies should differ somewhere. (Same AWS canary mock is used
     # for both, so anything that varies is necessarily the DB password.)
     assert body_1 != body_2, f"{path!r} renders identically across calls — password not randomized"
+
+
+@pytest.mark.parametrize("path,svc_marker", [
+    ("/sendgrid/.env", b"SENDGRID_API_KEY=SG."),
+    ("/postmark/.env", b"POSTMARK_SERVER_TOKEN="),
+    ("/mailjet/.env", b"MJ_APIKEY_PUBLIC="),
+    ("/brevo/.env", b"BREVO_API_KEY=xkeysib-"),
+    ("/mailgun/.env", b"MAILGUN_API_KEY=key-"),
+])
+def test_mail_service_env_renders_service_specific_key(path, svc_marker):
+    trap = tbenv._TRAP_BY_PATH[path]
+    body = trap.render(FAKE_TRACEBIT)
+    assert svc_marker in body, f"{path} should contain {svc_marker!r}"
+    assert b"AWS_ACCESS_KEY_ID=" in body, f"{path} should also embed AWS canary"
+    assert b"SMTP_HOST=" in body, f"{path} should contain SMTP config"
+    assert b"DATABASE_URL=" in body, f"{path} should contain DB URL"
+
+
+def test_mail_service_env_paths_produce_different_content():
+    sendgrid_trap = tbenv._TRAP_BY_PATH["/sendgrid/.env"]
+    postmark_trap = tbenv._TRAP_BY_PATH["/postmark/.env"]
+    sg_body = sendgrid_trap.render(FAKE_TRACEBIT)
+    pm_body = postmark_trap.render(FAKE_TRACEBIT)
+    assert b"SENDGRID_API_KEY" in sg_body
+    assert b"POSTMARK_SERVER_TOKEN" in pm_body
+    assert b"SENDGRID_API_KEY" not in pm_body
+    assert b"POSTMARK_SERVER_TOKEN" not in sg_body
 
 
 @pytest.mark.parametrize("path", [
