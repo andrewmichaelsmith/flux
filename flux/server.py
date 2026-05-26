@@ -632,6 +632,85 @@ RDWEB_PATHS = {
 # password-spraying targets; matches the broad install base.
 RDWEB_SERVER_BUILD = (os.environ.get("HONEYPOT_RDWEB_SERVER_BUILD") or "10.0.17763").strip()
 
+# --- Fake Palo Alto GlobalProtect gateway (CVE-2024-3400 bait) ----------
+# Multi-vendor VPN scanners probe `/global-protect/prelogin.esp` (with
+# PAN GlobalProtect UA) and `/ssl-vpn/prelogin.esp` to fingerprint
+# appliance mode (portal vs gateway). CVE-2024-3400 (CVSS 10.0,
+# unauthenticated command injection in the GlobalProtect gateway,
+# CISA KEV) targets the gateway path; returning a prelogin XML that
+# claims gateway mode invites follow-on exploit attempts at
+# `/api/v1/sessions` or SESSID cookie injection. Scanners also
+# probe `/global-protect/login.esp` for the credential form.
+GLOBALPROTECT_ENABLED = _env_bool("HONEYPOT_GLOBALPROTECT_ENABLED")
+_GLOBALPROTECT_DEFAULT_PATHS = ",".join([
+    "/global-protect/prelogin.esp",
+    "/ssl-vpn/prelogin.esp",
+    "/global-protect/login.esp",
+    "/global-protect/getconfig.esp",
+])
+GLOBALPROTECT_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_GLOBALPROTECT_PATHS_CSV") or _GLOBALPROTECT_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+GLOBALPROTECT_VERSION = (os.environ.get("HONEYPOT_GLOBALPROTECT_VERSION") or "10.2.3").strip()
+
+# --- Fake Sophos SSL VPN (XG Firewall user portal) ----------------------
+# `/svpn/index.cgi` is the Sophos XG Firewall SSL VPN landing.
+# Scanners check whether the VPN portal is enabled before attempting
+# credential brute-force or CVE-2022-1040 (auth bypass, CVSS 9.8)
+# exploit chains. Returning the portal login HTML invites credential
+# submissions.
+SOPHOS_VPN_ENABLED = _env_bool("HONEYPOT_SOPHOS_VPN_ENABLED")
+_SOPHOS_VPN_DEFAULT_PATHS = ",".join([
+    "/svpn/index.cgi",
+    "/userportal/webpages/myaccount/login.jsp",
+])
+SOPHOS_VPN_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_SOPHOS_VPN_PATHS_CSV") or _SOPHOS_VPN_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+
+# --- Fake Barracuda SSL VPN (BSDI) --------------------------------------
+# `/myvpn` with `sess=none&hdlc_framing=no&ipv4=1&ipv6=1` is the
+# Barracuda SSL VPN tunnel-setup negotiation endpoint. Scanners probe
+# this to discover Barracuda appliances for CVE-2023-7102 / CVE-2023-7101
+# (Spreadsheet::ParseExcel RCE chain). Returning a plausible tunnel
+# negotiation response keeps the probe alive.
+BARRACUDA_VPN_ENABLED = _env_bool("HONEYPOT_BARRACUDA_VPN_ENABLED")
+_BARRACUDA_VPN_DEFAULT_PATHS = ",".join([
+    "/myvpn",
+    "/cgi-mod/index.cgi",
+])
+BARRACUDA_VPN_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_BARRACUDA_VPN_PATHS_CSV") or _BARRACUDA_VPN_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+
+# --- Fake F5 BIG-IP APM (Access Policy Manager) -------------------------
+# `/my.policy` is the F5 BIG-IP APM access policy landing — scanners
+# probe it to fingerprint the BIG-IP web interface before checking for
+# CVE-2023-46747 (auth bypass, CVSS 9.8) or CVE-2022-1388 (iControl
+# REST RCE, CVSS 9.8). Also covers `/tmui/login.jsp` (the TMUI
+# management console targeted by CVE-2020-5902) and
+# `/sslvpnclient` (NetMotion/Zscaler client negotiation, often
+# bundled by multi-vendor VPN scanners).
+F5_BIGIP_ENABLED = _env_bool("HONEYPOT_F5_BIGIP_ENABLED")
+_F5_BIGIP_DEFAULT_PATHS = ",".join([
+    "/my.policy",
+    "/tmui/login.jsp",
+    "/tmui/login.jsp/..;/tmui/locallb/workspace/fileread.jsp",
+    "/sslvpnclient",
+])
+F5_BIGIP_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_F5_BIGIP_PATHS_CSV") or _F5_BIGIP_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+F5_BIGIP_VERSION = (os.environ.get("HONEYPOT_F5_BIGIP_VERSION") or "16.1.3.1").strip()
+
 # --- Fake Hikvision IP-camera ISAPI surface (CVE-2021-36260 bait) -------
 # Long-running banner-grab probes consistently fetch a small set of
 # ISAPI endpoints to identify Hikvision firmware before shipping a
@@ -1556,6 +1635,35 @@ def is_rdweb_path(path: str) -> bool:
     if not RDWEB_ENABLED:
         return False
     return path.lower() in RDWEB_PATHS
+
+
+def is_globalprotect_path(path: str) -> bool:
+    if not GLOBALPROTECT_ENABLED:
+        return False
+    return path.lower().split("?")[0] in GLOBALPROTECT_PATHS
+
+
+def is_sophos_vpn_path(path: str) -> bool:
+    if not SOPHOS_VPN_ENABLED:
+        return False
+    return path.lower() in SOPHOS_VPN_PATHS
+
+
+def is_barracuda_vpn_path(path: str) -> bool:
+    if not BARRACUDA_VPN_ENABLED:
+        return False
+    return path.lower().split("?")[0] in BARRACUDA_VPN_PATHS
+
+
+def is_f5_bigip_path(path: str) -> bool:
+    if not F5_BIGIP_ENABLED:
+        return False
+    lp = path.lower().split("?")[0]
+    if lp in F5_BIGIP_PATHS:
+        return True
+    if lp.startswith("/tmui/"):
+        return True
+    return False
 
 
 def is_hikvision_path(path: str) -> bool:
@@ -2561,6 +2669,225 @@ _FORTIGATE_CMD_INJECTION_INDICATORS = (
 def _fortigate_has_cmd_injection(body_preview: str, query: str) -> bool:
     haystack = f"{query} {body_preview}".lower()
     return any(needle in haystack for needle in _FORTIGATE_CMD_INJECTION_INDICATORS)
+
+
+# ---- GlobalProtect renderers ------------------------------------------------
+
+def render_globalprotect_prelogin_xml(version: str) -> bytes:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" ?>\n'
+        "<prelogin-cookie>\n"
+        f"  <status>0</status>\n"
+        f"  <ccusername></ccusername>\n"
+        f"  <autosubmit>false</autosubmit>\n"
+        f"  <msg></msg>\n"
+        f"  <newmsg></newmsg>\n"
+        f"  <authentication-message>Please login to continue</authentication-message>\n"
+        f"  <username-label>Username</username-label>\n"
+        f"  <password-label>Password</password-label>\n"
+        f"  <panos-version>{version}</panos-version>\n"
+        f"  <region>Americas</region>\n"
+        "</prelogin-cookie>\n"
+    ).encode("utf-8")
+
+
+def render_globalprotect_login_html(host: str) -> bytes:
+    safe_host = host or "globalprotect"
+    return (
+        "<!DOCTYPE html>\n<html><head>\n"
+        f"<title>GlobalProtect Portal - {safe_host}</title>\n"
+        "</head><body>\n"
+        '<div id="portal-login">\n'
+        '<form method="post" action="/global-protect/login.esp">\n'
+        '<input type="text" name="user" placeholder="Username" />\n'
+        '<input type="password" name="passwd" placeholder="Password" />\n'
+        '<input type="hidden" name="inputStr" />\n'
+        '<button type="submit">Log In</button>\n'
+        "</form>\n</div>\n"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
+def render_globalprotect_getconfig_xml(host: str, version: str) -> bytes:
+    safe_host = host or "globalprotect"
+    return (
+        '<?xml version="1.0" encoding="UTF-8" ?>\n'
+        "<response>\n"
+        f"  <portal>{safe_host}</portal>\n"
+        f"  <user></user>\n"
+        f"  <gateways>\n"
+        f"    <external>\n"
+        f"      <list>\n"
+        f"        <entry name=\"{safe_host}-gw\">\n"
+        f"          <description>{safe_host} Gateway</description>\n"
+        f"          <priority>1</priority>\n"
+        f"        </entry>\n"
+        f"      </list>\n"
+        f"    </external>\n"
+        f"  </gateways>\n"
+        "</response>\n"
+    ).encode("utf-8")
+
+
+def extract_globalprotect_form(body: bytes, content_type: str) -> tuple[str, bool]:
+    if not body:
+        return "", False
+    text = body.decode("utf-8", errors="replace")
+    username = ""
+    has_password = False
+    for part in text.split("&"):
+        if "=" not in part:
+            continue
+        key, _, val = part.partition("=")
+        key = unquote(key.strip().lower())
+        val = unquote(val.strip())
+        if key == "user":
+            username = val[:200]
+        elif key == "passwd" and val:
+            has_password = True
+    return username, has_password
+
+
+# ---- Sophos SSL VPN renderers -----------------------------------------------
+
+def render_sophos_vpn_login_html(host: str) -> bytes:
+    safe_host = host or "sophos-xg"
+    return (
+        "<!DOCTYPE html>\n<html><head>\n"
+        f"<title>Sophos Firewall - {safe_host}</title>\n"
+        '<meta name="viewport" content="width=device-width, initial-scale=1" />\n'
+        "</head><body>\n"
+        '<div id="login-container">\n'
+        '<h2>SSL VPN Login</h2>\n'
+        '<form method="post" action="/svpn/index.cgi">\n'
+        '<input type="text" name="username" placeholder="Username" />\n'
+        '<input type="password" name="password" placeholder="Password" />\n'
+        '<input type="hidden" name="ajax" value="1" />\n'
+        '<button type="submit">Login</button>\n'
+        "</form>\n</div>\n"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
+def extract_sophos_form(body: bytes, content_type: str) -> tuple[str, bool]:
+    if not body:
+        return "", False
+    text = body.decode("utf-8", errors="replace")
+    username = ""
+    has_password = False
+    for part in text.split("&"):
+        if "=" not in part:
+            continue
+        key, _, val = part.partition("=")
+        key = unquote(key.strip().lower())
+        val = unquote(val.strip())
+        if key == "username":
+            username = val[:200]
+        elif key == "password" and val:
+            has_password = True
+    return username, has_password
+
+
+# ---- Barracuda SSL VPN renderers --------------------------------------------
+
+def render_barracuda_vpn_negotiation() -> bytes:
+    return (
+        "HTTP/1.1 200 OK\r\n"
+        "X-Barracuda-VPN: enabled\r\n"
+        "Content-Type: text/plain\r\n\r\n"
+        "CONNECT\r\n"
+        "ipv4=1\r\n"
+        "ipv6=1\r\n"
+        "hdlc_framing=no\r\n"
+        "Z=deflate\r\n"
+    ).encode("utf-8")
+
+
+def render_barracuda_login_html(host: str) -> bytes:
+    safe_host = host or "barracuda"
+    return (
+        "<!DOCTYPE html>\n<html><head>\n"
+        f"<title>Barracuda SSL VPN - {safe_host}</title>\n"
+        "</head><body>\n"
+        '<div id="vpn-login">\n'
+        '<h2>Barracuda Networks SSL VPN</h2>\n'
+        '<form method="post" action="/cgi-mod/index.cgi">\n'
+        '<input type="text" name="username" placeholder="Username" />\n'
+        '<input type="password" name="password" placeholder="Password" />\n'
+        '<button type="submit">Log In</button>\n'
+        "</form>\n</div>\n"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
+# ---- F5 BIG-IP APM renderers ------------------------------------------------
+
+def render_f5_my_policy_html(host: str, version: str) -> bytes:
+    safe_host = host or "bigip"
+    return (
+        "<!DOCTYPE html>\n<html><head>\n"
+        f"<title>BIG-IP - {safe_host}</title>\n"
+        "</head><body>\n"
+        '<div id="access-policy">\n'
+        '<h2>BIG-IP Access Policy</h2>\n'
+        '<form method="post" action="/my.policy">\n'
+        '<input type="text" name="username" placeholder="Username" />\n'
+        '<input type="password" name="password" placeholder="Password" />\n'
+        '<input type="hidden" name="vhost" value="standard" />\n'
+        '<button type="submit">Logon</button>\n'
+        "</form>\n</div>\n"
+        f"<!-- F5 BIG-IP {version} -->\n"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
+def render_f5_tmui_login_html(host: str, version: str) -> bytes:
+    safe_host = host or "bigip"
+    return (
+        "<!DOCTYPE html>\n<html><head>\n"
+        f"<title>BIG-IP&reg; Configuration Utility</title>\n"
+        "</head><body>\n"
+        '<div id="main_table">\n'
+        '<form method="post" action="/tmui/logmein.html">\n'
+        '<input type="text" name="username" placeholder="Username" />\n'
+        '<input type="password" name="passwd" placeholder="Password" />\n'
+        '<button type="submit">Log in</button>\n'
+        "</form>\n</div>\n"
+        f"<!-- BIG-IP {version} -->\n"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
+def render_f5_sslvpnclient_xml() -> bytes:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<sslvpn>\n"
+        "  <status>enabled</status>\n"
+        "  <protocol>3</protocol>\n"
+        "  <platform>mac</platform>\n"
+        "  <ipv4>1</ipv4>\n"
+        "  <ipv6>1</ipv6>\n"
+        "</sslvpn>\n"
+    ).encode("utf-8")
+
+
+def extract_f5_form(body: bytes, content_type: str) -> tuple[str, bool]:
+    if not body:
+        return "", False
+    text = body.decode("utf-8", errors="replace")
+    username = ""
+    has_password = False
+    for part in text.split("&"):
+        if "=" not in part:
+            continue
+        key, _, val = part.partition("=")
+        key = unquote(key.strip().lower())
+        val = unquote(val.strip())
+        if key in ("username", "user"):
+            username = val[:200]
+        elif key in ("password", "passwd") and val:
+            has_password = True
+    return username, has_password
 
 
 def render_citrix_gateway_index_html(host: str, version: str) -> bytes:
@@ -10420,6 +10747,237 @@ async def _handle_fortigate_vpn(
     return web.Response(status=200, body=body, headers=headers)
 
 
+async def _handle_globalprotect(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    lpath = path.lower().split("?")[0]
+    method = request.method
+    host = str(log_context.get("host", ""))
+    content_type_req = request.headers.get("Content-Type", "")
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    set_cookie_value: str | None = None
+
+    if lpath in ("/global-protect/prelogin.esp", "/ssl-vpn/prelogin.esp"):
+        result_tag = "globalprotect-prelogin"
+        body = render_globalprotect_prelogin_xml(GLOBALPROTECT_VERSION)
+        content_type = "application/xml; charset=utf-8"
+    elif lpath == "/global-protect/login.esp":
+        result_tag = "globalprotect-login"
+        if method == "POST":
+            body = (
+                '<?xml version="1.0" encoding="UTF-8" ?>\n'
+                "<response><status>error</status>"
+                "<msg>Invalid credential</msg></response>\n"
+            ).encode("utf-8")
+            content_type = "application/xml; charset=utf-8"
+            set_cookie_value = f"PHPSESSID={uuid.uuid4().hex}; Path=/; Secure; HttpOnly"
+        else:
+            body = render_globalprotect_login_html(host)
+            content_type = "text/html; charset=utf-8"
+    elif lpath == "/global-protect/getconfig.esp":
+        result_tag = "globalprotect-getconfig"
+        body = render_globalprotect_getconfig_xml(host, GLOBALPROTECT_VERSION)
+        content_type = "application/xml; charset=utf-8"
+    else:
+        append_log({**log_context, "status": 404, "result": "globalprotect-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "globalprotectPath": path,
+        "globalprotectMethod": method,
+        "bytes": len(body),
+    }
+    if request_body and method == "POST":
+        username, has_password = extract_globalprotect_form(request_body, content_type_req)
+        if username:
+            log_entry["globalprotectUsername"] = username
+        log_entry["globalprotectHasPassword"] = has_password
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview[:400]
+    append_log(log_entry)
+
+    headers: dict[str, str] = {
+        "Content-Type": content_type,
+        "Cache-Control": "no-store",
+        "Server": "PanWeb Server/",
+    }
+    if set_cookie_value:
+        headers["Set-Cookie"] = set_cookie_value
+    return web.Response(status=200, body=body, headers=headers)
+
+
+async def _handle_sophos_vpn(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    method = request.method
+    host = str(log_context.get("host", ""))
+    content_type_req = request.headers.get("Content-Type", "")
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    result_tag = "sophos-vpn-login"
+    body = render_sophos_vpn_login_html(host)
+    content_type = "text/html; charset=utf-8"
+    set_cookie_value = f"JSESSIONID={uuid.uuid4().hex}; Path=/; Secure; HttpOnly"
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "sophosPath": path,
+        "sophosMethod": method,
+        "bytes": len(body),
+    }
+    if request_body and method == "POST":
+        username, has_password = extract_sophos_form(request_body, content_type_req)
+        if username:
+            log_entry["sophosUsername"] = username
+        log_entry["sophosHasPassword"] = has_password
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview[:400]
+    append_log(log_entry)
+
+    return web.Response(status=200, body=body, headers={
+        "Content-Type": content_type,
+        "Cache-Control": "no-store",
+        "Server": "xxxx",
+        "Set-Cookie": set_cookie_value,
+    })
+
+
+async def _handle_barracuda_vpn(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    lpath = path.lower().split("?")[0]
+    method = request.method
+    host = str(log_context.get("host", ""))
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    if lpath == "/myvpn":
+        result_tag = "barracuda-vpn-tunnel"
+        body = render_barracuda_vpn_negotiation()
+        content_type = "text/plain; charset=utf-8"
+    elif lpath == "/cgi-mod/index.cgi":
+        result_tag = "barracuda-vpn-login"
+        body = render_barracuda_login_html(host)
+        content_type = "text/html; charset=utf-8"
+    else:
+        append_log({**log_context, "status": 404, "result": "barracuda-vpn-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "barracudaPath": path,
+        "barracudaMethod": method,
+        "bytes": len(body),
+    }
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview[:400]
+    append_log(log_entry)
+
+    return web.Response(status=200, body=body, headers={
+        "Content-Type": content_type,
+        "Cache-Control": "no-store",
+    })
+
+
+async def _handle_f5_bigip(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    lpath = path.lower().split("?")[0]
+    method = request.method
+    host = str(log_context.get("host", ""))
+    query = str(log_context.get("query", "") or "")
+    content_type_req = request.headers.get("Content-Type", "")
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    has_path_traversal = "/.." in path or "%2e%2e" in path.lower()
+
+    set_cookie_value: str | None = None
+
+    if lpath == "/my.policy":
+        result_tag = "f5-bigip-apm-policy"
+        body = render_f5_my_policy_html(host, F5_BIGIP_VERSION)
+        content_type = "text/html; charset=utf-8"
+        set_cookie_value = f"MRHSession={uuid.uuid4().hex}; Path=/; Secure; HttpOnly"
+    elif lpath == "/tmui/login.jsp" or lpath.startswith("/tmui/"):
+        result_tag = "f5-bigip-tmui"
+        body = render_f5_tmui_login_html(host, F5_BIGIP_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/sslvpnclient":
+        result_tag = "f5-sslvpnclient"
+        body = render_f5_sslvpnclient_xml()
+        content_type = "application/xml; charset=utf-8"
+    else:
+        append_log({**log_context, "status": 404, "result": "f5-bigip-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "f5Path": path,
+        "f5Method": method,
+        "f5HasPathTraversal": has_path_traversal,
+        "bytes": len(body),
+    }
+    if request_body and method == "POST":
+        username, has_password = extract_f5_form(request_body, content_type_req)
+        if username:
+            log_entry["f5Username"] = username
+        log_entry["f5HasPassword"] = has_password
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview[:400]
+    append_log(log_entry)
+
+    headers: dict[str, str] = {
+        "Content-Type": content_type,
+        "Cache-Control": "no-store",
+        "Server": "BigIP",
+    }
+    if set_cookie_value:
+        headers["Set-Cookie"] = set_cookie_value
+    return web.Response(status=200, body=body, headers=headers)
+
+
 async def _handle_citrix_gateway(
     request: web.Request,
     log_context: dict[str, object],
@@ -12369,6 +12927,18 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_fortigate_vpn_path(path):
         return await _handle_fortigate_vpn(request, log_context, path, request_body)
 
+    if is_globalprotect_path(path):
+        return await _handle_globalprotect(request, log_context, path, request_body)
+
+    if is_sophos_vpn_path(path):
+        return await _handle_sophos_vpn(request, log_context, path, request_body)
+
+    if is_barracuda_vpn_path(path):
+        return await _handle_barracuda_vpn(request, log_context, path, request_body)
+
+    if is_f5_bigip_path(path):
+        return await _handle_f5_bigip(request, log_context, path, request_body)
+
     if is_citrix_gateway_path(path):
         return await _handle_citrix_gateway(request, log_context, path, request_body)
 
@@ -12514,6 +13084,14 @@ def main() -> int:
         active.append("aspera-faspex")
     if FORTIGATE_VPN_ENABLED:
         active.append("fortigate-vpn")
+    if GLOBALPROTECT_ENABLED:
+        active.append("globalprotect")
+    if SOPHOS_VPN_ENABLED:
+        active.append("sophos-vpn")
+    if BARRACUDA_VPN_ENABLED:
+        active.append("barracuda-vpn")
+    if F5_BIGIP_ENABLED:
+        active.append("f5-bigip")
     if CITRIX_GATEWAY_ENABLED:
         active.append("citrix-gateway")
     if RDWEB_ENABLED:

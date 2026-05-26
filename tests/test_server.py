@@ -557,6 +557,10 @@ def test_all_trap_families_default_on():
     assert tbenv.SAP_METADATAUPLOADER_ENABLED
     assert tbenv.CITRIX_GATEWAY_ENABLED
     assert tbenv.RDWEB_ENABLED
+    assert tbenv.GLOBALPROTECT_ENABLED
+    assert tbenv.SOPHOS_VPN_ENABLED
+    assert tbenv.BARRACUDA_VPN_ENABLED
+    assert tbenv.F5_BIGIP_ENABLED
     assert tbenv.NEXTJS_ENABLED
     assert tbenv.CMD_INJECTION_ENABLED
     assert tbenv.WEBAPP_FORM_ENABLED
@@ -2826,6 +2830,354 @@ async def test_dispatch_citrix_gateway_disabled_returns_404(flux_client, monkeyp
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)
     assert entries[-1]["result"] == "not-handled"
+
+
+# --- Palo Alto GlobalProtect trap ---
+
+
+def test_globalprotect_enabled_by_default():
+    assert tbenv.GLOBALPROTECT_ENABLED
+
+
+def test_globalprotect_default_paths_match_observed_probes():
+    for p in [
+        "/global-protect/prelogin.esp",
+        "/ssl-vpn/prelogin.esp",
+        "/global-protect/login.esp",
+        "/global-protect/getconfig.esp",
+    ]:
+        assert tbenv.is_globalprotect_path(p), f"{p} should match"
+
+
+def test_globalprotect_path_non_match():
+    for p in ["/", "/remote/login", "/vpn/index.html", "/global-protect"]:
+        assert not tbenv.is_globalprotect_path(p), f"{p} should NOT match"
+
+
+def test_globalprotect_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "GLOBALPROTECT_ENABLED", False)
+    assert not tbenv.is_globalprotect_path("/global-protect/prelogin.esp")
+
+
+def test_globalprotect_path_strips_query_string():
+    assert tbenv.is_globalprotect_path(
+        "/global-protect/prelogin.esp?tmp=tmp&clientVer=4100&clientos=Windows"
+    )
+
+
+async def test_dispatch_globalprotect_prelogin_returns_xml(flux_client):
+    resp = await flux_client.get(
+        "/global-protect/prelogin.esp?tmp=tmp&clientVer=4100",
+        headers={"X-Forwarded-For": "203.0.113.160", "Host": "gp.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "<prelogin-cookie>" in text
+    assert "<panos-version>" in text
+    assert resp.headers.get("Server") == "PanWeb Server/"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "globalprotect-prelogin"
+
+
+async def test_dispatch_globalprotect_login_get_returns_html(flux_client):
+    resp = await flux_client.get(
+        "/global-protect/login.esp",
+        headers={"X-Forwarded-For": "203.0.113.161"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "GlobalProtect Portal" in text
+    assert 'name="user"' in text
+
+
+async def test_dispatch_globalprotect_login_post_logs_username(flux_client):
+    resp = await flux_client.post(
+        "/global-protect/login.esp",
+        data="user=admin&passwd=secret123",
+        headers={
+            "X-Forwarded-For": "203.0.113.162",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Invalid credential" in text
+    assert "PHPSESSID" in resp.headers.get("Set-Cookie", "")
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "globalprotect-login"
+    assert entry["globalprotectUsername"] == "admin"
+    assert entry["globalprotectHasPassword"] is True
+
+
+async def test_dispatch_globalprotect_getconfig_returns_xml(flux_client):
+    resp = await flux_client.get(
+        "/global-protect/getconfig.esp",
+        headers={"X-Forwarded-For": "203.0.113.163", "Host": "gp.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "<portal>" in text
+    assert "<gateways>" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "globalprotect-getconfig"
+
+
+async def test_dispatch_globalprotect_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "GLOBALPROTECT_ENABLED", False)
+    resp = await flux_client.get(
+        "/global-protect/prelogin.esp",
+        headers={"X-Forwarded-For": "203.0.113.164"},
+    )
+    assert resp.status == 404
+
+
+# --- Sophos SSL VPN trap ---
+
+
+def test_sophos_vpn_enabled_by_default():
+    assert tbenv.SOPHOS_VPN_ENABLED
+
+
+def test_sophos_vpn_default_paths_match_observed_probes():
+    for p in ["/svpn/index.cgi", "/userportal/webpages/myaccount/login.jsp"]:
+        assert tbenv.is_sophos_vpn_path(p), f"{p} should match"
+
+
+def test_sophos_vpn_path_non_match():
+    for p in ["/", "/svpn", "/vpn/index.html"]:
+        assert not tbenv.is_sophos_vpn_path(p), f"{p} should NOT match"
+
+
+def test_sophos_vpn_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "SOPHOS_VPN_ENABLED", False)
+    assert not tbenv.is_sophos_vpn_path("/svpn/index.cgi")
+
+
+async def test_dispatch_sophos_vpn_login_returns_html(flux_client):
+    resp = await flux_client.get(
+        "/svpn/index.cgi",
+        headers={"X-Forwarded-For": "203.0.113.170", "Host": "sophos.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "SSL VPN Login" in text
+    assert 'name="username"' in text
+    assert "JSESSIONID" in resp.headers.get("Set-Cookie", "")
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "sophos-vpn-login"
+
+
+async def test_dispatch_sophos_vpn_post_logs_username(flux_client):
+    resp = await flux_client.post(
+        "/svpn/index.cgi",
+        data="username=admin&password=test123",
+        headers={
+            "X-Forwarded-For": "203.0.113.171",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "sophos-vpn-login"
+    assert entry["sophosUsername"] == "admin"
+    assert entry["sophosHasPassword"] is True
+
+
+async def test_dispatch_sophos_vpn_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "SOPHOS_VPN_ENABLED", False)
+    resp = await flux_client.get(
+        "/svpn/index.cgi",
+        headers={"X-Forwarded-For": "203.0.113.172"},
+    )
+    assert resp.status == 404
+
+
+# --- Barracuda SSL VPN trap ---
+
+
+def test_barracuda_vpn_enabled_by_default():
+    assert tbenv.BARRACUDA_VPN_ENABLED
+
+
+def test_barracuda_vpn_default_paths_match_observed_probes():
+    for p in ["/myvpn", "/cgi-mod/index.cgi"]:
+        assert tbenv.is_barracuda_vpn_path(p), f"{p} should match"
+
+
+def test_barracuda_vpn_path_strips_query_string():
+    assert tbenv.is_barracuda_vpn_path(
+        "/myvpn?sess=none&hdlc_framing=no&ipv4=1&ipv6=1"
+    )
+
+
+def test_barracuda_vpn_path_non_match():
+    for p in ["/", "/vpn", "/myvpn2"]:
+        assert not tbenv.is_barracuda_vpn_path(p), f"{p} should NOT match"
+
+
+def test_barracuda_vpn_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "BARRACUDA_VPN_ENABLED", False)
+    assert not tbenv.is_barracuda_vpn_path("/myvpn")
+
+
+async def test_dispatch_barracuda_vpn_tunnel_negotiation(flux_client):
+    resp = await flux_client.get(
+        "/myvpn?sess=none&hdlc_framing=no&ipv4=1&ipv6=1",
+        headers={"X-Forwarded-For": "203.0.113.180"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "CONNECT" in text
+    assert "hdlc_framing=no" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "barracuda-vpn-tunnel"
+
+
+async def test_dispatch_barracuda_vpn_login_returns_html(flux_client):
+    resp = await flux_client.get(
+        "/cgi-mod/index.cgi",
+        headers={"X-Forwarded-For": "203.0.113.181", "Host": "barracuda.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Barracuda Networks SSL VPN" in text
+    assert 'name="username"' in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "barracuda-vpn-login"
+
+
+async def test_dispatch_barracuda_vpn_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "BARRACUDA_VPN_ENABLED", False)
+    resp = await flux_client.get(
+        "/myvpn",
+        headers={"X-Forwarded-For": "203.0.113.182"},
+    )
+    assert resp.status == 404
+
+
+# --- F5 BIG-IP APM trap ---
+
+
+def test_f5_bigip_enabled_by_default():
+    assert tbenv.F5_BIGIP_ENABLED
+
+
+def test_f5_bigip_default_paths_match_observed_probes():
+    for p in ["/my.policy", "/tmui/login.jsp", "/sslvpnclient"]:
+        assert tbenv.is_f5_bigip_path(p), f"{p} should match"
+
+
+def test_f5_bigip_tmui_prefix_match():
+    assert tbenv.is_f5_bigip_path(
+        "/tmui/login.jsp/..;/tmui/locallb/workspace/fileread.jsp"
+    )
+    assert tbenv.is_f5_bigip_path("/tmui/logmein.html")
+
+
+def test_f5_bigip_path_non_match():
+    for p in ["/", "/vpn/index.html", "/my.policies"]:
+        assert not tbenv.is_f5_bigip_path(p), f"{p} should NOT match"
+
+
+def test_f5_bigip_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "F5_BIGIP_ENABLED", False)
+    assert not tbenv.is_f5_bigip_path("/my.policy")
+
+
+async def test_dispatch_f5_bigip_my_policy_returns_html_with_session(flux_client):
+    resp = await flux_client.get(
+        "/my.policy",
+        headers={"X-Forwarded-For": "203.0.113.190", "Host": "bigip.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "BIG-IP Access Policy" in text
+    assert 'name="username"' in text
+    assert "MRHSession" in resp.headers.get("Set-Cookie", "")
+    assert resp.headers.get("Server") == "BigIP"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "f5-bigip-apm-policy"
+
+
+async def test_dispatch_f5_bigip_tmui_login_returns_html(flux_client):
+    resp = await flux_client.get(
+        "/tmui/login.jsp",
+        headers={"X-Forwarded-For": "203.0.113.191"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Configuration Utility" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "f5-bigip-tmui"
+
+
+async def test_dispatch_f5_bigip_tmui_path_traversal_flagged(flux_client):
+    resp = await flux_client.get(
+        "/tmui/login.jsp/..;/tmui/locallb/workspace/fileread.jsp",
+        headers={"X-Forwarded-For": "203.0.113.192"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "f5-bigip-tmui"
+    assert entry["f5HasPathTraversal"] is True
+
+
+async def test_dispatch_f5_sslvpnclient_returns_xml(flux_client):
+    resp = await flux_client.get(
+        "/sslvpnclient?launchplatform=mac&neProto=3",
+        headers={"X-Forwarded-For": "203.0.113.193"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "<sslvpn>" in text
+    assert "<status>enabled</status>" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "f5-sslvpnclient"
+
+
+async def test_dispatch_f5_bigip_my_policy_session_per_request_unique(flux_client):
+    cookies = set()
+    for _ in range(3):
+        resp = await flux_client.get(
+            "/my.policy",
+            headers={"X-Forwarded-For": "203.0.113.194"},
+        )
+        cookies.add(resp.headers.get("Set-Cookie", ""))
+    assert len(cookies) == 3, "MRHSession cookie should be unique per request"
+
+
+async def test_dispatch_f5_bigip_post_logs_username(flux_client):
+    resp = await flux_client.post(
+        "/my.policy",
+        data="username=admin&password=pass123",
+        headers={
+            "X-Forwarded-For": "203.0.113.195",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "f5-bigip-apm-policy"
+    assert entry["f5Username"] == "admin"
+    assert entry["f5HasPassword"] is True
+
+
+async def test_dispatch_f5_bigip_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "F5_BIGIP_ENABLED", False)
+    resp = await flux_client.get(
+        "/my.policy",
+        headers={"X-Forwarded-For": "203.0.113.196"},
+    )
+    assert resp.status == 404
 
 
 # --- Microsoft RDWeb (RD Web Access) trap ---
