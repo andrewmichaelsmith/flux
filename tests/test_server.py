@@ -561,6 +561,7 @@ def test_all_trap_families_default_on():
     assert tbenv.SOPHOS_VPN_ENABLED
     assert tbenv.BARRACUDA_VPN_ENABLED
     assert tbenv.F5_BIGIP_ENABLED
+    assert tbenv.DOCKER_REGISTRY_ENABLED
     assert tbenv.NEXTJS_ENABLED
     assert tbenv.CMD_INJECTION_ENABLED
     assert tbenv.WEBAPP_FORM_ENABLED
@@ -3176,6 +3177,169 @@ async def test_dispatch_f5_bigip_disabled_returns_404(flux_client, monkeypatch):
     resp = await flux_client.get(
         "/my.policy",
         headers={"X-Forwarded-For": "203.0.113.196"},
+    )
+    assert resp.status == 404
+
+
+# --- Docker Registry V2 API trap ---
+
+
+def test_docker_registry_enabled_by_default():
+    assert tbenv.DOCKER_REGISTRY_ENABLED
+
+
+def test_docker_registry_version_check_path():
+    assert tbenv.is_docker_registry_path("/v2/")
+    assert tbenv.is_docker_registry_path("/v2")
+
+
+def test_docker_registry_catalog_path():
+    assert tbenv.is_docker_registry_path("/v2/_catalog")
+
+
+def test_docker_registry_tags_path():
+    assert tbenv.is_docker_registry_path("/v2/internal/api-gateway/tags/list")
+    assert tbenv.is_docker_registry_path("/v2/myrepo/tags/list")
+
+
+def test_docker_registry_manifest_path():
+    assert tbenv.is_docker_registry_path("/v2/myrepo/manifests/latest")
+    assert tbenv.is_docker_registry_path("/v2/internal/auth-service/manifests/sha256:" + "a" * 64)
+    assert tbenv.is_docker_registry_path("/v2/myrepo/manifests/v1.2.3")
+
+
+def test_docker_registry_blob_path():
+    assert tbenv.is_docker_registry_path("/v2/myrepo/blobs/sha256:" + "b" * 64)
+
+
+def test_docker_registry_path_non_match():
+    for path in (
+        "/",
+        "/v2/.env",
+        "/v2/api-docs",
+        "/api/v2/foo",
+        "/v3/_catalog",
+        "/v2/keys/?recursive=true",
+    ):
+        assert not tbenv.is_docker_registry_path(path), f"unexpected match: {path}"
+
+
+def test_docker_registry_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "DOCKER_REGISTRY_ENABLED", False)
+    assert not tbenv.is_docker_registry_path("/v2/_catalog")
+    assert not tbenv.is_docker_registry_path("/v2/")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_registry_version_check(flux_client):
+    resp = await flux_client.get(
+        "/v2/",
+        headers={"X-Forwarded-For": "203.0.113.200"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Docker-Distribution-Api-Version") == "registry/2.0"
+    body = await resp.json()
+    assert body == {}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_registry_catalog(flux_client):
+    resp = await flux_client.get(
+        "/v2/_catalog",
+        headers={"X-Forwarded-For": "203.0.113.200"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Docker-Distribution-Api-Version") == "registry/2.0"
+    body = await resp.json()
+    assert "repositories" in body
+    assert isinstance(body["repositories"], list)
+    assert len(body["repositories"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_registry_tags(flux_client):
+    resp = await flux_client.get(
+        "/v2/internal/api-gateway/tags/list",
+        headers={"X-Forwarded-For": "203.0.113.200"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["name"] == "internal/api-gateway"
+    assert "latest" in body["tags"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_registry_manifest(flux_client):
+    resp = await flux_client.get(
+        "/v2/internal/api-gateway/manifests/latest",
+        headers={"X-Forwarded-For": "203.0.113.200"},
+    )
+    assert resp.status == 200
+    assert "docker.distribution.manifest" in resp.headers.get("Content-Type", "")
+    body = await resp.json()
+    assert body["schemaVersion"] == 2
+    assert len(body["layers"]) > 0
+    assert body["config"]["digest"].startswith("sha256:")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_registry_blob(flux_client):
+    digest = "sha256:" + "a" * 64
+    resp = await flux_client.get(
+        f"/v2/internal/api-gateway/blobs/{digest}",
+        headers={"X-Forwarded-For": "203.0.113.200"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Content-Type") == "application/octet-stream"
+    body = await resp.read()
+    assert body[:2] == b"\x1f\x8b"  # gzip magic
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_registry_auth_header_logged(flux_client):
+    resp = await flux_client.get(
+        "/v2/_catalog",
+        headers={
+            "X-Forwarded-For": "203.0.113.200",
+            "Authorization": "Basic dXNlcjpwYXNz",
+        },
+    )
+    assert resp.status == 200
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-registry-catalog"]
+    assert len(entries) >= 1
+    assert entries[-1].get("dockerAuthHeader") == "Basic dXNlcjpwYXNz"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_registry_mutation_logged(flux_client):
+    resp = await flux_client.post(
+        "/v2/internal/api-gateway/manifests/latest",
+        headers={"X-Forwarded-For": "203.0.113.200"},
+        data=b'{"test":"manifest"}',
+    )
+    assert resp.status == 200
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-registry-manifest"]
+    assert len(entries) >= 1
+    assert entries[-1].get("dockerMutationMethod") == "POST"
+    assert entries[-1].get("dockerBodySha256")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_registry_unknown_repo_returns_404(flux_client):
+    resp = await flux_client.get(
+        "/v2/nonexistent-repo-xyz/tags/list",
+        headers={"X-Forwarded-For": "203.0.113.200"},
+    )
+    # Even unknown repos get a tags response — the trap serves any repo name
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_registry_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "DOCKER_REGISTRY_ENABLED", False)
+    resp = await flux_client.get(
+        "/v2/_catalog",
+        headers={"X-Forwarded-For": "203.0.113.200"},
     )
     assert resp.status == 404
 

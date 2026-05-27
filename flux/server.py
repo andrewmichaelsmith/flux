@@ -711,6 +711,25 @@ F5_BIGIP_PATHS = {
 }
 F5_BIGIP_VERSION = (os.environ.get("HONEYPOT_F5_BIGIP_VERSION") or "16.1.3.1").strip()
 
+# --- Fake Docker Registry V2 API ----------------------------------------
+# `/v2/_catalog` is the Docker Distribution Registry HTTP API V2 endpoint
+# that lists all repository names. Scanners probe it to discover exposed
+# private registries for image enumeration, credential extraction from
+# layer blobs, and malicious image push. The protocol is multi-step:
+# `/v2/` (version check) -> `/v2/_catalog` (repo list) ->
+# `/v2/<name>/tags/list` (tag enumeration) -> `/v2/<name>/manifests/<ref>`
+# (image manifest) -> `/v2/<name>/blobs/<digest>` (layer download).
+# Returning a plausible catalog with fake repo names invites follow-on
+# enumeration. The `Docker-Distribution-Api-Version` header is the
+# primary fingerprint real registries emit; scanners check for it.
+DOCKER_REGISTRY_ENABLED = _env_bool("HONEYPOT_DOCKER_REGISTRY_ENABLED")
+_DOCKER_REGISTRY_REPOS = [
+    r.strip()
+    for r in (os.environ.get("HONEYPOT_DOCKER_REGISTRY_REPOS_CSV")
+              or "internal/api-gateway,internal/auth-service,deploy/worker,staging/web-app,backup/db-migrator").split(",")
+    if r.strip()
+]
+
 # --- Fake Hikvision IP-camera ISAPI surface (CVE-2021-36260 bait) -------
 # Long-running banner-grab probes consistently fetch a small set of
 # ISAPI endpoints to identify Hikvision firmware before shipping a
@@ -1664,6 +1683,23 @@ def is_f5_bigip_path(path: str) -> bool:
     if lp.startswith("/tmui/"):
         return True
     return False
+
+
+_DOCKER_REGISTRY_V2_RE = re.compile(
+    r"^/v2/(?:"
+    r"_catalog"
+    r"|([a-z0-9_./-]+)/(?:tags/list|manifests/[a-zA-Z0-9._:+-]+|blobs/sha256:[0-9a-f]{64})"
+    r")$"
+)
+
+
+def is_docker_registry_path(path: str) -> bool:
+    if not DOCKER_REGISTRY_ENABLED:
+        return False
+    lp = path.lower().split("?")[0]
+    if lp in ("/v2/", "/v2"):
+        return True
+    return _DOCKER_REGISTRY_V2_RE.match(lp) is not None
 
 
 def is_hikvision_path(path: str) -> bool:
@@ -2869,6 +2905,44 @@ def render_f5_sslvpnclient_xml() -> bytes:
         "  <ipv6>1</ipv6>\n"
         "</sslvpn>\n"
     ).encode("utf-8")
+
+
+# --- Docker Registry V2 API renderers ------------------------------------
+
+def render_docker_registry_catalog() -> bytes:
+    payload = {"repositories": list(_DOCKER_REGISTRY_REPOS)}
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_docker_registry_tags(repo: str) -> bytes:
+    payload = {"name": repo, "tags": ["latest", "v1.2.3", "stable", "main"]}
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_docker_registry_manifest(repo: str, ref: str) -> bytes:
+    config_digest = "sha256:" + hashlib.sha256(
+        f"config-{repo}-{ref}".encode()
+    ).hexdigest()
+    layer_digest = "sha256:" + hashlib.sha256(
+        f"layer-{repo}-{ref}-0".encode()
+    ).hexdigest()
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {
+            "mediaType": "application/vnd.docker.container.image.v1+json",
+            "size": 1470,
+            "digest": config_digest,
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                "size": 27098240,
+                "digest": layer_digest,
+            },
+        ],
+    }
+    return json.dumps(manifest, separators=(",", ":")).encode("utf-8")
 
 
 def extract_f5_form(body: bytes, content_type: str) -> tuple[str, bool]:
@@ -10978,6 +11052,93 @@ async def _handle_f5_bigip(
     return web.Response(status=200, body=body, headers=headers)
 
 
+async def _handle_docker_registry(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    lpath = path.lower().split("?")[0]
+    method = request.method
+
+    auth_header = request.headers.get("Authorization", "")
+
+    body: bytes = b""
+    content_type = "application/json; charset=utf-8"
+    result_tag = "docker-registry-miss"
+    status_code = 404
+    extra: dict[str, object] = {}
+
+    registry_headers: dict[str, str] = {
+        "Docker-Distribution-Api-Version": "registry/2.0",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+    if lpath in ("/v2/", "/v2"):
+        result_tag = "docker-registry-version"
+        body = b"{}"
+        status_code = 200
+    elif lpath == "/v2/_catalog":
+        result_tag = "docker-registry-catalog"
+        body = render_docker_registry_catalog()
+        status_code = 200
+    else:
+        m = _DOCKER_REGISTRY_V2_RE.match(lpath)
+        if m and m.group(1):
+            repo = m.group(1)
+            extra["dockerRepo"] = repo
+            if "/tags/list" in lpath:
+                result_tag = "docker-registry-tags"
+                body = render_docker_registry_tags(repo)
+                status_code = 200
+            elif "/manifests/" in lpath:
+                ref = lpath.rsplit("/manifests/", 1)[-1]
+                extra["dockerRef"] = ref
+                result_tag = "docker-registry-manifest"
+                body = render_docker_registry_manifest(repo, ref)
+                content_type = "application/vnd.docker.distribution.manifest.v2+json"
+                status_code = 200
+            elif "/blobs/" in lpath:
+                digest = lpath.rsplit("/blobs/", 1)[-1]
+                extra["dockerDigest"] = digest
+                result_tag = "docker-registry-blob"
+                body = b"\x1f\x8b\x08\x00" + secrets.token_bytes(64)
+                content_type = "application/octet-stream"
+                status_code = 200
+
+    if auth_header:
+        extra["dockerAuthHeader"] = auth_header[:HEADER_VALUE_LOG_LIMIT]
+    extra["dockerMethod"] = method
+    extra["dockerPath"] = path
+
+    if method in ("PUT", "PATCH", "POST", "DELETE"):
+        extra["dockerMutationMethod"] = method
+        if request_body:
+            extra["dockerBodySha256"] = hashlib.sha256(request_body).hexdigest()
+            extra["dockerBodyPreview"] = request_body[:400].decode("utf-8", errors="replace")
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": status_code,
+        "result": result_tag,
+        "bytes": len(body),
+        **extra,
+    }
+    append_log(log_entry)
+
+    if status_code == 404:
+        return web.Response(
+            status=404, body=b'{"errors":[{"code":"NAME_UNKNOWN","message":"repository name not known to registry"}]}\n',
+            headers={**registry_headers, "Content-Type": "application/json; charset=utf-8"},
+        )
+
+    return web.Response(status=status_code, body=body, headers={
+        **registry_headers,
+        "Content-Type": content_type,
+        "Cache-Control": "no-store",
+    })
+
+
 async def _handle_citrix_gateway(
     request: web.Request,
     log_context: dict[str, object],
@@ -12939,6 +13100,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_f5_bigip_path(path):
         return await _handle_f5_bigip(request, log_context, path, request_body)
 
+    if is_docker_registry_path(path):
+        return await _handle_docker_registry(request, log_context, path, request_body)
+
     if is_citrix_gateway_path(path):
         return await _handle_citrix_gateway(request, log_context, path, request_body)
 
@@ -13092,6 +13256,8 @@ def main() -> int:
         active.append("barracuda-vpn")
     if F5_BIGIP_ENABLED:
         active.append("f5-bigip")
+    if DOCKER_REGISTRY_ENABLED:
+        active.append("docker-registry")
     if CITRIX_GATEWAY_ENABLED:
         active.append("citrix-gateway")
     if RDWEB_ENABLED:
