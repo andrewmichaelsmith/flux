@@ -2943,7 +2943,8 @@ def test_sophos_vpn_enabled_by_default():
 
 
 def test_sophos_vpn_default_paths_match_observed_probes():
-    for p in ["/svpn/index.cgi", "/userportal/webpages/myaccount/login.jsp"]:
+    for p in ["/svpn/index.cgi", "/userportal/webpages/myaccount/login.jsp",
+              "/userportal/", "/userportal/webpages/"]:
         assert tbenv.is_sophos_vpn_path(p), f"{p} should match"
 
 

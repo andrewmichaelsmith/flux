@@ -10,6 +10,8 @@ Fake Sophos XG Firewall SSL VPN login portal targeting CVE-2022-1040
 | `/svpn/index.cgi` | GET | HTML login form |
 | `/svpn/index.cgi` | POST | Same login form (captures credentials) |
 | `/userportal/webpages/myaccount/login.jsp` | GET/POST | HTML login form |
+| `/userportal/` | GET/POST | HTML login form |
+| `/userportal/webpages/` | GET/POST | HTML login form |
 
 ## Logging
 

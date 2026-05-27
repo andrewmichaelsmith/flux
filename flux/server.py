@@ -665,6 +665,8 @@ SOPHOS_VPN_ENABLED = _env_bool("HONEYPOT_SOPHOS_VPN_ENABLED")
 _SOPHOS_VPN_DEFAULT_PATHS = ",".join([
     "/svpn/index.cgi",
     "/userportal/webpages/myaccount/login.jsp",
+    "/userportal/",
+    "/userportal/webpages/",
 ])
 SOPHOS_VPN_PATHS = {
     value.strip().lower()
