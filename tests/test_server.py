@@ -3447,6 +3447,38 @@ async def test_dispatch_rdweb_login_post_logs_username_and_sets_session_cookie(f
     assert "UserPass" not in entry  # secret value never logged
 
 
+@pytest.mark.parametrize(
+    "post_path",
+    [
+        "/RDWeb",
+        "/RDWeb/",
+        "/RDWeb/Pages/",
+    ],
+)
+async def test_dispatch_rdweb_login_post_on_short_landing_paths(flux_client, post_path):
+    # Scanners observed in the wild POST credentials to the short landing
+    # paths (`/RDWeb`, `/RDWeb/`, `/RDWeb/Pages/`), not just the full
+    # `/RDWeb/Pages/en-US/login.aspx` URL. All four should be treated as
+    # credential POSTs: parse the form, mint a session cookie, log result.
+    resp = await flux_client.post(
+        post_path,
+        data="DomainUserName=DOMAIN%5Cadmin&UserPass=hunter2",
+        headers={
+            "X-Forwarded-For": "203.0.113.172",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    set_cookie = resp.headers.get("Set-Cookie", "")
+    assert "TSWAAuthHttpOnlyCookie=" in set_cookie
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "rdweb-login-post"
+    assert entry["rdwebPath"] == post_path
+    assert entry["rdwebUsername"] == "DOMAIN\\admin"
+    assert entry["rdwebHasPassword"] is True
+
+
 async def test_dispatch_rdweb_login_post_cookie_per_request_unique(flux_client):
     cookies = []
     for i in range(2):

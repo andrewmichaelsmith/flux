@@ -11249,10 +11249,12 @@ async def _handle_rdweb(
     set_cookie_value: str | None = None
 
     if lpath in {"/rdweb", "/rdweb/", "/rdweb/pages/", "/rdweb/pages/en-us/login.aspx"}:
-        # Treat all the landing variants as the login form; if a POST lands
-        # on `/rdweb/pages/en-us/login.aspx` we still serve the same HTML
-        # but log it as a credential POST and mint a session cookie.
-        if method == "POST" and lpath == "/rdweb/pages/en-us/login.aspx":
+        # Treat all the landing variants as the login form. Scanners
+        # commonly POST creds against the short `/RDWeb` path rather than
+        # the full `/RDWeb/Pages/en-US/login.aspx` ASP.NET handler URL —
+        # we still serve the same HTML, but log it as a credential POST
+        # and mint a session cookie on any of the four landing variants.
+        if method == "POST":
             result_tag = "rdweb-login-post"
             body = render_rdweb_default_html(host)
             content_type = "text/html; charset=utf-8"

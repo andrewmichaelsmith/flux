@@ -8,9 +8,12 @@ to the trap log.
 
 | Path | Methods | Response |
 | --- | --- | --- |
-| `/RDWeb` | `GET`, `HEAD`, `POST` | RDWeb logon HTML (same scaffold as `/RDWeb/Pages/en-US/login.aspx`) |
-| `/RDWeb/` | `GET`, `HEAD`, `POST` | Same logon HTML |
-| `/RDWeb/Pages/` | `GET`, `HEAD`, `POST` | Same logon HTML |
+| `/RDWeb` | `GET`, `HEAD` | RDWeb logon HTML (same scaffold as `/RDWeb/Pages/en-US/login.aspx`) |
+| `/RDWeb` | `POST` | Treated as credential POST: post-auth resource list HTML + `Set-Cookie: TSWAAuthHttpOnlyCookie=<per-request hex>; Path=/RDWeb; Secure; HttpOnly` |
+| `/RDWeb/` | `GET`, `HEAD` | Same logon HTML |
+| `/RDWeb/` | `POST` | Treated as credential POST (same response + cookie as above) |
+| `/RDWeb/Pages/` | `GET`, `HEAD` | Same logon HTML |
+| `/RDWeb/Pages/` | `POST` | Treated as credential POST (same response + cookie as above) |
 | `/RDWeb/Pages/en-US/login.aspx` | `GET`, `HEAD` | Logon HTML with a per-request `__VIEWSTATE` placeholder; form posts back to the same path |
 | `/RDWeb/Pages/en-US/login.aspx` | `POST` | Post-auth resource list HTML; `Set-Cookie: TSWAAuthHttpOnlyCookie=<per-request hex>; Path=/RDWeb; Secure; HttpOnly` |
 | `/RDWeb/Pages/en-US/Default.aspx` | `GET`, `HEAD`, `POST` | Empty `RemoteApp and Desktop Connection` panel (`No resources are currently available.`) |
@@ -28,8 +31,9 @@ The handler logs:
 - `result` tags (`rdweb-login`, `rdweb-login-post`, `rdweb-default`)
 - `rdwebPath` (exact request path)
 - `rdwebMethod` (HTTP verb)
-- `rdwebUsername` and `rdwebHasPassword` for `login.aspx` POSTs
-  (password value is never stored — only presence). Field-name handling
+- `rdwebUsername` and `rdwebHasPassword` for any landing-path POST
+  (`/RDWeb`, `/RDWeb/`, `/RDWeb/Pages/`, or `/RDWeb/Pages/en-US/login.aspx`).
+  Password value is never stored — only presence. Field-name handling
   accepts both the canonical `DomainUserName` + `UserPass` form-field
   names and the lowercased / generic `username` / `password` variants
   some scanners emit.
@@ -37,9 +41,8 @@ The handler logs:
 - `bytes` (response payload length)
 
 The `__VIEWSTATE` value embedded in the login HTML and the
-`TSWAAuthHttpOnlyCookie` minted on `/RDWeb/Pages/en-US/login.aspx`
-POSTs are per-request `uuid4().hex` — never a fixed literal across the
-fleet. The cookie name matches the real RDWeb session cookie name so
+`TSWAAuthHttpOnlyCookie` minted on landing-path POSTs are per-request
+`uuid4().hex` — never a fixed literal across the fleet. The cookie name matches the real RDWeb session cookie name so
 any later request replaying a captured cookie is attributable to the
 issuance event in the trap log.
 
