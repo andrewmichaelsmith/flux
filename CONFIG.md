@@ -207,6 +207,30 @@ POSTs are per-request unique (`uuid4().hex`). The trap responds with
 `Server: Microsoft-IIS/10.0` + `X-Powered-By: ASP.NET` so banner-grab
 fingerprint scrapers ship the credential POST.
 
+## Fake Microsoft Exchange (OWA / ECP / autodiscover / PSRemoting)
+
+No Tracebit key required. ProxyShell-shape bait (CVE-2021-34473 /
+CVE-2021-34523 / CVE-2021-31207).
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_EXCHANGE_ENABLED` | on | Master switch. |
+| `HONEYPOT_EXCHANGE_BUILD` | `15.02.1118.026` | Exchange build stamped in `X-OWA-Version`, the OWA logon footer, and the eDiscovery exporttool ClickOnce manifest `<assemblyIdentity version=…>`. Default falls inside the ProxyShell CVE-disclosure window so version-diffing scanners pick up the follow-on chain. |
+| `HONEYPOT_EXCHANGE_FE_SERVER` | `EX01` | Value advertised in the `X-FEServer` response header (the real Exchange Client Access Front-End hostname). |
+
+Path matching is prefix-based across `/owa/`, `/ecp/`,
+`/autodiscover/`, `/powershell/`, `/mapi/`, `/oab/`, `/ews/`, and
+`/rpc/rpcproxy.dll`. The OWA `canary` hidden input + `cadata` cookie,
+the ECP `msExchEcpCanary` cookie, the autodiscover `MailboxGuid` +
+`Bearer <token>` literal, and the per-response `request-id` header
+are all per-request unique. The `/powershell/` endpoint responds
+`401` + `WWW-Authenticate: Negotiate, Kerberos, NTLM` and flags
+`exchangeHasPowershellCmdlet` on ProxyShell-shaped POST bodies
+(`New-MailboxExportRequest`, `Import-Module`, `Invoke-Command`,
+`IEX(`, `DownloadString`, …). The literal `?@<spoof>` query shape
+flips a dedicated `exchange-autodiscover-proxyshell-ssrf` result
+tag for fast triage.
+
 ## Fake ColdFusion admin / component browser
 
 No Tracebit key required.

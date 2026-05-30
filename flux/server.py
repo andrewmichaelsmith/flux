@@ -89,6 +89,10 @@ _FINGERPRINT_DEFAULT_PATHS = ",".join([
     "/robots.txt",
     "/sitemap.xml",
     "/favicon.ico",
+    # PWA / Android manifest variant of /favicon.ico — scanners
+    # request it as a separate fingerprint slot to disambiguate
+    # appliance/web-stack images that ship a PNG but no ICO.
+    "/favicon.png",
 ])
 FINGERPRINT_PATHS = {
     value.strip().lower()
@@ -631,6 +635,28 @@ RDWEB_PATHS = {
 # Server 2019 LTSC build that scanners commonly fingerprint when picking
 # password-spraying targets; matches the broad install base.
 RDWEB_SERVER_BUILD = (os.environ.get("HONEYPOT_RDWEB_SERVER_BUILD") or "10.0.17763").strip()
+
+# --- Fake Microsoft Exchange (OWA / ECP / autodiscover / PSRemoting) ----
+# ProxyShell bait surface: scanners chain
+#   GET  /autodiscover/autodiscover.json?@<spoofed>.com&Email=… (CVE-2021-34473)
+#   POST /powershell/                                            (CVE-2021-34523)
+#   …    /ecp/<inject>                                            (CVE-2021-31207)
+# to land a webshell under /aspnet_client/system_web/. Real Exchange
+# also serves an `ediscovery exporttool` ClickOnce `.application`
+# manifest at /ecp/Current/exporttool/ — public scanners use it as a
+# pre-exploit fingerprint (the build version in the manifest tells
+# them which CVE chain to attempt). Per-request `cadata`/`X-Rps-CAT`
+# cookies + a per-hit OAuth bearer in the autodiscover JSON make
+# replay attribution possible without ever shipping a fixed literal.
+EXCHANGE_ENABLED = _env_bool("HONEYPOT_EXCHANGE_ENABLED")
+# 15.02.1118.026 is a Server 2019 CU14-vintage Exchange build that
+# falls inside the public-disclosure window for the ProxyShell CVEs;
+# matches what most scanners diff against to pick an exploit branch.
+EXCHANGE_BUILD = (os.environ.get("HONEYPOT_EXCHANGE_BUILD") or "15.02.1118.026").strip()
+# OWA `X-FEServer` header is the Client Access Front-End hostname.
+# Real Exchange returns the local NetBIOS name; defaulting to a
+# generic literal so scanners see something plausible.
+EXCHANGE_FE_SERVER = (os.environ.get("HONEYPOT_EXCHANGE_FE_SERVER") or "EX01").strip()
 
 # --- Fake Palo Alto GlobalProtect gateway (CVE-2024-3400 bait) ----------
 # Multi-vendor VPN scanners probe `/global-protect/prelogin.esp` (with
@@ -1726,6 +1752,41 @@ def is_rdweb_path(path: str) -> bool:
     if not RDWEB_ENABLED:
         return False
     return path.lower() in RDWEB_PATHS
+
+
+# Exchange surface is wide enough that an exact-match table would rot
+# fast; the matcher accepts the canonical prefix families instead.
+# `/aspnet_client/` is omitted on purpose — it's the webshell drop
+# directory that follows the ProxyShell chain, and catching it under
+# the Exchange trap would shadow the more useful webshell handler.
+_EXCHANGE_PREFIXES = (
+    "/owa/",
+    "/ecp/",
+    "/autodiscover/",
+    "/powershell/",
+    "/mapi/",
+    "/oab/",
+    "/rpc/rpcproxy.dll",
+    "/ews/",
+)
+_EXCHANGE_EXACT = {
+    "/owa",
+    "/ecp",
+    "/autodiscover",
+    "/powershell",
+    "/mapi",
+    "/oab",
+    "/ews",
+}
+
+
+def is_exchange_path(path: str) -> bool:
+    if not EXCHANGE_ENABLED:
+        return False
+    p = path.lower()
+    if p in _EXCHANGE_EXACT:
+        return True
+    return any(p.startswith(prefix) for prefix in _EXCHANGE_PREFIXES)
 
 
 def is_globalprotect_path(path: str) -> bool:
@@ -3564,6 +3625,227 @@ def render_rdweb_default_html(host: str) -> bytes:
 <small>{safe_host}</small></body></html>
 """
     return body.encode("utf-8")
+
+
+def render_exchange_owa_login_html(host: str, build: str) -> bytes:
+    """Microsoft OWA logon page (Exchange 2019).
+
+    Real Exchange logon.aspx is a 30 KB ASP.NET scaffold; we ship a
+    stripped form that posts back to /owa/auth.owa (the real Exchange
+    POST target) with `username` + `password` fields, plus the
+    `flags`, `forcedownlevel`, `trusted` hidden inputs that scanners
+    parse to pick a credential-stuffing payload shape.
+    """
+    safe_host = host or "owa"
+    canary = uuid.uuid4().hex
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>Outlook Web App</title>
+  <link rel="shortcut icon" href="/owa/auth/15.2.1118/themes/resources/favicon.ico" />
+</head>
+<body>
+  <div class="signInPage">
+    <h1>Outlook<sup>&reg;</sup> Web App</h1>
+    <form method="post" action="/owa/auth.owa" autocomplete="off" name="logonForm">
+      <input type="hidden" name="destination" value="https://{safe_host}/owa/" />
+      <input type="hidden" name="flags" value="4" />
+      <input type="hidden" name="forcedownlevel" value="0" />
+      <input type="hidden" name="trusted" value="0" />
+      <input type="hidden" name="isUtf8" value="1" />
+      <input type="hidden" name="canary" value="{canary}" />
+      <label>Domain\\user name:</label>
+      <input type="text" name="username" autocomplete="username" />
+      <label>Password:</label>
+      <input type="password" name="password" autocomplete="current-password" />
+      <button type="submit" name="SubmitCreds" value="Sign in">Sign in</button>
+    </form>
+  </div>
+  <div id="footer">
+    <small>&copy; 2019 Microsoft Corporation &middot; build {build} &middot; {safe_host}</small>
+  </div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_exchange_owa_default_html(host: str) -> bytes:
+    """OWA landing for the `/owa/` directory — real Exchange usually
+    302s to `/owa/auth/logon.aspx?url=…` when there's no cadata cookie.
+    We return the redirect HTML so any scanner-side follow chain
+    lands on the logon page next."""
+    safe_host = host or "owa"
+    body = f"""<!doctype html>
+<html><head><title>Outlook</title>
+<meta http-equiv="Refresh" content="0;URL=/owa/auth/logon.aspx?url=https%3A%2F%2F{safe_host}%2Fowa%2F&reason=0" />
+</head><body></body></html>
+"""
+    return body.encode("utf-8")
+
+
+def render_exchange_owa_error_html(host: str, http_code: str) -> bytes:
+    """OWA error landing — `/owa/auth/errorFE.aspx?httpCode=NNN` is the
+    real path Exchange redirects to when forms-based auth fails."""
+    safe_host = host or "owa"
+    code = http_code if http_code.isdigit() else "500"
+    body = f"""<!doctype html>
+<html><head><title>Outlook Web App</title></head>
+<body><div id="errorPage"><h1>Something went wrong</h1>
+<p>The Exchange server is temporarily unable to service your request (code {code}).</p>
+<small>{safe_host}</small></div></body></html>
+"""
+    return body.encode("utf-8")
+
+
+def render_exchange_owa_bootstrap_js(build: str) -> bytes:
+    """`/owa/auth/x.js` is a real-Exchange auth-bootstrap JS file. The
+    body is short and stable; scanners that diff it against a known
+    build hash use it to confirm Exchange version. We return a
+    minimal stub so the probe sees JS, not 404."""
+    body = f"// owa-build={build}\nvar OwaAuthBuild='{build}';\n"
+    return body.encode("utf-8")
+
+
+def render_exchange_ecp_logon_html(host: str, build: str) -> bytes:
+    """Exchange Control Panel login page (`/ecp/`). Real ECP shares the
+    OWA forms-auth landing but with an `isEcpLogon=1` hidden input.
+    We log the POST as a credential submission against ECP."""
+    safe_host = host or "ecp"
+    body = f"""<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8" /><title>Exchange Admin Center</title></head>
+<body>
+  <h1>Exchange Admin Center</h1>
+  <form method="post" action="/ecp/" autocomplete="off">
+    <input type="hidden" name="isEcpLogon" value="1" />
+    <input type="hidden" name="destination" value="https://{safe_host}/ecp/" />
+    <label>Domain\\user name:</label>
+    <input type="text" name="username" autocomplete="username" />
+    <label>Password:</label>
+    <input type="password" name="password" autocomplete="current-password" />
+    <button type="submit">Sign in</button>
+  </form>
+  <small>build {build} &middot; {safe_host}</small>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_exchange_exporttool_application(host: str, build: str) -> bytes:
+    """ClickOnce `microsoft.exchange.ediscovery.exporttool.application`
+    manifest. The file real Exchange ships at this path is XML with
+    the build version stamped inside `<assemblyIdentity version=…>`,
+    which scanners scrape to fingerprint the Exchange build before
+    picking a CVE chain (the version range determines which of
+    ProxyLogon / ProxyShell / ProxyNotShell branches are in scope).
+    Returning a plausible XML keeps the fingerprint pass alive."""
+    safe_host = host or "exchange"
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+<asmv1:assembly xsi:schemaLocation="urn:schemas-microsoft-com:asm.v1 assembly.adaptive.xsd"
+  manifestVersion="1.0"
+  xmlns:asmv1="urn:schemas-microsoft-com:asm.v1"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns="urn:schemas-microsoft-com:asm.v2">
+  <assemblyIdentity name="microsoft.exchange.ediscovery.exporttool.application"
+    version="{build}" publicKeyToken="b03f5f7f11d50a3a" language="neutral"
+    processorArchitecture="msil" xmlns="urn:schemas-microsoft-com:asm.v1" />
+  <description asmv2:publisher="Microsoft Corporation"
+    asmv2:product="Microsoft Exchange eDiscovery Export Tool"
+    xmlns:asmv2="urn:schemas-microsoft-com:asm.v2" />
+  <deployment install="true">
+    <subscription>
+      <update><expiration maximumAge="0" unit="hours" /></update>
+    </subscription>
+    <deploymentProvider codebase="https://{safe_host}/ecp/Current/exporttool/microsoft.exchange.ediscovery.exporttool.application" />
+  </deployment>
+</asmv1:assembly>
+"""
+    return body.encode("utf-8")
+
+
+def render_exchange_autodiscover_json(host: str, target_email: str, bearer: str) -> bytes:
+    """Outlook autodiscover JSON. CVE-2021-34473 (ProxyShell SSRF) lets
+    a scanner pass `/autodiscover/autodiscover.json?@<spoofed>.com&Email=<x>`
+    and have Exchange's backend forward to internal-only paths. The
+    real response is a small JSON object containing protocol URLs,
+    a `MailboxGuid`, and (when configured) an OAuth2 bearer in
+    `Token`. We embed a per-request bearer literal in `Token` plus
+    echo the spoof target back into the `Url` so the canary placement
+    is plausible to anyone scraping the JSON for secrets."""
+    safe_host = host or "exchange"
+    safe_email = (target_email or "user@" + safe_host)[:120].replace('"', "")
+    body = (
+        "{"
+        f'"Protocol":"AutodiscoverV1",'
+        f'"Url":"https://{safe_host}/autodiscover/autodiscover.json/{safe_email}",'
+        f'"Email":"{safe_email}",'
+        f'"AuthPackage":"Basic",'
+        f'"MailboxGuid":"{uuid.uuid4()}",'
+        f'"Token":"Bearer {bearer}"'
+        "}"
+    )
+    return body.encode("utf-8")
+
+
+def render_exchange_powershell_401(host: str) -> bytes:
+    """Real Exchange PSRemoting endpoint at `/PowerShell/` returns
+    401 + `WWW-Authenticate: Negotiate, Kerberos, NTLM` on an
+    unauthenticated probe. The header is set by the handler; the
+    body just describes the error."""
+    safe_host = host or "exchange"
+    body = (
+        b"<html><body><h1>HTTP/1.1 401 Unauthorized</h1>"
+        b"<p>Authentication required for /PowerShell/.</p>"
+        + safe_host.encode("utf-8", errors="replace")
+        + b"</body></html>\n"
+    )
+    return body
+
+
+_EXCHANGE_PS_CMDLET_INDICATORS = (
+    "new-mailboxexportrequest",
+    "new-managementroleassignment",
+    "set-mailbox",
+    "import-module",
+    "invoke-command",
+    "get-mailbox",
+    "search-mailbox",
+    "add-pssnapin",
+    "convert-fromsecurestring",
+    "iex(",
+    "downloadstring",
+)
+
+
+def _exchange_has_ps_cmdlet(body_preview: str) -> bool:
+    haystack = body_preview.lower()
+    return any(needle in haystack for needle in _EXCHANGE_PS_CMDLET_INDICATORS)
+
+
+def extract_exchange_form(body: bytes, content_type: str) -> tuple[str, bool]:
+    """Pull the OWA / ECP `username` and check for `password` presence.
+
+    OWA's form field is `username`, ECP's is also `username`, but
+    scanners frequently send `user` / `email` / `j_username` /
+    `UserName` from credential-stuffing toolkits — accept the
+    common variants without storing the password value.
+    """
+    form = parse_form_body(body, content_type)
+    username = ""
+    for key in ("username", "UserName", "user", "email", "j_username", "DomainUserName"):
+        values = form.get(key) or form.get(key.lower()) or form.get(key.upper())
+        if values and values[0]:
+            username = values[0][:120]
+            break
+    has_password = any(
+        bool((form.get(key) or form.get(key.lower()) or form.get(key.upper()) or [""])[0])
+        for key in ("password", "Password", "passwd", "j_password", "UserPass")
+    )
+    return username, has_password
 
 
 def extract_rdweb_form(body: bytes, content_type: str) -> tuple[str, bool]:
@@ -11835,6 +12117,292 @@ async def _handle_rdweb(
     return web.Response(status=200, body=body, headers=headers)
 
 
+async def _handle_exchange(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake Microsoft Exchange surface — OWA login + ECP login +
+    autodiscover JSON (ProxyShell SSRF target) + PowerShell remoting
+    endpoint + eDiscovery exporttool ClickOnce manifest. Multi-step
+    coverage so a scanner chaining CVE-2021-34473 / 34523 / 31207
+    sees plausible responses at every step instead of a mixed 404s
+    pattern that gives the trap away.
+    """
+    lpath = path.lower()
+    method = request.method
+    host = str(log_context.get("host", ""))
+    content_type_req = request.headers.get("Content-Type", "")
+    user_agent = request.headers.get("User-Agent", "")
+    rps_cat = request.headers.get("X-Rps-CAT", "") or request.headers.get("X-Rps-Cat", "")
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    extra_headers: dict[str, str] = {}
+    status = 200
+    set_cookie_value: str | None = None
+
+    # ---- autodiscover ---------------------------------------------------
+    if lpath.startswith("/autodiscover"):
+        # ProxyShell SSRF probe (CVE-2021-34473) shape:
+        #   GET /autodiscover/autodiscover.json?@<spoofed>.com&Email=…
+        # The spoofed-domain query string (`?@...`) and the `Email`
+        # parameter are the two attribution slots — log both.
+        spoof_target = ""
+        if "@" in (query_string or ""):
+            try:
+                spoof_target = (query_string.split("@", 1)[1].split("&", 1)[0])[:200]
+            except Exception:  # pragma: no cover — split is permissive
+                spoof_target = ""
+        query_params = parse_qs(query_string, keep_blank_values=True) if query_string else {}
+        target_email = ""
+        for key in ("Email", "email"):
+            v = query_params.get(key) or []
+            if v and v[0]:
+                target_email = v[0][:200]
+                break
+        # Per-request synthetic bearer for the JSON Token field —
+        # NOT a Tracebit canary, but a per-hit unique token so a
+        # replay across our sensors doesn't fingerprint the fleet.
+        bearer = secrets.token_urlsafe(32)
+        if lpath == "/autodiscover/autodiscover.json" or lpath.startswith("/autodiscover/autodiscover.json"):
+            result_tag = "exchange-autodiscover-json"
+            if spoof_target:
+                # `?@<host>` is the literal CVE-2021-34473 SSRF
+                # indicator; flip the dedicated tag so triage
+                # can pivot on the ProxyShell-shaped probes.
+                result_tag = "exchange-autodiscover-proxyshell-ssrf"
+            body = render_exchange_autodiscover_json(host, target_email or spoof_target, bearer)
+            content_type = "application/json; charset=utf-8"
+        elif lpath.startswith("/autodiscover/autodiscover.xml") or lpath == "/autodiscover/autodiscover.xml":
+            result_tag = "exchange-autodiscover-xml"
+            body = (
+                b"<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                b"<Autodiscover xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006\">"
+                b"<Response><Error><Message>Invalid request</Message></Error></Response>"
+                b"</Autodiscover>"
+            )
+            content_type = "application/xml; charset=utf-8"
+        else:
+            result_tag = "exchange-autodiscover-probe"
+            body = render_exchange_autodiscover_json(host, target_email or spoof_target, bearer)
+            content_type = "application/json; charset=utf-8"
+        log_entry: dict[str, object] = {
+            **log_context,
+            "status": status,
+            "result": result_tag,
+            "exchangePath": path,
+            "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD,
+            "bytes": len(body),
+        }
+        if spoof_target:
+            log_entry["exchangeAutodiscoverSpoofTarget"] = spoof_target
+        if target_email:
+            log_entry["exchangeAutodiscoverEmail"] = target_email
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview[:400]
+
+    # ---- ecp exporttool ClickOnce ---------------------------------------
+    elif lpath.endswith("/microsoft.exchange.ediscovery.exporttool.application"):
+        result_tag = "exchange-exporttool-manifest"
+        body = render_exchange_exporttool_application(host, EXCHANGE_BUILD)
+        content_type = "application/x-ms-application; charset=utf-8"
+        log_entry = {
+            **log_context, "status": status, "result": result_tag,
+            "exchangePath": path, "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD, "bytes": len(body),
+        }
+
+    # ---- ecp login ------------------------------------------------------
+    elif lpath in {"/ecp", "/ecp/", "/ecp/default.aspx"} or lpath.startswith("/ecp/"):
+        if method == "POST":
+            result_tag = "exchange-ecp-login-post"
+        else:
+            result_tag = "exchange-ecp-login"
+        body = render_exchange_ecp_logon_html(host, EXCHANGE_BUILD)
+        content_type = "text/html; charset=utf-8"
+        set_cookie_value = (
+            f"msExchEcpCanary={uuid.uuid4().hex}; Path=/ecp; Secure; HttpOnly"
+        )
+        log_entry = {
+            **log_context, "status": status, "result": result_tag,
+            "exchangePath": path, "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD, "bytes": len(body),
+        }
+        if method == "POST" and request_body:
+            username, has_password = extract_exchange_form(request_body, content_type_req)
+            if username:
+                log_entry["exchangeUsername"] = username
+            log_entry["exchangeHasPassword"] = has_password
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview[:400]
+
+    # ---- owa auth bootstrap js -----------------------------------------
+    elif lpath == "/owa/auth/x.js" or lpath.startswith("/owa/auth/") and lpath.endswith(".js"):
+        result_tag = "exchange-owa-bootstrap-js"
+        body = render_exchange_owa_bootstrap_js(EXCHANGE_BUILD)
+        content_type = "application/javascript; charset=utf-8"
+        log_entry = {
+            **log_context, "status": status, "result": result_tag,
+            "exchangePath": path, "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD, "bytes": len(body),
+        }
+
+    # ---- owa error page ------------------------------------------------
+    elif lpath == "/owa/auth/errorfe.aspx":
+        http_code = ""
+        if query_string:
+            qp = parse_qs(query_string, keep_blank_values=True)
+            v = qp.get("httpCode") or qp.get("httpcode") or []
+            if v and v[0]:
+                http_code = v[0][:8]
+        result_tag = "exchange-owa-error"
+        body = render_exchange_owa_error_html(host, http_code)
+        content_type = "text/html; charset=utf-8"
+        log_entry = {
+            **log_context, "status": status, "result": result_tag,
+            "exchangePath": path, "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD, "bytes": len(body),
+        }
+        if http_code:
+            log_entry["exchangeOwaErrorHttpCode"] = http_code
+
+    # ---- owa logon page ------------------------------------------------
+    elif lpath in {"/owa/auth/logon.aspx", "/owa/auth.owa", "/owa/auth/logon.aspx/"} or lpath.startswith("/owa/auth/logon.aspx"):
+        if method == "POST":
+            result_tag = "exchange-owa-credential-post"
+        else:
+            result_tag = "exchange-owa-login"
+        body = render_exchange_owa_login_html(host, EXCHANGE_BUILD)
+        content_type = "text/html; charset=utf-8"
+        # cadata is the OWA forms-auth session cookie name —
+        # per-request value so replays are attributable.
+        set_cookie_value = f"cadata={uuid.uuid4().hex}; Path=/; Secure; HttpOnly"
+        log_entry = {
+            **log_context, "status": status, "result": result_tag,
+            "exchangePath": path, "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD, "bytes": len(body),
+        }
+        if method == "POST" and request_body:
+            username, has_password = extract_exchange_form(request_body, content_type_req)
+            if username:
+                log_entry["exchangeUsername"] = username
+            log_entry["exchangeHasPassword"] = has_password
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview[:400]
+
+    # ---- owa landing ---------------------------------------------------
+    elif lpath in {"/owa", "/owa/"} or lpath.startswith("/owa/"):
+        result_tag = "exchange-owa-landing"
+        body = render_exchange_owa_default_html(host)
+        content_type = "text/html; charset=utf-8"
+        log_entry = {
+            **log_context, "status": status, "result": result_tag,
+            "exchangePath": path, "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD, "bytes": len(body),
+        }
+
+    # ---- PSRemoting (ProxyShell CVE-2021-34523 target) -----------------
+    elif lpath in {"/powershell", "/powershell/"} or lpath.startswith("/powershell/"):
+        # Real Exchange returns 401 + WWW-Authenticate to an
+        # unauthenticated probe of /PowerShell/. Anything beyond a
+        # bare probe (Kerberos+Negotiate ticket, or a POST with a
+        # PS body) is a ProxyShell-style follow-up; flag it.
+        status = 401
+        body = render_exchange_powershell_401(host)
+        content_type = "text/html; charset=utf-8"
+        extra_headers["WWW-Authenticate"] = "Negotiate, Kerberos, NTLM"
+        if method == "POST" or rps_cat or _exchange_has_ps_cmdlet(body_preview):
+            result_tag = "exchange-powershell-cmdlet-attempt"
+        else:
+            result_tag = "exchange-powershell-pre-auth"
+        log_entry = {
+            **log_context, "status": status, "result": result_tag,
+            "exchangePath": path, "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD, "bytes": len(body),
+        }
+        if rps_cat:
+            log_entry["exchangeXRpsCatPresent"] = True
+            log_entry["exchangeXRpsCatLen"] = len(rps_cat)
+        log_entry["exchangeHasPowershellCmdlet"] = _exchange_has_ps_cmdlet(body_preview)
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview[:400]
+
+    # ---- OAB / MAPI / EWS / RPC fallback -------------------------------
+    elif lpath in {"/mapi", "/mapi/"} or lpath.startswith("/mapi/"):
+        result_tag = "exchange-mapi-probe"
+        body = b"<?xml version=\"1.0\"?>\n<error><code>InvalidRequest</code></error>\n"
+        content_type = "application/xml; charset=utf-8"
+        log_entry = {
+            **log_context, "status": status, "result": result_tag,
+            "exchangePath": path, "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD, "bytes": len(body),
+        }
+    elif lpath in {"/oab", "/oab/"} or lpath.startswith("/oab/"):
+        result_tag = "exchange-oab-probe"
+        body = b"<?xml version=\"1.0\"?>\n<error><code>InvalidRequest</code></error>\n"
+        content_type = "application/xml; charset=utf-8"
+        log_entry = {
+            **log_context, "status": status, "result": result_tag,
+            "exchangePath": path, "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD, "bytes": len(body),
+        }
+    elif lpath in {"/ews", "/ews/"} or lpath.startswith("/ews/"):
+        result_tag = "exchange-ews-probe"
+        body = b"<?xml version=\"1.0\"?>\n<error><code>InvalidRequest</code></error>\n"
+        content_type = "application/xml; charset=utf-8"
+        log_entry = {
+            **log_context, "status": status, "result": result_tag,
+            "exchangePath": path, "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD, "bytes": len(body),
+        }
+    elif lpath.startswith("/rpc/rpcproxy.dll"):
+        result_tag = "exchange-rpc-proxy-probe"
+        body = b""
+        content_type = "application/rpc"
+        log_entry = {
+            **log_context, "status": status, "result": result_tag,
+            "exchangePath": path, "exchangeMethod": method,
+            "exchangeBuild": EXCHANGE_BUILD, "bytes": len(body),
+        }
+
+    else:
+        append_log({**log_context, "status": 404, "result": "exchange-miss"})
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    if user_agent:
+        log_entry["userAgent"] = user_agent
+    append_log(log_entry)
+
+    headers = {
+        "Content-Type": content_type,
+        "Cache-Control": "no-store",
+        # Real Exchange is fronted by IIS — the Server / X-* triad is
+        # the primary fingerprint scrapers diff before picking a CVE
+        # branch (ProxyLogon vs ProxyShell vs ProxyNotShell). The
+        # request-id is the literal `request-id` header Exchange
+        # emits on every response.
+        "Server": "Microsoft-IIS/10.0",
+        "X-Powered-By": "ASP.NET",
+        "X-AspNet-Version": "4.0.30319",
+        "X-FEServer": EXCHANGE_FE_SERVER,
+        "X-OWA-Version": EXCHANGE_BUILD,
+        "request-id": str(uuid.uuid4()),
+    }
+    headers.update(extra_headers)
+    if set_cookie_value:
+        headers["Set-Cookie"] = set_cookie_value
+    return web.Response(status=status, body=body, headers=headers)
+
+
 async def _handle_hikvision(
     request: web.Request,
     log_context: dict[str, object],
@@ -13643,6 +14211,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_rdweb_path(path):
         return await _handle_rdweb(request, log_context, path, request_body)
 
+    if is_exchange_path(path):
+        return await _handle_exchange(request, log_context, path, query_string, request_body)
+
     if is_hikvision_path(path):
         return await _handle_hikvision(request, log_context, path, query_string, request_body)
 
@@ -13796,6 +14367,8 @@ def main() -> int:
         active.append("citrix-gateway")
     if RDWEB_ENABLED:
         active.append("rdweb")
+    if EXCHANGE_ENABLED:
+        active.append("exchange")
     if HIKVISION_ENABLED:
         active.append("hikvision")
     if HNAP1_ENABLED:

