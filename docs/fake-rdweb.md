@@ -16,7 +16,7 @@ to the trap log.
 | `/RDWeb/Pages/` | `POST` | Treated as credential POST (same response + cookie as above) |
 | `/RDWeb/Pages/en-US/login.aspx` | `GET`, `HEAD` | Logon HTML with a per-request `__VIEWSTATE` placeholder; form posts back to the same path |
 | `/RDWeb/Pages/en-US/login.aspx` | `POST` | Post-auth resource list HTML; `Set-Cookie: TSWAAuthHttpOnlyCookie=<per-request hex>; Path=/RDWeb; Secure; HttpOnly` |
-| `/RDWeb/Pages/en-US/Default.aspx` | `GET`, `HEAD`, `POST` | Empty `RemoteApp and Desktop Connection` panel (`No resources are currently available.`) |
+| `/RDWeb/Pages/en-US/Default.aspx` | `GET`, `HEAD`, `POST` | `RemoteApp and Desktop Connection` panel; with `TRACEBIT_API_KEY` set, advertises one `Cloud Console` tile whose `RDPFileContents` HTML comment embeds a per-hit Tracebit AWS canary (`aws_access_key_id` / `aws_secret_access_key` / `aws_session_token`). Without an API key, falls back to `No resources are currently available.` |
 
 All matched paths return `200` with `Cache-Control: no-store`,
 `Server: Microsoft-IIS/10.0`, and `X-Powered-By: ASP.NET`. Disabled
@@ -37,6 +37,9 @@ The handler logs:
   accepts both the canonical `DomainUserName` + `UserPass` form-field
   names and the lowercased / generic `username` / `password` variants
   some scanners emit.
+- `canaryTypes` — list of Tracebit canary types embedded in the
+  response (e.g. `["aws"]` on landing-path POSTs and on
+  `Default.aspx` GETs/HEADs/POSTs when an API key is configured).
 - `bodyPreview` (first 400 bytes, decoded best-effort)
 - `bytes` (response payload length)
 
@@ -62,8 +65,22 @@ session.
 Returning the RDWeb logon HTML (with `Server: Microsoft-IIS/10.0` so
 fingerprint scrapers diff a real Server 2019 RDWeb deployment) plus a
 per-request `__VIEWSTATE` and `TSWAAuthHttpOnlyCookie` keeps the probe
-chain alive past the credential POST. The post-auth response is an
-empty resource list, so nothing useful reaches the scanner — but the
-credential POST body, body sha, and form-field name list (including
-which credential rotations the scanner submits) are captured in the
-trap log.
+chain alive past the credential POST.
+
+After a "successful" POST the resource list ships a single
+`Cloud Console` RemoteApp tile whose `RDPFileContents` HTML comment
+embeds a per-hit Tracebit AWS canary (access key, secret, session
+token). Real RDWeb deployments occasionally leak cloud-console
+bookmarks via the `PubName` / `RDPFileContents` slots, so
+credential-scraping bots that walk the post-auth resource list
+after a credential brute harvest the canary as if it were a careless
+admin's stashed cloud key — any later replay against AWS fires
+Tracebit. Without a `TRACEBIT_API_KEY` the panel falls back to the
+empty `No resources are currently available.` shape so keyless
+deployments still emit a plausible response. Per-IP TTL-cached
+issuance (`CANARY_TRAP_CACHE_TTL_SECONDS`, default 1h) bounds
+Tracebit cost under the credential-stuffing volume this trap absorbs.
+
+The credential POST body, body sha, and form-field name list
+(including which credential rotations the scanner submits) are
+captured in the trap log regardless of whether a canary was minted.

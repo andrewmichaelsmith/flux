@@ -3611,15 +3611,48 @@ def render_rdweb_login_html(host: str, server_build: str) -> bytes:
     return body.encode("utf-8")
 
 
-def render_rdweb_default_html(host: str) -> bytes:
+def render_rdweb_default_html(host: str, tb: dict[str, object] | None = None) -> bytes:
     """Post-auth RDWeb desktop list. Real Server 2019 returns the
     `RemoteApp and Desktop Connections` panel here when a session cookie
-    is present. We return an empty panel so any follow-on RDP descriptor
-    fetch (`rdp.aspx`, `rdpobject.aspx`) lands in the access log without
-    a useful payload reaching the scanner.
+    is present.
+
+    When `tb` is provided with an AWS canary, the panel advertises a
+    single "Cloud Console" RemoteApp tile whose connection metadata
+    embeds the canary access-key / secret. Real RDWeb deployments often
+    leak cloud-console bookmarks via PubName / RDPFileContents fields,
+    so credential-scraping bots that walk the post-auth resource list
+    after a "successful" login POST harvest the canary as if it were a
+    careless admin's stashed cloud key. Without a canary the panel
+    falls back to the empty `No resources are currently available.`
+    shape so keyless deployments still emit a plausible response.
     """
     safe_host = host or "rdweb"
-    body = f"""<!doctype html>
+    aws = _aws(tb) if tb else {}
+    access_key = aws.get("awsAccessKeyId", "")
+    secret_key = aws.get("awsSecretAccessKey", "")
+    session_token = aws.get("awsSessionToken", "")
+    if access_key and secret_key:
+        body = f"""<!doctype html>
+<html lang="en"><head><title>RemoteApp and Desktop Connection</title></head>
+<body>
+<div id="resourceList">
+  <h2>RemoteApp and Desktop Connections</h2>
+  <div class="tile" data-pubname="Cloud Console" data-terminalserver="{safe_host}">
+    <a href="/RDWeb/Pages/en-US/rdp.aspx?PubName=Cloud+Console">Cloud Console</a>
+    <!--
+      RDPFileContents:
+        full address:s:{safe_host}
+        username:s:svc-cloud-console
+        aws_access_key_id={access_key}
+        aws_secret_access_key={secret_key}
+        aws_session_token={session_token}
+    -->
+  </div>
+</div>
+<small>{safe_host}</small></body></html>
+"""
+    else:
+        body = f"""<!doctype html>
 <html lang="en"><head><title>RemoteApp and Desktop Connection</title></head>
 <body><div id="resourceList"><p>No resources are currently available.</p></div>
 <small>{safe_host}</small></body></html>
@@ -12056,6 +12089,13 @@ async def _handle_rdweb(
         body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
 
     set_cookie_value: str | None = None
+    tb: dict[str, object] | None = None
+
+    # Whether the response should embed a Tracebit AWS canary in the
+    # post-auth resource list. True on any landing-path POST ("successful
+    # login") and on direct GETs to Default.aspx (which scanners walk
+    # after harvesting a session cookie from the login POST).
+    serve_canary = False
 
     if lpath in {"/rdweb", "/rdweb/", "/rdweb/pages/", "/rdweb/pages/en-us/login.aspx"}:
         # Treat all the landing variants as the login form. Scanners
@@ -12065,8 +12105,8 @@ async def _handle_rdweb(
         # and mint a session cookie on any of the four landing variants.
         if method == "POST":
             result_tag = "rdweb-login-post"
-            body = render_rdweb_default_html(host)
             content_type = "text/html; charset=utf-8"
+            serve_canary = True
             # TSWAAuthHttpOnlyCookie is the real RDWeb session cookie
             # name; per-request hex value so replays are attributable.
             set_cookie_value = (
@@ -12078,14 +12118,33 @@ async def _handle_rdweb(
             content_type = "text/html; charset=utf-8"
     elif lpath == "/rdweb/pages/en-us/default.aspx":
         result_tag = "rdweb-default"
-        body = render_rdweb_default_html(host)
         content_type = "text/html; charset=utf-8"
+        serve_canary = True
     else:
         append_log({**log_context, "status": 404, "result": "rdweb-miss"})
         return web.Response(
             status=404, body=b"not found\n",
             headers={"Content-Type": "text/plain; charset=utf-8"},
         )
+
+    if serve_canary and API_KEY:
+        # Per-IP TTL-cached canary issuance bounds Tracebit cost under
+        # the credential-stuffing volume this trap absorbs (thousands of
+        # POSTs/IP/day from a single brute fleet). Tracebit unreachable
+        # → tb stays None and the renderer falls back to the empty
+        # resource list.
+        tb = await _get_or_issue_canary(
+            ("aws",),
+            str(log_context.get("clientIp", "")),
+            str(log_context.get("requestId", "")),
+            host,
+            str(log_context.get("userAgent", "")),
+            path,
+            str(log_context.get("protocol", "http")),
+        )
+
+    if result_tag != "rdweb-login":
+        body = render_rdweb_default_html(host, tb)
 
     log_entry: dict[str, object] = {
         **log_context,
@@ -12100,6 +12159,8 @@ async def _handle_rdweb(
         if username:
             log_entry["rdwebUsername"] = username
         log_entry["rdwebHasPassword"] = has_password
+    if tb:
+        log_entry["canaryTypes"] = [k for k, v in tb.items() if v]
     if body_preview:
         log_entry["bodyPreview"] = body_preview[:400]
     append_log(log_entry)

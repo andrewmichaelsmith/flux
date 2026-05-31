@@ -3794,7 +3794,10 @@ async def test_dispatch_rdweb_login_post_cookie_per_request_unique(flux_client):
     assert "TSWAAuthHttpOnlyCookie=" in cookies[1]
 
 
-async def test_dispatch_rdweb_default_returns_empty_resource_list(flux_client):
+async def test_dispatch_rdweb_default_without_api_key_returns_empty_resource_list(
+    flux_client, monkeypatch,
+):
+    monkeypatch.setattr(tbenv, "API_KEY", "")
     resp = await flux_client.get(
         "/RDWeb/Pages/en-US/Default.aspx",
         headers={"X-Forwarded-For": "203.0.113.190"},
@@ -3802,8 +3805,67 @@ async def test_dispatch_rdweb_default_returns_empty_resource_list(flux_client):
     assert resp.status == 200
     text = await resp.text()
     assert "No resources" in text
+    assert "aws_access_key_id" not in text
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "rdweb-default"
+    assert "canaryTypes" not in entry
+
+
+async def test_dispatch_rdweb_default_with_canary_embeds_aws_keys(
+    flux_client, monkeypatch,
+):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(
+        "/RDWeb/Pages/en-US/Default.aspx",
+        headers={"X-Forwarded-For": "203.0.113.190"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "AKIAFAKEEXAMPLE01" in text
+    assert "wJalrXUtnFEMI" in text
+    assert "Cloud Console" in text
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "rdweb-default"
+    assert "aws" in entry["canaryTypes"]
+
+
+async def test_dispatch_rdweb_post_with_canary_embeds_aws_keys_and_sets_cookie(
+    flux_client, monkeypatch,
+):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.post(
+        "/RDWeb/Pages/en-US/login.aspx",
+        data="DomainUserName=DOMAIN%5Cadmin&UserPass=hunter2",
+        headers={
+            "X-Forwarded-For": "203.0.113.193",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "AKIAFAKEEXAMPLE01" in text
+    assert "TSWAAuthHttpOnlyCookie=" in resp.headers.get("Set-Cookie", "")
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "rdweb-login-post"
+    assert entry["rdwebUsername"] == "DOMAIN\\admin"
+    assert "aws" in entry["canaryTypes"]
+
+
+def test_render_rdweb_default_html_no_canary_omits_credentials():
+    body = tbenv.render_rdweb_default_html("rdweb.example").decode("utf-8")
+    assert "No resources" in body
+    assert "aws_access_key_id" not in body
+    assert "Cloud Console" not in body
+
+
+def test_render_rdweb_default_html_with_canary_embeds_per_hit_unique_keys():
+    a = tbenv.render_rdweb_default_html("rdweb.example", FAKE_TRACEBIT).decode("utf-8")
+    assert "AKIAFAKEEXAMPLE01" in a
+    assert "Cloud Console" in a
+    assert "RDPFileContents" in a
+    assert "wJalrXUtnFEMI" in a
 
 
 async def test_dispatch_rdweb_disabled_returns_404(flux_client, monkeypatch):
