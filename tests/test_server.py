@@ -843,6 +843,26 @@ FAKE_TRACEBIT = {
     ("/app_dev.php/_profiler/phpinfo.php", b"AKIAFAKEEXAMPLE01"),
     ("/symfony/_profiler/phpinfo", b"AKIAFAKEEXAMPLE01"),
     ("/frontend_dev.php/_profiler/phpinfo", b"AKIAFAKEEXAMPLE01"),
+    # Profiler dashboard endpoints — same renderer; bytes-grep
+    # harvesters land on the canary regardless of dashboard chrome.
+    ("/_profiler/latest", b"AKIAFAKEEXAMPLE01"),
+    ("/_profiler/search", b"AKIAFAKEEXAMPLE01"),
+    ("/_profiler/", b"AKIAFAKEEXAMPLE01"),
+    ("/app_dev.php/_profiler/latest", b"AKIAFAKEEXAMPLE01"),
+    ("/symfony/_profiler/search", b"AKIAFAKEEXAMPLE01"),
+    ("/frontend_dev.php/_profiler/latest", b"AKIAFAKEEXAMPLE01"),
+    # Laravel Ignition dev-mode error page — AWS canary in the env
+    # block alongside `APP_KEY` / `DB_PASSWORD` / `MAIL_PASSWORD`
+    # / `REDIS_PASSWORD` per-hit synthetic values.
+    ("/_ignition/execute-solution", b"AKIAFAKEEXAMPLE01"),
+    ("/_ignition/execute-solution", b"APP_KEY"),
+    ("/_ignition/execute-solution", b"DB_PASSWORD"),
+    ("/_ignition/execute-solution", b"MAIL_PASSWORD"),
+    ("/_ignition/execute-solution", b"Ignition"),
+    ("/api/_ignition/execute-solution", b"AKIAFAKEEXAMPLE01"),
+    ("/backend/_ignition/execute-solution", b"AKIAFAKEEXAMPLE01"),
+    ("/_ignition/health-check", b"AKIAFAKEEXAMPLE01"),
+    ("/_ignition/scripts/ignition.js", b"AKIAFAKEEXAMPLE01"),
     # Symfony `parameters.yml` — YAML body has the canary in both
     # `aws_*` keys and the `_profiler/open` endpoint reuses the
     # renderer.
@@ -938,11 +958,19 @@ def test_canary_trap_renderers_embed_canary(path, needle):
     # mailer passwords — assert no fixed literal sneaks back in.
     "/_profiler/phpinfo",
     "/app_dev.php/_profiler/phpinfo",
+    "/_profiler/latest",
+    "/_profiler/search",
     "/parameters.yml",
     "/app/config/parameters.yml",
     "/_profiler/open",
     "/debug/default/view",
     "/frontend/web/debug/default/view",
+    # Laravel Ignition page emits per-hit APP_KEY / DB_PASSWORD /
+    # MAIL_PASSWORD / REDIS_PASSWORD.
+    "/_ignition/execute-solution",
+    "/api/_ignition/execute-solution",
+    "/backend/_ignition/execute-solution",
+    "/_ignition/health-check",
     "/sendgrid/.env",
     "/postmark/.env",
     "/mailjet/.env",

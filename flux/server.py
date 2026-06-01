@@ -9094,6 +9094,102 @@ def render_django_debug_toolbar(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_laravel_ignition(r: dict[str, object]) -> bytes:
+    """Laravel `facade/ignition` dev-mode error page — the HTML stack-trace
+    surface Laravel shows when `APP_DEBUG=true` and an exception fires.
+    Scanners hit `/_ignition/execute-solution` (CVE-2021-3129 RCE) and
+    `/api/_ignition/...` / `/backend/_ignition/...` rewrite-rule placements;
+    a credible response is the Ignition exception page itself, since that's
+    what a live Laravel-in-debug-mode would return for any unhandled error.
+    The page's "Environment" panel leaks the entire `$_ENV` block, which is
+    where field-keyed credential harvesters grep for `AWS_ACCESS_KEY_ID` /
+    `DB_PASSWORD` / `APP_KEY`. Bytes-grep harvesters that scan response
+    bodies for `AKIA…` literals land on the canary regardless of which
+    Ignition-shaped path they probed."""
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    db_password = _fake_db_password()
+    mail_password = _fake_db_password()
+    redis_password = _fake_db_password()
+    # APP_KEY is the Laravel app-secret env var. Real shape is
+    # `base64:<32-byte-base64>`. Per-hit unique so bodies don't fingerprint.
+    app_key = "base64:" + base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+    return (
+        "<!DOCTYPE html>\n"
+        "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<title>Illuminate \\ Database \\ QueryException</title>"
+        "<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;"
+        "margin:0;padding:0;background:#1a202c;color:#e2e8f0}"
+        ".header{background:#e53e3e;padding:20px 40px;color:#fff}"
+        ".header h1{font-size:18px;margin:0;font-weight:400}"
+        ".header h2{font-size:28px;margin:8px 0 0;font-weight:600}"
+        ".panel{padding:20px 40px;background:#2d3748}"
+        ".panel h3{margin-top:0;font-size:14px;color:#a0aec0;"
+        "text-transform:uppercase;letter-spacing:0.05em}"
+        "table{border-collapse:collapse;width:100%;font-family:Menlo,monospace;"
+        "font-size:12px}"
+        "th,td{padding:6px 12px;text-align:left;border-bottom:1px solid #4a5568}"
+        "th{color:#a0aec0;font-weight:400;width:30%}"
+        "td{color:#edf2f7}"
+        ".footer{padding:12px 40px;font-size:11px;color:#718096;"
+        "background:#171923}"
+        "</style></head><body>\n"
+        "<div class=\"header\">"
+        "<h1>Illuminate \\ Database \\ QueryException "
+        "<small>(SQLSTATE[HY000] [2002])</small></h1>"
+        "<h2>SQLSTATE[HY000] [2002] Connection refused "
+        "(SQL: select * from `users` where `users`.`id` = 1 limit 1)</h2>"
+        "</div>\n"
+        "<div class=\"panel\"><h3>Ignition</h3>"
+        "<p>Facade\\Ignition — Laravel error page. "
+        "Run <code>php artisan ignition:solution</code> to apply suggested fixes.</p>"
+        "</div>\n"
+        "<div class=\"panel\"><h3>Application</h3>"
+        "<table>"
+        "<tr><th>PHP Version</th><td>8.2.15</td></tr>"
+        "<tr><th>Laravel Version</th><td>10.43.0</td></tr>"
+        "<tr><th>Ignition Version</th><td>2.4.2</td></tr>"
+        "<tr><th>Environment</th><td>local</td></tr>"
+        "<tr><th>Debug Mode</th><td>true</td></tr>"
+        "</table></div>\n"
+        "<div class=\"panel\"><h3>Environment</h3>"
+        "<table>"
+        "<tr><th>APP_NAME</th><td>Laravel</td></tr>"
+        "<tr><th>APP_ENV</th><td>local</td></tr>"
+        "<tr><th>APP_DEBUG</th><td>true</td></tr>"
+        f"<tr><th>APP_KEY</th><td>{app_key}</td></tr>"
+        "<tr><th>APP_URL</th><td>http://localhost</td></tr>"
+        "<tr><th>DB_CONNECTION</th><td>mysql</td></tr>"
+        "<tr><th>DB_HOST</th><td>db.internal</td></tr>"
+        "<tr><th>DB_PORT</th><td>3306</td></tr>"
+        "<tr><th>DB_DATABASE</th><td>prod</td></tr>"
+        "<tr><th>DB_USERNAME</th><td>laravel</td></tr>"
+        f"<tr><th>DB_PASSWORD</th><td>{db_password}</td></tr>"
+        "<tr><th>REDIS_HOST</th><td>redis.internal</td></tr>"
+        "<tr><th>REDIS_PORT</th><td>6379</td></tr>"
+        f"<tr><th>REDIS_PASSWORD</th><td>{redis_password}</td></tr>"
+        "<tr><th>MAIL_MAILER</th><td>smtp</td></tr>"
+        "<tr><th>MAIL_HOST</th><td>smtp.sendgrid.net</td></tr>"
+        "<tr><th>MAIL_PORT</th><td>587</td></tr>"
+        "<tr><th>MAIL_USERNAME</th><td>apikey</td></tr>"
+        f"<tr><th>MAIL_PASSWORD</th><td>{mail_password}</td></tr>"
+        "<tr><th>AWS_DEFAULT_REGION</th><td>us-east-1</td></tr>"
+        f"<tr><th>AWS_ACCESS_KEY_ID</th><td>{ak}</td></tr>"
+        f"<tr><th>AWS_SECRET_ACCESS_KEY</th><td>{sk}</td></tr>"
+        f"<tr><th>AWS_SESSION_TOKEN</th><td>{st}</td></tr>"
+        "<tr><th>AWS_BUCKET</th><td>prod-uploads</td></tr>"
+        "<tr><th>FILESYSTEM_DISK</th><td>s3</td></tr>"
+        "</table></div>\n"
+        "<div class=\"footer\">"
+        "Powered by Ignition &middot; Facade — A beautiful error page for "
+        "Laravel apps."
+        "</div>"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
 def render_amplifyrc_json(r: dict[str, object]) -> bytes:
     """`.amplifyrc` is an AWS Amplify CLI project config that some teams
     accidentally commit. Real shape varies by Amplify version, but the
@@ -10333,6 +10429,23 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/symfony/_profiler/phpinfo.php",
             "/frontend_dev.php/_profiler/phpinfo",
             "/frontend_dev.php/_profiler/phpinfo.php",
+            # Profiler dashboard endpoints — `/_profiler/latest` redirects
+            # to the most recent token, `/_profiler/search` is the request
+            # browser. Scanners probing these expect a `dev`-mode 200; the
+            # same phpinfo-shaped body works since credential harvesters
+            # grep raw bytes for `AWS_ACCESS_KEY_ID` / `APP_SECRET` /
+            # `DATABASE_URL` regardless of the page chrome. URL-encoded
+            # prefix variants (`%2f`, `%2F`, `%252F`) collapse into the
+            # canonical path via `normalize_path`.
+            "/_profiler/latest",
+            "/_profiler/search",
+            "/_profiler/",
+            "/app_dev.php/_profiler/latest",
+            "/app_dev.php/_profiler/search",
+            "/symfony/_profiler/latest",
+            "/symfony/_profiler/search",
+            "/frontend_dev.php/_profiler/latest",
+            "/frontend_dev.php/_profiler/search",
         ),
         ("aws",),
         render_symfony_profiler_phpinfo,
@@ -10394,6 +10507,36 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ),
         ("aws",),
         render_django_debug_toolbar,
+        "text/html; charset=utf-8",
+    ),
+    CanaryTrap(
+        "laravel-ignition",
+        (
+            # `facade/ignition` debug-mode error page paths.
+            # `/_ignition/execute-solution` is the CVE-2021-3129 RCE
+            # entry point — scanners POST a JSON body targeting
+            # `MakeViewVariableOptionalSolution` to trigger phar
+            # deserialization. The `/api/_ignition/...` and
+            # `/backend/_ignition/...` placements match reverse-proxy
+            # rewrite rules that route Laravel under a sub-path. The
+            # health-check and ignition.js variants are scanner-recon
+            # probes used to confirm Ignition is present before
+            # firing the exploit. Returning the Ignition stack-trace
+            # HTML page (which leaks `$_ENV`) on every variant gives
+            # the same credential-harvest signal as a real debug-on
+            # Laravel; POST exploit bodies are captured via the
+            # request's `bodySha256` log field.
+            "/_ignition/execute-solution",
+            "/_ignition/execute-solution/",
+            "/api/_ignition/execute-solution",
+            "/backend/_ignition/execute-solution",
+            "/_ignition/health-check",
+            "/api/_ignition/health-check",
+            "/_ignition/scripts/ignition.js",
+            "/_ignition/styles/ignition.css",
+        ),
+        ("aws",),
+        render_laravel_ignition,
         "text/html; charset=utf-8",
     ),
     # ---- Niche cloud-provider credential files ----------------------------

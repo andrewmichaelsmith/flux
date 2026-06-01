@@ -9,10 +9,11 @@ these endpoints are looking for that disclosure.
 
 | Trap | Paths | Canary type | Log tag |
 |---|---|---|---|
-| Symfony Web Profiler phpinfo() | `/_profiler/phpinfo`, `.php`, plus `/app_dev.php/_profiler/...`, `/symfony/_profiler/...`, `/frontend_dev.php/_profiler/...` variants | `aws` | `symfony-profiler-phpinfo` |
+| Symfony Web Profiler phpinfo() + dashboard | `/_profiler/phpinfo`, `.php`, plus `/app_dev.php/_profiler/...`, `/symfony/_profiler/...`, `/frontend_dev.php/_profiler/...` variants; profiler-dashboard endpoints `/_profiler/latest`, `/_profiler/search`, `/_profiler/` (incl. `/app_dev.php/`, `/symfony/`, `/frontend_dev.php/` prefixes). URL-encoded prefix variants (`%2f_profiler/...`, `%252F_profiler/...`) collapse via `normalize_path`. | `aws` | `symfony-profiler-phpinfo` |
 | Symfony parameters.yml / profiler/open | `/parameters.yml`, `/config/parameters.yml`, `/app/config/parameters.yml`; `/_profiler/open`, `/app_dev.php/_profiler/open`, `/symfony/_profiler/open`, `/frontend_dev.php/_profiler/open` | `aws` | `symfony-parameters-yml` |
 | Yii2 debug toolbar config panel | `/debug/default/view`, `.html`, plus `/web/...`, `/frontend/web/...`, `/backend/web/...`, `/sapi/...` variants; `/debug/default/db-explain` | `aws` | `yii2-debug-view` |
 | Django debug toolbar | `/__debug__/render_panel/`, `/__debug__/`, `/__debug__/sql_select/`, `/__debug__/sql_explain/`, `/__debug__/sql_profile/`, `/__debug__/template_source/` | `aws` | `django-debug-toolbar` |
+| Laravel Ignition error page | `/_ignition/execute-solution` (+ trailing-slash); reverse-proxy aliases `/api/_ignition/execute-solution`, `/backend/_ignition/execute-solution`; scanner-recon variants `/_ignition/health-check`, `/api/_ignition/health-check`, `/_ignition/scripts/ignition.js`, `/_ignition/styles/ignition.css`. Same renderer on every method — POST bodies (CVE-2021-3129 RCE payloads) are captured via the request's `bodySha256` log field. | `aws` | `laravel-ignition` |
 
 All paths are case-insensitive exact matches (CanaryTrap shape) — the
 canary trap dispatcher matches the path-only piece, so any
@@ -45,6 +46,17 @@ slot a real dev-mode leak would expose it from:
   `?panel_id=TemplatePanel`, etc. — the `panel_id` query suffix is
   ignored since credential-grepping scanners target the path, not the
   panel type.
+- **Laravel Ignition** — HTML stack-trace page that mimics the
+  `facade/ignition` dev-mode error display. Header is a
+  `Illuminate\Database\QueryException`; the "Environment" panel emits
+  the full `$_ENV` block Laravel exposes when `APP_DEBUG=true`,
+  carrying `APP_KEY` (per-hit `base64:<32-byte>`), `DB_PASSWORD`
+  (per-hit), `REDIS_PASSWORD` (per-hit), `MAIL_PASSWORD` (per-hit),
+  plus the AWS canary triple. CVE-2021-3129 (the
+  `MakeViewVariableOptionalSolution` RCE) POSTs land on the same
+  renderer; the exploit body is captured via the request's
+  `bodySha256` log field, so payload rotations across scanner
+  populations are attributable.
 
 ## Why
 
