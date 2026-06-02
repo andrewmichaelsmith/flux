@@ -932,6 +932,24 @@ FAKE_TRACEBIT = {
     ("/mailing/.env", b"AKIAFAKEEXAMPLE01"),
     ("/mail/.env", b"AKIAFAKEEXAMPLE01"),
     ("/mailserver/.env", b"AKIAFAKEEXAMPLE01"),
+    # Azure CLI credential / profile cache — AWS canary embeds in the
+    # credential-bearing slots harvesters actually grab. Path keys are
+    # lowercased to match the case-insensitive `_TRAP_BY_PATH` lookup;
+    # real filenames are camelCase (azureProfile.json, accessTokens.json)
+    # and the dispatcher lowers them before lookup.
+    ("/.azure/azureprofile.json", b"AKIAFAKEEXAMPLE01"),
+    ("/.azure/azureprofile.json", b'"type": "servicePrincipal"'),
+    ("/.azure/accesstokens.json", b"AKIAFAKEEXAMPLE01"),
+    ("/.azure/accesstokens.json", b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+    ("/.azure/accesstokens.json", b'"tokenType": "Bearer"'),
+    ("/.azure/msal_token_cache.json", b"AKIAFAKEEXAMPLE01"),
+    ("/.azure/msal_token_cache.json", b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+    ("/.azure/msal_token_cache.json", b'"credential_type": "RefreshToken"'),
+    ("/.azure/service_principal_entries.json", b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+    ("/.azure/service_principal_entries.json", b'"client_secret"'),
+    ("/.azure/config", b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+    ("/.azure/config", b"[storage]"),
+    ("/.azure/clouds.config", b"[AzureCloud]"),
 ])
 def test_canary_trap_renderers_embed_canary(path, needle):
     trap = tbenv._TRAP_BY_PATH[path]
@@ -979,6 +997,16 @@ def test_canary_trap_renderers_embed_canary(path, needle):
     "/mailing/.env",
     "/mail/.env",
     "/mailserver/.env",
+    # Azure CLI renderers emit per-hit synthetic tenant / subscription /
+    # client / installation / home_account / storage-account / username
+    # identifiers — any fixed string across calls would turn the .azure/
+    # cache files into a fleet fingerprint.
+    "/.azure/azureprofile.json",
+    "/.azure/accesstokens.json",
+    "/.azure/msal_token_cache.json",
+    "/.azure/service_principal_entries.json",
+    "/.azure/config",
+    "/.azure/clouds.config",
 ])
 def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
     # Regression: the ``h6T!9pq2Wz@LmRnV`` / ``prod_rw`` DB-password literal
@@ -6953,6 +6981,123 @@ def test_render_streamlit_db_password_is_per_hit_random():
     m2 = re.search(r'\[database\][^\[]*password = "([^"]+)"', body2, re.S)
     assert m1 and m2
     assert m1.group(1) != m2.group(1), "Streamlit DB password must be per-hit unique"
+
+
+# --- Azure CLI credential cache (June 2026) ---
+
+
+def test_render_azure_profile_embeds_aws_canary_at_sp_subscription():
+    profile = json.loads(tbenv.render_azure_profile_json(FAKE_TRACEBIT))
+    subs = profile["subscriptions"]
+    sp = next(s for s in subs if s["user"]["type"] == "servicePrincipal")
+    assert sp["user"]["name"] == "AKIAFAKEEXAMPLE01"
+
+
+def test_render_azure_profile_per_hit_unique_guids():
+    p1 = json.loads(tbenv.render_azure_profile_json(FAKE_TRACEBIT))
+    p2 = json.loads(tbenv.render_azure_profile_json(FAKE_TRACEBIT))
+    assert p1["installationId"] != p2["installationId"]
+    assert p1["subscriptions"][0]["tenantId"] != p2["subscriptions"][0]["tenantId"]
+    assert p1["subscriptions"][0]["id"] != p2["subscriptions"][0]["id"]
+    assert p1["subscriptions"][0]["user"]["name"] != p2["subscriptions"][0]["user"]["name"]
+
+
+def test_render_azure_access_tokens_embed_aws_canary():
+    entries = json.loads(tbenv.render_azure_access_tokens_json(FAKE_TRACEBIT))
+    assert isinstance(entries, list) and entries
+    e = entries[0]
+    assert e["tokenType"] == "Bearer"
+    assert e["accessToken"] == "AKIAFAKEEXAMPLE01"
+    assert e["refreshToken"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert e["resource"] == "https://management.core.windows.net/"
+
+
+def test_render_azure_access_tokens_per_hit_unique():
+    e1 = json.loads(tbenv.render_azure_access_tokens_json(FAKE_TRACEBIT))[0]
+    e2 = json.loads(tbenv.render_azure_access_tokens_json(FAKE_TRACEBIT))[0]
+    assert e1["_clientId"] != e2["_clientId"]
+    assert e1["_authority"] != e2["_authority"]
+    assert e1["oid"] != e2["oid"]
+    assert e1["userId"] != e2["userId"]
+
+
+def test_render_azure_msal_cache_embeds_aws_canary_in_secret():
+    cache = json.loads(tbenv.render_azure_msal_token_cache_json(FAKE_TRACEBIT))
+    at_entries = list(cache["AccessToken"].values())
+    rt_entries = list(cache["RefreshToken"].values())
+    assert at_entries and at_entries[0]["secret"] == "AKIAFAKEEXAMPLE01"
+    assert rt_entries and rt_entries[0]["secret"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert at_entries[0]["credential_type"] == "AccessToken"
+    assert rt_entries[0]["credential_type"] == "RefreshToken"
+
+
+def test_render_azure_msal_cache_per_hit_unique():
+    c1 = json.loads(tbenv.render_azure_msal_token_cache_json(FAKE_TRACEBIT))
+    c2 = json.loads(tbenv.render_azure_msal_token_cache_json(FAKE_TRACEBIT))
+    assert list(c1["AccessToken"].keys()) != list(c2["AccessToken"].keys())
+    assert list(c1["Account"].keys()) != list(c2["Account"].keys())
+
+
+def test_render_azure_service_principal_embeds_aws_canary():
+    entries = json.loads(tbenv.render_azure_service_principal_entries_json(FAKE_TRACEBIT))
+    assert isinstance(entries, list) and entries
+    e = entries[0]
+    assert e["client_secret"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    # Per-hit unique client_id and tenant.
+    e2 = json.loads(tbenv.render_azure_service_principal_entries_json(FAKE_TRACEBIT))[0]
+    assert e["client_id"] != e2["client_id"]
+    assert e["tenant"] != e2["tenant"]
+
+
+def test_render_azure_cli_config_embeds_aws_canary_in_storage_key():
+    body = tbenv.render_azure_cli_config(FAKE_TRACEBIT).decode("utf-8")
+    assert "[cloud]" in body
+    assert "[storage]" in body
+    assert "key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    # The connection_string also carries the canary as the AccountKey.
+    assert "AccountKey=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+
+
+def test_render_azure_cli_config_per_hit_unique_account():
+    b1 = tbenv.render_azure_cli_config(FAKE_TRACEBIT).decode("utf-8")
+    b2 = tbenv.render_azure_cli_config(FAKE_TRACEBIT).decode("utf-8")
+    m1 = re.search(r"^account = (\S+)$", b1, re.M)
+    m2 = re.search(r"^account = (\S+)$", b2, re.M)
+    assert m1 and m2 and m1.group(1) != m2.group(1)
+
+
+def test_render_azure_clouds_config_no_credential_literal():
+    """clouds.config has no real credential slot in real-world content;
+    the trap exists so a `.azure/` directory walk doesn't see a partial
+    install. Body should NOT embed the AWS canary."""
+    body = tbenv.render_azure_clouds_config(FAKE_TRACEBIT)
+    assert b"AKIAFAKEEXAMPLE01" not in body
+    assert b"wJalrXUtnFEMI" not in body
+    assert b"[AzureCloud]" in body
+
+
+def test_azure_cli_paths_registered():
+    """All six Azure CLI credential / profile paths route to a CanaryTrap.
+
+    `_TRAP_BY_PATH` keys are lowercased so both `/.azure/azureProfile.json`
+    (real camelCase filename, lowered by the dispatcher) and the lowercase
+    table key route to the same trap."""
+    expected = {
+        "/.azure/azureprofile.json": "azure-cli-profile",
+        "/.azure/accesstokens.json": "azure-cli-access-tokens",
+        "/.azure/msal_token_cache.json": "azure-cli-msal-cache",
+        "/.azure/service_principal_entries.json": "azure-cli-service-principal",
+        "/.azure/config": "azure-cli-config",
+        "/.azure/clouds.config": "azure-cli-clouds-config",
+    }
+    for path, name in expected.items():
+        trap = tbenv._TRAP_BY_PATH.get(path)
+        assert trap is not None, f"{path} not registered"
+        assert trap.name == name, f"{path} routes to {trap.name} not {name}"
+    # Real-world request — camelCase — must also resolve via case-insensitive
+    # dispatch.
+    assert tbenv.find_canary_trap("/.azure/azureProfile.json") is not None
+    assert tbenv.find_canary_trap("/.azure/accessTokens.json") is not None
 
 
 def test_render_generic_ai_provider_embeds_aws_canary():

@@ -6474,6 +6474,245 @@ def render_cargo_credentials(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_azure_profile_json(r: dict[str, object]) -> bytes:
+    # `~/.azure/azureProfile.json` — Azure CLI's account-discovery file.
+    # Real CLI installs cache subscription/tenant IDs and the signed-in
+    # user email here; tokens live next door in accessTokens.json /
+    # msal_token_cache.json. Scanner pattern observed: GET this first to
+    # confirm Azure is configured, then walk the token files. A 404 here
+    # short-circuits the chain — returning a plausible profile keeps the
+    # scanner on the next request.
+    #
+    # No fixed literals. tenantId / subscriptionId / installationId are
+    # per-hit synthetic GUIDs; user.name is a per-hit synthetic email
+    # under a `.onmicrosoft.com` tenant. The AWS canary lands in the
+    # service-principal subscription's `user.name` — some CLI profiles
+    # cache the SP application-id there, and harvesters that scrape
+    # `subscriptions[].user.name` for cred-like strings will grab it.
+    aws = _aws(r)
+    sub_id = str(uuid.uuid4())
+    tenant_id = str(uuid.uuid4())
+    sp_sub_id = str(uuid.uuid4())
+    sp_tenant_id = str(uuid.uuid4())
+    profile = {
+        "installationId": str(uuid.uuid4()),
+        "subscriptions": [
+            {
+                "id": sub_id,
+                "name": "Pay-As-You-Go",
+                "state": "Enabled",
+                "user": {
+                    "name": f"azureadmin@{secrets.token_hex(4)}.onmicrosoft.com",
+                    "type": "user",
+                },
+                "isDefault": True,
+                "tenantId": tenant_id,
+                "environmentName": "AzureCloud",
+                "homeTenantId": tenant_id,
+                "managedByTenants": [],
+            },
+            {
+                "id": sp_sub_id,
+                "name": "internal-tools-prod",
+                "state": "Enabled",
+                "user": {
+                    "name": aws.get("awsAccessKeyId", ""),
+                    "type": "servicePrincipal",
+                },
+                "isDefault": False,
+                "tenantId": sp_tenant_id,
+                "environmentName": "AzureCloud",
+                "homeTenantId": sp_tenant_id,
+                "managedByTenants": [],
+            },
+        ],
+    }
+    return json.dumps(profile, indent=4).encode("utf-8")
+
+
+def render_azure_access_tokens_json(r: dict[str, object]) -> bytes:
+    # `~/.azure/accessTokens.json` — Azure CLI ≤ 2.30 ADAL token cache.
+    # JSON list of bearer/refresh token entries. The AWS canary lands in
+    # `accessToken` and `refreshToken` directly — a harvester that grabs
+    # the cached `accessToken` value and replays against any AWS surface
+    # (S3, STS, console-sign-in) trips the canary. Per-hit synthetic
+    # tenant / clientId / userId / oid keep every other identifier from
+    # being a fleet fingerprint.
+    aws = _aws(r)
+    tenant_id = str(uuid.uuid4())
+    user_id = f"azureadmin@{secrets.token_hex(4)}.onmicrosoft.com"
+    entries = [
+        {
+            "tokenType": "Bearer",
+            "expiresIn": 3599,
+            "expiresOn": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f"),
+            "resource": "https://management.core.windows.net/",
+            # Real Azure CLI uses a small set of well-known first-party client IDs
+            # (e.g. `04b07795-8ddb-461a-bbee-02f9e1bf7b46` for `az`). Using a
+            # per-hit synthetic GUID instead keeps the file from advertising
+            # a fixed flux fingerprint, at the (small) cost of a regex-strict
+            # harvester rejecting it.
+            "_clientId": str(uuid.uuid4()),
+            "_authority": f"https://login.microsoftonline.com/{tenant_id}",
+            "userId": user_id,
+            "isMRRT": True,
+            "accessToken": aws.get("awsAccessKeyId", ""),
+            "refreshToken": aws.get("awsSecretAccessKey", ""),
+            "oid": str(uuid.uuid4()),
+            "tenantId": tenant_id,
+            "identityProvider": "live.com",
+            "familyName": "Admin",
+            "givenName": "Azure",
+        },
+    ]
+    return json.dumps(entries, indent=4).encode("utf-8")
+
+
+def render_azure_msal_token_cache_json(r: dict[str, object]) -> bytes:
+    # `~/.azure/msal_token_cache.json` — Azure CLI ≥ 2.30 MSAL cache.
+    # Schema is MSAL Python's `SerializableTokenCache` shape: top-level
+    # `AccessToken` / `RefreshToken` / `Account` / `IdToken` dicts keyed
+    # by composite identifiers. The AWS canary embeds in the `secret`
+    # field of the RefreshToken and AccessToken entries — exactly what
+    # MSAL-aware harvesters scrape. Per-hit synthetic home_account_id,
+    # client_id, tenant ID.
+    aws = _aws(r)
+    home_acct = f"{uuid.uuid4()}.{uuid.uuid4()}"
+    client_id = str(uuid.uuid4())
+    tenant_id = str(uuid.uuid4())
+    realm = tenant_id
+    env = "login.microsoftonline.com"
+    at_key = (
+        f"{home_acct}-{env}-accesstoken-{client_id}-{realm}-"
+        "https://management.core.windows.net//.default"
+    ).lower()
+    rt_key = (f"{home_acct}-{env}-refreshtoken-{client_id}--").lower()
+    acct_key = f"{home_acct}-{env}-{realm}".lower()
+    cache = {
+        "AccessToken": {
+            at_key: {
+                "credential_type": "AccessToken",
+                "secret": aws.get("awsAccessKeyId", ""),
+                "home_account_id": home_acct,
+                "environment": env,
+                "client_id": client_id,
+                "target": "https://management.core.windows.net//.default",
+                "realm": realm,
+                "token_type": "Bearer",
+                "cached_at": str(int(time.time()) - 60),
+                "expires_on": str(int(time.time()) + 3599),
+                "extended_expires_on": str(int(time.time()) + 7199),
+            },
+        },
+        "RefreshToken": {
+            rt_key: {
+                "credential_type": "RefreshToken",
+                "secret": aws.get("awsSecretAccessKey", ""),
+                "home_account_id": home_acct,
+                "environment": env,
+                "client_id": client_id,
+                "family_id": "1",
+                "last_modification_time": str(int(time.time()) - 60),
+            },
+        },
+        "IdToken": {},
+        "Account": {
+            acct_key: {
+                "home_account_id": home_acct,
+                "environment": env,
+                "realm": realm,
+                "local_account_id": str(uuid.uuid4()),
+                "username": f"azureadmin@{secrets.token_hex(4)}.onmicrosoft.com",
+                "authority_type": "MSSTS",
+            },
+        },
+    }
+    return json.dumps(cache, indent=4).encode("utf-8")
+
+
+def render_azure_service_principal_entries_json(r: dict[str, object]) -> bytes:
+    # `~/.azure/service_principal_entries.json` — Azure CLI cache for
+    # `az login --service-principal` when credential storage falls back
+    # to the filesystem (no OS keychain, or `--use-cert-sn-issuer` not
+    # used). Each entry has the SP's `client_secret` in plaintext. The
+    # AWS canary embeds as the secret — a harvester that replays it as
+    # an AWS access key trips the canary even though the field is
+    # named `client_secret`.
+    aws = _aws(r)
+    entries = [
+        {
+            "client_id": str(uuid.uuid4()),
+            "tenant": str(uuid.uuid4()),
+            "client_secret": aws.get("awsSecretAccessKey", ""),
+        },
+    ]
+    return json.dumps(entries, indent=4).encode("utf-8")
+
+
+def render_azure_cli_config(r: dict[str, object]) -> bytes:
+    # `~/.azure/config` — INI written by `az configure`. No native
+    # credential slot, but the `[storage]` section's `key` and
+    # `connection_string` are the canonical Azure Storage account key
+    # placement. Real-world deploys do stash long-lived storage creds
+    # here for CI / shell convenience. Drop the AWS canary into both
+    # so a harvester picking either field gets the replay attribution.
+    aws = _aws(r)
+    sub_id = str(uuid.uuid4())
+    storage_account = "stprod" + secrets.token_hex(4)
+    storage_key = aws.get("awsSecretAccessKey", "")
+    return (
+        "[cloud]\n"
+        "name = AzureCloud\n"
+        "\n"
+        "[core]\n"
+        "output = json\n"
+        "collect_telemetry = false\n"
+        f"first_run = {datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S+00:00')}\n"
+        "\n"
+        "[defaults]\n"
+        f"group = rg-internal-tools\n"
+        f"location = eastus\n"
+        f"sub = {sub_id}\n"
+        "\n"
+        "[storage]\n"
+        f"account = {storage_account}\n"
+        f"key = {storage_key}\n"
+        f"connection_string = DefaultEndpointsProtocol=https;"
+        f"AccountName={storage_account};AccountKey={storage_key};"
+        "EndpointSuffix=core.windows.net\n"
+    ).encode("utf-8")
+
+
+def render_azure_clouds_config(r: dict[str, object]) -> bytes:
+    # `~/.azure/clouds.config` — INI listing the active Azure cloud and
+    # its endpoint URLs. No credentials in real-world content; this trap
+    # exists so a scanner walking the `.azure/` directory dictionary
+    # doesn't see a partial install (which a sophisticated harvester
+    # would skip). Per-hit synthetic tenant_id, no AWS canary embed.
+    tenant_id = str(uuid.uuid4())
+    return (
+        "[AzureCloud]\n"
+        "active_directory = https://login.microsoftonline.com\n"
+        "active_directory_data_lake_resource_id = https://datalake.azure.net/\n"
+        "active_directory_graph_resource_id = https://graph.windows.net/\n"
+        "active_directory_resource_id = https://management.core.windows.net/\n"
+        "batch_resource_id = https://batch.core.windows.net/\n"
+        "gallery = https://gallery.azure.com/\n"
+        "management = https://management.core.windows.net/\n"
+        "media_resource_id = https://rest.media.azure.net\n"
+        "microsoft_graph_resource_id = https://graph.microsoft.com/\n"
+        "ossrdbms_resource_id = https://ossrdbms-aad.database.windows.net\n"
+        "portal = https://portal.azure.com\n"
+        "resource_manager = https://management.azure.com/\n"
+        "sql_management = https://management.core.windows.net:8443/\n"
+        "storage_endpoint = core.windows.net\n"
+        "vm_image_alias_doc = https://raw.githubusercontent.com/Azure/azure-rest-api-specs/master/arm-compute/quickstart-templates/aliases.json\n"
+        "\n"
+        "[AzureCloud.endpoints]\n"
+        f"active_directory_tenant_id = {tenant_id}\n"
+    ).encode("utf-8")
+
+
 def render_gem_credentials(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     return (
@@ -10708,6 +10947,63 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("/.cargo/credentials",),
         ("aws",),
         render_cargo_credentials,
+        "text/plain; charset=utf-8",
+    ),
+    # `~/.azure/*` — Azure CLI credential / profile cache. Scanner
+    # dictionaries probe these alongside AWS / GCP / HuggingFace / Cargo
+    # credential files in the same pass; a 404 here breaks the discovery
+    # chain (scanner sees no Azure CLI present, doesn't follow up on the
+    # token file). Each entry returns a plausible Azure CLI-shaped
+    # response with per-hit synthetic tenant/subscription/client IDs,
+    # and the AWS canary embeds in slots a credential harvester actually
+    # grabs (`accessToken`/`refreshToken` in accessTokens.json,
+    # `secret` in MSAL cache entries, `client_secret` in
+    # service_principal_entries.json, the `[storage].key` field in
+    # `config`, and the SP subscription's `user.name` in azureProfile).
+    # Path keys lowercased to match the case-insensitive lookup in
+    # `_TRAP_BY_PATH`. The real Azure CLI filenames are camelCase
+    # (`azureProfile.json`, `accessTokens.json`) but the dispatcher
+    # lowers `path` before lookup, so the lowercase keys still match.
+    CanaryTrap(
+        "azure-cli-profile",
+        ("/.azure/azureprofile.json",),
+        ("aws",),
+        render_azure_profile_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "azure-cli-access-tokens",
+        ("/.azure/accesstokens.json",),
+        ("aws",),
+        render_azure_access_tokens_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "azure-cli-msal-cache",
+        ("/.azure/msal_token_cache.json",),
+        ("aws",),
+        render_azure_msal_token_cache_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "azure-cli-service-principal",
+        ("/.azure/service_principal_entries.json",),
+        ("aws",),
+        render_azure_service_principal_entries_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "azure-cli-config",
+        ("/.azure/config",),
+        ("aws",),
+        render_azure_cli_config,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "azure-cli-clouds-config",
+        ("/.azure/clouds.config",),
+        ("aws",),
+        render_azure_clouds_config,
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(
