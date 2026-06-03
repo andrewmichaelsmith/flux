@@ -13,6 +13,7 @@ and to classic CGI environment-leak scripts.
 | `*eval-stdin.php` with `phpunit` in the path | GET/POST | echoes simple PHP probe output such as `md5("Hello PHPUnit")` |
 | `/?...auto_prepend_file=php://input` / `/hello.world?...` | POST | PHP-CGI RCE probe; decodes `base64_decode(...)` command hints and echoes PHP probe output |
 | `/cgi-bin/.../bin/sh` path traversal | POST | Apache CGI shell probe; logs the stdin command body and returns empty 200 |
+| `/cgi-bin/php`, `/cgi-bin/php-cgi`, `/cgi-bin/php{5,7,8}{,-cgi,.cgi}`, `/cgi-bin/`, `/cgi-bin` | GET/HEAD | PHP-CGI bare-path liveness probe; returns the canonical `<br />\n<b>No input file specified.</b>` 200 page with `Server: Apache/2.4.41 (Win64) ... PHP/7.4.33` and `X-Powered-By: PHP/7.4.33` so the gated CVE-2024-4577 scanners send their exploit POST next (which lands in the body-RCE row above) |
 
 The handler reads the `cmd` value from `?cmd=…`, the equivalent
 `POST` form param (`cmd`, `command`, `exec`, `c`), and classifies it
@@ -32,12 +33,13 @@ Logged fields per event (in addition to the standard `LOGS.md` schema):
 `result` (`cmd-injection-probe` / `cmd-injection-command` /
 `cmd-injection-creds-leak` / `cmd-injection-printenv` /
 `cmd-injection-php-cgi-rce` / `cmd-injection-apache-cgi-shell` /
-`phpunit-eval-stdin`),
+`phpunit-eval-stdin` / `php-cgi-liveness`),
 `cmdInjectionPath`, `cmdSource` (`query` / `form` / `""`), `cmdKey`,
 `cmd`, `cmdFamily`, `outputBytes`, and `canaryStatus` (`issued` /
 `issue-failed`) when a Tracebit canary was minted. Body-RCE rows also
 include `bodyPreview`; PHP-CGI rows include `decodedCommand` when a
-`base64_decode(...)` payload was decoded.
+`base64_decode(...)` payload was decoded; liveness rows carry
+`phpCgiLivenessPath` and `phpCgiLivenessMethod`.
 
 ## Why
 
@@ -61,3 +63,15 @@ Two observed shapes drove this trap:
    `php://input`, and Apache CGI path-traversal `/bin/sh`. These now
    get 200 responses and structured body/decoded-command logging instead
    of falling through as generic 404s.
+4. CVE-2024-4577 (Windows PHP-CGI argument injection) scanners split
+   into two populations: "spray" scanners that POST the exploit on
+   every target regardless of liveness, and "gated" scanners that
+   probe `/cgi-bin/php` (or `/cgi-bin/php-cgi`, `/cgi-bin/`, etc.)
+   with a bare GET first and only send the exploit if they get a 200
+   back with a Windows-shape `Server` / `X-Powered-By` header. The
+   bare GETs were the top "not-handled" path in observed traffic by
+   a wide margin. The `php-cgi-liveness` row returns the canonical
+   `<br />\n<b>No input file specified.</b>` page with
+   `Server: Apache/2.4.41 (Win64) ... PHP/7.4.33` so the gated
+   population sends the follow-up exploit POST, which then lands in
+   the body-RCE handler in row #3.

@@ -431,6 +431,50 @@ PHPUNIT_EVAL_ENABLED = _env_bool("HONEYPOT_PHPUNIT_EVAL_ENABLED")
 BODY_RCE_ENABLED = _env_bool("HONEYPOT_BODY_RCE_ENABLED")
 BODY_RCE_PREVIEW_LIMIT = max(int((os.environ.get("HONEYPOT_BODY_RCE_PREVIEW_LIMIT") or "512").strip() or "512"), 128)
 
+# PHP-CGI bare-path liveness responder. CVE-2024-4577 scanners commonly
+# probe `/cgi-bin/php`, `/cgi-bin/`, and `/cgi-bin/php-cgi*` with a bare
+# GET as a liveness gate before sending the exploit POST (with the
+# `auto_prepend_file=php://input` query). A 404 on the gate teaches the
+# conditional/gated scanners there's no PHP-CGI to attack; the
+# "always-spray" scanners send the exploit anyway and land in the
+# body-RCE handler above. Returning the canonical Apache + PHP-CGI
+# "No input file specified." 200 response with a Windows-shape
+# `Server` / `X-Powered-By` tuple invites the gated population through
+# to the exploit phase as well.
+PHP_CGI_LIVENESS_ENABLED = _env_bool("HONEYPOT_PHP_CGI_LIVENESS_ENABLED")
+_PHP_CGI_LIVENESS_DEFAULT_PATHS = ",".join([
+    "/cgi-bin/php",
+    "/cgi-bin/php-cgi",
+    "/cgi-bin/php.cgi",
+    "/cgi-bin/php5",
+    "/cgi-bin/php5-cgi",
+    "/cgi-bin/php5.cgi",
+    "/cgi-bin/php7",
+    "/cgi-bin/php7-cgi",
+    "/cgi-bin/php7.cgi",
+    "/cgi-bin/php8",
+    "/cgi-bin/php8-cgi",
+    "/cgi-bin/php8.cgi",
+    "/cgi-bin/",
+    "/cgi-bin",
+])
+PHP_CGI_LIVENESS_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_PHP_CGI_LIVENESS_PATHS_CSV") or _PHP_CGI_LIVENESS_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# Server / X-Powered-By tuple advertised on the liveness response. The
+# Windows + Apache + PHP 7.4 combination matches what real CVE-2024-4577
+# scanners gate on (the CVE is Windows-only; Linux PHP-CGI is not
+# vulnerable).
+PHP_CGI_LIVENESS_SERVER = (
+    os.environ.get("HONEYPOT_PHP_CGI_LIVENESS_SERVER")
+    or "Apache/2.4.41 (Win64) OpenSSL/1.1.1c PHP/7.4.33 mod_perl/2.0.11"
+).strip()
+PHP_CGI_LIVENESS_POWERED_BY = (
+    os.environ.get("HONEYPOT_PHP_CGI_LIVENESS_POWERED_BY") or "PHP/7.4.33"
+).strip()
+
 # --- Fake SonicWall SSL VPN (CVE-2024-53704 bait chain) ------------------
 # Two overlapping behaviour patterns observed in mid-April 2026:
 #   - A dedicated SonicWall-precondition fleet hitting only
@@ -1962,6 +2006,12 @@ def is_php_cgi_rce_request(path: str, query: str) -> bool:
 
 def is_body_rce_request(path: str, query: str, body: bytes = b"") -> bool:
     return is_apache_cgi_shell_path(path, body) or is_php_cgi_rce_request(path, query)
+
+
+def is_php_cgi_liveness_path(path: str) -> bool:
+    if not PHP_CGI_LIVENESS_ENABLED:
+        return False
+    return path.lower() in PHP_CGI_LIVENESS_PATHS
 
 
 # Regex that matches a `cat`-of-a-credential-file probe. Supports URL-decoded
@@ -11640,6 +11690,40 @@ async def _handle_body_rce(
     )
 
 
+async def _handle_php_cgi_liveness(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    """Respond to a bare GET/HEAD probe against the canonical PHP-CGI
+    paths with the exact "No input file specified." 200 page that
+    Apache + PHP-CGI returns when invoked without args. Pairs with
+    `_handle_body_rce` — gated scanners use this response as the
+    liveness check before sending the CVE-2024-4577 exploit POST,
+    which then lands in the body-RCE handler. Always 200; the bait
+    is the Server / X-Powered-By tuple, not the body content."""
+    method = request.method
+    body = b"<br />\n<b>No input file specified.</b>\n"
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": "php-cgi-liveness",
+        "phpCgiLivenessPath": path,
+        "phpCgiLivenessMethod": method,
+        "bytes": len(body),
+    }
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": "text/html; charset=UTF-8",
+            "Server": PHP_CGI_LIVENESS_SERVER,
+            "X-Powered-By": PHP_CGI_LIVENESS_POWERED_BY,
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_cisco_webvpn(
     request: web.Request,
     log_context: dict[str, object],
@@ -14754,6 +14838,15 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_body_rce_request(path, query_string, request_body):
         return await _handle_body_rce(request, log_context, path, query_string, request_body)
 
+    # Bare GET/HEAD against the canonical PHP-CGI paths — falls through
+    # to here only when no body-RCE exploit query/body matched above,
+    # so the CVE-2024-4577 spray scanners that POST the exploit on
+    # every target still land in `_handle_body_rce`. Gated scanners
+    # that probe `/cgi-bin/php` for liveness first get a 200 with the
+    # Windows + Apache + PHP-CGI fingerprint they're checking for.
+    if is_php_cgi_liveness_path(path):
+        return await _handle_php_cgi_liveness(request, log_context, path)
+
     if is_wp_login_path(path):
         return await _handle_wp_login(request, log_context, path, request_body)
 
@@ -14889,6 +14982,8 @@ def main() -> int:
         active.append("nextjs")
     if CMD_INJECTION_ENABLED:
         active.append("cmd-injection")
+    if PHP_CGI_LIVENESS_ENABLED:
+        active.append("php-cgi-liveness")
     if WEBAPP_FORM_ENABLED:
         active.append("webapp-form")
     if WP_LOGIN_ENABLED:
