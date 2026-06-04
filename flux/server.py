@@ -7455,6 +7455,69 @@ def render_zsh_history(r: dict[str, object]) -> bytes:
     return ("\n".join(out_lines) + "\n").encode("utf-8")
 
 
+def render_vite_env(r: dict[str, object]) -> bytes:
+    # `/@vite/env` is the dev-mode env-leak surface Vite exposes when a
+    # project's dev server is reachable from the public internet
+    # (`server.host: '0.0.0.0'` left on, or a reverse-proxy that forwards
+    # `/@vite/*` paths to the dev server). The real client module at
+    # this path is the ES-module that exports `import.meta.env`, so it
+    # carries every `VITE_*` variable from the project's `.env` file —
+    # a known frontend-secret-leak vector because devs routinely ship
+    # API keys / cloud creds via `VITE_*` prefixes thinking they're
+    # build-time-only.
+    #
+    # Scanners that fetch this path grep the response for `VITE_`,
+    # `AWS_`, `AKIA`, `SECRET_` patterns and replay any value that
+    # looks like a credential. We embed the canary AWS triple in both
+    # `VITE_AWS_*` slots and the bare `VITE_API_KEY` slot (some scanner
+    # dictionaries key only on `VITE_API_KEY`), plus a synthetic
+    # `VITE_SENTRY_DSN` / `VITE_S3_BUCKET` so the body looks like a
+    # real leaky build rather than a stub. Per-hit-unique non-canary
+    # bits (sentry project id, S3 bucket suffix, app id) keep the
+    # response from acting as a fleet-wide fingerprint.
+    aws = _aws(r)
+    app_id = secrets.token_hex(6)
+    bucket_suffix = secrets.token_hex(4)
+    sentry_org_id = 1_000_000 + secrets.randbelow(900_000)
+    sentry_project_id = 1_000_000 + secrets.randbelow(9_000_000)
+    sentry_public_key = secrets.token_hex(16)
+    env = {
+        "BASE_URL": "/",
+        "MODE": "production",
+        "DEV": False,
+        "PROD": True,
+        "SSR": False,
+        "VITE_APP_VERSION": "1.4.2",
+        "VITE_API_BASE_URL": "https://api.internal.example.com",
+        "VITE_API_KEY": aws.get("awsAccessKeyId", ""),
+        "VITE_AWS_REGION": "us-east-1",
+        "VITE_AWS_ACCESS_KEY_ID": aws.get("awsAccessKeyId", ""),
+        "VITE_AWS_SECRET_ACCESS_KEY": aws.get("awsSecretAccessKey", ""),
+        "VITE_AWS_SESSION_TOKEN": aws.get("awsSessionToken", ""),
+        "VITE_S3_BUCKET": f"internal-app-uploads-{bucket_suffix}",
+        "VITE_SENTRY_DSN": (
+            f"https://{sentry_public_key}@o{sentry_org_id}.ingest.sentry.io/"
+            f"{sentry_project_id}"
+        ),
+        "VITE_APP_ID": app_id,
+    }
+    define_payload = {f"import.meta.env.{k}": v for k, v in env.items()}
+    body = (
+        "const context = (() => {\n"
+        "  if (typeof globalThis !== 'undefined') return globalThis\n"
+        "  if (typeof self !== 'undefined') return self\n"
+        "  if (typeof window !== 'undefined') return window\n"
+        "  if (typeof global !== 'undefined') return global\n"
+        "  throw new Error('unable to locate global object')\n"
+        "})()\n"
+        "\n"
+        "context.define = "
+        + json.dumps(define_payload, separators=(",", ":"))
+        + "\n"
+    )
+    return body.encode("utf-8")
+
+
 def render_env_vault(r: dict[str, object]) -> bytes:
     # `.env.vault` is the dotenv-vault file format: per-environment
     # encrypted ciphertext entries that need a `DOTENV_KEY` decryption
@@ -10094,6 +10157,22 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_env_vault,
         "text/plain; charset=utf-8",
+    ),
+    # Vite dev-server `/@vite/env` — the client-module path that
+    # serves a project's `VITE_*` env vars in dev mode when the dev
+    # server is publicly reachable. Frontend devs routinely smuggle
+    # cloud creds via `VITE_*` prefixes thinking they're build-time-
+    # only, so an opportunistic harvester treats anything matching
+    # `VITE_AWS_*` / `VITE_API_KEY` as live creds and replays.
+    # Companion `/@fs/` arbitrary-file-read primitive entries (under
+    # `bash-history`) handle the FS-walk pivot that scanners chain
+    # after the env probe.
+    CanaryTrap(
+        "vite-env",
+        ("/@vite/env",),
+        ("aws",),
+        render_vite_env,
+        "application/javascript; charset=utf-8",
     ),
     # Go `net/http/pprof` debug endpoints. `/debug/pprof/heap` and
     # `/debug/pprof/cmdline` are the highest-value scanner targets

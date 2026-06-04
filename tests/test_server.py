@@ -779,6 +779,14 @@ FAKE_TRACEBIT = {
     ("/.env.vault", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/.env.vault.bak", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/.env.vault.example", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    # Vite `/@vite/env` dev-mode env-leak — flat-key `context.define`
+    # exposes `VITE_*` env vars. Scanners grep raw bytes for AWS/AKIA,
+    # so the canary access key sits in both `VITE_AWS_*` slots and
+    # the bare `VITE_API_KEY` slot (different scanner dictionaries key
+    # on each).
+    ("/@vite/env", b"context.define"),
+    ("/@vite/env", b'"import.meta.env.VITE_API_KEY":"AKIAFAKEEXAMPLE01"'),
+    ("/@vite/env", b'"import.meta.env.VITE_AWS_ACCESS_KEY_ID":"AKIAFAKEEXAMPLE01"'),
     ("/debug/pprof/", b"heap profile:"),
     ("/debug/pprof/heap", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/debug/pprof/cmdline", b"AWS_SECRET_ACCESS_KEY="),
@@ -1203,6 +1211,85 @@ async def test_dispatch_routes_zsh_history_variants_to_trap(flux_client, monkeyp
     assert b"export AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
     entries = _log_entries(flux_client.log_path)
     assert entries[-1]["result"] == "zsh-history"
+
+
+def test_render_vite_env_embeds_canary_in_flat_define_block():
+    # The real Vite client at `/@vite/env` emits a JS module whose
+    # `context.define` is a flat-key dict like `{"import.meta.env.MODE":
+    # "production", "import.meta.env.VITE_API_KEY": "..."}`. Scanners
+    # grep raw bytes for `VITE_*` / `AWS_*` / `AKIA` so the canary must
+    # show up in both `VITE_AWS_*` slots and the bare `VITE_API_KEY`
+    # slot (some dictionaries only key on the latter).
+    body = tbenv.render_vite_env(FAKE_TRACEBIT).decode("utf-8")
+    assert "context.define" in body
+    assert '"import.meta.env.VITE_API_KEY":"AKIAFAKEEXAMPLE01"' in body
+    assert '"import.meta.env.VITE_AWS_ACCESS_KEY_ID":"AKIAFAKEEXAMPLE01"' in body
+    assert (
+        '"import.meta.env.VITE_AWS_SECRET_ACCESS_KEY":'
+        '"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"' in body
+    )
+    assert (
+        '"import.meta.env.VITE_AWS_SESSION_TOKEN":'
+        '"FwoGZXIvYXdzEXAMPLEFAKE="' in body
+    )
+    assert '"import.meta.env.MODE":"production"' in body
+
+
+def test_render_vite_env_is_per_hit_unique():
+    # Per-hit `VITE_APP_ID`, `VITE_S3_BUCKET` suffix, and `VITE_SENTRY_DSN`
+    # project/org/public-key vary across renders so the response body
+    # can't be cross-sensor fingerprinted.
+    body1 = tbenv.render_vite_env(FAKE_TRACEBIT)
+    body2 = tbenv.render_vite_env(FAKE_TRACEBIT)
+    assert body1 != body2
+
+
+def test_render_vite_env_does_not_embed_fixed_synthetic_secret():
+    # Per-hit synthetic Sentry public key must differ between renders —
+    # a hardcoded literal here would fingerprint the fleet by sharing
+    # the same string across every sensor (the same regression that hit
+    # wp-config / application.yml in April 2026).
+    def _sentry_key(body: bytes) -> str:
+        text = body.decode("utf-8")
+        marker = "VITE_SENTRY_DSN"
+        assert marker in text
+        # "...VITE_SENTRY_DSN":"https://<pubkey>@o<org>.ingest.sentry.io/<proj>"
+        dsn = text.split(marker, 1)[1].split('"', 3)[2]
+        assert dsn.startswith("https://"), dsn
+        return dsn.split("https://", 1)[1].split("@", 1)[0]
+    a = _sentry_key(tbenv.render_vite_env(FAKE_TRACEBIT))
+    b = _sentry_key(tbenv.render_vite_env(FAKE_TRACEBIT))
+    assert a != b
+
+
+async def test_dispatch_routes_vite_env_to_trap(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/@vite/env",
+        headers={"X-Forwarded-For": "203.0.113.44"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"] == "application/javascript; charset=utf-8"
+    body = await resp.read()
+    assert b"AKIAFAKEEXAMPLE01" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "vite-env"
+
+
+async def test_vite_env_404s_without_api_key(flux_client, monkeypatch):
+    # Keyless deployments must 404 the canary-backed paths — dispatch
+    # requires `TRACEBIT_API_KEY` on top of `CANARY_TRAPS_ENABLED`.
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+
+    resp = await flux_client.get(
+        "/@vite/env",
+        headers={"X-Forwarded-For": "203.0.113.45"},
+    )
+    assert resp.status == 404
 
 
 def test_htpasswd_falls_back_to_default_username_when_tracebit_missing():
