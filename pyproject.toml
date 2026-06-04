@@ -16,7 +16,7 @@ classifiers = [
   "Topic :: Security",
 ]
 dependencies = [
-  "aiohttp==3.13.5",
+  "aiohttp==3.14.0",
 ]
 
 [project.optional-dependencies]
