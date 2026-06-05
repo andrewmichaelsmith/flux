@@ -8231,6 +8231,202 @@ def render_actuator_threaddump(r: dict[str, object]) -> bytes:
     return json.dumps(payload, indent=2).encode("utf-8")
 
 
+def render_actuator_logfile(r: dict[str, object]) -> bytes:
+    # Spring Boot Actuator `/logfile` returns the contents of
+    # `logging.file.name` as `text/plain`. On a misconfigured app the
+    # startup log dumps unmasked env vars resolved by Spring's property
+    # placeholder system (`${AWS_ACCESS_KEY_ID}`) and the JDBC URL with
+    # user-info. Harvesters greppers walk this for `AWS_ACCESS_KEY_ID=`
+    # and `password=` patterns the same way they grep heapdumps.
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    db_password = _fake_db_password()
+    lines = (
+        "2024-11-12T03:14:21.842Z  INFO 1 --- [           main] o.s.b.StartupInfoLogger                  : Starting Application v1.0.0 using Java 17.0.9 on prod-app-01 with PID 1 (/app/app.jar started by app in /app)\n"
+        "2024-11-12T03:14:21.844Z  INFO 1 --- [           main] o.s.b.SpringApplication                  : The following 1 profile is active: \"production\"\n"
+        "2024-11-12T03:14:23.117Z  INFO 1 --- [           main] o.s.b.w.embedded.tomcat.TomcatWebServer  : Tomcat initialized with port(s): 8080 (http)\n"
+        "2024-11-12T03:14:23.221Z  INFO 1 --- [           main] o.apache.catalina.core.StandardEngine    : Starting Servlet engine: [Apache Tomcat/10.1.16]\n"
+        "2024-11-12T03:14:24.005Z  INFO 1 --- [           main] o.s.b.a.e.web.EndpointLinksResolver      : Exposing 18 endpoint(s) beneath base path '/actuator'\n"
+        "2024-11-12T03:14:24.018Z  WARN 1 --- [           main] o.s.b.a.endpoint.web.WebEndpointResponse : management.endpoint.env.show-values=ALWAYS — environment values will be returned unmasked\n"
+        f"2024-11-12T03:14:24.221Z  INFO 1 --- [           main] c.amazonaws.auth.DefaultAWSCredentialsProviderChain : Loaded credentials from EnvironmentVariableCredentialsProvider: AWS_ACCESS_KEY_ID={ak} AWS_DEFAULT_REGION=us-east-1\n"
+        f"2024-11-12T03:14:24.222Z DEBUG 1 --- [           main] c.amazonaws.auth.AWSCredentialsProviderChain : env: AWS_SECRET_ACCESS_KEY={sk} AWS_SESSION_TOKEN={st}\n"
+        f"2024-11-12T03:14:24.301Z  INFO 1 --- [           main] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Starting... (jdbcUrl=jdbc:postgresql://prod_rw:{db_password}@db.internal:5432/prod, username=prod_rw)\n"
+        f"2024-11-12T03:14:24.421Z  INFO 1 --- [           main] com.zaxxer.hikari.pool.HikariPool        : HikariPool-1 - Added connection org.postgresql.jdbc.PgConnection@1f, password resolved from spring.datasource.password={db_password}\n"
+        "2024-11-12T03:14:24.422Z  INFO 1 --- [           main] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Start completed.\n"
+        "2024-11-12T03:14:24.812Z  INFO 1 --- [           main] o.s.b.w.embedded.tomcat.TomcatWebServer  : Tomcat started on port(s): 8080 (http) with context path ''\n"
+        "2024-11-12T03:14:24.821Z  INFO 1 --- [           main] o.s.b.StartupInfoLogger                  : Started Application in 3.214 seconds (process running for 3.482)\n"
+        "2024-11-12T03:14:25.108Z  INFO 1 --- [nio-8080-exec-1] o.a.c.c.C.[Tomcat].[localhost].[/]       : Initializing Spring DispatcherServlet 'dispatcherServlet'\n"
+    )
+    return lines.encode("utf-8")
+
+
+def render_actuator_trace(r: dict[str, object]) -> bytes:
+    # Spring Boot 1.x `/trace` (and 2.x `/httptrace`) returns the last
+    # N HTTP exchanges as JSON. Real responses leak `Authorization`
+    # headers from inbound API calls — when a service-to-service call
+    # carries an AWS-SigV4 `Authorization: AWS4-HMAC-SHA256 ...` header
+    # or a bearer token, that header lands in the trace verbatim. We
+    # synthesise plausible recent exchanges with the canary credential
+    # in both an `Authorization` header and an outbound `X-Webhook-URL`
+    # that includes the canary access key as a query parameter — two
+    # idiomatic placements a real misconfigured trace exposes.
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    payload = {
+        "traces": [
+            {
+                "timestamp": "2024-11-12T03:14:31.082Z",
+                "principal": None,
+                "session": None,
+                "request": {
+                    "method": "POST",
+                    "uri": "https://api.internal/v1/objects",
+                    "headers": {
+                        "host": ["api.internal"],
+                        "user-agent": ["aws-sdk-java/2.21.12"],
+                        "authorization": [
+                            f"AWS4-HMAC-SHA256 Credential={ak}/20241112/us-east-1/s3/aws4_request, "
+                            f"SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+                            f"Signature={sk[:32] if sk else 'sigSigSigSigSigSig'}"
+                        ],
+                        "x-amz-date": ["20241112T031431Z"],
+                    },
+                },
+                "response": {
+                    "status": 200,
+                    "headers": {
+                        "content-type": ["application/json"],
+                        "x-amz-request-id": ["A8F4E0B2C9D71234"],
+                    },
+                },
+                "timeTaken": 142,
+            },
+            {
+                "timestamp": "2024-11-12T03:14:33.519Z",
+                "request": {
+                    "method": "GET",
+                    "uri": f"https://hooks.internal/notify?api_key={ak}&channel=ops",
+                    "headers": {
+                        "host": ["hooks.internal"],
+                        "user-agent": ["okhttp/4.12.0"],
+                    },
+                },
+                "response": {
+                    "status": 204,
+                    "headers": {},
+                },
+                "timeTaken": 88,
+            },
+            {
+                "timestamp": "2024-11-12T03:14:35.044Z",
+                "request": {
+                    "method": "POST",
+                    "uri": "https://github.com/api/v3/repos/internal/deployer/dispatches",
+                    "headers": {
+                        "host": ["github.com"],
+                        "authorization": [f"Bearer {sk}"],
+                        "content-type": ["application/json"],
+                    },
+                },
+                "response": {
+                    "status": 204,
+                    "headers": {},
+                },
+                "timeTaken": 311,
+            },
+        ],
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def render_gcp_service_account_json(r: dict[str, object]) -> bytes:
+    # GCP service-account JSON shape (the file `gcloud iam
+    # service-accounts keys create` writes). Harvesters look for
+    # `"type": "service_account"` first, then pull `private_key_id`
+    # and `private_key`. We embed the Tracebit AWS canary in
+    # `private_key_id` (well-formed lowercase-hex shape) and inside the
+    # `private_key` PEM body as a comment line + as a fake passphrase.
+    # The `client_email` and `project_id` use plausible-static
+    # non-credential filler — the per-hit uniqueness is carried by
+    # the canary fields.
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    # `private_key_id` on a real GCP key file is a 40-char lowercase
+    # hex. Map the canary access-key id into that shape so the file
+    # parses cleanly in any GCP SDK that tries to validate it, while
+    # the same canary value is recoverable from the body by a grep.
+    pk_id = ak.lower().replace("akia", "")[:24].rjust(40, "0") if ak else "0" * 40
+    pk_body = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        f"# CANARY-AWS-SECRET={sk}\n"
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDfake1234567890abcdef\n"
+        "ghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijkl\n"
+        "mnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnop\n"
+        "qrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrst\n"
+        "-----END PRIVATE KEY-----\n"
+    )
+    payload = {
+        "type": "service_account",
+        "project_id": "prod-platform",
+        "private_key_id": pk_id,
+        "private_key": pk_body,
+        "client_email": "deploy@prod-platform.iam.gserviceaccount.com",
+        "client_id": "108472659012437894216",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/deploy%40prod-platform.iam.gserviceaccount.com",
+        "universe_domain": "googleapis.com",
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def render_terraform_tfvars(r: dict[str, object]) -> bytes:
+    # `terraform.tfvars` is HCL; the JSON sibling is `.tfvars.json`.
+    # Scanner dictionaries that already walk `terraform.tfstate` walk
+    # `tfvars` too — `tfvars` is the more direct credential leak
+    # because it carries the *input* values (often raw API keys) that
+    # `tfstate` only echoes after a sensitive-attribute redaction step.
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    return (
+        f"aws_access_key = \"{aws.get('awsAccessKeyId', '')}\"\n"
+        f"aws_secret_key = \"{aws.get('awsSecretAccessKey', '')}\"\n"
+        f"aws_session_token = \"{aws.get('awsSessionToken', '')}\"\n"
+        "aws_region = \"us-east-1\"\n"
+        "environment = \"production\"\n"
+        f"db_password = \"{db_password}\"\n"
+        "db_host = \"db.internal\"\n"
+        "db_user = \"prod_rw\"\n"
+        "db_name = \"prod\"\n"
+        "vpc_cidr = \"10.0.0.0/16\"\n"
+        "allowed_admin_cidrs = [\"10.0.0.0/8\"]\n"
+    ).encode("utf-8")
+
+
+def render_terraform_tfvars_json(r: dict[str, object]) -> bytes:
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    payload = {
+        "aws_access_key": aws.get("awsAccessKeyId", ""),
+        "aws_secret_key": aws.get("awsSecretAccessKey", ""),
+        "aws_session_token": aws.get("awsSessionToken", ""),
+        "aws_region": "us-east-1",
+        "environment": "production",
+        "db_password": db_password,
+        "db_host": "db.internal",
+        "db_user": "prod_rw",
+        "db_name": "prod",
+        "vpc_cidr": "10.0.0.0/16",
+        "allowed_admin_cidrs": ["10.0.0.0/8"],
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
 def render_phpinfo(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     ak = aws.get("awsAccessKeyId", "")
@@ -9664,6 +9860,53 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_terraform_tfstate,
         "application/json; charset=utf-8",
     ),
+    # `terraform.tfvars` is the more direct credential leak: it carries
+    # *input* values (raw API keys, db passwords) before any redaction,
+    # whereas tfstate echoes them only after sensitive-attribute marking.
+    # Same scanner populations that walk tfstate walk tfvars; covering
+    # both prevents the 404-on-tfvars / 200-on-tfstate fingerprint.
+    CanaryTrap(
+        "terraform-tfvars",
+        (
+            "/terraform.tfvars",
+            "/.terraform/terraform.tfvars",
+        ),
+        ("aws",),
+        render_terraform_tfvars,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "terraform-tfvars-json",
+        (
+            "/terraform.tfvars.json",
+            "/.terraform/terraform.tfvars.json",
+        ),
+        ("aws",),
+        render_terraform_tfvars_json,
+        "application/json; charset=utf-8",
+    ),
+    # GCP service-account JSON at generic webroot paths. The existing
+    # `firebase-json` trap covers the canonical GCP/Firebase filenames
+    # (`/firebase-adminsdk.json`, `/.config/gcloud/...`); these are the
+    # off-the-shelf-dictionary aliases — bare `/gcp-credentials.json`,
+    # `/api/credentials.json`, etc. — that scanners walk separately
+    # from the canonical names. Same `type: service_account` shape so
+    # a harvester filtering on JSON shape harvests the canary.
+    CanaryTrap(
+        "gcp-credentials-json",
+        (
+            "/gcp-credentials.json",
+            "/config/gcp-credentials.json",
+            "/api/credentials.json",
+            "/private/credentials.json",
+            "/backend/credentials.json",
+            "/app/credentials.json",
+            "/private/gcp-credentials.json",
+        ),
+        ("aws",),
+        render_gcp_service_account_json,
+        "application/json; charset=utf-8",
+    ),
     CanaryTrap(
         "pgpass",
         ("/.pgpass",),
@@ -9943,6 +10186,12 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/manage/env",
             "/management/env",
             "/api/actuator/env",
+            # `/app/` and `/backend/` reverse-proxy base paths — recurring
+            # scanner-dict prefixes that mount a Spring Boot service
+            # behind an HTTP gateway. Without these the same dictionary
+            # collects 1 hit (`/actuator/env`) instead of 3.
+            "/app/actuator/env",
+            "/backend/actuator/env",
         ),
         ("aws",),
         render_actuator_env_json,
@@ -9952,8 +10201,9 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     # by the same broad-secrets fleets that hit /actuator/env: a 200 with
     # the right JSON / HPROF shape passes the scanner's filter, the
     # embedded canary credential gets harvested. Path aliases follow the
-    # `/manage`, `/management`, `/api/actuator` reverse-proxy shapes
-    # already covered by actuator-env.
+    # `/manage`, `/management`, `/api/actuator`, `/app/actuator`,
+    # `/backend/actuator` reverse-proxy shapes already covered by
+    # actuator-env.
     CanaryTrap(
         "actuator-heapdump",
         (
@@ -9961,6 +10211,8 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/manage/heapdump",
             "/management/heapdump",
             "/api/actuator/heapdump",
+            "/app/actuator/heapdump",
+            "/backend/actuator/heapdump",
         ),
         ("aws",),
         render_actuator_heapdump,
@@ -9973,6 +10225,8 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/manage/configprops",
             "/management/configprops",
             "/api/actuator/configprops",
+            "/app/actuator/configprops",
+            "/backend/actuator/configprops",
         ),
         ("aws",),
         render_actuator_configprops,
@@ -9985,6 +10239,8 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/manage/health",
             "/management/health",
             "/api/actuator/health",
+            "/app/actuator/health",
+            "/backend/actuator/health",
         ),
         ("aws",),
         render_actuator_health,
@@ -9997,6 +10253,8 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/manage/mappings",
             "/management/mappings",
             "/api/actuator/mappings",
+            "/app/actuator/mappings",
+            "/backend/actuator/mappings",
         ),
         ("aws",),
         render_actuator_mappings,
@@ -10009,9 +10267,56 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/manage/threaddump",
             "/management/threaddump",
             "/api/actuator/threaddump",
+            "/app/actuator/threaddump",
+            "/backend/actuator/threaddump",
         ),
         ("aws",),
         render_actuator_threaddump,
+        "application/vnd.spring-boot.actuator.v3+json; charset=utf-8",
+    ),
+    # `/actuator/logfile` returns the contents of `logging.file.name`
+    # as `text/plain` — startup logs leak unmasked env vars via
+    # Spring's `${AWS_ACCESS_KEY_ID}` property placeholders and the
+    # JDBC URL via Hikari's `Added connection ...` line. Scanner
+    # dictionaries probe it alongside heapdump/configprops as a known
+    # secret-leak endpoint.
+    CanaryTrap(
+        "actuator-logfile",
+        (
+            "/actuator/logfile",
+            "/manage/logfile",
+            "/management/logfile",
+            "/api/actuator/logfile",
+            "/app/actuator/logfile",
+            "/backend/actuator/logfile",
+        ),
+        ("aws",),
+        render_actuator_logfile,
+        "text/plain; charset=utf-8",
+    ),
+    # `/actuator/trace` is Spring Boot 1.x (the 2.x name is `httptrace`)
+    # but the 1.x path is still in every off-the-shelf scanner dict.
+    # Real `/trace` responses leak inbound `Authorization` headers
+    # verbatim — AWS SigV4 headers carry the access-key id in the
+    # `Credential=` segment, which harvesters grep for. Cover the 2.x
+    # rename too.
+    CanaryTrap(
+        "actuator-trace",
+        (
+            "/actuator/trace",
+            "/actuator/httptrace",
+            "/trace",
+            "/manage/trace",
+            "/management/trace",
+            "/api/actuator/trace",
+            "/app/actuator/trace",
+            "/backend/actuator/trace",
+            "/manage/httptrace",
+            "/management/httptrace",
+            "/api/actuator/httptrace",
+        ),
+        ("aws",),
+        render_actuator_trace,
         "application/vnd.spring-boot.actuator.v3+json; charset=utf-8",
     ),
     CanaryTrap(
@@ -10068,6 +10373,22 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/srv/.env",
             "/var/www/.env",
             "/app/.env",
+            # `/backend/.env*` and `/api/.env*` — reverse-proxy webroot
+            # prefixes that mount a backend service behind an HTTP
+            # gateway, mirroring the same prefix shape that scanners use
+            # for `/backend/actuator/*` and `/api/actuator/*`. Cover the
+            # bare file plus the four common per-env rotation names that
+            # the same dictionary walks.
+            "/backend/.env",
+            "/backend/.env.production",
+            "/backend/.env.local",
+            "/backend/.env.dev",
+            "/backend/.env.development",
+            "/backend/.env.staging",
+            "/api/.env",
+            "/api/.env.production",
+            "/api/.env.local",
+            "/api/.env.dev",
         ),
         ("aws",),
         render_env_production,

@@ -1464,6 +1464,144 @@ def test_render_actuator_heapdump_carries_canary_in_raw_bytes():
     assert other != body
 
 
+def test_render_actuator_logfile_carries_canary_and_per_hit_unique():
+    body1 = tbenv.render_actuator_logfile(FAKE_TRACEBIT).decode("utf-8")
+    # Grep-style harvest pattern — the same one heapdump tests assert.
+    assert "AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body1
+    assert "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI" in body1
+    # JDBC URL with embedded password — per-hit synthetic, never a fixed literal.
+    import re
+    m = re.search(r"jdbc:postgresql://prod_rw:([^@]+)@db\.internal", body1)
+    assert m, "logfile must embed a JDBC URL with the per-hit DB password"
+    pw1 = m.group(1)
+    body2 = tbenv.render_actuator_logfile(FAKE_TRACEBIT).decode("utf-8")
+    pw2 = re.search(r"jdbc:postgresql://prod_rw:([^@]+)@db\.internal", body2).group(1)
+    assert pw1 != pw2, "DB password must be per-hit unique"
+
+
+def test_render_actuator_trace_is_valid_and_carries_canary():
+    body = tbenv.render_actuator_trace(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body)
+    assert "traces" in payload
+    # AWS SigV4 Authorization header on a recent trace carries the access key id.
+    auth_headers = []
+    for t in payload["traces"]:
+        h = t.get("request", {}).get("headers", {})
+        if "authorization" in h:
+            auth_headers.extend(h["authorization"])
+    joined = " ".join(auth_headers)
+    assert "AKIAFAKEEXAMPLE01" in joined
+    # Webhook URL on one trace carries the access key as a query param.
+    uris = [t.get("request", {}).get("uri", "") for t in payload["traces"]]
+    assert any("api_key=AKIAFAKEEXAMPLE01" in u for u in uris)
+
+
+def test_render_gcp_service_account_json_is_valid_and_carries_canary():
+    body = tbenv.render_gcp_service_account_json(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body)
+    # The first thing a harvester filters on.
+    assert payload["type"] == "service_account"
+    # AWS canary embedded in the private_key body (idiomatic grep target).
+    assert "wJalrXUtnFEMI" in payload["private_key"]
+    # Required GCP-shape fields so SDK validators accept the file.
+    for field_name in ("project_id", "private_key_id", "client_email", "token_uri"):
+        assert payload[field_name], f"required field {field_name} missing"
+    # private_key_id is shaped like a 40-char lowercase hex
+    assert len(payload["private_key_id"]) == 40
+    assert payload["private_key_id"] == payload["private_key_id"].lower()
+
+
+def test_render_terraform_tfvars_carries_canary():
+    body = tbenv.render_terraform_tfvars(FAKE_TRACEBIT).decode("utf-8")
+    assert 'aws_access_key = "AKIAFAKEEXAMPLE01"' in body
+    assert 'aws_secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"' in body
+    # Per-hit DB password — never a fixed literal.
+    import re
+    m1 = re.search(r'db_password = "([^"]+)"', body)
+    assert m1
+    body2 = tbenv.render_terraform_tfvars(FAKE_TRACEBIT).decode("utf-8")
+    m2 = re.search(r'db_password = "([^"]+)"', body2)
+    assert m1.group(1) != m2.group(1)
+
+
+def test_render_terraform_tfvars_json_is_valid_json():
+    body = tbenv.render_terraform_tfvars_json(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body)
+    assert payload["aws_access_key"] == "AKIAFAKEEXAMPLE01"
+    assert payload["aws_secret_key"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["db_password"]
+
+
+@pytest.mark.parametrize("path", [
+    # actuator-logfile family
+    "/actuator/logfile",
+    "/manage/logfile",
+    "/management/logfile",
+    "/api/actuator/logfile",
+    "/app/actuator/logfile",
+    "/backend/actuator/logfile",
+    # actuator-trace family (1.x name + 2.x rename to httptrace)
+    "/actuator/trace",
+    "/actuator/httptrace",
+    "/app/actuator/trace",
+    "/backend/actuator/trace",
+    "/api/actuator/httptrace",
+    # new /app/ + /backend/ prefixes on existing actuator handlers
+    "/app/actuator/env",
+    "/backend/actuator/env",
+    "/app/actuator/heapdump",
+    "/backend/actuator/heapdump",
+    "/app/actuator/configprops",
+    "/backend/actuator/configprops",
+    "/app/actuator/health",
+    "/backend/actuator/health",
+    "/app/actuator/mappings",
+    "/backend/actuator/mappings",
+    "/app/actuator/threaddump",
+    "/backend/actuator/threaddump",
+    # terraform-tfvars + .json sibling
+    "/terraform.tfvars",
+    "/.terraform/terraform.tfvars",
+    "/terraform.tfvars.json",
+    "/.terraform/terraform.tfvars.json",
+    # gcp-credentials-json family
+    "/gcp-credentials.json",
+    "/config/gcp-credentials.json",
+    "/api/credentials.json",
+    "/private/credentials.json",
+    "/backend/credentials.json",
+    "/app/credentials.json",
+    # env-production webroot-prefix expansion
+    "/backend/.env",
+    "/backend/.env.production",
+    "/backend/.env.local",
+    "/backend/.env.dev",
+    "/backend/.env.staging",
+    "/api/.env",
+    "/api/.env.production",
+    "/api/.env.local",
+])
+def test_new_canary_trap_paths_dispatch(path):
+    assert path.lower() in tbenv._TRAP_BY_PATH, (
+        f"{path!r} should be a CanaryTrap entry"
+    )
+
+
+@pytest.mark.parametrize("path", [
+    # Regression: scanner-walkable variants on the gcp-credentials-json
+    # family must NOT collide with the existing config-json trap that
+    # claims bare `/credentials.json`. The new alias prefixes are only
+    # `/api/`, `/private/`, `/backend/`, `/app/`, `/config/` — bare
+    # `/credentials.json` stays with config-json.
+    "/credentials.json",
+])
+def test_bare_credentials_json_routes_to_config_json(path):
+    trap = tbenv._TRAP_BY_PATH[path.lower()]
+    assert trap.name == "config-json", (
+        f"{path!r} must remain on config-json, not gcp-credentials-json"
+    )
+
+
 def test_default_canary_types_includes_gitlab_username_password():
     # /.env bare handler uses CANARY_TYPES when the caller doesn't pass an
     # explicit list. Default should request both aws (fires globally via
