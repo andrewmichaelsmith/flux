@@ -924,6 +924,103 @@ def _hikvision_has_cmdi(query: str, body_preview: str) -> bool:
     return any(needle in haystack for needle in _HIKVISION_CMDI_INDICATORS)
 
 
+# --- Fake ONVIF device_service (Dahua-class IP-camera bait) -------------
+# ONVIF is the unified web-services API that IP cameras / NVRs / DVRs
+# expose at `/onvif/device_service`. The `GetDeviceInformation` SOAP
+# action returns manufacturer, model, firmware version, hardware ID and
+# serial — the fingerprinting fields a scanner walks before deciding
+# whether to ship a known-CVE follow-up (CVE-2024-7029 Dahua auth-bypass
+# command-injection, CVE-2023-43261 exposed RTSP cred leak,
+# CVE-2021-33044 Dahua identity-auth bypass). We respond regardless of
+# method (GET banner-grab vs POST SOAP envelope) with a plausible Dahua
+# DH-IPC-HFW1230S body whose firmware sits in the public-disclosure
+# window for those CVEs. No credentials are emitted on this surface
+# (the `GetUsers` action would, but it isn't in the default off-the-
+# shelf probe dictionary); fingerprint fields are fixed plausible
+# filler per the design principle — what must never be fixed is
+# anything credential-shaped, and there isn't anything credential-
+# shaped on `GetDeviceInformation`.
+ONVIF_ENABLED = _env_bool("HONEYPOT_ONVIF_ENABLED")
+_ONVIF_DEFAULT_PATHS = ",".join([
+    # Canonical ONVIF device service endpoint.
+    "/onvif/device_service",
+    # WSDL discovery sibling — same handler, returns SOAP body too.
+    "/onvif/services",
+    # Capability-name path some scanner dictionaries probe.
+    "/onvif/device",
+    # Bare `/device_service` (no `/onvif/` prefix) appears in stripped
+    # banner-grab dictionaries that walked a root-relative listing on
+    # an embedded HTTP server which mounted device_service at `/`.
+    "/device_service",
+])
+ONVIF_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_ONVIF_PATHS_CSV") or _ONVIF_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# Dahua-rebadged ONVIF firmware in the disclosure window for the
+# Dahua-class CVEs listed above. Scanners that gate exploit delivery on
+# a vulnerable banner string don't bail on this version. Fixed strings
+# (no credentials, plausible filler — same rule as Hikvision banner).
+ONVIF_MANUFACTURER = (os.environ.get("HONEYPOT_ONVIF_MANUFACTURER") or "Dahua").strip()
+ONVIF_MODEL = (os.environ.get("HONEYPOT_ONVIF_MODEL") or "DH-IPC-HFW1230S").strip()
+ONVIF_FIRMWARE_VERSION = (
+    os.environ.get("HONEYPOT_ONVIF_FIRMWARE_VERSION") or "2.800.0000000.7.R"
+).strip()
+ONVIF_HARDWARE_ID = (os.environ.get("HONEYPOT_ONVIF_HARDWARE_ID") or "IPC-HFW1230S").strip()
+ONVIF_SERIAL = (os.environ.get("HONEYPOT_ONVIF_SERIAL") or "1A05ABCPAW00123").strip()
+
+# Shell-meta indicators on the SOAP body — CVE-2024-7029 ships its
+# command in the `<UpgradeUrl>` element of FirmwareUpgrade; broader
+# scanners walk the same indicators as Hikvision (shared crawler).
+_ONVIF_CMDI_INDICATORS = (
+    "$(",
+    "`",
+    "&&",
+    "||",
+    ";",
+    "|",
+    "wget ",
+    "curl ",
+    "/bin/sh",
+    "bash -",
+    "nc -",
+)
+# Action-name indicators that flip cmdi heuristics independently of
+# shell-meta: the FirmwareUpgrade sink is itself suspicious.
+_ONVIF_CMDI_ACTIONS = ("UpgradeUrl", "FirmwareUpgrade")
+
+
+def _onvif_has_cmdi(body_preview: str) -> bool:
+    haystack = body_preview.lower()
+    if any(needle in haystack for needle in _ONVIF_CMDI_INDICATORS):
+        return True
+    return any(needle in body_preview for needle in _ONVIF_CMDI_ACTIONS)
+
+
+# Recognisable ONVIF actions for logging triage; the local element name
+# under `<s:Body>` names the action.
+_ONVIF_KNOWN_ACTIONS = (
+    "GetDeviceInformation",
+    "GetSystemDateAndTime",
+    "GetCapabilities",
+    "GetServices",
+    "GetUsers",
+    "GetHostname",
+    "GetNetworkInterfaces",
+    "GetWsdlUrl",
+    "FirmwareUpgrade",
+    "SystemReboot",
+)
+
+
+def _onvif_soap_action_from_body(body_preview: str) -> str:
+    for action in _ONVIF_KNOWN_ACTIONS:
+        if action in body_preview:
+            return action
+    return ""
+
+
 # --- Fake D-Link / Linksys HNAP1 router endpoint (CVE-2015-2051 bait) ----
 # HNAP1 is the SOAP-over-HTTP control surface on a long tail of consumer
 # routers (D-Link DIR-*, Linksys WRT-*, Zyxel home gateways). It lives at
@@ -1911,6 +2008,12 @@ def is_hikvision_path(path: str) -> bool:
     if not HIKVISION_ENABLED:
         return False
     return path.lower() in HIKVISION_PATHS
+
+
+def is_onvif_path(path: str) -> bool:
+    if not ONVIF_ENABLED:
+        return False
+    return path.lower() in ONVIF_PATHS
 
 
 def is_hnap1_path(path: str) -> bool:
@@ -9803,7 +9906,15 @@ def _gitlab_cookie_header(r: dict[str, object]) -> tuple[tuple[str, str], ...]:
 CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     CanaryTrap(
         "aws-credentials-file",
-        ("/.aws/credentials",),
+        (
+            "/.aws/credentials",
+            # Backup rotation names — scanner dictionaries walk the
+            # `.bak`/`.old` siblings of every dotfile config they probe
+            # for. Same renderer; harvester greps for AKIA bytes
+            # regardless of suffix.
+            "/.aws/credentials.bak",
+            "/.aws/credentials.old",
+        ),
         ("aws",),
         render_aws_credentials_ini,
         "text/plain; charset=utf-8",
@@ -9855,6 +9966,15 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/.terraform/terraform.tfstate",
             "/terraform.tfstate",
             "/terraform.tfstate.backup",
+            # Webroot-prefix variants — scanner dictionaries walk the
+            # `/<app-root>/terraform.tfstate` pattern for monorepos that
+            # commit a per-environment tfstate inside an `infra/`,
+            # `ops/`, or `terraform/` subdir checked into a misconfigured
+            # webroot. Same render; same canary placement.
+            "/terraform/terraform.tfstate",
+            "/infra/terraform.tfstate",
+            "/infrastructure/terraform.tfstate",
+            "/ops/terraform.tfstate",
         ),
         ("aws",),
         render_terraform_tfstate,
@@ -9902,6 +10022,16 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/backend/credentials.json",
             "/app/credentials.json",
             "/private/gcp-credentials.json",
+            # Off-the-shelf dictionary aliases observed walking the same
+            # `type: service_account` shape. `/.gcp/credentials.json`
+            # mirrors the `gcloud auth login` adc default subdir;
+            # `/google-credentials.json`, `/service_account.json`, and
+            # `/gcp-key.json` are the bare-filename variants scanners
+            # walk root-relative when they don't know the webroot.
+            "/.gcp/credentials.json",
+            "/google-credentials.json",
+            "/service_account.json",
+            "/gcp-key.json",
         ),
         ("aws",),
         render_gcp_service_account_json,
@@ -10389,6 +10519,13 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/api/.env.production",
             "/api/.env.local",
             "/api/.env.dev",
+            # `/env.*` (no leading dot) — scanner dictionaries probe the
+            # mis-named-but-still-grepped variants where an operator
+            # accidentally checked in `env.bak` / `env.txt` rather than
+            # `.env.bak`. Same render shape; harvester greps for the
+            # AKIA bytes regardless of leading dot.
+            "/env.bak",
+            "/env.txt",
         ),
         ("aws",),
         render_env_production,
@@ -10533,7 +10670,21 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "phpinfo",
-        ("/phpinfo.php", "/info.php", "/php.php", "/test.php"),
+        (
+            "/phpinfo.php",
+            "/info.php",
+            "/php.php",
+            "/test.php",
+            # Underscore + extensionless + 1-2 char variants — scanner
+            # dictionaries walk these aliases when probing for legacy
+            # admin-uploaded phpinfo scripts. Same render shape works:
+            # the harvester greps for `AKIA...` bytes in the env table.
+            "/php_info.php",
+            "/phpinfo",
+            "/pinfo.php",
+            "/i.php",
+            "/pi.php",
+        ),
         ("aws",),
         render_phpinfo,
         "text/html; charset=utf-8",
@@ -13473,6 +13624,72 @@ async def _handle_hikvision(
     )
 
 
+def _render_onvif_get_device_information() -> bytes:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+        ' xmlns:tds="http://www.onvif.org/ver10/device/wsdl">\n'
+        '<s:Body>\n'
+        '<tds:GetDeviceInformationResponse>\n'
+        f'<tds:Manufacturer>{ONVIF_MANUFACTURER}</tds:Manufacturer>\n'
+        f'<tds:Model>{ONVIF_MODEL}</tds:Model>\n'
+        f'<tds:FirmwareVersion>{ONVIF_FIRMWARE_VERSION}</tds:FirmwareVersion>\n'
+        f'<tds:SerialNumber>{ONVIF_SERIAL}</tds:SerialNumber>\n'
+        f'<tds:HardwareId>{ONVIF_HARDWARE_ID}</tds:HardwareId>\n'
+        '</tds:GetDeviceInformationResponse>\n'
+        '</s:Body>\n'
+        '</s:Envelope>\n'
+    ).encode("utf-8")
+
+
+async def _handle_onvif(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake ONVIF device_service. Returns a plausible Dahua-class
+    `GetDeviceInformation` SOAP envelope on any method; logs the SOAP
+    action name (where parseable) and a cmdi indicator for
+    FirmwareUpgrade-shaped payloads (CVE-2024-7029 sink)."""
+    method = request.method
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+
+    soap_action_header = request.headers.get("SOAPAction", "").strip().strip('"')
+    soap_action_body = _onvif_soap_action_from_body(body_preview)
+    has_cmdi = _onvif_has_cmdi(body_preview)
+
+    body = _render_onvif_get_device_information()
+
+    log_entry = {
+        **log_context,
+        "status": 200,
+        "result": "onvif-device-service",
+        "onvifPath": path,
+        "onvifMethod": method,
+        "onvifSoapActionHeader": soap_action_header,
+        "onvifSoapActionBody": soap_action_body,
+        "onvifHasCmdInjection": has_cmdi,
+        "bytes": len(body),
+    }
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview
+    append_log(log_entry)
+
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": "application/soap+xml; charset=utf-8",
+            # Real Dahua devices advertise lighttpd; scanners that
+            # fingerprint on Server header don't bail on this string.
+            "Server": "lighttpd/1.4.35",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_hnap1(
     request: web.Request,
     log_context: dict[str, object],
@@ -15201,6 +15418,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_hikvision_path(path):
         return await _handle_hikvision(request, log_context, path, query_string, request_body)
 
+    if is_onvif_path(path):
+        return await _handle_onvif(request, log_context, path, request_body)
+
     if is_hnap1_path(path):
         return await _handle_hnap1(request, log_context, path, query_string, request_body)
 
@@ -15364,6 +15584,8 @@ def main() -> int:
         active.append("exchange")
     if HIKVISION_ENABLED:
         active.append("hikvision")
+    if ONVIF_ENABLED:
+        active.append("onvif")
     if HNAP1_ENABLED:
         active.append("hnap1-router")
     if GEOSERVER_ENABLED:

