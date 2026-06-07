@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable
-from urllib.parse import parse_qs, quote, unquote
+from urllib.parse import parse_qs, parse_qsl, quote, unquote
 
 import aiohttp
 from aiohttp import web
@@ -1352,11 +1352,40 @@ NEXTJS_PATHS = {
 }
 # Path prefixes that route to the trap. `_next/data/<buildId>/*.json` is
 # Next.js's ISR data endpoint; `_next/static/chunks/pages/...` is the
-# build-output JS chunk path. Both are characteristic enough that hits
-# only come from Next.js-aware scanners. We deliberately do NOT match
-# `/api/` as a prefix — too generic, and the observable probes use a
-# small set of Next.js-conventional `/api/*` paths covered above.
-_NEXTJS_PATH_PREFIXES = ("/_next/data/", "/_next/static/chunks/pages/")
+# build-output JS chunk path. `__nextjs_` covers the dev-mode internal
+# endpoints (`/__nextjs_action`, `/__nextjs_launch-editor`,
+# `/__nextjs_error_overlay`, `/__nextjs_original-stack-frame`,
+# `/__nextjs_stack_frame`) that only Next.js-aware scanners probe. We
+# deliberately do NOT match `/api/` as a prefix — too generic, and the
+# observable probes use a small set of Next.js-conventional `/api/*`
+# paths covered above.
+_NEXTJS_PATH_PREFIXES = (
+    "/_next/data/",
+    "/_next/static/chunks/pages/",
+    "/__nextjs_",
+)
+
+# Some scanners prepend URL-encoded slashes as a path-normalization
+# bypass (single `%2f` and double-encoded `%252f`). Decode any leading
+# run of those so the same dispatcher predicates match both the clean
+# and encoded shapes; the rest of the path stays intact so renderers
+# still see exactly what the scanner sent.
+_NEXTJS_ENCODED_SLASH_VARIANTS = ("%2f", "%252f")
+
+
+def _nextjs_normalize_path(path: str) -> str:
+    p = path.lower()
+    while p.startswith("/"):
+        tail = p[1:]
+        stripped = False
+        for variant in _NEXTJS_ENCODED_SLASH_VARIANTS:
+            if tail.startswith(variant):
+                p = "/" + tail[len(variant):]
+                stripped = True
+                break
+        if not stripped:
+            break
+    return p
 NEXTJS_BODY_DECODE_LIMIT = max(int((os.environ.get("HONEYPOT_NEXTJS_BODY_DECODE_LIMIT") or "8192").strip() or "8192"), 512)
 
 # SSJS-injection indicators inside the decoded `cmd=` payload (or raw
@@ -2282,8 +2311,13 @@ def is_coldfusion_path(path: str) -> bool:
 def is_nextjs_path(path: str) -> bool:
     if not NEXTJS_ENABLED:
         return False
-    p = path.lower()
+    p = _nextjs_normalize_path(path)
     if p in NEXTJS_PATHS:
+        return True
+    # Trim a trailing slash so `/__nextjs_action/` matches the same
+    # bucket as `/__nextjs_action`. Query args are already stripped
+    # upstream before the dispatcher sees `path`.
+    if p.rstrip("/") in NEXTJS_PATHS:
         return True
     return p.startswith(_NEXTJS_PATH_PREFIXES)
 
@@ -14142,6 +14176,59 @@ def render_nextjs_static_chunk() -> bytes:
     return body.encode("utf-8")
 
 
+_NEXTJS_OVERLAY_SOURCES = (
+    "app/page.tsx",
+    "app/api/route.ts",
+    "app/layout.tsx",
+    "components/Header.tsx",
+    "pages/index.tsx",
+    "pages/_app.tsx",
+    "src/server/handlers.ts",
+)
+
+
+def render_nextjs_error_overlay() -> bytes:
+    """Plausible dev-mode error-overlay fragment with a per-hit
+    synthetic source path. Real Next.js dev-mode error responses are
+    HTML stack frames pointing at the offending source file; emitting
+    one keeps Next.js-aware scanners moving without shipping a fixed
+    literal across the sensor fleet."""
+    source = secrets.choice(_NEXTJS_OVERLAY_SOURCES)
+    line = secrets.randbelow(180) + 1
+    col = secrets.randbelow(80) + 1
+    body = (
+        "<!doctype html>\n"
+        "<html><body>\n"
+        '<div data-nextjs-dialog>\n'
+        f"  <pre>TypeError: undefined is not iterable\n"
+        f"    at &lt;anonymous&gt; ({source}:{line}:{col})</pre>\n"
+        "</div>\n"
+        "</body></html>\n"
+    )
+    return body.encode("utf-8")
+
+
+_NEXTJS_DEVMODE_QUERY_KEYS = ("file", "fileName", "line", "column", "name", "args", "path")
+
+
+def _nextjs_extract_devmode_query(query_string: str) -> dict[str, str] | None:
+    """Pull out the interesting query args scanners send to the
+    dev-mode endpoints — `file=` is the IDE-launch file path, `name=`
+    / `args=` / `path=` are the Server-Action variants. Empty result
+    becomes None so we don't bloat the log on bare GETs."""
+    if not query_string:
+        return None
+    out: dict[str, str] = {}
+    try:
+        parsed = parse_qsl(query_string, keep_blank_values=True)
+    except Exception:
+        return None
+    for key, value in parsed:
+        if key in _NEXTJS_DEVMODE_QUERY_KEYS and value:
+            out[key] = value[:256]
+    return out or None
+
+
 async def _handle_sap_metadatauploader(
     request: web.Request,
     log_context: dict[str, object],
@@ -14552,7 +14639,10 @@ async def _handle_nextjs(
     if body_preview:
         log_extra["bodyPreview"] = body_preview[:400]
 
-    lpath = path.lower()
+    lpath = _nextjs_normalize_path(path).rstrip("/")
+    devmode_qs = _nextjs_extract_devmode_query(query_string)
+    if devmode_qs:
+        log_extra["nextjsDevModeQuery"] = devmode_qs
     if has_ssjs:
         # Reflect a simulated echo so scanner thinks SSJS evaluation
         # worked. Anything other than `echo <safe-token>` falls back to
@@ -14569,6 +14659,46 @@ async def _handle_nextjs(
         result_tag = "nextjs-static-chunk"
         body = render_nextjs_static_chunk()
         content_type = "application/javascript; charset=utf-8"
+    elif lpath == "/__nextjs_action" or lpath.startswith("/__nextjs_action/"):
+        # Server Actions endpoint. POST bodies are React Server
+        # Component payloads (multipart or RSC text/x-component); any
+        # bytes here are interesting capture. Return the empty 200
+        # shape a real Server Action returns when the action resolves
+        # to `void` — invites the scanner's follow-up exploit body.
+        result_tag = "nextjs-server-action"
+        body = b""
+        content_type = "text/x-component; charset=utf-8"
+    elif lpath == "/__nextjs_launch-editor":
+        # Dev-mode IDE-launch endpoint. Real Next.js calls the
+        # configured editor to open a file at the path given by the
+        # `file=` query arg; in vulnerable versions this has been a
+        # pre-auth RCE shape (CVE-2021-37699-class). Returning
+        # `{"opened":true}` makes the scanner believe the launch
+        # succeeded, inviting a second probe with a more interesting
+        # file path.
+        result_tag = "nextjs-launch-editor"
+        body = b'{"opened":true}'
+        content_type = "application/json; charset=utf-8"
+    elif lpath in (
+        "/__nextjs_error_overlay",
+        "/__nextjs_original-stack-frame",
+        "/__nextjs_stack_frame",
+    ):
+        # Dev-mode error overlay endpoints. Real Next.js returns an
+        # HTML fragment naming the source file + line; emit one with a
+        # per-hit synthetic file path so the response varies per hit
+        # (no fixed literal across sensors) while staying plausible.
+        result_tag = "nextjs-error-overlay"
+        body = render_nextjs_error_overlay()
+        content_type = "text/html; charset=utf-8"
+    elif lpath.startswith("/__nextjs_"):
+        # Any other dev-mode `__nextjs_*` endpoint — log under a
+        # dedicated tag so we can see what variants scanners probe
+        # next, and return the empty-but-shaped 200 a real dev-mode
+        # surface usually emits.
+        result_tag = "nextjs-devmode-other"
+        body = b"{}"
+        content_type = "application/json; charset=utf-8"
     else:
         # `/api/*` route hit without an SSJS payload — return an empty
         # JSON object, the canonical "endpoint exists but returned

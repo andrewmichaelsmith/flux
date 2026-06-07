@@ -6659,10 +6659,67 @@ def test_nextjs_path_non_match():
         assert not tbenv.is_nextjs_path(path), f"unexpected match: {path}"
 
 
+def test_nextjs_devmode_paths_route_to_handler():
+    """Dev-mode internal endpoints (`/__nextjs_*`) only get probed by
+    Next.js-aware scanners, so route them all to the trap. Trailing
+    slashes and `/__nextjs_action/<sub>` shapes still match."""
+    for path in (
+        "/__nextjs_action",
+        "/__nextjs_action/",
+        "/__nextjs_action/foo",
+        "/__nextjs_launch-editor",
+        "/__nextjs_error_overlay",
+        "/__nextjs_original-stack-frame",
+        "/__nextjs_stack_frame",
+    ):
+        assert tbenv.is_nextjs_path(path), f"expected match: {path}"
+
+
+def test_nextjs_url_encoded_slash_bypass_still_matches():
+    """Some scanners prepend URL-encoded slashes as a path-normalization
+    bypass. `/%2f__nextjs_action`, `/%252f__nextjs_action%2f`, etc.
+    should still route to the trap."""
+    for path in (
+        "/%2f__nextjs_action",
+        "/%2f__nextjs_action/",
+        "/%252f__nextjs_action",
+        "/%252f__nextjs_action%2f",  # trailing %2f stays in path, fine
+        "/%2f__nextjs_launch-editor",
+        "/%252f__nextjs_error_overlay",
+    ):
+        assert tbenv.is_nextjs_path(path), f"expected match: {path}"
+
+
 def test_nextjs_disabled_returns_false(monkeypatch):
     monkeypatch.setattr(tbenv, "NEXTJS_ENABLED", False)
     assert not tbenv.is_nextjs_path("/_next/data/abc/page.json")
     assert not tbenv.is_nextjs_path("/api/endpoint")
+    assert not tbenv.is_nextjs_path("/__nextjs_action")
+
+
+def test_nextjs_normalize_path_strips_encoded_slashes():
+    assert tbenv._nextjs_normalize_path("/__nextjs_action") == "/__nextjs_action"
+    assert tbenv._nextjs_normalize_path("/%2f__nextjs_action") == "/__nextjs_action"
+    assert tbenv._nextjs_normalize_path("/%252f__nextjs_action") == "/__nextjs_action"
+    # Double-stacked encoded slashes also strip.
+    assert (
+        tbenv._nextjs_normalize_path("/%2f%2f__nextjs_action")
+        == "/__nextjs_action"
+    )
+    # Encoded slash NOT at the start should be preserved (the renderer
+    # wants to see exactly what the scanner sent).
+    assert (
+        tbenv._nextjs_normalize_path("/__nextjs_action%2fsub")
+        == "/__nextjs_action%2fsub"
+    )
+
+
+def test_nextjs_extract_devmode_query_picks_interesting_keys():
+    qs = "file=/etc/passwd&line=42&junk=ignored"
+    extracted = tbenv._nextjs_extract_devmode_query(qs)
+    assert extracted == {"file": "/etc/passwd", "line": "42"}
+    assert tbenv._nextjs_extract_devmode_query("") is None
+    assert tbenv._nextjs_extract_devmode_query("junk=x&blah=y") is None
 
 
 def test_nextjs_decode_cmd_param_base64():
@@ -6834,6 +6891,82 @@ async def test_dispatch_nextjs_disabled_returns_404(flux_client, monkeypatch):
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)
     assert entries[-1]["result"] == "not-handled"
+
+
+async def test_dispatch_nextjs_server_action_get_returns_empty_rsc(flux_client):
+    resp = await flux_client.get(
+        "/__nextjs_action",
+        headers={"X-Forwarded-For": "203.0.113.86"},
+    )
+    assert resp.status == 200
+    assert (await resp.read()) == b""
+    assert resp.headers.get("Content-Type", "").startswith("text/x-component")
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "nextjs-server-action"
+
+
+async def test_dispatch_nextjs_server_action_post_logs_body(flux_client):
+    body = b"0:{\"action\":\"runShell\",\"args\":[\"id\"]}\n"
+    resp = await flux_client.post(
+        "/__nextjs_action/",
+        data=body,
+        headers={
+            "X-Forwarded-For": "203.0.113.87",
+            "Content-Type": "text/x-component",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "nextjs-server-action"
+    assert "runShell" in entry["bodyPreview"]
+
+
+async def test_dispatch_nextjs_launch_editor_returns_opened_true(flux_client):
+    resp = await flux_client.get(
+        "/__nextjs_launch-editor?file=/etc/passwd&line=1",
+        headers={"X-Forwarded-For": "203.0.113.88"},
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload == {"opened": True}
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "nextjs-launch-editor"
+    assert entry["nextjsDevModeQuery"] == {"file": "/etc/passwd", "line": "1"}
+
+
+async def test_dispatch_nextjs_error_overlay_returns_html(flux_client):
+    resp = await flux_client.get(
+        "/__nextjs_error_overlay",
+        headers={"X-Forwarded-For": "203.0.113.89"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "data-nextjs-dialog" in text
+    assert "TypeError" in text
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "nextjs-error-overlay"
+
+
+async def test_dispatch_nextjs_url_encoded_slash_bypass_routes_to_action(flux_client):
+    # Scanner probes `/%2f__nextjs_action` as a path-normalization
+    # bypass — must still reach the trap.
+    resp = await flux_client.get(
+        "/%2f__nextjs_action",
+        headers={"X-Forwarded-For": "203.0.113.90"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "nextjs-server-action"
+
+
+async def test_dispatch_nextjs_unknown_devmode_path_uses_other_tag(flux_client):
+    resp = await flux_client.get(
+        "/__nextjs_some_new_endpoint",
+        headers={"X-Forwarded-For": "203.0.113.91"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "nextjs-devmode-other"
 
 
 # --- Cmd-injection trap (/admin/config?cmd=, /printenv, /cgi-bin/printenv) ---

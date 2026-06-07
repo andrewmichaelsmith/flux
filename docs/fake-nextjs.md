@@ -11,6 +11,16 @@ follow-up exploitation request that we capture in the next event.
 | `/api/endpoint`, `/api/test`, `/api/[[...slug]]`, `/api/v2/about` | any | Empty Next.js JSON `{}`; `nextjs-api` (or `nextjs-ssjs-probe` when `cmd=` decodes to a JS-eval shape) |
 | `/_next/data/<buildId>/*.json` | any | Plausible page-data JSON `{ "pageProps": {}, "__N_SSG": true }`; `nextjs-page-data` (or `nextjs-ssjs-probe`) |
 | `/_next/static/chunks/pages/*.js` | any | Minimal valid webpack chunk; `nextjs-static-chunk` |
+| `/__nextjs_action`, `/__nextjs_action/<sub>` | any (esp. POST) | Empty `text/x-component` 200 — the shape a real `void`-returning Server Action emits. POST body captured in `bodyPreview` (likely contains the serialised RSC payload + base64-encoded `child_process` calls); `nextjs-server-action` |
+| `/__nextjs_launch-editor` | any | `{"opened":true}` JSON — the IDE-launch dev-mode endpoint has been a pre-auth RCE shape in older Next.js versions. The `file=` / `line=` query args are captured in `nextjsDevModeQuery`; `nextjs-launch-editor` |
+| `/__nextjs_error_overlay`, `/__nextjs_original-stack-frame`, `/__nextjs_stack_frame` | any | Per-hit synthetic dev-mode error-overlay HTML (random source file name + line/column from a small project-shaped pool) so the response varies per hit; `nextjs-error-overlay` |
+| any other `/__nextjs_*` | any | Empty `{}` JSON 200 captured under `nextjs-devmode-other` so the operator can see what new dev-mode endpoints scanners probe next |
+
+URL-encoded leading slashes (`/%2f__nextjs_action`,
+`/%252f__nextjs_action%2f`) — a path-normalisation bypass some scanners
+use — are decoded before dispatch, so the same predicates match both
+the clean and the encoded shape; the rest of the path is preserved so
+renderers still see exactly what the scanner sent.
 
 When a `cmd=` query parameter is present, the handler:
 
@@ -31,12 +41,15 @@ When a `cmd=` query parameter is present, the handler:
 The handler logs:
 
 - `result` tags (`nextjs-api`, `nextjs-page-data`, `nextjs-static-chunk`,
-  `nextjs-ssjs-probe`)
+  `nextjs-ssjs-probe`, `nextjs-server-action`, `nextjs-launch-editor`,
+  `nextjs-error-overlay`, `nextjs-devmode-other`)
 - `nextjsPath`
 - `nextjsHasSsjs` — true when the decoded `cmd=` body contains an
   SSJS-eval indicator
 - `nextjsCmdDecoded` — first 512 chars of the decoded `cmd=` payload
 - `nextjsCmdLiteral` — extracted `var cmd = "..."` literal (if present)
+- `nextjsDevModeQuery` — extracted `{file, line, column, name, args, path}`
+  query args on dev-mode endpoints (`/__nextjs_launch-editor` etc.)
 - `bodyPreview` — first 400 chars of the request body for non-GET probes
 
 No Tracebit key is required. The trap does not emit credential-shaped
