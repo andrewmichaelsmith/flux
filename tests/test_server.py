@@ -573,6 +573,7 @@ def test_all_trap_families_default_on():
     assert tbenv.SPRING_GATEWAY_ENABLED
     assert tbenv.BACKUP_ARCHIVE_ENABLED
     assert tbenv.WP_LOGIN_ENABLED
+    assert tbenv.GRAPHQL_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -8488,6 +8489,340 @@ async def test_dispatch_openapi_does_not_shadow_other_traps(
     for path in ["/.env", "/.git/config", "/v1/models"]:
         kind = tbenv.openapi_swagger_kind(path)
         assert kind == "", f"{path} unexpectedly matched as {kind}"
+
+
+# --- Fake GraphQL endpoint -----------------------------------------------
+
+
+def test_graphql_enabled_by_default():
+    """Cheap, low FP risk, modern API surface — default on."""
+    assert tbenv.GRAPHQL_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/graphql",
+    "/graphql/",
+    "/api/graphql",
+    "/api/graphql/",
+    "/graphql/api",
+    "/api/gql",
+    "/gql",
+    "/v1/graphql",
+    "/api/v1/graphql",
+    "/query",
+    "/api/query",
+])
+def test_graphql_default_paths_match(path):
+    assert tbenv.is_graphql_path(path), f"{path} should match"
+
+
+def test_graphql_path_case_insensitive():
+    assert tbenv.is_graphql_path("/GraphQL")
+    assert tbenv.is_graphql_path("/API/GraphQL")
+    assert tbenv.is_graphql_path("/V1/GRAPHQL")
+
+
+@pytest.mark.parametrize("path", [
+    "/",
+    "/graphql.json",         # `/graphql/.env`-shape scrape leaks the host
+    "/graphqlx",
+    "/api/graph",
+    "/api/v2/graphql",
+    "/.env",
+    "/.git/config",
+])
+def test_graphql_path_non_match(path):
+    assert not tbenv.is_graphql_path(path)
+
+
+def test_graphql_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "GRAPHQL_ENABLED", False)
+    assert not tbenv.is_graphql_path("/graphql")
+    assert not tbenv.is_graphql_path("/api/graphql")
+
+
+@pytest.mark.parametrize("query,expected", [
+    ("query IntrospectionQuery { __schema { types { name } } }", "introspection"),
+    ("{ __type(name: \"User\") { fields { name } } }", "introspection"),
+    ("query { __schema { queryType { name } } }", "introspection"),
+    ("mutation { login(username: \"admin\", password: \"x\") { token } }", "auth-mutation"),
+    ("mutation Login($u:String!,$p:String!) { signIn(email:$u,password:$p) { token } }", "auth-mutation"),
+    ("mutation { createUser(input: { username: \"a\", email: \"b\", password: \"c\" }) { id } }", "auth-mutation"),
+    ("{ currentUser { id apiToken awsAccessKeyId } }", "credential-field"),
+    ("{ viewer { accessToken refreshToken } }", "credential-field"),
+    ("mutation { setSetting(key: \"x\", value: \"y\") }", "mutation"),
+    ("{ users { id email } }", "query"),
+    ("", ""),
+])
+def test_graphql_classify_query(query, expected):
+    assert tbenv._graphql_classify(query) == expected
+
+
+def test_graphql_extract_query_from_json_body():
+    body = json.dumps({"query": "{ __schema { types { name } } }"}).encode("utf-8")
+    assert "__schema" in tbenv._graphql_extract_query(body, "application/json", "")
+
+
+def test_graphql_extract_query_from_application_graphql_body():
+    body = b"query Introspection { __schema { types { name } } }"
+    assert "__schema" in tbenv._graphql_extract_query(body, "application/graphql", "")
+
+
+def test_graphql_extract_query_from_query_string():
+    assert (
+        tbenv._graphql_extract_query(b"", "", "query=%7B__schema%7Btypes%7Bname%7D%7D%7D")
+        == "{__schema{types{name}}}"
+    )
+
+
+def test_graphql_extract_query_batched_request():
+    body = json.dumps([
+        {"query": "{ __schema { types { name } } }"},
+        {"query": "{ currentUser { apiToken } }"},
+    ]).encode("utf-8")
+    extracted = tbenv._graphql_extract_query(body, "application/json", "")
+    assert "__schema" in extracted
+    assert "apiToken" in extracted
+
+
+def test_graphql_extract_username_inline_literal():
+    q = 'mutation { login(username: "admin@example.com", password: "x") { token } }'
+    assert tbenv._graphql_extract_username(q, b"") == "admin@example.com"
+
+
+def test_graphql_extract_username_from_variables():
+    body = json.dumps({
+        "query": "mutation Login($u:String!,$p:String!) { login(username:$u,password:$p){token} }",
+        "variables": {"u": "shipped-test@example.com", "p": "secret"},
+        "operationName": "Login",
+    }).encode("utf-8")
+    # username is in `u` variable; the renderer tries common keys; check the
+    # explicit `username` key path
+    body2 = json.dumps({
+        "query": "mutation { login(username:$username,password:$password){token} }",
+        "variables": {"username": "user-via-vars", "password": "secret"},
+    }).encode("utf-8")
+    assert tbenv._graphql_extract_username("", body2) == "user-via-vars"
+
+
+def test_graphql_redact_passwords_strips_inline_literal():
+    """Password literals must be redacted from any query preview that
+    lands in the log. Field name stays so triage can still see the
+    operation shape; value is replaced with `[REDACTED]`."""
+    q = 'mutation { login(username: "u@e.com", password: "hunter2") { token } }'
+    redacted = tbenv._graphql_redact_passwords(q)
+    assert "hunter2" not in redacted
+    assert "[REDACTED]" in redacted
+    assert "u@e.com" in redacted   # username stays
+    assert "password:" in redacted  # field name stays
+
+
+def test_graphql_has_password_detects_inline_and_vars():
+    assert tbenv._graphql_has_password('login(password: "x")', b"")
+    body = json.dumps({
+        "query": "mutation Login($username:String!,$password:String!) { login(username:$username,password:$password){token} }",
+        "variables": {"username": "a", "password": "secret"},
+    }).encode("utf-8")
+    assert tbenv._graphql_has_password("", body)
+
+
+def test_graphql_introspection_response_lists_credential_fields():
+    """The schema returned to introspection must name the credential-shaped
+    fields a scraper walks (apiToken / awsAccessKeyId / secretKey).
+    A field set that omits them would defeat the canary bait at the
+    follow-on data hop."""
+    body = tbenv.render_graphql_introspection_response()
+    payload = json.loads(body)
+    types = {t["name"]: t for t in payload["data"]["__schema"]["types"]}
+    user_fields = {f["name"] for f in types["User"]["fields"]}
+    for field in ("apiToken", "awsAccessKeyId", "awsSecretAccessKey", "refreshToken", "webhookSecret"):
+        assert field in user_fields, f"User type missing credential bait field {field}"
+
+
+def test_graphql_user_canary_embeds_aws_in_token_slots():
+    body = tbenv.render_graphql_user_canary(FAKE_TRACEBIT)
+    payload = json.loads(body)
+    user = payload["data"]["currentUser"]
+    access_key = FAKE_TRACEBIT["aws"]["awsAccessKeyId"]
+    secret_key = FAKE_TRACEBIT["aws"]["awsSecretAccessKey"]
+    # All four scraper-favourite slots carry the canary access key
+    assert user["apiToken"] == access_key
+    assert user["accessToken"] == access_key
+    assert user["awsAccessKeyId"] == access_key
+    assert user["awsSecretAccessKey"] == secret_key
+    assert user["secretKey"] == secret_key
+    # refreshToken / webhookSecret are per-hit random — must not be the
+    # canary string (zero detection value on replay) and must not be a
+    # fixed literal across calls
+    body2 = tbenv.render_graphql_user_canary(FAKE_TRACEBIT)
+    payload2 = json.loads(body2)
+    assert user["refreshToken"] != access_key
+    assert user["refreshToken"] != payload2["data"]["currentUser"]["refreshToken"]
+    assert user["webhookSecret"] != payload2["data"]["currentUser"]["webhookSecret"]
+
+
+def test_graphql_auth_payload_embeds_aws_token():
+    body = tbenv.render_graphql_auth_payload(FAKE_TRACEBIT)
+    payload = json.loads(body)
+    access_key = FAKE_TRACEBIT["aws"]["awsAccessKeyId"]
+    assert payload["data"]["login"]["token"] == access_key
+    # refreshToken is per-hit synthetic
+    body2 = tbenv.render_graphql_auth_payload(FAKE_TRACEBIT)
+    payload2 = json.loads(body2)
+    assert payload["data"]["login"]["refreshToken"] != payload2["data"]["login"]["refreshToken"]
+
+
+def test_graphql_generic_error_has_no_data_key():
+    """Real graphql error shape: only `errors`, no `data`. A `data: null`
+    leaks "I'm an error envelope but I tried to resolve" which a few
+    introspection-walking tools fingerprint on."""
+    payload = json.loads(tbenv.render_graphql_generic_error("Cannot query"))
+    assert "errors" in payload
+    assert "data" not in payload
+    assert payload["errors"][0]["message"] == "Cannot query"
+
+
+async def test_dispatch_graphql_get_returns_graphiql(flux_client):
+    resp = await flux_client.get("/graphql", headers={"X-Forwarded-For": "203.0.113.91"})
+    assert resp.status == 200
+    assert "text/html" in resp.headers["Content-Type"]
+    body = await resp.read()
+    assert b"GraphiQL" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "graphql-playground"
+    assert entries[-1]["graphqlMethod"] == "GET"
+
+
+async def test_dispatch_graphql_introspection_post(flux_client, monkeypatch):
+    """Introspection response must list `User.apiToken`-class fields and
+    must NOT issue a canary (canary fires on the follow-on data hop)."""
+    issued = []
+
+    async def tracking_canary(*args, **kwargs):
+        issued.append(args)
+        return FAKE_TRACEBIT
+
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", tracking_canary)
+    payload = json.dumps({
+        "query": "query IntrospectionQuery { __schema { types { name fields { name } } } }",
+        "operationName": "IntrospectionQuery",
+    })
+    resp = await flux_client.post(
+        "/graphql",
+        data=payload,
+        headers={"Content-Type": "application/json", "X-Forwarded-For": "203.0.113.92"},
+    )
+    assert resp.status == 200
+    assert "application/json" in resp.headers["Content-Type"]
+    body = await resp.read()
+    j = json.loads(body)
+    assert "__schema" in j["data"]
+    assert not issued, "Introspection must not burn a canary"
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "graphql-introspection"
+    assert entries[-1]["graphqlClassification"] == "introspection"
+    assert entries[-1]["graphqlOperationName"] == "IntrospectionQuery"
+
+
+async def test_dispatch_graphql_credential_field_query_issues_canary(
+    flux_client, monkeypatch,
+):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    payload = json.dumps({
+        "query": "{ currentUser { id username apiToken awsAccessKeyId awsSecretAccessKey } }",
+    })
+    resp = await flux_client.post(
+        "/api/graphql",
+        data=payload,
+        headers={"Content-Type": "application/json", "X-Forwarded-For": "203.0.113.93"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    j = json.loads(body)
+    access_key = FAKE_TRACEBIT["aws"]["awsAccessKeyId"]
+    assert j["data"]["currentUser"]["apiToken"] == access_key
+    assert j["data"]["currentUser"]["awsAccessKeyId"] == access_key
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "graphql-credential-canary"
+    assert entries[-1]["canaryStatus"] == "issued"
+    assert "aws" in entries[-1]["canaryTypes"]
+
+
+async def test_dispatch_graphql_auth_mutation_captures_username(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    payload = json.dumps({
+        "query": "mutation { login(username: \"victim@example.com\", password: \"hunter2\") { token user { id } } }",
+    })
+    resp = await flux_client.post(
+        "/api/gql",
+        data=payload,
+        headers={"Content-Type": "application/json", "X-Forwarded-For": "203.0.113.94"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    j = json.loads(body)
+    assert j["data"]["login"]["token"] == FAKE_TRACEBIT["aws"]["awsAccessKeyId"]
+    entries = _log_entries(flux_client.log_path)
+    last = entries[-1]
+    assert last["result"] == "graphql-auth-canary"
+    assert last["graphqlUsername"] == "victim@example.com"
+    assert last["graphqlHasPassword"] is True
+    assert "hunter2" not in json.dumps(last), "password value must not be logged"
+
+
+async def test_dispatch_graphql_auth_mutation_no_api_key_returns_error(
+    flux_client, monkeypatch,
+):
+    """Without TRACEBIT_API_KEY we still log the username + has-password
+    but return an `Invalid credentials` envelope rather than a stale
+    canary. No `data` key in the response — pure errors envelope."""
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    payload = json.dumps({
+        "query": "mutation { login(username: \"user2@example.com\", password: \"x\") { token } }",
+    })
+    resp = await flux_client.post(
+        "/graphql/api",
+        data=payload,
+        headers={"Content-Type": "application/json", "X-Forwarded-For": "203.0.113.95"},
+    )
+    assert resp.status == 200
+    j = json.loads(await resp.read())
+    assert "errors" in j
+    assert "data" not in j
+    entries = _log_entries(flux_client.log_path)
+    last = entries[-1]
+    assert last["result"] == "graphql-auth-error"
+    assert last["graphqlUsername"] == "user2@example.com"
+    assert last["graphqlHasPassword"] is True
+
+
+async def test_dispatch_graphql_empty_body_returns_syntax_error(flux_client):
+    resp = await flux_client.post(
+        "/graphql",
+        data=b"",
+        headers={"Content-Type": "application/json", "X-Forwarded-For": "203.0.113.96"},
+    )
+    assert resp.status == 200
+    j = json.loads(await resp.read())
+    assert "errors" in j
+    assert "data" not in j
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "graphql-syntax-error"
+
+
+async def test_dispatch_graphql_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "GRAPHQL_ENABLED", False)
+    resp = await flux_client.post(
+        "/graphql",
+        data=b'{"query":"{__schema{types{name}}}"}',
+        headers={"Content-Type": "application/json", "X-Forwarded-For": "203.0.113.97"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
 
 
 # --- Backup-archive canary trap ---

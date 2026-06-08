@@ -143,6 +143,19 @@ No Tracebit key required.
 | `HONEYPOT_LLM_ENDPOINT_PATHS_CSV` | *(built-in — `/v1/models`, `/anthropic/v1/models`, `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages`, `/anthropic/v1/messages`)* | Exact, case-insensitive. Override to add/remove without a code change. |
 | `HONEYPOT_LLM_BODY_DECODE_LIMIT` | `4096` | Max chars of the extracted `llmPromptPreview` written to the log. The raw body is still capped by `HONEYPOT_WEBSHELL_BODY_READ_LIMIT` (shared cap, default 64 KiB off the wire). |
 
+## Fake GraphQL endpoint
+
+`TRACEBIT_API_KEY` required for the credential-field and auth-mutation
+canary responses; without it the trap still serves GraphiQL on `GET`
+and the introspection schema on `POST`, but auth mutations fall back
+to an `Invalid credentials` error envelope.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_GRAPHQL_ENABLED` | on | Master switch. |
+| `HONEYPOT_GRAPHQL_PATHS_CSV` | *(built-in — `/graphql`, `/graphql/`, `/api/graphql`, `/api/graphql/`, `/graphql/api`, `/api/gql`, `/gql`, `/v1/graphql`, `/api/v1/graphql`, `/query`, `/api/query`)* | Exact, case-insensitive. Override to add/remove without a code change. |
+| `HONEYPOT_GRAPHQL_BODY_DECODE_LIMIT` | `16384` | Max bytes of the request body decoded for query extraction + classification. Larger limit than the LLM trap because GraphQL clients often ship long introspection queries. |
+
 ## Fake SonicWall SSL VPN
 
 No Tracebit key required.

@@ -1324,6 +1324,112 @@ _SPRING_GATEWAY_SPEL_INDICATORS = (
 )
 
 
+# --- Fake GraphQL endpoint (introspection + credential-bait responder) ---
+# `/graphql`, `/api/graphql`, `/graphql/api`, `/api/gql`, `/v1/graphql`,
+# `/api/v1/graphql` are the canonical paths a modern API gateway exposes.
+# Scanner traffic is high-diversity at the path level: a single fleet
+# sweep typically POSTs the same JSON body to multiple variants in
+# parallel. Three populations gate exploit delivery on whether the host
+# "looks like" a GraphQL endpoint:
+#
+#   1. **Introspection enumerators.** POST `{"query":"query
+#      IntrospectionQuery { __schema { types { name fields { name } } } }"}`
+#      to map the schema. A bare 404 leaks "no graphql here"; returning
+#      a plausible schema invites them to follow up with concrete data
+#      queries against the named types.
+#   2. **Credential / secret scrapers.** Walk the introspection-revealed
+#      `User` / `Viewer` types for fields named `apiToken`,
+#      `accessToken`, `refreshToken`, `awsAccessKeyId`, `secretKey`,
+#      `webhookSecret`. We respond to data queries against those fields
+#      with a Tracebit AWS canary as the value — the scraper harvests
+#      a key that fires on AWS replay.
+#   3. **Auth-mutation brute.** POST `mutation { login(username,
+#      password) }` (or `signIn`, `authenticate`, `tokenAuth`) against
+#      the same surface RDWeb/OWA scanners do. We capture the username
+#      string and log it; password presence is logged, never stored.
+#
+# Real GraphQL servers expose GraphiQL on GET; a few scanner families
+# fingerprint on the GraphiQL HTML. The handler returns the canonical
+# GraphiQL bootstrap page on GET so those tools see what they expect.
+GRAPHQL_ENABLED = _env_bool("HONEYPOT_GRAPHQL_ENABLED")
+_GRAPHQL_DEFAULT_PATHS = ",".join([
+    "/graphql",
+    "/graphql/",
+    "/api/graphql",
+    "/api/graphql/",
+    "/graphql/api",
+    "/api/gql",
+    "/gql",
+    "/v1/graphql",
+    "/api/v1/graphql",
+    "/query",
+    "/api/query",
+])
+GRAPHQL_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_GRAPHQL_PATHS_CSV") or _GRAPHQL_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+GRAPHQL_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_GRAPHQL_BODY_DECODE_LIMIT") or "16384").strip() or "16384"),
+    1024,
+)
+# Substrings that indicate the POST body is an introspection query.
+# `__schema` and `__type` are the two top-level introspection roots
+# every GraphQL spec requires; `IntrospectionQuery` is the operation
+# name the canonical Apollo / graphql-core introspection emits.
+_GRAPHQL_INTROSPECTION_INDICATORS = (
+    "__schema",
+    "__type",
+    "IntrospectionQuery",
+)
+# Field-name substrings the credential-scraper population walks. Hitting
+# one in the request query body is the trigger for canary issuance: we
+# can plausibly return AWS-shaped values in those slots.
+_GRAPHQL_CREDENTIAL_FIELD_INDICATORS = (
+    "apitoken",
+    "apikey",
+    "api_key",
+    "accesstoken",
+    "access_token",
+    "refreshtoken",
+    "refresh_token",
+    "awsaccesskey",
+    "aws_access_key",
+    "secretkey",
+    "secret_key",
+    "webhooksecret",
+    "webhook_secret",
+    "privatekey",
+    "private_key",
+    "sessiontoken",
+    "session_token",
+)
+# Auth-mutation operation names — credential capture path. The
+# extractor below pulls `username:"..."` / `email:"..."` from any
+# matched body regardless of operation name.
+_GRAPHQL_AUTH_MUTATION_INDICATORS = (
+    "login",
+    "signin",
+    "sign_in",
+    "signup",
+    "sign_up",
+    "register",
+    "createuser",
+    "create_user",
+    "authenticate",
+    "tokenauth",
+    "token_auth",
+    "obtaintoken",
+    "obtain_token",
+    "loginuser",
+    "userlogin",
+    "adminlogin",
+    "resetpassword",
+    "reset_password",
+)
+
+
 # --- Fake Next.js application + SSJS-injection probe responder ----------
 # Probes seen in the wild send a base64-encoded JS payload via `?cmd=...`
 # against Next.js conventional routes. The decoded body is an
@@ -2426,6 +2532,196 @@ def is_spring_gateway_path(path: str) -> bool:
     for prefix in prefixes:
         if p == prefix or p.startswith(prefix + "/"):
             return True
+    return False
+
+
+def is_graphql_path(path: str) -> bool:
+    if not GRAPHQL_ENABLED:
+        return False
+    return path.lower() in GRAPHQL_PATHS
+
+
+def _graphql_extract_query(body: bytes, content_type: str, query_string: str) -> str:
+    """Best-effort extract the GraphQL `query` payload from a request.
+
+    GraphQL clients ship the query in one of three shapes:
+      1. JSON body `{"query": "...", "operationName": "...", "variables": {...}}`
+      2. `application/graphql` body — the raw query string is the body.
+      3. URL query string `?query=...` (used by GET probes and some
+         introspection-only enumerators).
+
+    Returns the decoded query text (truncated to the decode limit), or
+    "" if nothing recognisable was found.
+    """
+    if body:
+        ct = (content_type or "").split(";", 1)[0].strip().lower()
+        sample = body[:GRAPHQL_BODY_DECODE_LIMIT]
+        if ct == "application/graphql":
+            return sample.decode("utf-8", errors="replace")
+        if ct == "application/json" or ct == "":
+            try:
+                payload = json.loads(sample.decode("utf-8", errors="replace"))
+            except (ValueError, UnicodeDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                q = payload.get("query")
+                if isinstance(q, str):
+                    return q[:GRAPHQL_BODY_DECODE_LIMIT]
+            elif isinstance(payload, list):
+                # Batched queries — concatenate so introspection /
+                # credential indicators in any sub-query are visible.
+                parts: list[str] = []
+                for item in payload:
+                    if isinstance(item, dict):
+                        q = item.get("query")
+                        if isinstance(q, str):
+                            parts.append(q)
+                if parts:
+                    return ("\n".join(parts))[:GRAPHQL_BODY_DECODE_LIMIT]
+    if query_string:
+        try:
+            params = parse_qs(query_string, keep_blank_values=True)
+        except (ValueError, UnicodeDecodeError):
+            params = {}
+        for key in ("query",):
+            values = params.get(key)
+            if values:
+                return values[0][:GRAPHQL_BODY_DECODE_LIMIT]
+    return ""
+
+
+def _graphql_extract_operation_name(body: bytes, query_string: str) -> str:
+    if body:
+        try:
+            payload = json.loads(body[:GRAPHQL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            op = payload.get("operationName")
+            if isinstance(op, str) and op:
+                return op[:160]
+    if query_string:
+        try:
+            params = parse_qs(query_string, keep_blank_values=True)
+        except (ValueError, UnicodeDecodeError):
+            params = {}
+        values = params.get("operationName")
+        if values:
+            return values[0][:160]
+    return ""
+
+
+# `mutation` / `query` keyword at the start of the operation body. Real
+# GraphQL clients can omit the keyword (shorthand `{ field }` is treated
+# as a `query`). We match both `mutation { ... }` and `mutation Login(
+# $u: String!, $p: String! ) { login(...) }` shapes.
+_GRAPHQL_MUTATION_RE = re.compile(r"\bmutation\b", re.IGNORECASE)
+
+# Pull `username:"..."` / `email:"..."` / `user:"..."` literals from an
+# auth-mutation body. Variables-style mutations (`$username`) lift the
+# value from the `variables` JSON object instead — handled separately.
+_GRAPHQL_USERNAME_LITERAL_RE = re.compile(
+    r'\b(username|user|email|login|userName)\s*:\s*"([^"\\\r\n]{1,160})"',
+    re.IGNORECASE,
+)
+
+# Password-field presence detector — matches the literal field name in
+# the body whether the value is a string literal or a `$password`
+# variable reference. Used to flag `graphqlHasPassword` without storing
+# the value itself.
+_GRAPHQL_PASSWORD_PRESENCE_RE = re.compile(
+    r'\b(password|pass|passwd|userPass)\s*:\s*("([^"\\\r\n]{0,200})"|\$\w+)',
+    re.IGNORECASE,
+)
+
+
+def _graphql_classify(query: str) -> str:
+    """Return a result-tag classifier for the extracted GraphQL query.
+
+    Returns one of:
+      - "introspection" — query references `__schema` / `__type` / the
+        canonical `IntrospectionQuery` operation name.
+      - "auth-mutation" — `mutation` keyword present AND an auth-shaped
+        operation/field name (login, signIn, register, …).
+      - "credential-field" — query references a known credential-shaped
+        field (apiToken, accessToken, secretKey, …). Triggers canary
+        issuance in the data response.
+      - "mutation" — generic mutation, not auth-shaped.
+      - "query" — anything else.
+    """
+    if not query:
+        return ""
+    haystack = query.lower()
+    if any(needle.lower() in haystack for needle in _GRAPHQL_INTROSPECTION_INDICATORS):
+        return "introspection"
+    is_mutation = bool(_GRAPHQL_MUTATION_RE.search(query))
+    if is_mutation and any(needle in haystack for needle in _GRAPHQL_AUTH_MUTATION_INDICATORS):
+        return "auth-mutation"
+    if any(needle in haystack for needle in _GRAPHQL_CREDENTIAL_FIELD_INDICATORS):
+        return "credential-field"
+    if is_mutation:
+        return "mutation"
+    return "query"
+
+
+def _graphql_extract_username(query: str, body: bytes) -> str:
+    """Pull `username` / `email` / `login` / `user` from an auth-mutation
+    body. Tries inline string literals first, then the `variables` JSON
+    object for `$variable`-style mutations.
+    """
+    if query:
+        m = _GRAPHQL_USERNAME_LITERAL_RE.search(query)
+        if m:
+            return m.group(2)[:120]
+    if body:
+        try:
+            payload = json.loads(body[:GRAPHQL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            variables = payload.get("variables")
+            if isinstance(variables, dict):
+                for key in ("username", "user", "email", "login", "userName"):
+                    value = variables.get(key)
+                    if isinstance(value, str) and value:
+                        return value[:120]
+    return ""
+
+
+_GRAPHQL_PASSWORD_REDACT_RE = re.compile(
+    r'(\b(?:password|pass|passwd|userPass)\s*:\s*)"[^"\\\r\n]{0,200}"',
+    re.IGNORECASE,
+)
+
+
+def _graphql_redact_passwords(text: str) -> str:
+    """Strip inline password literals out of a GraphQL query preview.
+
+    The trap should log the operation shape and the username for triage,
+    but never the password value. Variables-style mutations don't carry
+    the password in the query body — only inline-literal shapes need
+    redaction here.
+    """
+    if not text:
+        return text
+    return _GRAPHQL_PASSWORD_REDACT_RE.sub(r'\1"[REDACTED]"', text)
+
+
+def _graphql_has_password(query: str, body: bytes) -> bool:
+    if query and _GRAPHQL_PASSWORD_PRESENCE_RE.search(query):
+        return True
+    if body:
+        try:
+            payload = json.loads(body[:GRAPHQL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            variables = payload.get("variables")
+            if isinstance(variables, dict):
+                for key in ("password", "pass", "passwd", "userPass"):
+                    value = variables.get(key)
+                    if value:
+                        return True
     return False
 
 
@@ -6302,6 +6598,208 @@ def render_redoc_html(host: str, spec_url: str = "/openapi.json") -> bytes:
         "</body>\n"
         "</html>\n"
     ).encode("utf-8")
+
+
+def render_graphiql_html(host: str, endpoint: str) -> bytes:
+    """GraphiQL bootstrap page — the in-browser IDE bundled with most
+    GraphQL servers (Apollo, graphql-yoga, graphene). Scanners that
+    probe `/graphql` with a plain `GET` and check the response title
+    accept this as proof the host is a GraphQL endpoint.
+
+    The endpoint URL embedded in the bootstrap is per-request (the
+    same path the scanner hit) so a multi-variant fanout sees
+    consistent state.
+    """
+    safe_host = (host or "").split(":", 1)[0]
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "graphql"
+    safe_endpoint = re.sub(r"[^a-zA-Z0-9/_\-.]", "", endpoint or "/graphql") or "/graphql"
+    return (
+        "<!DOCTYPE html>\n"
+        "<html>\n"
+        "<head>\n"
+        "  <meta charset=\"utf-8\">\n"
+        f"  <title>GraphiQL — {safe_host}</title>\n"
+        "  <link href=\"https://unpkg.com/graphiql/graphiql.min.css\" rel=\"stylesheet\" />\n"
+        "</head>\n"
+        "<body style=\"margin: 0;\">\n"
+        "  <div id=\"graphiql\" style=\"height: 100vh;\"></div>\n"
+        "  <script crossorigin src=\"https://unpkg.com/react@17/umd/react.production.min.js\"></script>\n"
+        "  <script crossorigin src=\"https://unpkg.com/react-dom@17/umd/react-dom.production.min.js\"></script>\n"
+        "  <script crossorigin src=\"https://unpkg.com/graphiql/graphiql.min.js\"></script>\n"
+        "  <script>\n"
+        f"    const fetcher = GraphiQL.createFetcher({{ url: '{safe_endpoint}' }});\n"
+        "    ReactDOM.render(React.createElement(GraphiQL, { fetcher }), document.getElementById('graphiql'));\n"
+        "  </script>\n"
+        "</body>\n"
+        "</html>\n"
+    ).encode("utf-8")
+
+
+def render_graphql_introspection_response() -> bytes:
+    """Plausible introspection response covering the field names the
+    credential-scraper population walks (`apiToken`, `awsAccessKeyId`,
+    `secretKey`, …). No canary lives in this response — the canary is
+    issued one hop later when the scraper actually queries those
+    fields with a data query against `currentUser` / `viewer`.
+
+    Schema shape:
+      Query.viewer: User
+      Query.currentUser: User
+      Query.users: [User!]!
+      User.id / username / email / apiToken / accessToken /
+        refreshToken / awsAccessKeyId / webhookSecret / role
+      Mutation.login(username, password): AuthPayload
+      Mutation.signIn(email, password): AuthPayload
+      Mutation.createUser(input: CreateUserInput!): User
+      AuthPayload.token / refreshToken / user: User
+    """
+    payload = {
+        "data": {
+            "__schema": {
+                "queryType": {"name": "Query"},
+                "mutationType": {"name": "Mutation"},
+                "subscriptionType": None,
+                "types": [
+                    {
+                        "kind": "OBJECT", "name": "Query",
+                        "fields": [
+                            {"name": "viewer", "type": {"kind": "OBJECT", "name": "User", "ofType": None}},
+                            {"name": "currentUser", "type": {"kind": "OBJECT", "name": "User", "ofType": None}},
+                            {"name": "users", "type": {"kind": "LIST", "name": None, "ofType": {"kind": "OBJECT", "name": "User"}}},
+                            {"name": "user", "type": {"kind": "OBJECT", "name": "User", "ofType": None}},
+                            {"name": "node", "type": {"kind": "INTERFACE", "name": "Node", "ofType": None}},
+                        ],
+                    },
+                    {
+                        "kind": "OBJECT", "name": "Mutation",
+                        "fields": [
+                            {"name": "login", "type": {"kind": "OBJECT", "name": "AuthPayload", "ofType": None}},
+                            {"name": "signIn", "type": {"kind": "OBJECT", "name": "AuthPayload", "ofType": None}},
+                            {"name": "signUp", "type": {"kind": "OBJECT", "name": "AuthPayload", "ofType": None}},
+                            {"name": "createUser", "type": {"kind": "OBJECT", "name": "User", "ofType": None}},
+                            {"name": "resetPassword", "type": {"kind": "SCALAR", "name": "Boolean", "ofType": None}},
+                            {"name": "refreshToken", "type": {"kind": "OBJECT", "name": "AuthPayload", "ofType": None}},
+                        ],
+                    },
+                    {
+                        "kind": "OBJECT", "name": "User",
+                        "fields": [
+                            {"name": "id", "type": {"kind": "NON_NULL", "name": None, "ofType": {"kind": "SCALAR", "name": "ID"}}},
+                            {"name": "username", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "email", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "role", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "apiToken", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "accessToken", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "refreshToken", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "awsAccessKeyId", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "awsSecretAccessKey", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "secretKey", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "webhookSecret", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "createdAt", "type": {"kind": "SCALAR", "name": "DateTime", "ofType": None}},
+                        ],
+                    },
+                    {
+                        "kind": "OBJECT", "name": "AuthPayload",
+                        "fields": [
+                            {"name": "token", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "refreshToken", "type": {"kind": "SCALAR", "name": "String", "ofType": None}},
+                            {"name": "user", "type": {"kind": "OBJECT", "name": "User", "ofType": None}},
+                        ],
+                    },
+                    {
+                        "kind": "INPUT_OBJECT", "name": "CreateUserInput",
+                        "inputFields": [
+                            {"name": "username", "type": {"kind": "NON_NULL", "name": None, "ofType": {"kind": "SCALAR", "name": "String"}}},
+                            {"name": "email", "type": {"kind": "NON_NULL", "name": None, "ofType": {"kind": "SCALAR", "name": "String"}}},
+                            {"name": "password", "type": {"kind": "NON_NULL", "name": None, "ofType": {"kind": "SCALAR", "name": "String"}}},
+                        ],
+                    },
+                    {"kind": "SCALAR", "name": "String", "fields": None},
+                    {"kind": "SCALAR", "name": "ID", "fields": None},
+                    {"kind": "SCALAR", "name": "Boolean", "fields": None},
+                    {"kind": "SCALAR", "name": "DateTime", "fields": None},
+                ],
+            }
+        }
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_graphql_user_canary(r: dict[str, object]) -> bytes:
+    """Data response to a `currentUser { apiToken ... }`-shape query.
+
+    Embeds the Tracebit AWS canary as the `apiToken` / `accessToken` /
+    `awsAccessKeyId` / `awsSecretAccessKey` values. A scraper that
+    walked the introspection schema and is now harvesting the named
+    credential fields lifts an AWS-replayable canary regardless of
+    which field name it scraped. The `refreshToken` / `webhookSecret`
+    are per-hit random synthetics — never fixed literals.
+    """
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "") or ""
+    secret_key = aws.get("awsSecretAccessKey", "") or ""
+    session_token = aws.get("awsSessionToken", "") or ""
+    refresh = secrets.token_urlsafe(32)
+    webhook = secrets.token_urlsafe(24)
+    payload = {
+        "data": {
+            "currentUser": {
+                "id": "1",
+                "username": "admin",
+                "email": "admin@example.com",
+                "role": "ADMIN",
+                "apiToken": access_key,
+                "accessToken": access_key,
+                "refreshToken": refresh,
+                "awsAccessKeyId": access_key,
+                "awsSecretAccessKey": secret_key,
+                "awsSessionToken": session_token,
+                "secretKey": secret_key,
+                "webhookSecret": webhook,
+            }
+        }
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_graphql_auth_payload(r: dict[str, object]) -> bytes:
+    """Response to a successful `mutation login(...) { token ... }`.
+
+    The `token` is a Tracebit AWS access key — credential-stuffing
+    fleets that capture session tokens for replay get an AWS-replayable
+    canary. The `refreshToken` is a per-hit synthetic so it doesn't
+    repeat across the fleet.
+    """
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "") or ""
+    refresh = secrets.token_urlsafe(32)
+    payload = {
+        "data": {
+            "login": {
+                "token": access_key,
+                "refreshToken": refresh,
+                "user": {
+                    "id": "1",
+                    "username": "admin",
+                    "email": "admin@example.com",
+                    "role": "ADMIN",
+                },
+            }
+        }
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_graphql_generic_error(message: str = "Syntax Error: Unexpected Name") -> bytes:
+    """Error envelope returned for unparseable / unknown queries.
+
+    Real graphql-core errors take this exact shape: `{"errors": [{...}]}`
+    no `data` key. The message line is plausible — `graphql-core` emits
+    `Syntax Error: Unexpected Name "..."` on a malformed query, and
+    Apollo emits the same prefix.
+    """
+    payload = {"errors": [{"message": message[:240], "locations": [{"line": 1, "column": 1}]}]}
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
 def render_fake_passwd() -> bytes:
@@ -14411,6 +14909,124 @@ async def _handle_drupal(
     )
 
 
+async def _handle_graphql(
+    request: web.Request,
+    log_context: dict[str, object],
+    request_id: str,
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake GraphQL endpoint — dispatches by query classification.
+
+    GET    → GraphiQL bootstrap HTML.
+    POST `?query=` / `{"query":"... __schema ..."}`
+           → introspection schema (no canary; baited at the data hop).
+    POST `{"query":"mutation { login(username, password) { token } }"}`
+           → AuthPayload with the Tracebit AWS canary as `token`,
+           captures the username, logs `graphqlHasPassword`.
+    POST `{"query":"{ currentUser { apiToken awsAccessKeyId ... } }"}`
+           → data response with the canary in every credential-shaped
+           field; per-hit synthetic for `refreshToken` / `webhookSecret`.
+    Anything else (malformed body, unrecognised query) → a plausible
+    `Syntax Error` envelope so the scanner doesn't bail on us.
+    """
+    method = request.method
+    host = str(log_context.get("host", ""))
+    content_type_req = request.headers.get("Content-Type", "")
+    client_ip = str(log_context.get("clientIp", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+
+    if method in {"GET", "HEAD"}:
+        body = render_graphiql_html(host, path)
+        append_log({
+            **log_context, "status": 200, "result": "graphql-playground",
+            "graphqlPath": path, "graphqlMethod": method, "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"},
+        )
+
+    query_text = _graphql_extract_query(request_body, content_type_req, query_string)
+    classification = _graphql_classify(query_text)
+    operation_name = _graphql_extract_operation_name(request_body, query_string)
+
+    log_extra: dict[str, object] = {
+        "graphqlPath": path,
+        "graphqlMethod": method,
+        "graphqlClassification": classification or "empty",
+    }
+    if operation_name:
+        log_extra["graphqlOperationName"] = operation_name
+    if query_text:
+        log_extra["graphqlQueryPreview"] = _graphql_redact_passwords(query_text)[:400]
+
+    if classification == "introspection":
+        body = render_graphql_introspection_response()
+        result_tag = "graphql-introspection"
+        append_log({**log_context, "status": 200, "result": result_tag, **log_extra, "bytes": len(body)})
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"},
+        )
+
+    tracebit_response: dict[str, object] | None = None
+    canary_status = ""
+    if classification in {"credential-field", "auth-mutation"} and API_KEY:
+        tracebit_response = await _get_or_issue_canary(
+            ("aws",), client_ip, request_id, host, user_agent, path, proto,
+        )
+        if tracebit_response is None:
+            canary_status = "issue-failed"
+
+    if classification == "credential-field" and tracebit_response is not None:
+        body = render_graphql_user_canary(tracebit_response)
+        result_tag = "graphql-credential-canary"
+        canary_status = "issued"
+    elif classification == "auth-mutation":
+        username = _graphql_extract_username(query_text, request_body)
+        has_password = _graphql_has_password(query_text, request_body)
+        if username:
+            log_extra["graphqlUsername"] = username
+        log_extra["graphqlHasPassword"] = has_password
+        if tracebit_response is not None:
+            body = render_graphql_auth_payload(tracebit_response)
+            result_tag = "graphql-auth-canary"
+            canary_status = "issued"
+        else:
+            # No API key — return a generic InvalidCredentials so the
+            # scanner doesn't bail on "endpoint is broken", but no
+            # canary leaves the host.
+            body = render_graphql_generic_error("Invalid credentials")
+            result_tag = "graphql-auth-error"
+    elif classification == "mutation":
+        body = render_graphql_generic_error("Cannot execute mutation: permission denied")
+        result_tag = "graphql-mutation-denied"
+    elif classification == "query":
+        body = render_graphql_generic_error("Cannot query field on type 'Query'")
+        result_tag = "graphql-query-unknown"
+    else:
+        # Empty / unparseable body — a Syntax Error envelope is what a
+        # real graphql server emits.
+        body = render_graphql_generic_error()
+        result_tag = "graphql-syntax-error"
+
+    log_entry: dict[str, object] = {
+        **log_context, "status": 200, "result": result_tag, **log_extra, "bytes": len(body),
+    }
+    if canary_status:
+        log_entry["canaryStatus"] = canary_status
+    if tracebit_response is not None:
+        log_entry["canaryTypes"] = [k for k, v in tracebit_response.items() if v]
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=body,
+        headers={"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"},
+    )
+
+
 async def _handle_spring_gateway(
     request: web.Request,
     log_context: dict[str, object],
@@ -15502,6 +16118,11 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_openapi_swagger_path(path):
         return await _handle_openapi_swagger(request, log_context, request_id, path)
+
+    if is_graphql_path(path):
+        return await _handle_graphql(
+            request, log_context, request_id, path, query_string, request_body,
+        )
 
     if is_sonicwall_path(path):
         return await _handle_sonicwall(request, log_context, path, request_body)
