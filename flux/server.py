@@ -2773,7 +2773,7 @@ _LLM_MODEL_NAMES: tuple[str, ...] = (
 
 
 def extract_llm_prompt(body: bytes, content_type: str) -> tuple[str, str, str, bool]:
-    """Best-effort pull of (model, prompt, action, has_auth_hint) from a JSON body.
+    """Best-effort pull of (model, prompt, action, stream_requested) from a JSON body.
 
     Handles the three wire formats we see probes against:
     - Ollama:         {"model": "...", "prompt": "..."}               /api/generate
@@ -2784,9 +2784,11 @@ def extract_llm_prompt(body: bytes, content_type: str) -> tuple[str, str, str, b
                       {"model": "...", "input": "..."|[..]}            /v1/embeddings
     - Anthropic:      {"model": "...", "messages": [{"role","content"}]}  /v1/messages
 
-    Returns `(model, prompt_prefix, action, has_auth_hint)`. Unknown shape
-    returns all-empty. `has_auth_hint` is always False at this layer; the
-    caller fills it from the request headers. Prompt is truncated to
+    Returns `(model, prompt_prefix, action, stream_requested)`. Unknown shape
+    returns all-empty/False. `stream_requested` is the literal `"stream": true`
+    flag from the body (OpenAI / Anthropic / Ollama all use the same key); when
+    set, the caller should serve SSE/NDJSON instead of a single JSON blob so
+    real-SDK clients don't bail on a malformed protocol. Prompt is truncated to
     LLM_BODY_DECODE_LIMIT chars.
     """
     if not body:
@@ -2846,7 +2848,8 @@ def extract_llm_prompt(body: bytes, content_type: str) -> tuple[str, str, str, b
 
     if len(prompt) > LLM_BODY_DECODE_LIMIT:
         prompt = prompt[:LLM_BODY_DECODE_LIMIT]
-    return model, prompt, action, False
+    stream_requested = bool(payload.get("stream"))
+    return model, prompt, action, stream_requested
 
 
 # --- LLM renderers --------------------------------------------------------
@@ -3031,6 +3034,186 @@ def render_anthropic_message(model: str) -> bytes:
         "usage": {"input_tokens": 24, "output_tokens": 32},
     }
     return json.dumps(payload).encode("utf-8")
+
+
+# --- LLM streaming helpers ------------------------------------------------
+# Real OpenAI / Anthropic / Ollama SDK clients that pass `stream: true` open the
+# socket expecting an event-stream (or NDJSON for Ollama). Returning a single
+# JSON blob on that contract makes well-behaved clients bail before sending a
+# follow-up. The streaming renderers below emit a small number of deltas so the
+# wire shape is right; the content is still the bland canned reply.
+
+
+def _split_reply_chunks(reply: str, count: int = 3) -> list[str]:
+    """Split the canned reply into ~equal pieces so streaming looks token-ish."""
+    if count <= 1:
+        return [reply]
+    pieces = reply.split(" ")
+    if len(pieces) <= count:
+        return pieces
+    step = len(pieces) // count
+    chunks: list[str] = []
+    for i in range(count):
+        start = i * step
+        end = (i + 1) * step if i < count - 1 else len(pieces)
+        joiner = "" if i == 0 else " "
+        chunks.append(joiner + " ".join(pieces[start:end]))
+    return chunks
+
+
+def render_openai_chat_sse_chunks(model: str) -> list[bytes]:
+    """OpenAI chat-completion streaming wire format: `data: {...}\\n\\n` per chunk + `[DONE]`."""
+    chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    model_id = model or "gpt-4o-mini"
+    deltas = _split_reply_chunks(_LLM_CANNED_REPLY, count=3)
+    out: list[bytes] = []
+    # Initial chunk: role marker, no content yet.
+    out.append(_sse_data({
+        "id": chat_id, "object": "chat.completion.chunk", "created": created,
+        "model": model_id,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    }))
+    for piece in deltas:
+        out.append(_sse_data({
+            "id": chat_id, "object": "chat.completion.chunk", "created": created,
+            "model": model_id,
+            "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+        }))
+    out.append(_sse_data({
+        "id": chat_id, "object": "chat.completion.chunk", "created": created,
+        "model": model_id,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }))
+    out.append(b"data: [DONE]\n\n")
+    return out
+
+
+def render_openai_completion_sse_chunks(model: str) -> list[bytes]:
+    """Legacy `/v1/completions` SSE — same envelope as chat but with `text` fields."""
+    chat_id = f"cmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    model_id = model or "gpt-4o-mini"
+    out: list[bytes] = []
+    for piece in _split_reply_chunks(_LLM_CANNED_REPLY, count=3):
+        out.append(_sse_data({
+            "id": chat_id, "object": "text_completion", "created": created,
+            "model": model_id,
+            "choices": [{"text": piece, "index": 0, "finish_reason": None}],
+        }))
+    out.append(_sse_data({
+        "id": chat_id, "object": "text_completion", "created": created,
+        "model": model_id,
+        "choices": [{"text": "", "index": 0, "finish_reason": "stop"}],
+    }))
+    out.append(b"data: [DONE]\n\n")
+    return out
+
+
+def render_anthropic_message_sse_chunks(model: str) -> list[bytes]:
+    """Anthropic Messages-API SSE: `event: <name>\\ndata: {...}\\n\\n` per chunk."""
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    model_id = model or "claude-3-5-sonnet-20241022"
+    deltas = _split_reply_chunks(_LLM_CANNED_REPLY, count=3)
+    out: list[bytes] = []
+    out.append(_sse_event("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id, "type": "message", "role": "assistant", "model": model_id,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 24, "output_tokens": 1},
+        },
+    }))
+    out.append(_sse_event("content_block_start", {
+        "type": "content_block_start", "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    }))
+    for piece in deltas:
+        out.append(_sse_event("content_block_delta", {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": piece},
+        }))
+    out.append(_sse_event("content_block_stop", {
+        "type": "content_block_stop", "index": 0,
+    }))
+    out.append(_sse_event("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": 32},
+    }))
+    out.append(_sse_event("message_stop", {"type": "message_stop"}))
+    return out
+
+
+def render_ollama_chat_ndjson_chunks(model: str) -> list[bytes]:
+    """Ollama streaming is NDJSON (one JSON object per line), no SSE wrapper."""
+    model_id = model or "llama3.2:latest"
+    deltas = _split_reply_chunks(_LLM_CANNED_REPLY, count=3)
+    out: list[bytes] = []
+    for piece in deltas:
+        out.append((json.dumps({
+            "model": model_id, "created_at": utc_now(),
+            "message": {"role": "assistant", "content": piece},
+            "done": False,
+        }) + "\n").encode("utf-8"))
+    out.append((json.dumps({
+        "model": model_id, "created_at": utc_now(),
+        "message": {"role": "assistant", "content": ""},
+        "done": True, "done_reason": "stop",
+        "total_duration": 1_234_567_890, "load_duration": 12_345_678,
+        "prompt_eval_count": 24, "prompt_eval_duration": 123_456_789,
+        "eval_count": 32, "eval_duration": 987_654_321,
+    }) + "\n").encode("utf-8"))
+    return out
+
+
+def render_ollama_generate_ndjson_chunks(model: str) -> list[bytes]:
+    """Ollama `/api/generate` streaming — same NDJSON shape but `response` not `message`."""
+    model_id = model or "llama3.2:latest"
+    deltas = _split_reply_chunks(_LLM_CANNED_REPLY, count=3)
+    out: list[bytes] = []
+    for piece in deltas:
+        out.append((json.dumps({
+            "model": model_id, "created_at": utc_now(),
+            "response": piece, "done": False,
+        }) + "\n").encode("utf-8"))
+    out.append((json.dumps({
+        "model": model_id, "created_at": utc_now(),
+        "response": "", "done": True, "done_reason": "stop",
+    }) + "\n").encode("utf-8"))
+    return out
+
+
+def _sse_data(payload: dict[str, object]) -> bytes:
+    return (b"data: " + json.dumps(payload).encode("utf-8") + b"\n\n")
+
+
+def _sse_event(event_name: str, payload: dict[str, object]) -> bytes:
+    return (
+        f"event: {event_name}\n".encode("utf-8")
+        + b"data: " + json.dumps(payload).encode("utf-8") + b"\n\n"
+    )
+
+
+def capture_llm_auth_token(auth_header: str, api_key_header: str) -> tuple[str, str]:
+    """Return (sha256_hex, preview) for whichever of Authorization / x-api-key
+    is presented. The preview shows the first 12 + last 4 chars so a `sk-proj-`
+    or `pk-live-` prefix is visible (useful for grouping replay-fleet tokens)
+    without storing the middle entropy in plaintext alongside the hash."""
+    raw = ""
+    if auth_header:
+        parts = auth_header.split(" ", 1)
+        raw = parts[1].strip() if len(parts) == 2 else auth_header.strip()
+    if not raw and api_key_header:
+        raw = api_key_header.strip()
+    if not raw:
+        return "", ""
+    sha = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+    if len(raw) <= 16:
+        preview = raw[:4] + "..." + raw[-2:] if len(raw) > 6 else raw[:2] + "..."
+    else:
+        preview = raw[:12] + "..." + raw[-4:]
+    return sha, preview
 
 
 # --- SonicWall SSL VPN renderers -----------------------------------------
@@ -12248,19 +12431,36 @@ async def _handle_llm_endpoint(
     log_context: dict[str, object],
     path: str,
     request_body: bytes,
-) -> web.Response:
-    """Dispatch a fake LLM-API response by path. Always 200 + JSON; the
-    whole point is to look live enough that the scanner keeps going."""
+) -> web.StreamResponse:
+    """Dispatch a fake LLM-API response by path. Always 200; usually JSON, but
+    SSE/NDJSON when the client opted into streaming (`"stream": true`).
+
+    Captures the bearer / x-api-key token (sha256 + safe preview) so the same
+    stolen key replayed across IPs is linkable — the token itself is the intel."""
     lpath = path.lower()
     method = request.method
     content_type_req = request.headers.get("Content-Type", "")
     auth_header = request.headers.get("Authorization", "")
     api_key_header = request.headers.get("x-api-key", "") or request.headers.get("X-Api-Key", "")
     has_auth = bool(auth_header) or bool(api_key_header)
+    token_sha, token_preview = capture_llm_auth_token(auth_header, api_key_header)
 
-    model, prompt, action, _ = extract_llm_prompt(request_body, content_type_req)
+    model, prompt, action, stream_requested = extract_llm_prompt(request_body, content_type_req)
+
+    # Routes that can stream (SSE for OpenAI/Anthropic; NDJSON for Ollama).
+    # Listing paths instead of result_tags so the dispatch table below stays
+    # one branch.
+    _streamable = {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/anthropic/v1/messages",
+        "/api/chat",
+        "/api/generate",
+    }
 
     # Route to a renderer.
+    body: bytes = b""
     if lpath in {"/v1/models"}:
         result_tag = "llm-endpoint-models-list"
         body = render_openai_models()
@@ -12293,22 +12493,27 @@ async def _handle_llm_endpoint(
             action = "show-model"
     elif lpath == "/api/chat":
         result_tag = "llm-endpoint-ollama-chat"
-        body = render_ollama_chat(model)
+        if not stream_requested:
+            body = render_ollama_chat(model)
     elif lpath == "/api/generate":
         result_tag = "llm-endpoint-ollama-generate"
-        body = render_ollama_generate(model)
+        if not stream_requested:
+            body = render_ollama_generate(model)
     elif lpath == "/v1/chat/completions":
         result_tag = "llm-endpoint-openai-chat"
-        body = render_openai_chat(model)
+        if not stream_requested:
+            body = render_openai_chat(model)
     elif lpath == "/v1/completions":
         result_tag = "llm-endpoint-openai-completion"
-        body = render_openai_completion(model)
+        if not stream_requested:
+            body = render_openai_completion(model)
     elif lpath == "/v1/embeddings":
         result_tag = "llm-endpoint-openai-embedding"
         body = render_openai_embedding(model)
     elif lpath in {"/v1/messages", "/anthropic/v1/messages"}:
         result_tag = "llm-endpoint-anthropic-message"
-        body = render_anthropic_message(model)
+        if not stream_requested:
+            body = render_anthropic_message(model)
     else:
         # Path matched the set but no renderer — shouldn't happen; defensive 404.
         append_log({**log_context, "status": 404, "result": "llm-endpoint-miss"})
@@ -12317,7 +12522,7 @@ async def _handle_llm_endpoint(
             headers={"Content-Type": "text/plain; charset=utf-8"},
         )
 
-    log_entry = {
+    log_entry: dict[str, object] = {
         **log_context,
         "status": 200,
         "result": result_tag,
@@ -12327,10 +12532,64 @@ async def _handle_llm_endpoint(
         "llmHasAuth": has_auth,
         "llmAuthScheme": auth_header.split(" ", 1)[0].lower() if auth_header else "",
         "llmMethod": method,
-        "bytes": len(body),
+        "llmStreamRequested": stream_requested,
     }
     if prompt:
         log_entry["llmPromptPreview"] = prompt
+    if token_sha:
+        log_entry["llmAuthTokenSha256"] = token_sha
+        log_entry["llmAuthTokenPreview"] = token_preview
+
+    # Streaming path — keeps SDK clients (which opened the socket expecting an
+    # event-stream / NDJSON wire shape) from bailing on a malformed protocol.
+    if stream_requested and lpath in _streamable:
+        if lpath == "/v1/chat/completions":
+            chunks = render_openai_chat_sse_chunks(model)
+            content_type = "text/event-stream; charset=utf-8"
+        elif lpath == "/v1/completions":
+            chunks = render_openai_completion_sse_chunks(model)
+            content_type = "text/event-stream; charset=utf-8"
+        elif lpath in {"/v1/messages", "/anthropic/v1/messages"}:
+            chunks = render_anthropic_message_sse_chunks(model)
+            content_type = "text/event-stream; charset=utf-8"
+        elif lpath == "/api/chat":
+            chunks = render_ollama_chat_ndjson_chunks(model)
+            content_type = "application/x-ndjson; charset=utf-8"
+        else:  # /api/generate
+            chunks = render_ollama_generate_ndjson_chunks(model)
+            content_type = "application/x-ndjson; charset=utf-8"
+
+        response = web.StreamResponse(status=200, headers={
+            "Content-Type": content_type,
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        })
+        bytes_sent = 0
+        prepared = False
+        try:
+            await response.prepare(request)
+            prepared = True
+            log_entry["bytes"] = sum(len(c) for c in chunks)
+            log_entry["llmStreamChunks"] = len(chunks)
+            append_log(log_entry)
+            for chunk in chunks:
+                await response.write(chunk)
+                bytes_sent += len(chunk)
+                # Small per-chunk delay; real model streams pace tokens, and the
+                # dwell time itself is mild measurement upside (was the scanner
+                # patient enough to read the whole stream?).
+                await asyncio.sleep(0.05)
+        except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientConnectionError):
+            append_log({
+                **log_context,
+                "status": 200,
+                "result": (result_tag + "-disconnect") if prepared else (result_tag + "-prepare-disconnect"),
+                "llmStreamBytesSent": bytes_sent,
+            })
+        return response
+
+    # Non-streaming path — original JSON-blob response.
+    log_entry["bytes"] = len(body)
     append_log(log_entry)
 
     return web.Response(

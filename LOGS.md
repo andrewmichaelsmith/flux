@@ -118,6 +118,8 @@ One log line per hit. `result` identifies which family was served.
 | `llm-endpoint-openai-completion` | 200 | `POST /v1/completions` |
 | `llm-endpoint-openai-embedding` | 200 | `POST /v1/embeddings` |
 | `llm-endpoint-anthropic-message` | 200 | `POST /v1/messages` or `POST /anthropic/v1/messages` |
+| `llm-endpoint-<route>-disconnect` | 200 | Streaming response: scanner closed the socket mid-stream (e.g. `llm-endpoint-openai-chat-disconnect`). |
+| `llm-endpoint-<route>-prepare-disconnect` | 200 | Streaming response: scanner closed before the headers went out. |
 | `llm-endpoint-miss` | 404 | Matched the path set but no renderer (shouldn't occur; defensive) |
 
 Extras on every `llm-endpoint-*` line:
@@ -129,8 +131,13 @@ Extras on every `llm-endpoint-*` line:
 | `llmModel` | string | `model` field pulled from a JSON body; `""` on GETs or malformed bodies. Truncated to 120 chars. |
 | `llmHasAuth` | bool | `true` if `Authorization` or `x-api-key` header was present — the strongest signal that the scanner already has a harvested key. |
 | `llmAuthScheme` | string | Lowercased first token of `Authorization` (`bearer`, `basic`, …); `""` otherwise. |
+| `llmAuthTokenSha256` | string | sha256 of the raw bearer / x-api-key token. Same token across many IPs = same actor / fleet. Omitted when no auth was sent. |
+| `llmAuthTokenPreview` | string | First 12 + last 4 chars of the token with a `...` elision — preserves the leak-source prefix (`sk-proj-`, `sk-ant-…`) for grouping. Omitted when no auth was sent. |
 | `llmMethod` | string | Request method (`GET` / `POST` / `HEAD`). |
-| `bytes` | int | Size of the JSON body returned. |
+| `llmStreamRequested` | bool | `true` if the JSON body set `"stream": true`. Streaming routes branch into SSE / NDJSON wire format. |
+| `llmStreamChunks` | int | Number of chunks written when streaming. Present only on streaming responses. |
+| `llmStreamBytesSent` | int | Bytes written before the scanner disconnected. Present only on `-disconnect` / `-prepare-disconnect` lines. |
+| `bytes` | int | Size of the response body returned (sum across streaming chunks). |
 | `llmPromptPreview` | string | Prefix of the extracted prompt, truncated to `HONEYPOT_LLM_BODY_DECODE_LIMIT`. Omitted if empty. |
 
 ### Fake SonicWall SSL VPN

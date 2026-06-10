@@ -2185,6 +2185,196 @@ async def test_dispatch_llm_malformed_json_still_200(flux_client):
     assert "llmPromptPreview" not in entry
 
 
+# --- LLM-endpoint expansion: bearer-token capture + SSE/NDJSON streaming ---
+
+
+def test_extract_llm_prompt_detects_stream_flag():
+    """SDK clients flag `"stream": true`; the trap branches on it."""
+    body = b'{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+    _, _, _, stream = tbenv.extract_llm_prompt(body, "application/json")
+    assert stream is True
+
+
+def test_extract_llm_prompt_default_stream_false():
+    body = b'{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+    _, _, _, stream = tbenv.extract_llm_prompt(body, "application/json")
+    assert stream is False
+
+
+def test_capture_llm_auth_token_bearer_preview_and_hash():
+    sha, preview = tbenv.capture_llm_auth_token(
+        "Bearer sk-proj-abcdefghijklmnopqrstuvwxyz1234", "",
+    )
+    # Hex sha256 over the raw token (sans "Bearer " prefix)
+    assert sha == hashlib.sha256(b"sk-proj-abcdefghijklmnopqrstuvwxyz1234").hexdigest()
+    # Preview keeps the prefix (12 chars) + last 4 — enough to group fleets by
+    # known leak-source prefixes without storing the middle entropy in plaintext.
+    assert preview.startswith("sk-proj-abcd")
+    assert preview.endswith("1234")
+    assert "..." in preview
+
+
+def test_capture_llm_auth_token_x_api_key_fallback():
+    sha, preview = tbenv.capture_llm_auth_token("", "ant-api03-XXXXXXXXXXXX1234")
+    assert sha == hashlib.sha256(b"ant-api03-XXXXXXXXXXXX1234").hexdigest()
+    assert preview.startswith("ant-api03-XX")
+
+
+def test_capture_llm_auth_token_empty_returns_empty():
+    assert tbenv.capture_llm_auth_token("", "") == ("", "")
+
+
+def test_capture_llm_auth_token_short_token():
+    """Short tokens still get a sha + a degraded preview, no exceptions."""
+    sha, preview = tbenv.capture_llm_auth_token("Bearer short", "")
+    assert sha == hashlib.sha256(b"short").hexdigest()
+    assert preview  # non-empty
+
+
+def test_render_openai_chat_sse_chunks_shape():
+    chunks = tbenv.render_openai_chat_sse_chunks("gpt-4o-mini")
+    blob = b"".join(chunks)
+    assert blob.startswith(b"data: ")
+    assert b"data: [DONE]\n\n" in blob
+    assert b"chat.completion.chunk" in blob
+    # final chunk before [DONE] has finish_reason=stop
+    assert b'"finish_reason": "stop"' in blob
+
+
+def test_render_anthropic_message_sse_chunks_shape():
+    chunks = tbenv.render_anthropic_message_sse_chunks("claude-3-5-sonnet-20241022")
+    blob = b"".join(chunks)
+    assert b"event: message_start\n" in blob
+    assert b"event: content_block_delta\n" in blob
+    assert b"event: message_stop\n" in blob
+
+
+def test_render_ollama_chat_ndjson_chunks_shape():
+    chunks = tbenv.render_ollama_chat_ndjson_chunks("llama3.2:latest")
+    # Each chunk is a single JSON line ending in '\n'
+    for c in chunks:
+        assert c.endswith(b"\n")
+        json.loads(c)
+    # Last chunk has done=True
+    assert json.loads(chunks[-1])["done"] is True
+    # All earlier chunks have done=False
+    for c in chunks[:-1]:
+        assert json.loads(c)["done"] is False
+
+
+async def test_dispatch_openai_chat_streams_when_stream_true(flux_client):
+    """When the client opts into streaming, return text/event-stream so real
+    SDKs (which open the socket expecting SSE) don't bail on a JSON blob."""
+    resp = await flux_client.post(
+        "/v1/chat/completions",
+        headers={
+            "X-Forwarded-For": "198.51.100.50",
+            "Authorization": "Bearer sk-stolen-canary-llmjack-9999",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({
+            "model": "gpt-4o-mini", "stream": True,
+            "messages": [{"role": "user", "content": "Say OK in one word."}],
+        }),
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/event-stream")
+    body = await resp.read()
+    assert b"data: [DONE]" in body
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "llm-endpoint-openai-chat"
+    assert entry["llmStreamRequested"] is True
+    assert entry["llmStreamChunks"] >= 3
+    # Token capture: sha + safe preview, no full token leak.
+    assert entry["llmAuthScheme"] == "bearer"
+    assert entry["llmAuthTokenSha256"] == hashlib.sha256(
+        b"sk-stolen-canary-llmjack-9999"
+    ).hexdigest()
+    assert entry["llmAuthTokenPreview"].startswith("sk-stolen-ca")
+
+
+async def test_dispatch_openai_chat_no_stream_still_returns_json(flux_client):
+    """Default (no stream flag) keeps the original single-blob JSON path."""
+    resp = await flux_client.post(
+        "/v1/chat/completions",
+        headers={"X-Forwarded-For": "198.51.100.51", "Content-Type": "application/json"},
+        data=json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+        }),
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("application/json")
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["llmStreamRequested"] is False
+    assert "llmStreamChunks" not in entry
+
+
+async def test_dispatch_anthropic_messages_streams_event_stream(flux_client):
+    """Anthropic SSE has a different envelope (`event: <name>\\ndata: ...`)."""
+    resp = await flux_client.post(
+        "/v1/messages",
+        headers={
+            "X-Forwarded-For": "198.51.100.52",
+            "X-Api-Key": "ant-api03-test-token-1234567890ab",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({
+            "model": "claude-3-5-sonnet-20241022", "stream": True,
+            "messages": [{"role": "user", "content": "ping"}],
+        }),
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/event-stream")
+    body = await resp.read()
+    assert b"event: message_start" in body
+    assert b"event: message_stop" in body
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "llm-endpoint-anthropic-message"
+    assert entry["llmStreamRequested"] is True
+    # x-api-key path also gets captured
+    assert entry["llmAuthTokenSha256"] == hashlib.sha256(
+        b"ant-api03-test-token-1234567890ab"
+    ).hexdigest()
+
+
+async def test_dispatch_ollama_chat_streams_ndjson(flux_client):
+    """Ollama streams NDJSON (not SSE); each line is a JSON object."""
+    resp = await flux_client.post(
+        "/api/chat",
+        headers={"X-Forwarded-For": "198.51.100.53", "Content-Type": "application/json"},
+        data=json.dumps({
+            "model": "llama3.2:latest", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        }),
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("application/x-ndjson")
+    body = await resp.read()
+    lines = [ln for ln in body.split(b"\n") if ln]
+    assert len(lines) >= 2
+    parsed = [json.loads(ln) for ln in lines]
+    assert parsed[-1]["done"] is True
+
+
+async def test_dispatch_llm_no_auth_no_token_fields(flux_client):
+    """When no Authorization / x-api-key header is sent, don't add token fields."""
+    resp = await flux_client.post(
+        "/v1/chat/completions",
+        headers={"X-Forwarded-For": "198.51.100.54", "Content-Type": "application/json"},
+        data=json.dumps({"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "x"}]}),
+    )
+    assert resp.status == 200
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["llmHasAuth"] is False
+    assert "llmAuthTokenSha256" not in entry
+    assert "llmAuthTokenPreview" not in entry
+
+
 # --- Fake SonicWall SSL VPN trap ---
 #
 # Two overlapping behaviour patterns observed in mid-April 2026:
@@ -5256,14 +5446,14 @@ def test_render_ollama_ps_shape():
 
 
 def test_extract_llm_prompt_embedding_list_input():
-    model, prompt, action, has_auth = tbenv.extract_llm_prompt(
+    model, prompt, action, stream = tbenv.extract_llm_prompt(
         b'{"model":"text-embedding-3-small","input":["hello","world"]}',
         "application/json",
     )
     assert model == "text-embedding-3-small"
     assert action == "embedding"
     assert "hello" in prompt and "world" in prompt
-    assert has_auth is False
+    assert stream is False
 
 
 def test_extract_llm_prompt_embedding_scalar_input():
