@@ -551,6 +551,7 @@ def test_all_trap_families_default_on():
     assert tbenv.FORTIGATE_VPN_ENABLED
     assert tbenv.HIKVISION_ENABLED
     assert tbenv.HNAP1_ENABLED
+    assert tbenv.SERVER_STATUS_ENABLED
     assert tbenv.GEOSERVER_ENABLED
     assert tbenv.COLDFUSION_ENABLED
     assert tbenv.CONFLUENCE_ENABLED
@@ -5063,6 +5064,162 @@ async def test_dispatch_hnap1_disabled_returns_404(flux_client, monkeypatch):
     assert entries[-1]["result"] == "not-handled"
 
 
+# --- Apache mod_status (`/server-status`) trap ---
+
+
+def test_server_status_enabled_by_default():
+    assert tbenv.SERVER_STATUS_ENABLED
+
+
+def test_server_status_default_paths_match_observed_probes():
+    for path in (
+        "/server-status",
+        "/server-status/",
+        "/SERVER-STATUS",
+        "/server-status?auto",
+        "/server-status?refresh=5",
+    ):
+        assert tbenv.is_server_status_path(path), f"expected match: {path}"
+
+
+def test_server_status_path_non_match():
+    for path in (
+        "/",
+        "/server",
+        "/server-status-extra",
+        "/api/server-status",
+        "/.env",
+    ):
+        assert not tbenv.is_server_status_path(path), f"unexpected match: {path}"
+
+
+def test_server_status_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "SERVER_STATUS_ENABLED", False)
+    assert not tbenv.is_server_status_path("/server-status")
+
+
+def test_server_status_parse_refresh():
+    assert tbenv._server_status_parse_refresh("refresh=5") == 5
+    assert tbenv._server_status_parse_refresh("refresh=60&foo=bar") == 60
+    assert tbenv._server_status_parse_refresh("foo=1&refresh=10") == 10
+    # bad values
+    assert tbenv._server_status_parse_refresh("") is None
+    assert tbenv._server_status_parse_refresh("auto") is None
+    assert tbenv._server_status_parse_refresh("refresh=abc") is None
+    assert tbenv._server_status_parse_refresh("refresh=0") is None
+    assert tbenv._server_status_parse_refresh("refresh=99999") is None
+
+
+def test_server_status_html_embeds_canary_in_recent_request_urls():
+    body = tbenv._server_status_render_html(
+        "victim.example", tbenv._aws(FAKE_TRACEBIT),
+    ).decode("utf-8")
+    # Apache version banner — version-gated scanners must see this.
+    assert tbenv.SERVER_STATUS_APACHE_VERSION in body
+    assert "Server MPM: event" in body
+    # The canary access key is embedded in URL query strings in the
+    # scoreboard's `Request` column where credential-scrapers grep.
+    assert "AKIAFAKEEXAMPLE01" in body
+    assert "aws_access_key_id=" in body
+    assert "aws_secret_access_key=" in body
+    # Scoreboard string carries the expected `W`/`_` shape so monitoring
+    # parsers that gate on it don't bail.
+    assert "<pre>WWWWWWW_______</pre>" in body
+
+
+def test_server_status_auto_embeds_canary_and_mod_status_keys():
+    body = tbenv._server_status_render_auto(
+        tbenv._aws(FAKE_TRACEBIT),
+    ).decode("utf-8")
+    # Canonical mod_status `?auto` keys monitoring tools parse.
+    for key in (
+        "Total Accesses:",
+        "Total kBytes:",
+        "CPULoad:",
+        "Uptime:",
+        "ReqPerSec:",
+        "BusyWorkers:",
+        "IdleWorkers:",
+        "Scoreboard:",
+    ):
+        assert key in body, f"missing mod_status auto key: {key}"
+    # Canary key surfaces in the LastReq lines.
+    assert "AKIAFAKEEXAMPLE01" in body
+
+
+async def test_dispatch_server_status_html_returns_apache_banner(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/server-status",
+        headers={"X-Forwarded-For": "203.0.113.151"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Content-Type", "").startswith("text/html")
+    # Apache version banner pins the Server header — scanners use it to
+    # decide whether to ship a version-gated exploit.
+    assert resp.headers.get("Server", "").startswith("Apache/2.4")
+    text = await resp.text()
+    assert "Apache Server Status" in text
+    assert "AKIAFAKEEXAMPLE01" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "server-status-html"
+    assert entry["serverStatusFormat"] == "html"
+    assert "aws" in entry["canaryTypes"]
+
+
+async def test_dispatch_server_status_auto_query_returns_text_format(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/server-status?auto",
+        headers={"X-Forwarded-For": "203.0.113.152"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Content-Type", "").startswith("text/plain")
+    text = await resp.text()
+    assert "Scoreboard:" in text
+    assert "BusyWorkers:" in text
+    assert "AKIAFAKEEXAMPLE01" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "server-status-auto"
+    assert entry["serverStatusFormat"] == "auto"
+
+
+async def test_dispatch_server_status_keyless_still_serves_banner(flux_client, monkeypatch):
+    # Without TRACEBIT_API_KEY the canary slots go empty but the page
+    # still 200s so banner-grab scanners get the Apache fingerprint.
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    resp = await flux_client.get(
+        "/server-status",
+        headers={"X-Forwarded-For": "203.0.113.153"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Apache Server Status" in text
+    # No canary value rendered, but the URL slot is still there.
+    assert "aws_access_key_id=" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "server-status-html"
+    assert entry["canaryTypes"] == []
+
+
+async def test_dispatch_server_status_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "SERVER_STATUS_ENABLED", False)
+    resp = await flux_client.get(
+        "/server-status",
+        headers={"X-Forwarded-For": "203.0.113.154"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
 # --- GeoServer trap (CVE-2024-36401 bait) ---
 
 
@@ -5955,19 +6112,72 @@ def test_fake_git_repo_serves_master_alias_and_remote_tracking_refs():
         assert sha in body, key
 
 
-def test_fake_git_repo_ships_all_fourteen_sample_hooks():
+def test_fake_git_repo_ships_canonical_sample_hooks():
     secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
     files, _meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
-    # Every name in the canonical hook set lands at a `.sample` path with a
+    # Every name in the hook set lands at a `.sample` path with a
     # non-trivial shell-shaped body. Returning 404 on any one of these is a
     # cheap fingerprint for "this is a hand-rolled fake repo".
-    assert len(tbenv._FAKE_GIT_HOOK_NAMES) == 14
+    # Canonical git template ships 14 (`applypatch-msg` … `update`); we
+    # additionally ship the `post-*` hooks scanner enumeration dictionaries
+    # walk (`post-commit`, `post-receive`, `post-checkout`, `post-merge`,
+    # `post-rewrite`) — those are common at orgs that wire CI through them,
+    # so a real exposed repo plausibly carries them.
+    canonical_template_hooks = {
+        "applypatch-msg", "commit-msg", "fsmonitor-watchman", "post-update",
+        "pre-applypatch", "pre-commit", "pre-merge-commit", "pre-push",
+        "pre-rebase", "pre-receive", "prepare-commit-msg",
+        "push-to-checkout", "sendemail-validate", "update",
+    }
+    assert canonical_template_hooks <= set(tbenv._FAKE_GIT_HOOK_NAMES)
+    extra_hooks = {
+        "post-commit", "post-receive", "post-checkout", "post-merge",
+        "post-rewrite",
+    }
+    assert extra_hooks <= set(tbenv._FAKE_GIT_HOOK_NAMES)
     for hook_name in tbenv._FAKE_GIT_HOOK_NAMES:
         body = files[f"/.git/hooks/{hook_name}.sample"]
         assert body.startswith(b"#!/bin/sh\n"), hook_name
         assert hook_name.encode("utf-8") in body, hook_name
         # Defensive: the body must not regress to a one-line stub.
         assert body.count(b"\n") >= 5, hook_name
+
+
+def test_fake_git_repo_covers_common_branch_refs():
+    """Scanner enumeration dictionaries walk `refs/heads/<branch>` for
+    common branch names (`develop`, `staging`, `production`, …) — a 404
+    on every one of them while `main` / `master` return 200 is a strong
+    "this is a synthesized fake repo" tell."""
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    sha = meta["commitSha"]
+    for branch in tbenv._FAKE_GIT_EXTRA_BRANCHES:
+        for key in (
+            f"/.git/refs/heads/{branch}",
+            f"/.git/refs/remotes/origin/{branch}",
+            f"/.git/logs/refs/heads/{branch}",
+            f"/.git/logs/refs/remotes/origin/{branch}",
+        ):
+            assert key in files, f"missing fake-git surface: {key}"
+            assert sha in files[key].decode("utf-8"), key
+
+
+def test_fake_git_repo_covers_stash_and_wip_refs():
+    """`refs/stash` + `logs/refs/stash` are present in any repo with a
+    saved stash; the git-wip extension adds `refs/wip/index/...` and
+    `refs/wip/wtree/...`. Scanners enumerate both — covering them
+    closes a measurable miss-rate gap."""
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    sha = meta["commitSha"]
+    assert sha in files["/.git/refs/stash"].decode("utf-8")
+    assert sha in files["/.git/logs/refs/stash"].decode("utf-8")
+    for branch in ("main", "master", *tbenv._FAKE_GIT_EXTRA_BRANCHES):
+        for key in (
+            f"/.git/refs/wip/index/refs/heads/{branch}",
+            f"/.git/refs/wip/wtree/refs/heads/{branch}",
+        ):
+            assert sha in files[key].decode("utf-8"), key
 
 
 def test_fake_git_hook_body_is_not_verbatim_git_template():

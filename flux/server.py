@@ -1043,6 +1043,38 @@ _HNAP1_DEFAULT_PATHS = ",".join([
     "/hnap1",
     "/hnap1/",
 ])
+
+# --- Fake Apache mod_status (`/server-status`) ---
+# Apache `mod_status` is a long-standing info-leak target: when exposed,
+# its HTML page reveals the server's version banner, uptime, worker
+# scoreboard, and the most recent request URLs (with full query strings)
+# every active worker is processing. Sec scanners hunt it because the
+# "Request" column commonly leaks session tokens / API keys / admin URLs
+# carried in query strings, and the version banner identifies the
+# vulnerability surface. The recent-request column is the lure: by
+# rendering plausible recent requests that reference admin / credential
+# URLs whose query strings carry the per-hit Tracebit AWS canary in
+# `aws_access_key_id` and `aws_secret_access_key`, credential-scrapers
+# that grep mod_status output for `AKIA…` patterns harvest a
+# replay-fireable key. Also handles the `?auto` machine-parseable
+# variant (Apache mod_status's text format used by Munin / monitoring
+# tools), which is what some scripted scanners request first.
+SERVER_STATUS_ENABLED = _env_bool("HONEYPOT_SERVER_STATUS_ENABLED")
+_SERVER_STATUS_DEFAULT_PATHS = ",".join([
+    "/server-status",
+    "/server-status/",
+])
+SERVER_STATUS_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_SERVER_STATUS_PATHS_CSV") or _SERVER_STATUS_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# Apache version pinned inside the public-disclosure window for
+# CVE-2024-38476 / CVE-2024-38477 / CVE-2024-38475 so version-gated
+# scanners don't bail on the banner.
+SERVER_STATUS_APACHE_VERSION = (
+    os.environ.get("HONEYPOT_SERVER_STATUS_APACHE_VERSION") or "Apache/2.4.58 (Ubuntu)"
+).strip()
 HNAP1_PATHS = {
     value.strip().lower()
     for value in (os.environ.get("HONEYPOT_HNAP1_PATHS_CSV") or _HNAP1_DEFAULT_PATHS).split(",")
@@ -2155,6 +2187,15 @@ def is_hnap1_path(path: str) -> bool:
     if not HNAP1_ENABLED:
         return False
     return path.lower() in HNAP1_PATHS
+
+
+def is_server_status_path(path: str) -> bool:
+    if not SERVER_STATUS_ENABLED:
+        return False
+    # Path may carry `?auto`, `?refresh=N`, or no query — match on the
+    # path component only.
+    lp = path.lower().split("?", 1)[0]
+    return lp in SERVER_STATUS_PATHS
 
 
 # OGNL / Java-runtime indicators surfaced when CVE-2024-36401 (or related
@@ -6138,6 +6179,11 @@ _FAKE_GIT_HOOK_NAMES: tuple[str, ...] = (
     "applypatch-msg",
     "commit-msg",
     "fsmonitor-watchman",
+    "post-checkout",
+    "post-commit",
+    "post-merge",
+    "post-receive",
+    "post-rewrite",
     "post-update",
     "pre-applypatch",
     "pre-commit",
@@ -6149,6 +6195,23 @@ _FAKE_GIT_HOOK_NAMES: tuple[str, ...] = (
     "push-to-checkout",
     "sendemail-validate",
     "update",
+)
+
+# Extra branch names that enumeration scanners hit alongside
+# `main` / `master`. These are the high-signal repeats from the
+# fake-git-miss logs: each shows up at single-digit-to-low-double-digit
+# IP-counts/day across the sensor fleet, all `.sample` hooks and
+# common branch refs. Same `commit_sha` keeps each ref consistent
+# with the synthesized tree.
+_FAKE_GIT_EXTRA_BRANCHES: tuple[str, ...] = (
+    "develop",
+    "development",
+    "dev",
+    "staging",
+    "production",
+    "prod",
+    "release",
+    "qa",
 )
 
 
@@ -6376,6 +6439,37 @@ def _build_fake_repo(
     }
     for hook_name in _FAKE_GIT_HOOK_NAMES:
         files[f"/.git/hooks/{hook_name}.sample"] = _fake_git_hook_body(hook_name)
+
+    # Extra branch refs (`refs/heads/<branch>`, `refs/remotes/origin/<branch>`,
+    # and the matching reflog entries). Same commit_sha across all branches —
+    # a synthesized fake repo with one commit projected onto many branch
+    # heads is plausible (a freshly-tagged release would look like this) and
+    # closes the gap where scanners enumerating standard branch names
+    # (`develop` / `staging` / `production` / …) were getting a 404 on every
+    # one of them — a strong "this isn't a real repo" tell.
+    for branch in _FAKE_GIT_EXTRA_BRANCHES:
+        files[f"/.git/refs/heads/{branch}"] = f"{commit_sha}\n".encode("utf-8")
+        files[f"/.git/refs/remotes/origin/{branch}"] = f"{commit_sha}\n".encode("utf-8")
+        files[f"/.git/logs/refs/heads/{branch}"] = reflog_line.encode("utf-8")
+        files[f"/.git/logs/refs/remotes/origin/{branch}"] = reflog_line.encode("utf-8")
+
+    # git-stash refs: a real repo with any saved stash has these; their
+    # absence is a banner-grab tell for scanners that enumerate
+    # `/.git/refs/stash` after `/.git/HEAD`. Empty stash list (just the
+    # stash commit ref itself + empty reflog) keeps the fingerprint
+    # plausible without inventing a fake stash entry.
+    files["/.git/refs/stash"] = f"{commit_sha}\n".encode("utf-8")
+    files["/.git/logs/refs/stash"] = reflog_line.encode("utf-8")
+
+    # git-wip extension refs (`refs/wip/index/...`, `refs/wip/wtree/...`).
+    # The git-wip third-party extension snapshots staging area + working
+    # tree under each branch on every save; scanners include these paths
+    # in enumeration dictionaries because exposed repos using git-wip
+    # are common at orgs that adopted it. Pointed at the same commit
+    # for every covered branch (main, master, plus the extras).
+    for branch in ("main", "master", *_FAKE_GIT_EXTRA_BRANCHES):
+        files[f"/.git/refs/wip/index/refs/heads/{branch}"] = f"{commit_sha}\n".encode("utf-8")
+        files[f"/.git/refs/wip/wtree/refs/heads/{branch}"] = f"{commit_sha}\n".encode("utf-8")
     meta: dict[str, object] = {
         "commitSha": commit_sha,
         "rootTreeSha": root_tree_sha,
@@ -14590,6 +14684,235 @@ async def _handle_hnap1(
     )
 
 
+def _server_status_recent_request_urls(aws: dict[str, str]) -> list[str]:
+    """Recent-request URLs rendered into the mod_status scoreboard.
+
+    Two of them embed the per-hit Tracebit AWS canary in query-string
+    `aws_access_key_id` / `aws_secret_access_key` slots — the slot
+    credential-scrapers grep raw output for. Mixed with plausible
+    real-app URLs so the canary URLs don't stick out.
+    """
+    akid = aws.get("awsAccessKeyId", "")
+    secret = aws.get("awsSecretAccessKey", "")
+    return [
+        f"GET /admin/api/v1/keys?aws_access_key_id={akid}&aws_secret_access_key={secret} HTTP/1.1",
+        "GET /api/v1/users/me HTTP/1.1",
+        "POST /api/v1/sessions HTTP/1.1",
+        f"GET /internal/aws-credentials.json?access_key={akid} HTTP/1.1",
+        "GET /static/js/app.js HTTP/1.1",
+        "GET /healthz HTTP/1.1",
+        "GET /metrics HTTP/1.1",
+    ]
+
+
+def _server_status_render_html(
+    host: str,
+    aws: dict[str, str],
+    *,
+    refresh: int | None = None,
+) -> bytes:
+    """Render the Apache mod_status HTML page.
+
+    Layout mirrors mod_status from Apache 2.4: server-version + MPM,
+    uptime, total accesses, busy/idle worker counts, a scoreboard
+    bar, and a per-worker table whose `Request` column embeds the
+    canary URLs.
+    """
+    urls = _server_status_recent_request_urls(aws)
+    workers_running = len(urls)
+    workers_idle = 7
+    scoreboard = "W" * workers_running + "_" * workers_idle
+    meta = (
+        f'<meta http-equiv="refresh" content="{refresh}">\n'
+        if refresh and 0 < refresh <= 3600 else ""
+    )
+    rows = []
+    for i, url in enumerate(urls):
+        rows.append(
+            f"<tr>"
+            f"<td>{i}-0</td>"
+            f"<td>{20000 + i}</td>"
+            f"<td>0/{i + 1}/{i + 12}</td>"
+            f"<td>W</td>"
+            f"<td>0.04</td>"
+            f"<td>0</td>"
+            f"<td>0</td>"
+            f"<td>0.0</td>"
+            f"<td>0.10</td>"
+            f"<td>2.45</td>"
+            f"<td>10.0.0.{10 + i}</td>"
+            f"<td>{host}:443</td>"
+            f"<td nowrap>{url}</td>"
+            f"</tr>"
+        )
+    body = (
+        f"<!DOCTYPE html>\n<html><head>\n{meta}"
+        f"<title>Apache Status</title>\n</head><body>\n"
+        f"<h1>Apache Server Status for {host} (via 127.0.0.1)</h1>\n"
+        f"<dl>"
+        f"<dt>Server Version: {SERVER_STATUS_APACHE_VERSION} OpenSSL/3.0.13</dt>"
+        f"<dt>Server MPM: event</dt>"
+        f"<dt>Server Built: 2024-04-04T17:45:00</dt>"
+        f"</dl><hr/>\n"
+        f"<dl>"
+        f"<dt>Current Time: Wednesday, 11-Jun-2026 12:34:56 UTC</dt>"
+        f"<dt>Restart Time: Tuesday, 10-Jun-2026 03:00:00 UTC</dt>"
+        f"<dt>Parent Server Config. Generation: 1</dt>"
+        f"<dt>Parent Server MPM Generation: 0</dt>"
+        f"<dt>Server uptime: 1 day 9 hours 34 minutes 56 seconds</dt>"
+        f"<dt>Server load: 0.12 0.08 0.05</dt>"
+        f"<dt>Total accesses: 184320 - Total Traffic: 587 MB - Total Duration: 412345 ms</dt>"
+        f"<dt>CPU Usage: u.42 s.18 cu0 cs0 - .07% CPU load</dt>"
+        f"<dt>1.51 requests/sec - 4.9 kB/second - 3.2 kB/request - 2.24 ms/request</dt>"
+        f"<dt>{workers_running} requests currently being processed, {workers_idle} idle workers</dt>"
+        f"</dl>\n"
+        f"<pre>{scoreboard}</pre>\n"
+        f'<p>Scoreboard Key:<br/>\n'
+        f'"_" Waiting for Connection, "S" Starting up, "R" Reading Request,<br/>\n'
+        f'"W" Sending Reply, "K" Keepalive (read), "D" DNS Lookup,<br/>\n'
+        f'"C" Closing connection, "L" Logging, "G" Gracefully finishing,<br/>\n'
+        f'"I" Idle cleanup of worker, "." Open slot with no current process</p>\n'
+        f'<table border="0"><tr><th>Srv</th><th>PID</th><th>Acc</th><th>M</th>'
+        f'<th>CPU</th><th>SS</th><th>Req</th><th>Dur</th><th>Conn</th>'
+        f'<th>Child</th><th>Slot</th><th>Client</th><th>VHost</th><th>Request</th></tr>\n'
+        + "\n".join(rows) +
+        f"\n</table>\n</body></html>\n"
+    )
+    return body.encode("utf-8")
+
+
+def _server_status_render_auto(aws: dict[str, str]) -> bytes:
+    """Render the `?auto` machine-parseable text format.
+
+    Mirrors Apache mod_status's text output (one `Key: value` per line)
+    that monitoring scripts (Munin / nagios) consume. The scoreboard
+    string is the same shape as the HTML version, and the recent
+    request URLs go into a synthetic `LastReq:` block — not part of
+    the canonical mod_status fields but commonly added by patched
+    deployments, and the canary URLs need somewhere to live.
+    """
+    urls = _server_status_recent_request_urls(aws)
+    workers_running = len(urls)
+    workers_idle = 7
+    scoreboard = "W" * workers_running + "_" * workers_idle
+    lines = [
+        f"ServerVersion: {SERVER_STATUS_APACHE_VERSION} OpenSSL/3.0.13",
+        "ServerMPM: event",
+        "Server Built: 2024-04-04T17:45:00",
+        "CurrentTime: Wednesday, 11-Jun-2026 12:34:56 UTC",
+        "RestartTime: Tuesday, 10-Jun-2026 03:00:00 UTC",
+        "ParentServerConfigGeneration: 1",
+        "ParentServerMPMGeneration: 0",
+        "ServerUptimeSeconds: 121200",
+        "ServerUptime: 1 day 9 hours 34 minutes 56 seconds",
+        "Load1: 0.12",
+        "Load5: 0.08",
+        "Load15: 0.05",
+        "Total Accesses: 184320",
+        "Total kBytes: 600320",
+        "Total Duration: 412345",
+        "CPUUser: .42",
+        "CPUSystem: .18",
+        "CPUChildrenUser: 0",
+        "CPUChildrenSystem: 0",
+        "CPULoad: .07",
+        "Uptime: 121200",
+        "ReqPerSec: 1.51",
+        "BytesPerSec: 5063",
+        "BytesPerReq: 3344",
+        "DurationPerReq: 2.24",
+        f"BusyWorkers: {workers_running}",
+        f"IdleWorkers: {workers_idle}",
+        "ConnsTotal: 12",
+        "ConnsAsyncWriting: 0",
+        "ConnsAsyncKeepAlive: 4",
+        "ConnsAsyncClosing: 0",
+        f"Scoreboard: {scoreboard}",
+    ]
+    for i, url in enumerate(urls):
+        lines.append(f"LastReq{i}: {url}")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _server_status_parse_refresh(query_string: str) -> int | None:
+    """Extract `refresh=<int>` from a mod_status query string."""
+    if not query_string:
+        return None
+    for part in query_string.split("&"):
+        if "=" not in part:
+            continue
+        key, _, value = part.partition("=")
+        if key.lower() == "refresh":
+            try:
+                n = int(value.strip())
+            except (TypeError, ValueError):
+                return None
+            if 0 < n <= 3600:
+                return n
+    return None
+
+
+async def _handle_server_status(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+) -> web.Response:
+    """Apache mod_status response. Mints a per-request Tracebit AWS
+    canary and embeds it in the "recent request" URLs that mod_status
+    canonically leaks, so credential-scrapers that grep the page for
+    `AKIA…` patterns harvest a replay-fireable key."""
+    request_id = str(log_context.get("requestId", ""))
+    host = str(log_context.get("host", ""))
+    client_ip = str(log_context.get("clientIp", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+
+    tracebit_response = None
+    if API_KEY:
+        tracebit_response = await _get_or_issue_canary(
+            ("aws",), client_ip, request_id, host, user_agent, path, proto,
+        )
+    if tracebit_response is None:
+        # Keyless deployments (or upstream failure) still serve a
+        # plausible mod_status page so banner-grab scanners get a
+        # 200 — the canary slots just go empty.
+        tracebit_response = {}
+    aws = _aws(tracebit_response)
+
+    query_lower = (query_string or "").lower()
+    is_auto = "auto" in query_lower.split("&") or query_lower.startswith("auto") or query_lower == "auto"
+    refresh = _server_status_parse_refresh(query_string)
+
+    if is_auto:
+        body = _server_status_render_auto(aws)
+        content_type = "text/plain; charset=utf-8"
+        result_tag = "server-status-auto"
+    else:
+        body = _server_status_render_html(host, aws, refresh=refresh)
+        content_type = "text/html; charset=utf-8"
+        result_tag = "server-status-html"
+
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "serverStatusFormat": "auto" if is_auto else "html",
+        "serverStatusRefresh": refresh or 0,
+        "canaryTypes": [k for k, v in tracebit_response.items() if v],
+        "bytes": len(body),
+    })
+
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": content_type,
+            "Server": SERVER_STATUS_APACHE_VERSION,
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_geoserver(
     request: web.Request,
     log_context: dict[str, object],
@@ -16434,6 +16757,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_hnap1_path(path):
         return await _handle_hnap1(request, log_context, path, query_string, request_body)
 
+    if is_server_status_path(path):
+        return await _handle_server_status(request, log_context, path, query_string)
+
     if is_geoserver_path(path):
         return await _handle_geoserver(request, log_context, path, request_body)
 
@@ -16598,6 +16924,8 @@ def main() -> int:
         active.append("onvif")
     if HNAP1_ENABLED:
         active.append("hnap1-router")
+    if SERVER_STATUS_ENABLED:
+        active.append("server-status")
     if GEOSERVER_ENABLED:
         active.append("geoserver")
     if COLDFUSION_ENABLED:
