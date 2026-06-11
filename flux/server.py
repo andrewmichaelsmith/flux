@@ -7,6 +7,7 @@ import bz2
 import gzip
 import hashlib
 import io
+import ipaddress
 import json
 import lzma
 import os
@@ -1850,20 +1851,41 @@ def append_log(payload: dict[str, object]) -> None:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
-def client_ip_from_xff(header_value: str) -> str:
-    """Real client IP from an ``X-Forwarded-For`` chain set by a single
-    trusted reverse proxy.
+def _is_internal_ip(value: str) -> bool:
+    """True for loopback/private/link-local/reserved addresses — i.e. our
+    own reverse-proxy hops, not an external client."""
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return (ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_reserved or ip.is_unspecified)
 
-    nginx (``$proxy_add_x_forwarded_for``) appends the real peer
-    (``$remote_addr``) to the right of whatever the client supplied, so the
-    rightmost entry is the only value the client cannot forge. Trusting the
-    leftmost entry lets a scanner send ``X-Forwarded-For: 127.0.0.1`` and
-    poison client-IP attribution: the spoofed value survives as the left
-    entry while the real address is appended on the right.
+
+def client_ip_from_xff(header_value: str) -> str:
+    """Real external client IP from an ``X-Forwarded-For`` chain.
+
+    The request reaches Flux through one or more trusted reverse-proxy hops
+    (public nginx, then an internal loopback hop). Each appends its peer on
+    the RIGHT via ``$proxy_add_x_forwarded_for``: the public nginx appends
+    the real client, and the internal hop(s) append loopback/private
+    addresses to its right. The client controls only the LEFT of the chain,
+    so we walk from the right and return the first non-internal entry — the
+    real client, and the only value a scanner cannot forge.
+
+    A scanner sending ``X-Forwarded-For: 127.0.0.1`` lands on the left and
+    is ignored; the nginx-appended real address (which sits to the right of
+    the spoof but left of the internal loopback hops) wins.
     """
     if not header_value:
         return ""
-    return header_value.rsplit(",", 1)[-1].strip()
+    parts = [p.strip() for p in header_value.split(",") if p.strip()]
+    if not parts:
+        return ""
+    for candidate in reversed(parts):
+        if not _is_internal_ip(candidate):
+            return candidate
+    return parts[-1]
 
 
 def clean_host(header_value: str) -> str:

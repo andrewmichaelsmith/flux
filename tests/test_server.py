@@ -9743,37 +9743,64 @@ def test_django_debug_toolbar_renderer_per_hit_unique_secret_key():
 
 def test_client_ip_from_xff_empty():
     assert tbenv.client_ip_from_xff("") == ""
+    assert tbenv.client_ip_from_xff("   ") == ""
 
 
 def test_client_ip_from_xff_single_entry():
-    assert tbenv.client_ip_from_xff("203.0.113.9") == "203.0.113.9"
-
-
-def test_client_ip_from_xff_trusts_rightmost_appended_peer():
-    # nginx appends the real $remote_addr on the right; left is client-supplied.
-    assert tbenv.client_ip_from_xff("203.0.113.9, 198.51.100.7") == "198.51.100.7"
+    assert tbenv.client_ip_from_xff("8.8.8.8") == "8.8.8.8"
 
 
 def test_client_ip_from_xff_ignores_spoofed_loopback():
-    # A scanner sending "X-Forwarded-For: 127.0.0.1" must not poison attribution.
-    assert tbenv.client_ip_from_xff("127.0.0.1, 198.51.100.7") == "198.51.100.7"
+    # A scanner sending "X-Forwarded-For: 127.0.0.1" must not poison
+    # attribution; nginx appends the real address to its right.
+    assert tbenv.client_ip_from_xff("127.0.0.1, 8.8.8.8") == "8.8.8.8"
 
 
-def test_client_ip_from_xff_multi_hop_takes_last():
-    assert tbenv.client_ip_from_xff("1.1.1.1, 2.2.2.2, 3.3.3.3") == "3.3.3.3"
+def test_client_ip_from_xff_skips_trailing_loopback_hop():
+    # Real fleet shape: spoofed left, real client in the middle, an internal
+    # loopback proxy hop appended on the right. The middle (real) wins.
+    assert tbenv.client_ip_from_xff(
+        "127.0.0.1, 8.8.8.8, 127.0.0.1") == "8.8.8.8"
+
+
+def test_client_ip_from_xff_skips_trailing_private_hops():
+    assert tbenv.client_ip_from_xff(
+        "1.1.1.1, 8.8.8.8, 10.0.0.3, 127.0.0.1") == "8.8.8.8"
+
+
+def test_client_ip_from_xff_all_internal_falls_back_to_last():
+    assert tbenv.client_ip_from_xff("127.0.0.1, 10.0.0.1") == "10.0.0.1"
+
+
+def test_client_ip_from_xff_handles_non_ip_tokens():
+    # Non-IP tokens (e.g. "unknown") are not treated as internal hops.
+    assert tbenv.client_ip_from_xff("unknown, 8.8.8.8, 127.0.0.1") == "8.8.8.8"
 
 
 def test_client_ip_from_xff_strips_whitespace():
-    assert tbenv.client_ip_from_xff("127.0.0.1,   198.51.100.7  ") == "198.51.100.7"
+    assert tbenv.client_ip_from_xff(
+        "127.0.0.1,   8.8.8.8 , 127.0.0.1 ") == "8.8.8.8"
 
 
-def test_log_context_uses_rightmost_xff_for_client_ip():
+def test_is_internal_ip():
+    assert tbenv._is_internal_ip("127.0.0.1")
+    assert tbenv._is_internal_ip("10.0.0.1")
+    assert tbenv._is_internal_ip("192.168.1.1")
+    assert tbenv._is_internal_ip("::1")
+    assert not tbenv._is_internal_ip("8.8.8.8")
+    assert not tbenv._is_internal_ip("unknown")
+
+
+def test_log_context_picks_real_client_through_two_proxy_hops():
+    # Mirrors the live fleet XFF exactly: spoofed 127.0.0.1, real client
+    # appended by the public nginx, then an internal loopback hop on the
+    # right ("127.0.0.1, <real>, 127.0.0.1").
     from aiohttp.test_utils import make_mocked_request
 
     req = make_mocked_request(
         "GET", "/.env",
-        headers={"X-Forwarded-For": "127.0.0.1, 198.51.100.7",
+        headers={"X-Forwarded-For": "127.0.0.1, 206.189.115.96, 127.0.0.1",
                  "Host": "sensor.example.com"},
     )
     ctx = tbenv._log_context_from_request(req, "req-1", 0, "")
-    assert ctx["clientIp"] == "198.51.100.7"
+    assert ctx["clientIp"] == "206.189.115.96"
