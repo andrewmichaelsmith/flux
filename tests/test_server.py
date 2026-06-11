@@ -9739,3 +9739,41 @@ def test_django_debug_toolbar_renderer_per_hit_unique_secret_key():
     sk2 = _re.search(rb"SECRET_KEY</td><td>'([^']+)'", body2)
     assert sk1 and sk2
     assert sk1.group(1) != sk2.group(1)
+
+
+def test_client_ip_from_xff_empty():
+    assert tbenv.client_ip_from_xff("") == ""
+
+
+def test_client_ip_from_xff_single_entry():
+    assert tbenv.client_ip_from_xff("203.0.113.9") == "203.0.113.9"
+
+
+def test_client_ip_from_xff_trusts_rightmost_appended_peer():
+    # nginx appends the real $remote_addr on the right; left is client-supplied.
+    assert tbenv.client_ip_from_xff("203.0.113.9, 198.51.100.7") == "198.51.100.7"
+
+
+def test_client_ip_from_xff_ignores_spoofed_loopback():
+    # A scanner sending "X-Forwarded-For: 127.0.0.1" must not poison attribution.
+    assert tbenv.client_ip_from_xff("127.0.0.1, 198.51.100.7") == "198.51.100.7"
+
+
+def test_client_ip_from_xff_multi_hop_takes_last():
+    assert tbenv.client_ip_from_xff("1.1.1.1, 2.2.2.2, 3.3.3.3") == "3.3.3.3"
+
+
+def test_client_ip_from_xff_strips_whitespace():
+    assert tbenv.client_ip_from_xff("127.0.0.1,   198.51.100.7  ") == "198.51.100.7"
+
+
+def test_log_context_uses_rightmost_xff_for_client_ip():
+    from aiohttp.test_utils import make_mocked_request
+
+    req = make_mocked_request(
+        "GET", "/.env",
+        headers={"X-Forwarded-For": "127.0.0.1, 198.51.100.7",
+                 "Host": "sensor.example.com"},
+    )
+    ctx = tbenv._log_context_from_request(req, "req-1", 0, "")
+    assert ctx["clientIp"] == "198.51.100.7"

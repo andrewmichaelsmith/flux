@@ -1850,10 +1850,20 @@ def append_log(payload: dict[str, object]) -> None:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
-def first_forwarded_ip(header_value: str) -> str:
+def client_ip_from_xff(header_value: str) -> str:
+    """Real client IP from an ``X-Forwarded-For`` chain set by a single
+    trusted reverse proxy.
+
+    nginx (``$proxy_add_x_forwarded_for``) appends the real peer
+    (``$remote_addr``) to the right of whatever the client supplied, so the
+    rightmost entry is the only value the client cannot forge. Trusting the
+    leftmost entry lets a scanner send ``X-Forwarded-For: 127.0.0.1`` and
+    poison client-IP attribution: the spoofed value survives as the left
+    entry while the real address is appended on the right.
+    """
     if not header_value:
         return ""
-    return header_value.split(",", 1)[0].strip()
+    return header_value.rsplit(",", 1)[-1].strip()
 
 
 def clean_host(header_value: str) -> str:
@@ -12494,7 +12504,7 @@ def find_canary_trap(path: str) -> "CanaryTrap | None":
 
 def _log_context_from_request(request: web.Request, request_id: str, body_bytes_read: int, body_sha256: str) -> dict[str, object]:
     host = clean_host(request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or "")
-    client_ip = first_forwarded_ip(request.headers.get("X-Forwarded-For", ""))
+    client_ip = client_ip_from_xff(request.headers.get("X-Forwarded-For", ""))
     user_agent = request.headers.get("User-Agent", "")
     proto = (request.headers.get("X-Forwarded-Proto") or "http").strip().lower()
     url = request.rel_url
