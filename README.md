@@ -156,6 +156,8 @@ case-insensitive exact matches.
 | --- | --- | --- | --- |
 | AWS credentials file (INI) | `/.aws/credentials` | `aws` | `aws-credentials-file` |
 | AWS SDK config (INI) | `/.aws/config` | `aws` | `aws-config-file` |
+| AWS Console-downloaded `credentials.csv` (IAM-user-creation) — [docs](./docs/aws-credentials-csv.md) | `/credentials.csv`, `/aws-credentials.csv`, `/aws_credentials.csv`, `/new_user_credentials.csv`, `/iam-credentials.csv`, `/iam_credentials.csv`, plus webroot-prefix `/admin/`, `/users/`, `/iam/`, `/app/`, `/backend/`, `/api/`, `/private/`, `/backup/` variants | `aws` | `aws-credentials-csv` |
+| AWS Console "Create access key" CSV (two-column) — [docs](./docs/aws-credentials-csv.md) | `/accesskeys.csv`, `/access_keys.csv`, `/access-keys.csv`, `/accesskey.csv`, `/rootkey.csv`, `/root_key.csv`, `/root-key.csv`, `/aws-access-keys.csv`, `/aws_access_keys.csv` | `aws` | `aws-access-keys-csv` |
 | AWS Python SDK / `gsutil` boto config | `/.boto`, `/.boto3`, `/root/.boto`, `/home/.boto` | `aws` | `boto-config` |
 | AWS Amplify CLI project config | `/.amplifyrc` | `aws` | `amplifyrc` |
 | Terraform tfstate (JSON) — [docs](./docs/terraform-tfstate.md) | `/.terraform/terraform.tfstate`, `/terraform.tfstate`, `/terraform.tfstate.backup` | `aws` | `terraform-tfstate` |

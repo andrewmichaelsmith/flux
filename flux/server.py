@@ -10682,6 +10682,52 @@ def render_laravel_ignition(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_aws_credentials_csv(r: dict[str, object]) -> bytes:
+    """AWS Console-downloaded `credentials.csv` — the file every IAM-user-
+    creation flow drops in the operator's browser when "Provide user access
+    to the AWS Console" is selected. Five-column shape with the Console
+    sign-in password alongside the programmatic access key, plus a
+    `signin.aws.amazon.com` URL whose subdomain is the 12-digit account ID.
+    Scanner dictionaries walk this filename (and the historical siblings
+    `accessKeys.csv` / `new_user_credentials.csv` / `rootkey.csv`) ahead of
+    `~/.aws/credentials` because the CSV is what shows up in misconfigured
+    static-file servers — operators "back up" the download into the webroot
+    and forget. Field-keyed harvesters greppe row 2 cols 3+4 for AKIA
+    bytes; the password column is a per-hit synthetic (not a Tracebit
+    canary — the gitlab-username-password type replays against a hosted
+    GitLab URL, not the AWS Console). Account ID is per-hit random so the
+    URL isn't a fleet-wide fingerprint."""
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "")
+    secret_key = aws.get("awsSecretAccessKey", "")
+    password = _fake_db_password()
+    account_id = "".join(secrets.choice("0123456789") for _ in range(12))
+    # AWS Console downloads use CRLF line endings.
+    return (
+        "User name,Password,Access key ID,Secret access key,Console login link\r\n"
+        f"iam-deploy-bot,{password},{access_key},{secret_key},"
+        f"https://{account_id}.signin.aws.amazon.com/console\r\n"
+    ).encode("utf-8")
+
+
+def render_aws_access_keys_csv(r: dict[str, object]) -> bytes:
+    """AWS Console "Create access key" CSV — the two-column download you
+    get from the IAM user's Security credentials tab when minting a new
+    access key for an existing user. Same canary placement as the
+    five-column credentials.csv, but without the Console sign-in fields
+    (there's no new password to ship). Historical filenames that hit
+    this shape include `accessKeys.csv` and the deprecated `rootkey.csv`
+    (root-account access-keys download, retired by AWS in 2014 but still
+    walked by scanner dictionaries to this day)."""
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "")
+    secret_key = aws.get("awsSecretAccessKey", "")
+    return (
+        "Access key ID,Secret access key\r\n"
+        f"{access_key},{secret_key}\r\n"
+    ).encode("utf-8")
+
+
 def render_amplifyrc_json(r: dict[str, object]) -> bytes:
     """`.amplifyrc` is an AWS Amplify CLI project config that some teams
     accidentally commit. Real shape varies by Amplify version, but the
@@ -10796,6 +10842,64 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_amplifyrc_json,
         "application/json; charset=utf-8",
+    ),
+    # AWS Console-downloaded `credentials.csv` — the file every IAM-user-
+    # creation flow drops in the operator's browser when "Provide user
+    # access to the AWS Console" is selected. Five-column shape (User
+    # name, Password, Access key ID, Secret access key, Console login
+    # link). Scanner dictionaries walk this filename ahead of
+    # `~/.aws/credentials` because the CSV is what tends to end up in
+    # misconfigured static-file servers — operators "back up" the
+    # download into the webroot and forget. Webroot-prefix variants
+    # (`/admin/`, `/users/`, `/iam/`, `/app/`, `/backend/`) mirror the
+    # gcp-credentials-json and terraform-tfstate patterns for monorepos
+    # checking the CSV into an `infra/`-style subdir.
+    CanaryTrap(
+        "aws-credentials-csv",
+        (
+            "/credentials.csv",
+            "/aws-credentials.csv",
+            "/aws_credentials.csv",
+            "/new_user_credentials.csv",
+            "/iam-credentials.csv",
+            "/iam_credentials.csv",
+            # Webroot-prefix variants — same scanner-dictionary walking
+            # pattern that hits `/admin/credentials.json` etc.
+            "/admin/credentials.csv",
+            "/users/credentials.csv",
+            "/iam/credentials.csv",
+            "/app/credentials.csv",
+            "/backend/credentials.csv",
+            "/api/credentials.csv",
+            "/private/credentials.csv",
+            "/backup/credentials.csv",
+        ),
+        ("aws",),
+        render_aws_credentials_csv,
+        "text/csv; charset=utf-8",
+    ),
+    # AWS Console "Create access key" CSV — the two-column download
+    # operators get from the IAM user's Security credentials tab. Same
+    # canary placement as the five-column variant above; the difference
+    # is only the surrounding columns. `rootkey.csv` is the deprecated
+    # root-account access-key download (retired by AWS in 2014 but
+    # still walked by every credential-scanning dictionary in the wild).
+    CanaryTrap(
+        "aws-access-keys-csv",
+        (
+            "/accesskeys.csv",
+            "/access_keys.csv",
+            "/access-keys.csv",
+            "/accesskey.csv",
+            "/rootkey.csv",
+            "/root_key.csv",
+            "/root-key.csv",
+            "/aws-access-keys.csv",
+            "/aws_access_keys.csv",
+        ),
+        ("aws",),
+        render_aws_access_keys_csv,
+        "text/csv; charset=utf-8",
     ),
     CanaryTrap(
         "terraform-tfstate",

@@ -814,6 +814,26 @@ FAKE_TRACEBIT = {
     # aws-credentials-file backup-rotation variants.
     ("/.aws/credentials.bak", b"aws_access_key_id"),
     ("/.aws/credentials.old", b"aws_access_key_id"),
+    # aws-credentials-csv — AWS Console IAM-user-creation download.
+    # Five-column shape with the Console password alongside the access
+    # key. Field-keyed harvesters greppe row 2 cols 3+4 for AKIA bytes.
+    ("/credentials.csv", b"User name,Password,Access key ID,Secret access key,Console login link"),
+    ("/credentials.csv", b",AKIAFAKEEXAMPLE01,wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY,"),
+    ("/credentials.csv", b"signin.aws.amazon.com/console"),
+    ("/aws-credentials.csv", b"AKIAFAKEEXAMPLE01"),
+    ("/new_user_credentials.csv", b"AKIAFAKEEXAMPLE01"),
+    ("/admin/credentials.csv", b"AKIAFAKEEXAMPLE01"),
+    ("/backend/credentials.csv", b"AKIAFAKEEXAMPLE01"),
+    ("/iam/credentials.csv", b"AKIAFAKEEXAMPLE01"),
+    # aws-access-keys-csv — AWS Console "Create access key" two-column
+    # download for an existing IAM user. Also catches `rootkey.csv`
+    # (deprecated root-account access-key download, retired 2014 but
+    # still walked by scanner dictionaries).
+    ("/accesskeys.csv", b"Access key ID,Secret access key"),
+    ("/accesskeys.csv", b"AKIAFAKEEXAMPLE01,wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+    ("/access_keys.csv", b"AKIAFAKEEXAMPLE01"),
+    ("/rootkey.csv", b"AKIAFAKEEXAMPLE01"),
+    ("/root-key.csv", b"AKIAFAKEEXAMPLE01"),
     # terraform-tfstate webroot-prefix variants.
     ("/terraform/terraform.tfstate", b"AKIAFAKEEXAMPLE01"),
     ("/infra/terraform.tfstate", b"AKIAFAKEEXAMPLE01"),
@@ -1627,6 +1647,33 @@ def test_render_terraform_tfvars_json_is_valid_json():
     "/infra/terraform.tfstate",
     "/infrastructure/terraform.tfstate",
     "/ops/terraform.tfstate",
+    # aws-credentials-csv — AWS Console IAM-user-creation download
+    # and its scanner-dictionary siblings.
+    "/credentials.csv",
+    "/aws-credentials.csv",
+    "/aws_credentials.csv",
+    "/new_user_credentials.csv",
+    "/iam-credentials.csv",
+    "/iam_credentials.csv",
+    "/admin/credentials.csv",
+    "/users/credentials.csv",
+    "/iam/credentials.csv",
+    "/app/credentials.csv",
+    "/backend/credentials.csv",
+    "/api/credentials.csv",
+    "/private/credentials.csv",
+    "/backup/credentials.csv",
+    # aws-access-keys-csv — two-column "Create access key" download
+    # and the deprecated root-account access-key download.
+    "/accesskeys.csv",
+    "/access_keys.csv",
+    "/access-keys.csv",
+    "/accesskey.csv",
+    "/rootkey.csv",
+    "/root_key.csv",
+    "/root-key.csv",
+    "/aws-access-keys.csv",
+    "/aws_access_keys.csv",
 ])
 def test_new_canary_trap_paths_dispatch(path):
     assert path.lower() in tbenv._TRAP_BY_PATH, (
@@ -1722,6 +1769,58 @@ async def test_dispatch_routes_aws_credentials_file_to_trap(flux_client, monkeyp
     assert b"AKIAFAKEEXAMPLE01" in body
     entries = _log_entries(flux_client.log_path)
     assert entries[-1]["result"] == "aws-credentials-file"
+
+
+@pytest.mark.parametrize("path,expected_result", [
+    ("/credentials.csv", "aws-credentials-csv"),
+    ("/new_user_credentials.csv", "aws-credentials-csv"),
+    ("/admin/credentials.csv", "aws-credentials-csv"),
+    # Case-scrambling is the high-intent scanner shape per the Console
+    # download — `_TRAP_BY_PATH` lookups are case-folded.
+    ("/Credentials.CSV", "aws-credentials-csv"),
+    ("/accessKeys.csv", "aws-access-keys-csv"),
+    ("/rootkey.csv", "aws-access-keys-csv"),
+    ("/ACCESS_KEYS.CSV", "aws-access-keys-csv"),
+])
+async def test_dispatch_routes_aws_credentials_csv_to_trap(
+    flux_client, monkeypatch, path, expected_result,
+):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.11"})
+    assert resp.status == 200
+    assert resp.headers["Content-Type"] == "text/csv; charset=utf-8"
+    body = await resp.read()
+    # Real AWS Console downloads use CRLF line endings.
+    assert body.count(b"\r\n") >= 2
+    assert b"AKIAFAKEEXAMPLE01" in body
+    assert b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == expected_result
+    assert "aws" in entries[-1]["canaryTypes"]
+
+
+def test_aws_credentials_csv_account_id_is_per_hit_unique():
+    # Account ID embedded in the Console-login URL must rotate per hit so
+    # the rendered body isn't a fleet-wide fingerprint. (Username and the
+    # AKIA bytes are also per-hit, but the account ID is the one that
+    # would otherwise default to a single fixed literal.)
+    bodies = {tbenv.render_aws_credentials_csv(FAKE_TRACEBIT) for _ in range(8)}
+    assert len(bodies) >= 4, "account-id and password should rotate per render"
+
+
+def test_aws_credentials_csv_has_no_fixed_credential_literal():
+    # Synthetic password must change between renders — a fixed literal
+    # would turn the trap into a fleet-wide fingerprint string.
+    passwords = set()
+    for _ in range(8):
+        body = tbenv.render_aws_credentials_csv(FAKE_TRACEBIT).decode("utf-8")
+        # Row 2: `iam-deploy-bot,<password>,AKIA...`
+        data_row = body.splitlines()[1]
+        passwords.add(data_row.split(",")[1])
+    assert len(passwords) >= 4, "password column must be per-hit synthetic"
 
 
 @pytest.mark.parametrize("path", [
