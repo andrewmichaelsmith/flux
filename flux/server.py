@@ -1212,6 +1212,57 @@ def _confluence_has_ognl(path: str, query: str, body_preview: str) -> bool:
     return any(needle in haystack for needle in _CONFLUENCE_OGNL_INDICATORS)
 
 
+# --- Fake Liferay Portal JSON Web Services (CVE-2020-7961 marshaller RCE bait) ---
+# `/api/jsonws` is the auto-generated JSON Web Services discovery surface
+# on Liferay Portal 6.x / 7.x. Scanners walk it to:
+#   1. Fingerprint Liferay + the available service catalog
+#      (GET /api/jsonws → HTML index page that lists every registered
+#      JSONWebService bean).
+#   2. Read method signatures for follow-on exploitation
+#      (GET /api/jsonws?serviceClassName=... → JSON catalog for a single
+#      service).
+#   3. Ship the marshaller-RCE payload to /api/jsonws/invoke — a JSON
+#      array whose entries declare {className, args}; on a vulnerable
+#      build the JODD-marshaller instantiates arbitrary classes. The
+#      canonical CVE-2020-7961 sink is
+#      `com.mchange.v2.c3p0.WrapperConnectionPoolDataSource` with a
+#      `userOverridesAsString` JNDI lookup that points at an
+#      attacker-controlled LDAP server.
+# Real Liferay ships a Tomcat-style server header and a
+# `Liferay-Portal: ...` response header that version-gated scanners use
+# to decide whether to send the exploit; the landing HTML is also the
+# slot credential scrapers grep for AKIA/secret pairs configured in
+# portal-ext.properties for S3-backed Document Library storage.
+LIFERAY_ENABLED = _env_bool("HONEYPOT_LIFERAY_ENABLED")
+LIFERAY_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_LIFERAY_BODY_DECODE_LIMIT") or "8192").strip() or "8192"),
+    512,
+)
+# Pinned inside the CVE-2020-7961 public-disclosure window so version-
+# gated scanners ship the marshaller payload instead of bailing on a
+# patched banner.
+LIFERAY_VERSION = (os.environ.get("HONEYPOT_LIFERAY_VERSION") or "7.2.0 GA1").strip()
+LIFERAY_BUILD_NUMBER = (os.environ.get("HONEYPOT_LIFERAY_BUILD_NUMBER") or "7200").strip()
+# Marshaller / JNDI / RCE indicators on the /api/jsonws/invoke body —
+# flips `liferayHasMarshallerPayload` for fast triage. The canonical
+# CVE-2020-7961 payload always carries the WrapperConnectionPoolDataSource
+# class name plus an `ldap://` or `rmi://` JNDI URL; the broader set
+# catches obfuscation variants and follow-on probes.
+_LIFERAY_MARSHALLER_INDICATORS = (
+    b"wrapperconnectionpooldatasource",  # CVE-2020-7961 canonical sink
+    b"useroverridesasstring",
+    b"com.mchange.v2.c3p0",
+    b"javax.naming",
+    b"jndilookup",
+    b"$jndilookup",
+    b"ldap://",
+    b"rmi://",
+    b"runtime.getruntime",
+    b"processbuilder",
+    b"jodd.bean",
+)
+
+
 # --- Fake SAP NetWeaver Visual Composer MetadataUploader ---------------
 # `/developmentserver/metadatauploader` is the Visual Composer endpoint
 # scanners walk to fingerprint SAP NetWeaver Application Server Java and
@@ -2258,6 +2309,25 @@ def is_geoserver_path(path: str) -> bool:
     if p == "/geoserver":
         return True
     return p.startswith("/geoserver/")
+
+
+def is_liferay_path(path: str) -> bool:
+    """Match the Liferay Portal JSON-WS discovery surface. Strip any
+    query string before comparing — `/api/jsonws?serviceClassName=…`
+    and bare `/api/jsonws` must both dispatch here."""
+    if not LIFERAY_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    if lp in {"/api/jsonws", "/api/jsonws/"}:
+        return True
+    return lp.startswith("/api/jsonws/")
+
+
+def _liferay_has_marshaller(body_bytes: bytes) -> bool:
+    if not body_bytes:
+        return False
+    haystack = body_bytes[:LIFERAY_BODY_DECODE_LIMIT].lower()
+    return any(needle in haystack for needle in _LIFERAY_MARSHALLER_INDICATORS)
 
 
 def is_cmd_injection_path(path: str) -> bool:
@@ -4807,6 +4877,113 @@ def render_geoserver_capabilities(service: str, version: str) -> bytes:
 </{svc}_Capabilities>
 """
     return body.encode("utf-8")
+
+
+def render_liferay_jsonws_landing(host: str, aws: dict, version: str, build: str) -> bytes:
+    """Liferay JSON-WS HTML index. The real `/api/jsonws` page lists every
+    @JSONWebService-annotated method registered in the portal; scanners
+    grep the table for service names and AKIA/secret pairs that
+    deployments sometimes leave in service-description text after copying
+    portal-ext.properties values into documentation."""
+    key = aws.get("awsAccessKeyId", "") if isinstance(aws, dict) else ""
+    secret = aws.get("awsSecretAccessKey", "") if isinstance(aws, dict) else ""
+    safe_host = (host or "portal.example").replace("<", "&lt;").replace(">", "&gt;")
+    body = f"""<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <title>JSON Web Services API</title>
+  <meta name=\"generator\" content=\"Liferay Portal Community Edition {version} (Build {build})\" />
+</head>
+<body class=\"liferay-portal-jsonws\">
+  <h1>{safe_host} - JSON Web Services API</h1>
+  <p>Liferay Community Edition <strong>{version}</strong> (build {build}).
+     The following services are available; click a row to inspect
+     method signatures or POST a JSON-RPC envelope to
+     <code>/api/jsonws/invoke</code>.</p>
+  <table class=\"jsonws-services\">
+    <thead><tr><th>Context</th><th>Service</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>Portal</td>
+          <td><a href=\"/api/jsonws?serviceClassName=com.liferay.portal.kernel.service.UserService\">UserService</a></td>
+          <td>User account CRUD + role management.</td></tr>
+      <tr><td>Portal</td>
+          <td><a href=\"/api/jsonws?serviceClassName=com.liferay.portal.kernel.service.GroupService\">GroupService</a></td>
+          <td>Site / organization group management.</td></tr>
+      <tr><td>Document Library</td>
+          <td><a href=\"/api/jsonws?serviceClassName=com.liferay.document.library.kernel.service.DLAppService\">DLAppService</a></td>
+          <td>Document Library file + folder CRUD. Backed by S3 bucket
+              <code>liferay-prod-documents</code>; portal-ext.properties
+              key <code>{key}</code> / secret <code>{secret}</code>
+              configured in dl.store.s3.</td></tr>
+      <tr><td>Document Library</td>
+          <td><a href=\"/api/jsonws?serviceClassName=com.liferay.document.library.kernel.service.DLFileEntryService\">DLFileEntryService</a></td>
+          <td>Document Library file entry queries.</td></tr>
+      <tr><td>Journal</td>
+          <td><a href=\"/api/jsonws?serviceClassName=com.liferay.journal.service.JournalArticleService\">JournalArticleService</a></td>
+          <td>Web Content / Journal article CRUD.</td></tr>
+      <tr><td>Asset</td>
+          <td><a href=\"/api/jsonws?serviceClassName=com.liferay.asset.kernel.service.AssetEntryService\">AssetEntryService</a></td>
+          <td>Asset entry queries + tagging.</td></tr>
+    </tbody>
+  </table>
+  <p class=\"jsonws-invoke\">Need to invoke a service from JSON?
+     POST a JSON-RPC envelope to
+     <code>/api/jsonws/invoke</code> (Content-Type:
+     <code>application/json</code>).</p>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_liferay_jsonws_service_signature(
+    service_class: str, aws: dict, version: str, build: str,
+) -> bytes:
+    """Single-service method catalog. Mimics the real /api/jsonws
+    `?serviceClassName=...` response: a JSON object with the service
+    name, method signatures, and parameter docs."""
+    key = aws.get("awsAccessKeyId", "") if isinstance(aws, dict) else ""
+    secret = aws.get("awsSecretAccessKey", "") if isinstance(aws, dict) else ""
+    catalog = {
+        "context": "Liferay-Portal",
+        "version": version,
+        "build": build,
+        "serviceClassName": service_class[:200],
+        "methods": [
+            {
+                "name": "getConfiguredS3Bucket",
+                "parameters": [],
+                "returnType": "java.util.Map<java.lang.String, java.lang.String>",
+                "default": {
+                    "bucket": "liferay-prod-documents",
+                    "region": "us-east-1",
+                    "accessKey": key,
+                    "secretKey": secret,
+                },
+            },
+            {
+                "name": "getFileAsStream",
+                "parameters": [
+                    {"name": "groupId", "type": "long"},
+                    {"name": "fileEntryId", "type": "long"},
+                ],
+                "returnType": "java.io.InputStream",
+            },
+            {
+                "name": "addFileEntry",
+                "parameters": [
+                    {"name": "groupId", "type": "long"},
+                    {"name": "folderId", "type": "long"},
+                    {"name": "sourceFileName", "type": "java.lang.String"},
+                    {"name": "mimeType", "type": "java.lang.String"},
+                    {"name": "bytes", "type": "byte[]"},
+                ],
+                "returnType": "com.liferay.document.library.kernel.model.DLFileEntry",
+            },
+        ],
+    }
+    return json.dumps(catalog, indent=2).encode("utf-8")
 
 
 def render_coldfusion_public_page(path: str, host: str, version: str) -> bytes:
@@ -15179,6 +15356,161 @@ async def _handle_geoserver(
     )
 
 
+async def _handle_liferay(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Liferay Portal JSON Web Services discovery + invoke (CVE-2020-7961
+    marshaller RCE bait). Mints a per-request Tracebit AWS canary and
+    embeds it in a fake S3-backed Document Library service description
+    so scrapers walking the discovery page (or the per-service signature
+    JSON) harvest a replay-fireable key. POST /api/jsonws/invoke captures
+    the JSON-RPC body and flips `liferayHasMarshallerPayload` on the
+    canonical CVE-2020-7961 sink indicators."""
+    lpath = path.lower().split("?", 1)[0]
+    method = request.method
+    host = str(log_context.get("host", ""))
+    request_id = str(log_context.get("requestId", ""))
+    client_ip = str(log_context.get("clientIp", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+
+    body_preview = ""
+    if request_body:
+        try:
+            body_preview = request_body[:LIFERAY_BODY_DECODE_LIMIT].decode(
+                "utf-8", errors="replace",
+            )
+        except UnicodeDecodeError:
+            body_preview = ""
+
+    has_marshaller = _liferay_has_marshaller(request_body)
+
+    service_class = ""
+    if query_string:
+        try:
+            qs = parse_qs(query_string, keep_blank_values=True)
+        except (ValueError, UnicodeDecodeError):
+            qs = {}
+        for key_name in ("serviceClassName", "serviceclassname"):
+            values = qs.get(key_name)
+            if values and values[0]:
+                service_class = values[0][:200]
+                break
+
+    log_extra: dict[str, object] = {
+        "liferayPath": path,
+        "liferayMethod": method,
+        "liferayHasMarshallerPayload": has_marshaller,
+    }
+    if service_class:
+        log_extra["liferayServiceClassName"] = service_class
+    if has_marshaller:
+        # Truncate aggressively — a single marshaller payload can be
+        # multi-KB and the existing log fields stay compact.
+        log_extra["liferayPayloadPreview"] = body_preview[:400]
+
+    tracebit_response = None
+    if API_KEY:
+        tracebit_response = await _get_or_issue_canary(
+            ("aws",), client_ip, request_id, host, user_agent, path, proto,
+        )
+    if tracebit_response is None:
+        # Keyless deployments (or upstream failure) still serve a
+        # plausible discovery page so banner-grab scanners keep walking;
+        # the canary slots just go empty.
+        tracebit_response = {}
+    aws = _aws(tracebit_response)
+    canary_types = [k for k, v in tracebit_response.items() if v]
+
+    common_headers = {
+        "Server": "Apache-Coyote/1.1",
+        "Liferay-Portal": f"Liferay Community Edition {LIFERAY_VERSION} (Build {LIFERAY_BUILD_NUMBER})",
+        "Cache-Control": "no-store",
+    }
+
+    # /api/jsonws/invoke — the CVE-2020-7961 sink. Capture the body and
+    # return a generic Liferay JSON-WS error envelope (a real vulnerable
+    # build returns the same shape when the marshaller fails before the
+    # JNDI lookup completes; the scanner expects a non-200 here on
+    # success path anyway).
+    if lpath == "/api/jsonws/invoke":
+        envelope = (
+            b'{"exception":"com.liferay.portal.kernel.jsonwebservice.'
+            b'JSONWebServiceInvocationException: Unable to convert '
+            b'parameters"}'
+        )
+        append_log({
+            **log_context,
+            "status": 500,
+            "result": "liferay-jsonws-invoke",
+            **log_extra,
+            "canaryTypes": canary_types,
+            "bytes": len(envelope),
+        })
+        return web.Response(
+            status=500, body=envelope,
+            headers={**common_headers, "Content-Type": "application/json; charset=utf-8"},
+        )
+
+    # GET (or HEAD) with ?serviceClassName=... — single-service catalog.
+    if service_class:
+        body = render_liferay_jsonws_service_signature(
+            service_class, aws, LIFERAY_VERSION, LIFERAY_BUILD_NUMBER,
+        )
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "liferay-jsonws-service-signature",
+            **log_extra,
+            "canaryTypes": canary_types,
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={**common_headers, "Content-Type": "application/json; charset=utf-8"},
+        )
+
+    # Bare /api/jsonws or /api/jsonws/ — landing HTML.
+    if lpath in {"/api/jsonws", "/api/jsonws/"}:
+        body = render_liferay_jsonws_landing(
+            host, aws, LIFERAY_VERSION, LIFERAY_BUILD_NUMBER,
+        )
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "liferay-jsonws-landing",
+            **log_extra,
+            "canaryTypes": canary_types,
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={**common_headers, "Content-Type": "text/html; charset=utf-8"},
+        )
+
+    # Anything else under /api/jsonws/ — log + Liferay-shaped 404.
+    envelope = (
+        b'{"exception":"com.liferay.portal.kernel.jsonwebservice.'
+        b'JSONWebServiceInvocationException: Path not mapped"}'
+    )
+    append_log({
+        **log_context,
+        "status": 404,
+        "result": "liferay-jsonws-miss",
+        **log_extra,
+        "canaryTypes": canary_types,
+        "bytes": len(envelope),
+    })
+    return web.Response(
+        status=404, body=envelope,
+        headers={**common_headers, "Content-Type": "application/json; charset=utf-8"},
+    )
+
+
 async def _handle_coldfusion(
     request: web.Request,
     log_context: dict[str, object],
@@ -16898,6 +17230,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_geoserver_path(path):
         return await _handle_geoserver(request, log_context, path, request_body)
+
+    if is_liferay_path(path):
+        return await _handle_liferay(request, log_context, path, query_string, request_body)
 
     if is_coldfusion_path(path):
         return await _handle_coldfusion(request, log_context, path, request_body)
