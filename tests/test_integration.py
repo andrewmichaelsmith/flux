@@ -590,7 +590,11 @@ async def test_integration_tarpit_drips_then_client_disconnects(live_server, mon
     base, log_path = live_server
     timeout = aiohttp.ClientTimeout(total=2)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(f"{base}/.env.bak") as resp:
+        # Use a `.env.*` leaf that is NOT in the env-production trap's
+        # expanded suffix list (every canonical suffix — `.bak`, `.local`,
+        # `.production`, etc. — now dispatches to the canary trap instead
+        # of the generic tarpit).
+        async with session.get(f"{base}/.env.unmapped-suffix") as resp:
             assert resp.status == 200
             # Read a little, then bail. Server should see the disconnect on its
             # next write and log tarpit-disconnect.

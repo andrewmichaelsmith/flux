@@ -6356,6 +6356,11 @@ def format_env_payload(tracebit_response: dict[str, object]) -> str:
 
 _FAKE_GIT_LOCK: asyncio.Lock | None = None
 _FAKE_GIT_CACHE: dict[str, tuple[float, dict[str, bytes], dict[str, object]]] = {}
+# Single-flight gate: same shape as `_CANARY_INFLIGHT`. A burst of concurrent
+# `<prefix>/.git/config` probes from one IP would otherwise all bypass the
+# empty cache, all call `issue_credentials`, and most of them 502 when the
+# upstream rate-limits.
+_FAKE_GIT_INFLIGHT: dict[str, "asyncio.Future[tuple[dict[str, bytes], dict[str, object]] | None]"] = {}
 
 
 def _get_fake_git_lock() -> asyncio.Lock:
@@ -6710,28 +6715,57 @@ async def _fake_git_get_or_build(
         entry = _FAKE_GIT_CACHE.get(cache_key)
         if entry and entry[0] > now:
             return entry[1], entry[2]
+        inflight = _FAKE_GIT_INFLIGHT.get(cache_key)
+        if inflight is not None:
+            waiter = inflight
+            is_issuer = False
+        else:
+            waiter = asyncio.get_event_loop().create_future()
+            _FAKE_GIT_INFLIGHT[cache_key] = waiter
+            is_issuer = True
 
-    # Release the lock during the network call so a burst of different IPs
-    # can issue in parallel; the cache is only guarded for mutation.
+    if not is_issuer:
+        try:
+            return await waiter
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+
+    # Release the lock during the network call so different IPs can issue in
+    # parallel; for the same IP, the in-flight gate above coalesces N hits
+    # onto this one issuance.
     try:
-        tracebit_response = await issue_credentials(request_id, client_ip, host, user_agent, path, proto)
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-        return None
+        try:
+            tracebit_response = await issue_credentials(request_id, client_ip, host, user_agent, path, proto)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            async with lock:
+                _FAKE_GIT_INFLIGHT.pop(cache_key, None)
+            if not waiter.done():
+                waiter.set_result(None)
+            return None
 
-    secrets_body = _format_secrets_yaml(tracebit_response)
-    files, meta = _build_fake_repo(secrets_body, tracebit_response)
-    meta["canaryTypes"] = [key for key, value in tracebit_response.items() if value]
+        secrets_body = _format_secrets_yaml(tracebit_response)
+        files, meta = _build_fake_repo(secrets_body, tracebit_response)
+        meta["canaryTypes"] = [key for key, value in tracebit_response.items() if value]
 
-    expiry = now + FAKE_GIT_CACHE_TTL_SECONDS
-    async with lock:
-        expired = [k for k, v in _FAKE_GIT_CACHE.items() if v[0] <= now]
-        for k in expired:
-            del _FAKE_GIT_CACHE[k]
-        if len(_FAKE_GIT_CACHE) >= FAKE_GIT_CACHE_MAX_ENTRIES:
-            oldest_key = min(_FAKE_GIT_CACHE, key=lambda k: _FAKE_GIT_CACHE[k][0])
-            del _FAKE_GIT_CACHE[oldest_key]
-        _FAKE_GIT_CACHE[cache_key] = (expiry, files, meta)
-    return files, meta
+        expiry = now + FAKE_GIT_CACHE_TTL_SECONDS
+        async with lock:
+            expired = [k for k, v in _FAKE_GIT_CACHE.items() if v[0] <= now]
+            for k in expired:
+                del _FAKE_GIT_CACHE[k]
+            if len(_FAKE_GIT_CACHE) >= FAKE_GIT_CACHE_MAX_ENTRIES:
+                oldest_key = min(_FAKE_GIT_CACHE, key=lambda k: _FAKE_GIT_CACHE[k][0])
+                del _FAKE_GIT_CACHE[oldest_key]
+            _FAKE_GIT_CACHE[cache_key] = (expiry, files, meta)
+            _FAKE_GIT_INFLIGHT.pop(cache_key, None)
+        if not waiter.done():
+            waiter.set_result((files, meta))
+        return files, meta
+    except BaseException:
+        async with lock:
+            _FAKE_GIT_INFLIGHT.pop(cache_key, None)
+        if not waiter.done():
+            waiter.set_result(None)
+        raise
 
 
 # --- Canary-backed file traps ---
@@ -6743,6 +6777,10 @@ async def _fake_git_get_or_build(
 
 _CANARY_LOCK: asyncio.Lock | None = None
 _CANARY_CACHE: dict[tuple[str, tuple[str, ...]], tuple[float, dict[str, object]]] = {}
+# In-flight issuance futures keyed identically to _CANARY_CACHE. Concurrent
+# requests with the same (IP, types) tuple await one issuance instead of all
+# racing into issue_credentials() and getting rate-limited by the canary API.
+_CANARY_INFLIGHT: dict[tuple[str, tuple[str, ...]], "asyncio.Future[dict[str, object] | None]"] = {}
 CANARY_TRAP_CACHE_TTL_SECONDS = max(
     int((os.environ.get("CANARY_TRAP_CACHE_TTL_SECONDS") or "3600").strip() or "3600"), 60,
 )
@@ -6771,7 +6809,11 @@ async def _get_or_issue_canary(
     """Per-(IP, types) TTL-cached canary issuance.
 
     A scanner that fans out on the same trap (or different traps needing the
-    same canary types) within the TTL gets one canary, not N.
+    same canary types) within the TTL gets one canary, not N. Concurrent
+    requests that arrive before the first issuance returns share one in-flight
+    Future via `_CANARY_INFLIGHT` — without this single-flight gate, a burst
+    of N parallel hits on the same key all bypass the empty cache and all hit
+    the upstream API, which then rate-limits and 502s every trap response.
     """
     now = time.monotonic()
     cache_key = (client_ip or f"_anon-{request_id}", types)
@@ -6780,20 +6822,49 @@ async def _get_or_issue_canary(
         entry = _CANARY_CACHE.get(cache_key)
         if entry and entry[0] > now:
             return entry[1]
+        inflight = _CANARY_INFLIGHT.get(cache_key)
+        if inflight is not None:
+            waiter = inflight
+            is_issuer = False
+        else:
+            waiter = asyncio.get_event_loop().create_future()
+            _CANARY_INFLIGHT[cache_key] = waiter
+            is_issuer = True
+
+    if not is_issuer:
+        try:
+            return await waiter
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+
     try:
-        resp = await issue_credentials(request_id, client_ip, host, user_agent, path, proto, types=types)
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-        return None
-    expiry = now + CANARY_TRAP_CACHE_TTL_SECONDS
-    async with lock:
-        expired = [k for k, v in _CANARY_CACHE.items() if v[0] <= now]
-        for k in expired:
-            del _CANARY_CACHE[k]
-        if len(_CANARY_CACHE) >= CANARY_TRAP_CACHE_MAX_ENTRIES:
-            oldest_key = min(_CANARY_CACHE, key=lambda k: _CANARY_CACHE[k][0])
-            del _CANARY_CACHE[oldest_key]
-        _CANARY_CACHE[cache_key] = (expiry, resp)
-    return resp
+        try:
+            resp = await issue_credentials(request_id, client_ip, host, user_agent, path, proto, types=types)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            async with lock:
+                _CANARY_INFLIGHT.pop(cache_key, None)
+            if not waiter.done():
+                waiter.set_result(None)
+            return None
+        expiry = now + CANARY_TRAP_CACHE_TTL_SECONDS
+        async with lock:
+            expired = [k for k, v in _CANARY_CACHE.items() if v[0] <= now]
+            for k in expired:
+                del _CANARY_CACHE[k]
+            if len(_CANARY_CACHE) >= CANARY_TRAP_CACHE_MAX_ENTRIES:
+                oldest_key = min(_CANARY_CACHE, key=lambda k: _CANARY_CACHE[k][0])
+                del _CANARY_CACHE[oldest_key]
+            _CANARY_CACHE[cache_key] = (expiry, resp)
+            _CANARY_INFLIGHT.pop(cache_key, None)
+        if not waiter.done():
+            waiter.set_result(resp)
+        return resp
+    except BaseException:
+        async with lock:
+            _CANARY_INFLIGHT.pop(cache_key, None)
+        if not waiter.done():
+            waiter.set_result(None)
+        raise
 
 
 # --- Render functions: (tracebit_response) -> bytes ---
@@ -8372,6 +8443,137 @@ def render_env_production(r: dict[str, object]) -> bytes:
         "AWS_REGION=us-east-1\n"
         f"DATABASE_URL=postgresql://prod_rw:{db_password}@db.internal:5432/prod\n"
     ).encode("utf-8")
+
+
+# `.env*` file siblings the off-the-shelf env-checker dictionaries walk for
+# every prefix. The empty string covers the bare `/<prefix>/.env`. The
+# canonical four-env tier (`.production` / `.local` / `.dev` / `.staging`)
+# is the most-walked subset; the rest catches sloppy-deploy artefacts
+# (editor swaps, numbered backups, .yaml/.yml/.json restyles, the
+# `.remote`/`.preprod`/`.uat`/`.stage`/`.sample` per-environment names) so a
+# scanner cycling its dictionary across `<prefix>/.env.<suffix>` lands on a
+# canary regardless of which file the suffix dictionary picks.
+_ENV_FILE_SUFFIXES: tuple[str, ...] = (
+    "",
+    ".production", ".prod", ".live",
+    ".local", ".dev", ".development", ".development.local",
+    ".test", ".test.local", ".staging", ".stage", ".uat", ".preprod",
+    ".qa", ".ci",
+    ".docker",
+    ".example", ".example.local", ".sample",
+    ".save", ".bak", ".backup", ".backup1", ".backup2",
+    ".old", ".orig", ".swp", "~",
+    ".dist", ".override", ".private", ".remote",
+    ".json", ".yaml", ".yml", ".txt",
+    "1", "2",
+    "_bak", "_old", "_orig", "_copy", "_priv", "_example",
+)
+
+# Webroot-prefix variants. Off-the-shelf env-harvester dictionaries walk a
+# `<prefix>/.env*` matrix that's much larger than the original
+# {mailer,opt,srv,var/www,app,backend,api} set this trap originally
+# shipped. Without coverage for the broader set, those probes fall into
+# the generic tarpit and never see the canary they were grepping for. The
+# list mirrors a representative full-dictionary scanner walk: app-server
+# prefixes, env tiers, build/CI roots, source-tree subdirs, niche
+# framework names, cloud/queue/db sidecars. Mail-service prefixes (sendgrid,
+# postmark, mailjet, brevo, mailgun, mailing, mail, mailserver) are owned
+# by the `mail-service-env` trap below and are not duplicated here.
+_ENV_WEBROOT_PREFIXES: tuple[str, ...] = (
+    "actions", "admin", "admin-panel", "administrator", "angular", "ansible",
+    "api", "app", "application", "apps", "assets", "aws", "azure",
+    "backend", "backup", "backups", "beta", "bin", "bootstrap", "build",
+    "buildkite", "bulk",
+    "cache", "cakephp", "campaign", "cd", "ci", "circleci", "client",
+    "cloud", "cms", "codeigniter", "config", "control-panel", "core", "crm",
+    "cron", "cronlab", "current",
+    "dashboard", "database", "deploy", "dev", "development", "dist",
+    "docker", "drupal",
+    "elasticsearch", "email", "en", "erp", "exapi", "express",
+    "frontend",
+    "gateway", "gcp", "github", "gitlab", "graphql",
+    "htdocs", "html",
+    "infrastructure", "internal",
+    "jenkins", "job", "joomla",
+    "k8s", "kafka", "kubernetes",
+    "lab", "laravel", "laravel5", "lib", "live", "local", "logs",
+    "magento", "mailer", "microservice", "mongodb", "mysql",
+    "nest", "newsletter", "next", "node", "notifications", "notify", "nuxt",
+    "old", "opt",
+    "panel", "portal", "postgres", "prestashop", "preview", "private",
+    "prod", "production", "project", "psnlink", "public", "public_html",
+    "qa", "queue",
+    "rabbitmq", "react", "redis", "release", "releases", "resources",
+    "rest",
+    "saas", "sbin", "scripts", "server", "service", "shared", "shop",
+    "shopify", "site", "sitemaps", "smtp", "src", "stage", "staging",
+    "storage", "store", "svelte", "symfony",
+    "temp", "terraform", "test", "tmp", "tools", "transactional",
+    "travis",
+    "uat", "uploads", "user-panel",
+    "v1", "v2", "v3", "vendor", "vite", "vue",
+    "web", "wordpress", "worker", "wp", "www",
+    "yii",
+    "zend",
+)
+
+_ENV_DEEP_PREFIXES: tuple[str, ...] = (
+    "var/www",
+    "var/www/html",
+    "srv",
+)
+
+
+def _env_production_paths() -> tuple[str, ...]:
+    """Generate the path tuple for the env-production canary trap.
+
+    Builds three groups:
+      1. Bare-dotfile variants — `/.env.production`, `/.env.bak`, etc.
+         Cover every entry in `_ENV_FILE_SUFFIXES` plus the legacy
+         `_<suffix>` aliases (`/.env_bak`, `/.env2`, `/.environ`).
+      2. `<prefix>/.env*` cross-product across `_ENV_WEBROOT_PREFIXES`
+         and `_ENV_DEEP_PREFIXES` (deeper than one segment).
+      3. `env.*` no-leading-dot variants (`/env.bak`, `/env.txt`) for the
+         sloppy-commit shape some dictionaries probe.
+
+    Mail-service prefixes (sendgrid, postmark, …) are excluded — the
+    dedicated `mail-service-env` trap below handles them with its own
+    renderer.
+    """
+    paths: list[str] = []
+
+    # Group 1 — bare-dotfile siblings. Every suffix EXCEPT the empty one
+    # (bare `/.env` is owned by the dedicated `_send_env` handler upstream
+    # of canary-trap dispatch — see handle() in server.py).
+    for suffix in _ENV_FILE_SUFFIXES:
+        if suffix == "":
+            continue
+        paths.append(f"/.env{suffix}")
+    # `/.environ` (no separator) is a recurring entry in newer harvesters.
+    paths.append("/.environ")
+
+    # Group 2 — webroot-prefix cross-product. Each prefix gets every
+    # suffix variant so the scanner's per-prefix dictionary walk lands
+    # on a canary on the first matching file.
+    for prefix in _ENV_WEBROOT_PREFIXES + _ENV_DEEP_PREFIXES:
+        for suffix in _ENV_FILE_SUFFIXES:
+            paths.append(f"/{prefix}/.env{suffix}")
+
+    # Group 3 — `env.*` (no leading dot). Same render shape; harvester
+    # greps for the AKIA bytes regardless of leading dot.
+    for suffix in (".bak", ".txt", ".old", ".save", ".backup"):
+        paths.append(f"/env{suffix}")
+
+    # Dedupe while preserving order — defensive against future overlap
+    # between the bare-dotfile and prefix loops.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        unique.append(p)
+    return tuple(unique)
 
 
 def _fake_mail_api_key(service: str) -> str:
@@ -11573,82 +11775,7 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "env-production",
-        (
-            # The canonical production / prod / live triple — the names
-            # scanners and operators agree mean "the file with real
-            # secrets in it".
-            "/.env.production",
-            "/.env.prod",
-            "/.env.live",
-            # Dev/test/staging/ci sibling files. Scanner dictionaries
-            # walk the full set, so a 200 on `.env.production` and a 404
-            # on `.env.local` / `.env.dev` is itself a fingerprint of a
-            # hand-rolled fake. Same render shape on every variant — a
-            # harvester greps for `AWS_ACCESS_KEY_ID=` and walks away
-            # with the canary regardless of which sibling it hit.
-            "/.env.local",
-            "/.env.dev",
-            "/.env.development",
-            "/.env.development.local",
-            "/.env.test",
-            "/.env.test.local",
-            "/.env.staging",
-            "/.env.example",
-            "/.env.example.local",
-            "/.env.ci",
-            "/.env.save",
-            "/.env.private",
-            "/.env.docker",
-            "/.env.override",
-            "/.env2",
-            # Underscore-separated backup variants used by the
-            # off-the-shelf "EnvChecker"-shaped dictionaries that hit
-            # the bare-dotfile + every common rotation-name in one
-            # sweep. Without these, a scanner with this dictionary
-            # collects 1 canary (`/.env`) instead of 6.
-            "/.env_bak",
-            "/.env_old",
-            "/.env_orig",
-            "/.env_priv",
-            "/.env_example",
-            # `/.environ` (no separator at all) is a niche but
-            # recurring entry in newer harvester dictionaries.
-            "/.environ",
-            # Webroot-prefix `.env` variants — scanners walking the
-            # `/<app-root>/.env` pattern. `/mailer/.env` was the
-            # original prefix; `/opt/.env` and the FHS-canonical app
-            # roots (`/srv`, `/var/www`, `/app`) extend the same
-            # shape. Same render — every harvester greps for the
-            # canary triple regardless of where the file lives.
-            "/mailer/.env",
-            "/opt/.env",
-            "/srv/.env",
-            "/var/www/.env",
-            "/app/.env",
-            # `/backend/.env*` and `/api/.env*` — reverse-proxy webroot
-            # prefixes that mount a backend service behind an HTTP
-            # gateway, mirroring the same prefix shape that scanners use
-            # for `/backend/actuator/*` and `/api/actuator/*`. Cover the
-            # bare file plus the four common per-env rotation names that
-            # the same dictionary walks.
-            "/backend/.env",
-            "/backend/.env.production",
-            "/backend/.env.local",
-            "/backend/.env.dev",
-            "/backend/.env.development",
-            "/backend/.env.staging",
-            "/api/.env",
-            "/api/.env.production",
-            "/api/.env.local",
-            "/api/.env.dev",
-            # `/env.*` (no leading dot) — scanner dictionaries probe the
-            # mis-named-but-still-grepped variants where an operator
-            # accidentally checked in `env.bak` / `env.txt` rather than
-            # `.env.bak`. Same render shape; harvester greps for the
-            # AKIA bytes regardless of leading dot.
-            "/env.bak",
-            "/env.txt",
-        ),
+        _env_production_paths(),
         ("aws",),
         render_env_production,
         "text/plain; charset=utf-8",

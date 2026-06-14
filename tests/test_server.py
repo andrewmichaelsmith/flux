@@ -1,11 +1,13 @@
 """Tests for flux.server."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
 import re
 
+import aiohttp
 import pytest
 
 from flux import server as tbenv
@@ -1695,6 +1697,212 @@ def test_bare_credentials_json_routes_to_config_json(path):
     assert trap.name == "config-json", (
         f"{path!r} must remain on config-json, not gcp-credentials-json"
     )
+
+
+@pytest.mark.parametrize("path", [
+    # Webroot-prefix `.env*` cross-product additions. These were previously
+    # silently captured by the tarpit (any leaf starting with `.env` hit
+    # `is_tarpit_path`), which dripped junk bytes but never embedded the
+    # canary the scanner was grepping for. Each entry below must dispatch
+    # to the env-production trap so a scanner-dictionary walk lands on a
+    # canary on first match.
+    # Representative app-framework prefixes
+    "/wp/.env", "/wordpress/.env", "/laravel/.env", "/symfony/.env",
+    "/magento/.env", "/drupal/.env", "/joomla/.env", "/prestashop/.env",
+    "/yii/.env", "/zend/.env", "/cakephp/.env", "/codeigniter/.env",
+    # Reverse-proxy webroot conventions
+    "/www/.env", "/web/.env", "/public/.env", "/public_html/.env",
+    "/html/.env", "/site/.env", "/htdocs/.env",
+    # Env tiers
+    "/dev/.env", "/development/.env", "/prod/.env", "/production/.env",
+    "/staging/.env", "/stage/.env", "/qa/.env", "/test/.env",
+    "/uat/.env", "/preprod" if False else "/preview/.env",  # 'preprod' covered as a suffix on dev
+    # Source/build tree
+    "/src/.env", "/core/.env", "/build/.env", "/dist/.env",
+    "/vendor/.env", "/lib/.env",
+    # API + frontend frameworks
+    "/api/.env", "/v1/.env", "/v2/.env", "/v3/.env", "/rest/.env",
+    "/graphql/.env", "/next/.env", "/nuxt/.env", "/vue/.env",
+    "/react/.env", "/angular/.env", "/svelte/.env", "/vite/.env",
+    # Cloud / CI / orchestration
+    "/aws/.env", "/azure/.env", "/gcp/.env", "/docker/.env",
+    "/k8s/.env", "/kubernetes/.env", "/terraform/.env", "/ansible/.env",
+    "/jenkins/.env", "/circleci/.env", "/github/.env", "/gitlab/.env",
+    # DB sidecars
+    "/mysql/.env", "/postgres/.env", "/mongodb/.env", "/redis/.env",
+    "/elasticsearch/.env", "/rabbitmq/.env", "/kafka/.env",
+    "/database/.env",
+    # Admin/dashboard surfaces
+    "/admin/.env", "/admin-panel/.env", "/administrator/.env",
+    "/dashboard/.env", "/panel/.env", "/portal/.env", "/cms/.env",
+    "/crm/.env", "/erp/.env", "/saas/.env", "/control-panel/.env",
+    "/user-panel/.env", "/shop/.env", "/store/.env", "/shopify/.env",
+    # Deep prefixes
+    "/var/www/.env", "/var/www/html/.env", "/srv/.env",
+    # Same prefix, common suffix variants — confirms the cross-product
+    # covers both axes, not just the bare `.env`.
+    "/wp/.env.production", "/wp/.env.local", "/wp/.env.bak",
+    "/wp/.env.dev", "/wp/.env.staging", "/wp/.env.backup",
+    "/wp/.env.remote", "/wp/.env_copy", "/wp/.env.swp", "/wp/.env~",
+    "/wp/.env.yaml", "/wp/.env.yml", "/wp/.env.json", "/wp/.env.dist",
+    "/wp/.env.uat", "/wp/.env.sample", "/wp/.env.preprod",
+    "/wp/.env.stage", "/wp/.env1", "/wp/.env2",
+    "/laravel/.env.production", "/laravel/.env.local",
+    "/laravel/.env.bak", "/laravel/.env.backup",
+    "/api/.env.production", "/api/.env.local", "/api/.env.bak",
+    "/api/.env.staging", "/api/.env.dev",
+    # Bare-dotfile suffix coverage gaps the original list missed
+    "/.env.bak", "/.env.backup", "/.env.backup1", "/.env.backup2",
+    "/.env.remote", "/.env.sample", "/.env.stage", "/.env.uat",
+    "/.env.preprod", "/.env.swp", "/.env~", "/.env.dist",
+    "/.env.yaml", "/.env.yml", "/.env.json", "/.env.txt",
+    "/.env1", "/.env_copy",
+    # Sloppy-commit `env.*` (no leading dot) variants
+    "/env.old", "/env.save", "/env.backup",
+])
+def test_env_prefix_paths_dispatch_to_env_production(path):
+    trap = tbenv._TRAP_BY_PATH.get(path.lower())
+    assert trap is not None and trap.name == "env-production", (
+        f"{path!r} should dispatch to env-production, got {trap and trap.name!r}"
+    )
+
+
+def test_env_prefix_paths_do_not_clobber_mail_service_env():
+    # Mail-service prefixes (sendgrid/postmark/mailjet/brevo/mailgun/
+    # mailing/mail/mailserver) must stay routed to the dedicated
+    # mail-service-env trap — not silently overwritten by the env-prefix
+    # cross-product. Regression for the trap-table ordering invariant.
+    for prefix in ("sendgrid", "postmark", "mailjet", "brevo", "mailgun",
+                   "mailing", "mail", "mailserver"):
+        trap = tbenv._TRAP_BY_PATH.get(f"/{prefix}/.env")
+        assert trap is not None and trap.name == "mail-service-env", (
+            f"/{prefix}/.env should be mail-service-env, got {trap and trap.name!r}"
+        )
+
+
+def test_env_prefix_paths_skip_bare_dot_env():
+    # Bare `/.env` is owned by the dedicated `_send_env` handler upstream
+    # of canary-trap dispatch — the env-production trap must not claim it
+    # or the dispatch order breaks.
+    assert "/.env" not in tbenv._TRAP_BY_PATH
+
+
+def test_env_production_paths_unique():
+    # The generator should dedupe — defensive against future overlap
+    # between bare-dotfile, prefix, and `env.*` loops.
+    paths = tbenv._env_production_paths()
+    assert len(paths) == len(set(paths)), "env-production paths should be unique"
+
+
+@pytest.mark.asyncio
+async def test_get_or_issue_canary_coalesces_concurrent_requests(monkeypatch):
+    """Concurrent requests for the same (IP, types) tuple must share one
+    upstream issuance — without single-flight, a burst of N parallel hits
+    from one scanner trips the canary API rate limit and most responses
+    come back as 502 errors.
+    """
+    monkeypatch.setattr(tbenv, "_CANARY_CACHE", {})
+    monkeypatch.setattr(tbenv, "_CANARY_INFLIGHT", {})
+    monkeypatch.setattr(tbenv, "_CANARY_LOCK", None)
+
+    issue_calls = 0
+
+    async def _slow_issue(*a, **kw):
+        nonlocal issue_calls
+        issue_calls += 1
+        await asyncio.sleep(0.05)
+        return {"aws": {"awsAccessKeyId": f"AKIAFAKE{issue_calls:04d}"}}
+
+    monkeypatch.setattr(tbenv, "issue_credentials", _slow_issue)
+
+    results = await asyncio.gather(*[
+        tbenv._get_or_issue_canary(
+            ("aws",), "10.0.0.1", f"req-{i}", "host", "ua", "/p", "https",
+        )
+        for i in range(20)
+    ])
+    # Exactly one upstream call, regardless of fan-out.
+    assert issue_calls == 1, f"expected 1 issue, got {issue_calls}"
+    # Every concurrent waiter got the same canary back.
+    assert all(r == results[0] for r in results)
+    assert results[0] is not None
+
+
+@pytest.mark.asyncio
+async def test_get_or_issue_canary_clears_inflight_on_error(monkeypatch):
+    """A failed issuance must clear `_CANARY_INFLIGHT` so the next request
+    re-tries rather than hanging forever on a stale future.
+    """
+    monkeypatch.setattr(tbenv, "_CANARY_CACHE", {})
+    monkeypatch.setattr(tbenv, "_CANARY_INFLIGHT", {})
+    monkeypatch.setattr(tbenv, "_CANARY_LOCK", None)
+
+    call_n = 0
+
+    async def _flaky_issue(*a, **kw):
+        nonlocal call_n
+        call_n += 1
+        if call_n == 1:
+            raise aiohttp.ClientError("simulated rate limit")
+        return {"aws": {"awsAccessKeyId": "AKIAFAKERECOVER"}}
+
+    monkeypatch.setattr(tbenv, "issue_credentials", _flaky_issue)
+
+    first = await tbenv._get_or_issue_canary(
+        ("aws",), "10.0.0.2", "req-1", "host", "ua", "/p", "https",
+    )
+    assert first is None
+    assert not tbenv._CANARY_INFLIGHT, (
+        "in-flight future should be cleared after failure"
+    )
+
+    # Second request, fresh, should succeed and populate the cache.
+    second = await tbenv._get_or_issue_canary(
+        ("aws",), "10.0.0.2", "req-2", "host", "ua", "/p", "https",
+    )
+    assert second is not None
+    assert second["aws"]["awsAccessKeyId"] == "AKIAFAKERECOVER"
+
+
+@pytest.mark.asyncio
+async def test_fake_git_get_or_build_coalesces_concurrent_requests(monkeypatch):
+    """Same single-flight contract as `_get_or_issue_canary` — a burst of
+    `<prefix>/.git/config` probes from one scanner IP must collapse to one
+    upstream issuance, not N parallel 502s.
+    """
+    monkeypatch.setattr(tbenv, "_FAKE_GIT_CACHE", {})
+    monkeypatch.setattr(tbenv, "_FAKE_GIT_INFLIGHT", {})
+    monkeypatch.setattr(tbenv, "_FAKE_GIT_LOCK", None)
+
+    issue_calls = 0
+
+    async def _slow_issue(*a, **kw):
+        nonlocal issue_calls
+        issue_calls += 1
+        await asyncio.sleep(0.05)
+        return {
+            "aws": {
+                "awsAccessKeyId": f"AKIAFAKE{issue_calls:04d}",
+                "awsSecretAccessKey": "fakeSecret",
+                "awsSessionToken": "fakeToken",
+            },
+        }
+
+    monkeypatch.setattr(tbenv, "issue_credentials", _slow_issue)
+
+    results = await asyncio.gather(*[
+        tbenv._fake_git_get_or_build(
+            "10.0.0.3", f"req-{i}", "host", "ua", "/.git/config", "https",
+        )
+        for i in range(10)
+    ])
+    assert issue_calls == 1, f"expected 1 issue, got {issue_calls}"
+    # All callers see the same files dict (object identity, since they
+    # share the in-flight Future's result).
+    first_files, first_meta = results[0]
+    for files, meta in results[1:]:
+        assert files is first_files
+        assert meta is first_meta
 
 
 def test_default_canary_types_includes_gitlab_username_password():
