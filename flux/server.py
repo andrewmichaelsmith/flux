@@ -1816,6 +1816,53 @@ _OPENAPI_SWAGGER_UI_PATHS = frozenset({
 })
 
 
+# --- Fake Gravity SMTP WordPress plugin REST surface --------------------
+# `/wp-json/gravitysmtp/v1/...` is the WordPress REST namespace for the
+# Gravity SMTP plugin (Gravity Forms' email-routing companion). The
+# `config` and `connector/<provider>` endpoints expose backend mail
+# credentials (AWS SES Access Key / Secret, Mailgun API key, SendGrid
+# API key, SMTP user/pass, Gmail OAuth refresh token) when the request
+# isn't authenticated as an admin — a class of WordPress-REST
+# authentication-gap that scanner dictionaries probe in bulk alongside
+# `/wp-json/wp/v2/users` (CVE-2017-1001000 territory).
+#
+# Scanner shapes observed against the namespace fall into three buckets:
+#   1. **Settings / config discovery.** GET `/v1/settings` and
+#      `/v1/config` to inventory which connectors are configured. The
+#      `/config` response is the credential-leak slot.
+#   2. **Per-connector enumeration.** GET `/v1/connector/<provider>` to
+#      pull the connector-specific credentials. Real Gravity SMTP names
+#      the connectors `amazonses`, `mailgun`, `sendgrid`, `smtp`,
+#      `gmail`, `office365`, `sparkpost`.
+#   3. **Plugin debug surface.** GET `/v1/tests/mock-data` (+
+#      `?page=gravitysmtp-settings`) and `/v1/data/debug` are the
+#      diagnostic endpoints that ship a recent-emails sample —
+#      another credential-adjacent disclosure path.
+#
+# AWS SES is the only connector type with a Tracebit-backed canary
+# (AWS Access Key + Secret); the other connectors emit per-hit random
+# synthetics so scanners don't see a fleet-wide fixed literal but
+# replay-driven attribution rests on the AWS canary alone. The
+# AWS_SECRETACCESSKEY shape on SES is grep-equivalent to the
+# `aws_secret_access_key` slot credential-scrapers harvest from
+# `.env` / `wp-config.php`, so the same upstream detector fires.
+GRAVITY_SMTP_ENABLED = _env_bool("HONEYPOT_GRAVITY_SMTP_ENABLED")
+GRAVITY_SMTP_PATH_PREFIX = "/wp-json/gravitysmtp/v1"
+# Connectors the plugin advertises — limits which `/connector/<name>`
+# probes get a credential-shaped response (any other name 404s through
+# the `gravitysmtp-miss` branch so we don't ship synthetic creds for
+# arbitrary path segments scanners invent).
+_GRAVITY_SMTP_KNOWN_CONNECTORS = frozenset({
+    "amazonses",
+    "mailgun",
+    "sendgrid",
+    "smtp",
+    "gmail",
+    "office365",
+    "sparkpost",
+})
+
+
 # --- Backup-archive canary trap ----------------------------------------
 # Scanner dictionaries enumerate the cross product `<base>.<ext>` of a
 # 60+-name base list and ~15 compressed-archive extensions hunting for
@@ -2321,6 +2368,24 @@ def is_liferay_path(path: str) -> bool:
     if lp in {"/api/jsonws", "/api/jsonws/"}:
         return True
     return lp.startswith("/api/jsonws/")
+
+
+def is_gravity_smtp_path(path: str) -> bool:
+    """Match the Gravity SMTP WordPress plugin REST namespace under
+    `/wp-json/gravitysmtp/v1/...`. Strip any query string before
+    comparing — scanners hit `/v1/tests/mock-data?page=gravitysmtp-...`
+    and the bare path with equal frequency, both should dispatch.
+
+    Bare `/wp-json/gravitysmtp/v1` (no trailing slash) and the trailing-
+    slash variant both land — real WP-REST returns the namespace index
+    on either form.
+    """
+    if not GRAVITY_SMTP_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    if lp in {GRAVITY_SMTP_PATH_PREFIX, GRAVITY_SMTP_PATH_PREFIX + "/"}:
+        return True
+    return lp.startswith(GRAVITY_SMTP_PATH_PREFIX + "/")
 
 
 def _liferay_has_marshaller(body_bytes: bytes) -> bool:
@@ -4984,6 +5049,263 @@ def render_liferay_jsonws_service_signature(
         ],
     }
     return json.dumps(catalog, indent=2).encode("utf-8")
+
+
+def _gravity_smtp_fake_smtp_username() -> str:
+    """Plausible-looking but non-credential WordPress mailer username.
+    Mailers ship with a fixed-ish naming convention (`wp_mailer`,
+    `noreply`); rotating across a small list keeps the scanner-side
+    fingerprint heterogeneous without polluting the per-hit-unique
+    rule (the password slot still carries a fresh random)."""
+    return secrets.choice((
+        "wp_mailer", "wp_relay", "noreply", "mailer", "wp_smtp", "wp_outbound",
+    ))
+
+
+def _gravity_smtp_fake_mailgun_api_key() -> str:
+    """Per-hit synthetic Mailgun key. Real keys start `key-` followed
+    by 32 hex chars — match the shape so scanner regex extractors
+    classify it correctly."""
+    return "key-" + secrets.token_hex(16)
+
+
+def _gravity_smtp_fake_sendgrid_api_key() -> str:
+    """Per-hit synthetic SendGrid key. Real keys start `SG.` and
+    contain two dot-separated base64url segments. Length follows
+    SG's own published shape."""
+    return f"SG.{secrets.token_urlsafe(22)}.{secrets.token_urlsafe(43)}"
+
+
+def _gravity_smtp_fake_sparkpost_api_key() -> str:
+    """Per-hit synthetic SparkPost key (40 hex chars, no prefix)."""
+    return secrets.token_hex(20)
+
+
+def _gravity_smtp_fake_gmail_oauth() -> dict[str, object]:
+    """Per-hit synthetic Google OAuth tuple. None of the fields are
+    canary-backed (Tracebit does not issue Google OAuth canaries)
+    — each is a fresh random of the right shape so replay attempts
+    are individually attributable in the access log without leaking
+    a fleet-wide fingerprint."""
+    return {
+        "client_id": secrets.token_hex(12) + ".apps.googleusercontent.com",
+        "client_secret": "GOCSPX-" + secrets.token_urlsafe(20),
+        "access_token": "ya29." + secrets.token_urlsafe(60),
+        "refresh_token": "1//0e" + secrets.token_urlsafe(40),
+        "scopes": [
+            "https://www.googleapis.com/auth/gmail.send",
+            "https://www.googleapis.com/auth/userinfo.email",
+        ],
+        "token_type": "Bearer",
+        "expires_in": 3599,
+    }
+
+
+def render_gravity_smtp_settings(host: str) -> bytes:
+    """`/wp-json/gravitysmtp/v1/settings` — plugin-wide settings JSON.
+
+    No credentials in this surface; just the global mailer config
+    (default connector, debug toggles, retention windows) so scanners
+    walking the namespace see a plausible, populated install before
+    they pivot to `/config` and `/connector/<name>` for the credential
+    grabs. `from_email` is derived from the request `Host` so each
+    sensor advertises its own apex (no fleet-wide fixed literal)."""
+    safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
+    payload = {
+        "default_connector": "amazonses",
+        "fallback_connector": "smtp",
+        "from_email": f"wordpress@{safe_host}",
+        "from_name": "WordPress",
+        "force_from_email": True,
+        "force_from_name": False,
+        "debug_mode_enabled": True,
+        "delete_event_logs_after_days": 30,
+        "event_retention_days": 30,
+        "connectors_enabled": sorted(_GRAVITY_SMTP_KNOWN_CONNECTORS),
+        "rate_limit_per_minute": 60,
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_gravity_smtp_config(r: dict[str, object], host: str) -> bytes:
+    """`/wp-json/gravitysmtp/v1/config` — per-connector backend config.
+
+    The AWS SES block carries the per-request Tracebit AWS canary
+    (`aws_access_key_id` / `aws_secret_access_key` — the same field
+    names scraper regexes match on `.env` / `wp-config.php`).
+    Mailgun / SendGrid / SparkPost / SMTP / Gmail blocks ship per-hit
+    random synthetics in the shape each provider publishes, so the
+    same harvest tooling regex-matches and stores them — but only
+    the AWS canary replay fires a Tracebit alert.
+
+    `enabled=true` only for `amazonses` so the response also reads
+    like a real install with one chosen mailer (mirrors the
+    `default_connector` field in `/settings`).
+    """
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "") or ""
+    secret_key = aws.get("awsSecretAccessKey", "") or ""
+    safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
+    payload = {
+        "amazonses": {
+            "enabled": True,
+            "aws_access_key_id": access_key,
+            "aws_secret_access_key": secret_key,
+            "region": "us-east-1",
+            "from_email": f"noreply@{safe_host}",
+            "configuration_set": "wordpress-transactional",
+        },
+        "mailgun": {
+            "enabled": False,
+            "api_key": _gravity_smtp_fake_mailgun_api_key(),
+            "domain": f"mg.{safe_host}",
+            "region": "us",
+        },
+        "sendgrid": {
+            "enabled": False,
+            "api_key": _gravity_smtp_fake_sendgrid_api_key(),
+        },
+        "sparkpost": {
+            "enabled": False,
+            "api_key": _gravity_smtp_fake_sparkpost_api_key(),
+            "region": "us",
+        },
+        "smtp": {
+            "enabled": False,
+            "host": f"smtp.{safe_host}",
+            "port": 587,
+            "username": _gravity_smtp_fake_smtp_username(),
+            "password": _fake_db_password(),
+            "encryption": "tls",
+            "authentication": True,
+        },
+        "office365": {
+            "enabled": False,
+            "tenant_id": secrets.token_hex(16),
+            "client_id": secrets.token_hex(16),
+            "client_secret": secrets.token_urlsafe(32),
+        },
+        "gmail": {
+            "enabled": False,
+            **_gravity_smtp_fake_gmail_oauth(),
+        },
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_gravity_smtp_connector(
+    r: dict[str, object], connector: str, host: str,
+) -> bytes:
+    """`/wp-json/gravitysmtp/v1/connector/<name>` — single-connector
+    config slice. AWS SES carries the Tracebit canary; every other
+    connector ships per-hit synthetics. Unknown connector names take
+    the `gravitysmtp-miss` branch in the dispatcher rather than this
+    renderer."""
+    aws = _aws(r)
+    safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
+    body: dict[str, object] = {"connector": connector, "enabled": True}
+    if connector == "amazonses":
+        body.update({
+            "aws_access_key_id": aws.get("awsAccessKeyId", "") or "",
+            "aws_secret_access_key": aws.get("awsSecretAccessKey", "") or "",
+            "region": "us-east-1",
+            "from_email": f"noreply@{safe_host}",
+            "configuration_set": "wordpress-transactional",
+        })
+    elif connector == "mailgun":
+        body.update({
+            "api_key": _gravity_smtp_fake_mailgun_api_key(),
+            "domain": f"mg.{safe_host}",
+            "region": "us",
+        })
+    elif connector == "sendgrid":
+        body.update({"api_key": _gravity_smtp_fake_sendgrid_api_key()})
+    elif connector == "sparkpost":
+        body.update({
+            "api_key": _gravity_smtp_fake_sparkpost_api_key(),
+            "region": "us",
+        })
+    elif connector == "smtp":
+        body.update({
+            "host": f"smtp.{safe_host}",
+            "port": 587,
+            "username": _gravity_smtp_fake_smtp_username(),
+            "password": _fake_db_password(),
+            "encryption": "tls",
+        })
+    elif connector == "office365":
+        body.update({
+            "tenant_id": secrets.token_hex(16),
+            "client_id": secrets.token_hex(16),
+            "client_secret": secrets.token_urlsafe(32),
+        })
+    elif connector == "gmail":
+        body.update(_gravity_smtp_fake_gmail_oauth())
+    return json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+
+def render_gravity_smtp_mock_data(host: str) -> bytes:
+    """`/wp-json/gravitysmtp/v1/tests/mock-data` — diagnostic surface
+    that the plugin's settings-page test button uses to render a
+    sample outbound email. No credentials in the payload; useful as
+    a fingerprint slot that keeps the scanner walking the namespace."""
+    safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
+    payload = {
+        "to": [f"admin@{safe_host}"],
+        "from": f"wordpress@{safe_host}",
+        "from_name": "WordPress",
+        "subject": "Gravity SMTP Test Email",
+        "body": (
+            "Hello,\n\nThis is a test email sent from your WordPress site "
+            f"({safe_host}) using the Gravity SMTP plugin. "
+            "If you received this message the mailer is configured correctly.\n\n"
+            "— Gravity SMTP"
+        ),
+        "headers": {
+            "X-Mailer": "Gravity SMTP",
+            "Content-Type": "text/plain; charset=UTF-8",
+        },
+        "attachments": [],
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_gravity_smtp_debug(host: str) -> bytes:
+    """`/wp-json/gravitysmtp/v1/data/debug` — recent-events log slice
+    the plugin's debug panel renders. Includes a couple of synthetic
+    `sent` rows with redacted recipients so scanners see the slot
+    populated, plus the active connector (`amazonses`) so the chain
+    matches `/settings` and `/config`."""
+    safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
+    payload = {
+        "active_connector": "amazonses",
+        "fallback_connector": "smtp",
+        "debug_mode": True,
+        "recent_events": [
+            {
+                "id": secrets.token_hex(8),
+                "status": "sent",
+                "to": f"u***@{safe_host}",
+                "subject": "Your password reset link",
+                "connector": "amazonses",
+                "ts": "2026-01-01T00:00:00Z",
+            },
+            {
+                "id": secrets.token_hex(8),
+                "status": "sent",
+                "to": f"a***@{safe_host}",
+                "subject": "[WordPress] New comment on your post",
+                "connector": "amazonses",
+                "ts": "2026-01-01T00:00:00Z",
+            },
+        ],
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
 def render_coldfusion_public_page(path: str, host: str, version: str) -> bytes:
@@ -15638,6 +15960,186 @@ async def _handle_liferay(
     )
 
 
+async def _handle_gravity_smtp(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+) -> web.Response:
+    """Gravity SMTP WordPress plugin REST namespace
+    (`/wp-json/gravitysmtp/v1/...`). Routes the per-endpoint surface
+    described in the config block above:
+
+      - `/settings`, `/tests/mock-data`, `/data/debug` → plausible
+        diagnostic JSON (no credentials in the payload).
+      - `/config` and `/connector/<known>` → Tracebit AWS canary in
+        the AWS SES slot plus per-hit synthetic secrets for the other
+        connectors. Connector names outside the published Gravity
+        SMTP set 404 through the `gravitysmtp-miss` branch.
+
+    Logs `gravitysmtpPath`, `gravitysmtpMethod`, `gravitysmtpConnector`
+    (when a `/connector/<name>` request resolves), `result`,
+    `canaryTypes`, and `bytes`."""
+    lpath = path.lower().split("?", 1)[0]
+    method = request.method
+    host = str(log_context.get("host", ""))
+    request_id = str(log_context.get("requestId", ""))
+    client_ip = str(log_context.get("clientIp", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+
+    # Strip the namespace prefix to dispatch on the trailing component
+    # of the path. The prefix-match in `is_gravity_smtp_path` guarantees
+    # at least one of these starts-with checks fires when we reach here.
+    trailing = ""
+    if lpath.startswith(GRAVITY_SMTP_PATH_PREFIX + "/"):
+        trailing = lpath[len(GRAVITY_SMTP_PATH_PREFIX) + 1:]
+    elif lpath == GRAVITY_SMTP_PATH_PREFIX:
+        trailing = ""
+    # Trailing slash on `/v1/connector/gmail/` is equivalent to the
+    # un-slashed form for dispatch purposes.
+    trailing = trailing.rstrip("/")
+
+    log_extra: dict[str, object] = {
+        "gravitysmtpPath": path,
+        "gravitysmtpMethod": method,
+    }
+
+    common_headers = {
+        "Server": "Apache/2.4.58 (Ubuntu)",
+        "X-Powered-By": "PHP/8.1.0",
+        "Cache-Control": "no-store",
+    }
+    json_ct = "application/json; charset=utf-8"
+
+    # `/settings` — namespace-wide settings.
+    if trailing == "settings":
+        body = render_gravity_smtp_settings(host)
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "gravitysmtp-settings",
+            **log_extra,
+            "canaryTypes": [],
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={**common_headers, "Content-Type": json_ct},
+        )
+
+    # `/tests/mock-data` (any query string allowed — the plugin's
+    # settings page passes `?page=gravitysmtp-settings`, also covered
+    # by stripping the query string before the dispatch).
+    if trailing == "tests/mock-data":
+        body = render_gravity_smtp_mock_data(host)
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "gravitysmtp-mock-data",
+            **log_extra,
+            "canaryTypes": [],
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={**common_headers, "Content-Type": json_ct},
+        )
+
+    # `/data/debug` — debug-panel slice.
+    if trailing == "data/debug":
+        body = render_gravity_smtp_debug(host)
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "gravitysmtp-debug",
+            **log_extra,
+            "canaryTypes": [],
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={**common_headers, "Content-Type": json_ct},
+        )
+
+    # `/config` — credential-disclosure surface. Mints a per-request
+    # AWS canary for the SES slot; on keyless deployments still serves
+    # the response (with empty AWS slots) so banner-grab scanners walk
+    # the namespace, but no canary issuance fires.
+    if trailing == "config":
+        tracebit_response: dict[str, object] = {}
+        if API_KEY:
+            issued = await _get_or_issue_canary(
+                ("aws",), client_ip, request_id, host, user_agent, path, proto,
+            )
+            if issued is not None:
+                tracebit_response = issued
+        canary_types = [k for k, v in tracebit_response.items() if v]
+        body = render_gravity_smtp_config(tracebit_response, host)
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "gravitysmtp-config",
+            **log_extra,
+            "canaryTypes": canary_types,
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={**common_headers, "Content-Type": json_ct},
+        )
+
+    # `/connector/<name>` — single-connector slice. Known names get
+    # a credential-shaped response (Tracebit AWS canary for SES, per-
+    # hit synthetics otherwise); unknown names fall through to miss.
+    if trailing.startswith("connector/"):
+        connector = trailing.split("/", 1)[1].split("/", 1)[0]
+        if connector in _GRAVITY_SMTP_KNOWN_CONNECTORS:
+            tracebit_response = {}
+            if API_KEY and connector == "amazonses":
+                issued = await _get_or_issue_canary(
+                    ("aws",), client_ip, request_id, host, user_agent, path, proto,
+                )
+                if issued is not None:
+                    tracebit_response = issued
+            canary_types = [k for k, v in tracebit_response.items() if v]
+            body = render_gravity_smtp_connector(
+                tracebit_response, connector, host,
+            )
+            append_log({
+                **log_context,
+                "status": 200,
+                "result": f"gravitysmtp-connector-{connector}",
+                **log_extra,
+                "gravitysmtpConnector": connector,
+                "canaryTypes": canary_types,
+                "bytes": len(body),
+            })
+            return web.Response(
+                status=200, body=body,
+                headers={**common_headers, "Content-Type": json_ct},
+            )
+
+    # Everything else under the namespace — log + WP-REST-shaped 404.
+    envelope = (
+        b'{"code":"rest_no_route",'
+        b'"message":"No route was found matching the URL and request method.",'
+        b'"data":{"status":404}}'
+    )
+    append_log({
+        **log_context,
+        "status": 404,
+        "result": "gravitysmtp-miss",
+        **log_extra,
+        "canaryTypes": [],
+        "bytes": len(envelope),
+    })
+    return web.Response(
+        status=404, body=envelope,
+        headers={**common_headers, "Content-Type": json_ct},
+    )
+
+
 async def _handle_coldfusion(
     request: web.Request,
     log_context: dict[str, object],
@@ -17361,6 +17863,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_liferay_path(path):
         return await _handle_liferay(request, log_context, path, query_string, request_body)
 
+    if is_gravity_smtp_path(path):
+        return await _handle_gravity_smtp(request, log_context, path, query_string)
+
     if is_coldfusion_path(path):
         return await _handle_coldfusion(request, log_context, path, request_body)
 
@@ -17546,6 +18051,8 @@ def main() -> int:
         active.append("webapp-form")
     if WP_LOGIN_ENABLED:
         active.append("wp-login")
+    if GRAVITY_SMTP_ENABLED:
+        active.append("gravity-smtp")
     print(
         f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
         file=sys.stderr,

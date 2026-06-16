@@ -559,6 +559,7 @@ def test_all_trap_families_default_on():
     assert tbenv.COLDFUSION_ENABLED
     assert tbenv.CONFLUENCE_ENABLED
     assert tbenv.SAP_METADATAUPLOADER_ENABLED
+    assert tbenv.GRAVITY_SMTP_ENABLED
     assert tbenv.CITRIX_GATEWAY_ENABLED
     assert tbenv.RDWEB_ENABLED
     assert tbenv.EXCHANGE_ENABLED
@@ -5897,6 +5898,218 @@ async def test_dispatch_liferay_disabled_returns_404(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "LIFERAY_ENABLED", False)
     resp = await flux_client.get(
         "/api/jsonws", headers={"X-Forwarded-For": "203.0.113.96"},
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+# --- Gravity SMTP plugin (WordPress REST) trap ---
+
+
+def test_gravity_smtp_enabled_by_default():
+    assert tbenv.GRAVITY_SMTP_ENABLED
+
+
+def test_gravity_smtp_path_matches_observed_endpoints():
+    must_match = [
+        "/wp-json/gravitysmtp/v1",
+        "/wp-json/gravitysmtp/v1/",
+        "/wp-json/gravitysmtp/v1/settings",
+        "/wp-json/gravitysmtp/v1/config",
+        "/wp-json/gravitysmtp/v1/tests/mock-data",
+        "/wp-json/gravitysmtp/v1/tests/mock-data?page=gravitysmtp-settings",
+        "/wp-json/gravitysmtp/v1/connector/gmail",
+        "/wp-json/gravitysmtp/v1/connector/amazonses",
+        "/wp-json/gravitysmtp/v1/data/debug",
+        # Mixed case (WP-REST is case-insensitive on the namespace
+        # segment) and trailing-segment variant.
+        "/WP-JSON/gravitysmtp/v1/settings",
+    ]
+    for path in must_match:
+        assert tbenv.is_gravity_smtp_path(path), f"expected match: {path}"
+
+
+def test_gravity_smtp_path_does_not_match_unrelated_paths():
+    for path in [
+        "/",
+        "/wp-json",
+        "/wp-json/",
+        "/wp-json/wp/v2/users",
+        "/wp-json/gravityforms/v2/forms",       # the other Gravity plugin
+        "/wp-json/gravitysmtpX/v1/settings",    # no slash boundary
+        "/wp-json/gravitysmtp",                 # missing v1 segment
+        "/.env",
+    ]:
+        assert not tbenv.is_gravity_smtp_path(path), f"unexpected match: {path}"
+
+
+def test_gravity_smtp_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "GRAVITY_SMTP_ENABLED", False)
+    assert not tbenv.is_gravity_smtp_path("/wp-json/gravitysmtp/v1/config")
+
+
+def test_gravity_smtp_config_embeds_aws_canary_and_per_hit_synthetics():
+    body = tbenv.render_gravity_smtp_config(FAKE_TRACEBIT, "victim.example").decode("utf-8")
+    payload = json.loads(body)
+    # AWS SES carries the Tracebit canary in the credential-grep slot.
+    assert payload["amazonses"]["aws_access_key_id"] == "AKIAFAKEEXAMPLE01"
+    assert payload["amazonses"]["aws_secret_access_key"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert payload["amazonses"]["enabled"] is True
+    # Per-hit synthetics on the other connectors carry the right shape.
+    assert payload["mailgun"]["api_key"].startswith("key-")
+    assert len(payload["mailgun"]["api_key"]) == len("key-") + 32  # 16 hex bytes → 32 chars
+    assert payload["sendgrid"]["api_key"].startswith("SG.")
+    assert payload["sendgrid"]["api_key"].count(".") == 2
+    assert len(payload["sparkpost"]["api_key"]) == 40
+    assert payload["gmail"]["access_token"].startswith("ya29.")
+    assert payload["gmail"]["client_secret"].startswith("GOCSPX-")
+    assert payload["smtp"]["host"] == "smtp.victim.example"
+
+
+def test_gravity_smtp_config_synthetics_rotate_per_hit():
+    """Two calls in the same process must produce different values for
+    every per-hit-synthetic field — this is the lock on the design
+    principle that no credential-shaped value is a fixed literal."""
+    a = json.loads(tbenv.render_gravity_smtp_config(FAKE_TRACEBIT, "victim.example"))
+    b = json.loads(tbenv.render_gravity_smtp_config(FAKE_TRACEBIT, "victim.example"))
+    assert a["mailgun"]["api_key"] != b["mailgun"]["api_key"]
+    assert a["sendgrid"]["api_key"] != b["sendgrid"]["api_key"]
+    assert a["sparkpost"]["api_key"] != b["sparkpost"]["api_key"]
+    assert a["smtp"]["password"] != b["smtp"]["password"]
+    assert a["gmail"]["access_token"] != b["gmail"]["access_token"]
+    assert a["gmail"]["refresh_token"] != b["gmail"]["refresh_token"]
+    assert a["office365"]["client_secret"] != b["office365"]["client_secret"]
+
+
+def test_gravity_smtp_settings_has_no_credential_fields():
+    """Settings is a fingerprint surface, not a credential surface — make
+    sure no `password` / `secret_key` / `api_key` field leaks into it
+    by accident on a future expansion."""
+    body = tbenv.render_gravity_smtp_settings("victim.example").decode("utf-8")
+    payload = json.loads(body)
+    forbidden = {"password", "secret_key", "api_key", "aws_secret_access_key"}
+    for key in payload:
+        assert key not in forbidden, f"credential field {key!r} leaked into /settings"
+    # Sanity: host-derived from_email is per-sensor (no fleet-wide fixed literal).
+    assert payload["from_email"] == "wordpress@victim.example"
+
+
+def test_gravity_smtp_connector_unknown_takes_miss_branch():
+    """Unknown connector names must not be served a credential-shaped
+    response (the dispatch falls through to `gravitysmtp-miss`)."""
+    # The renderer itself is only called for known connectors — confirm
+    # the dispatcher-side gate by asserting the known set excludes things
+    # scanners could probe.
+    for unknown in ("postmark", "mailjet", "fakemailer", "../etc"):
+        assert unknown not in tbenv._GRAVITY_SMTP_KNOWN_CONNECTORS
+
+
+async def test_dispatch_gravity_smtp_config_embeds_canary(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/wp-json/gravitysmtp/v1/config",
+        headers={"X-Forwarded-For": "203.0.113.110"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Content-Type", "").startswith("application/json")
+    payload = json.loads(await resp.text())
+    assert payload["amazonses"]["aws_access_key_id"] == "AKIAFAKEEXAMPLE01"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "gravitysmtp-config"
+    assert entry["gravitysmtpMethod"] == "GET"
+    assert "aws" in entry["canaryTypes"]
+
+
+async def test_dispatch_gravity_smtp_settings_returns_settings(flux_client):
+    resp = await flux_client.get(
+        "/wp-json/gravitysmtp/v1/settings",
+        headers={"X-Forwarded-For": "203.0.113.111", "Host": "victim.example"},
+    )
+    assert resp.status == 200
+    payload = json.loads(await resp.text())
+    assert payload["default_connector"] == "amazonses"
+    assert "amazonses" in payload["connectors_enabled"]
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "gravitysmtp-settings"
+
+
+async def test_dispatch_gravity_smtp_mock_data_with_query_string(flux_client):
+    """Real scanners hit `?page=gravitysmtp-settings`; the query string
+    must not change dispatch."""
+    resp = await flux_client.get(
+        "/wp-json/gravitysmtp/v1/tests/mock-data?page=gravitysmtp-settings",
+        headers={"X-Forwarded-For": "203.0.113.112"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "gravitysmtp-mock-data"
+
+
+async def test_dispatch_gravity_smtp_connector_gmail(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/wp-json/gravitysmtp/v1/connector/gmail",
+        headers={"X-Forwarded-For": "203.0.113.113"},
+    )
+    assert resp.status == 200
+    payload = json.loads(await resp.text())
+    assert payload["connector"] == "gmail"
+    # Gmail OAuth shape — per-hit synthetic, not a canary.
+    assert payload["access_token"].startswith("ya29.")
+    assert payload["refresh_token"].startswith("1//")
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "gravitysmtp-connector-gmail"
+    assert entry["gravitysmtpConnector"] == "gmail"
+    # No AWS canary on gmail (only the SES connector triggers issuance).
+    assert "aws" not in entry["canaryTypes"]
+
+
+async def test_dispatch_gravity_smtp_connector_unknown_404s(flux_client):
+    resp = await flux_client.get(
+        "/wp-json/gravitysmtp/v1/connector/postmark",
+        headers={"X-Forwarded-For": "203.0.113.114"},
+    )
+    assert resp.status == 404
+    payload = json.loads(await resp.text())
+    assert payload["code"] == "rest_no_route"
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "gravitysmtp-miss"
+
+
+async def test_dispatch_gravity_smtp_keyless_serves_config_with_empty_canary(flux_client, monkeypatch):
+    """A keyless deployment (no `TRACEBIT_API_KEY`) must still serve the
+    `/config` response so banner-grab scanners walk the namespace — the
+    AWS slots just go empty."""
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+
+    resp = await flux_client.get(
+        "/wp-json/gravitysmtp/v1/config",
+        headers={"X-Forwarded-For": "203.0.113.115"},
+    )
+    assert resp.status == 200
+    payload = json.loads(await resp.text())
+    assert payload["amazonses"]["aws_access_key_id"] == ""
+    assert payload["amazonses"]["aws_secret_access_key"] == ""
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "gravitysmtp-config"
+    # No canary issuance happens on keyless deployments.
+    assert entry["canaryTypes"] == []
+
+
+async def test_dispatch_gravity_smtp_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "GRAVITY_SMTP_ENABLED", False)
+    resp = await flux_client.get(
+        "/wp-json/gravitysmtp/v1/config",
+        headers={"X-Forwarded-For": "203.0.113.116"},
     )
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)
