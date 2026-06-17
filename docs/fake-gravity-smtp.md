@@ -16,6 +16,7 @@ bulk alongside the namespace's other diagnostic endpoints.
 | `/wp-json/gravitysmtp/v1/connector/{mailgun,sendgrid,sparkpost,smtp,office365,gmail}` | `GET`, `HEAD` | `200` JSON single-connector slice with per-hit synthetic credentials in the published shape for that provider |
 | `/wp-json/gravitysmtp/v1/tests/mock-data`<br>(also `?page=gravitysmtp-settings`) | `GET`, `HEAD` | `200` JSON sample outbound-email payload (no credentials) |
 | `/wp-json/gravitysmtp/v1/data/debug` | `GET`, `HEAD` | `200` JSON recent-events slice (no credentials) |
+| `/{blog,wordpress,wp,site,news,cms,press}/wp-json/gravitysmtp/v1/...` | any | Same dispatch as the bare path — sub-directory placements where WordPress is mounted under a webroot folder rather than at `/` |
 | anything else under `/wp-json/gravitysmtp/v1/...` | any | `404` WordPress-REST-shaped `rest_no_route` envelope |
 
 The handler logs:

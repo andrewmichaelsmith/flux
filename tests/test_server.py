@@ -5950,6 +5950,67 @@ def test_gravity_smtp_disabled_returns_false(monkeypatch):
     assert not tbenv.is_gravity_smtp_path("/wp-json/gravitysmtp/v1/config")
 
 
+def test_gravity_smtp_path_matches_wp_subdir_installs():
+    """WordPress is commonly installed at `/blog/`, `/wordpress/`,
+    `/wp/`, `/site/`, `/news/`, `/cms/`, `/press/` rather than at the
+    webroot. Scanners enumerate both shapes; the predicate must
+    catch them so the trailing-component dispatch fires identically."""
+    for prefix in ("blog", "wordpress", "wp", "site", "news", "cms", "press"):
+        for tail in (
+            "/wp-json/gravitysmtp/v1",
+            "/wp-json/gravitysmtp/v1/",
+            "/wp-json/gravitysmtp/v1/settings",
+            "/wp-json/gravitysmtp/v1/config",
+            "/wp-json/gravitysmtp/v1/tests/mock-data",
+            "/wp-json/gravitysmtp/v1/connector/amazonses",
+        ):
+            path = f"/{prefix}{tail}"
+            assert tbenv.is_gravity_smtp_path(path), f"expected match: {path}"
+
+
+def test_gravity_smtp_strip_subdir_preserves_unprefixed_paths():
+    base = "/wp-json/gravitysmtp/v1/config"
+    assert tbenv._gravity_smtp_strip_subdir(base) == base
+    assert tbenv._gravity_smtp_strip_subdir("/blog" + base) == base
+    assert tbenv._gravity_smtp_strip_subdir("/wordpress" + base) == base
+    # Sub-dir prefix that isn't a known WP install (`/api/wp-json/...`)
+    # does NOT get stripped; that path shouldn't match.
+    other = "/api/wp-json/gravitysmtp/v1/config"
+    assert tbenv._gravity_smtp_strip_subdir(other) == other
+
+
+def test_gravity_smtp_subdir_does_not_match_unrelated_prefixes():
+    """Make sure the sub-dir normaliser is scoped — `/random/wp-json/`
+    must NOT match (only the known WP install dirs)."""
+    for path in [
+        "/api/wp-json/gravitysmtp/v1/config",
+        "/admin/wp-json/gravitysmtp/v1/config",
+        "/blogx/wp-json/gravitysmtp/v1/config",  # no slash boundary
+    ]:
+        assert not tbenv.is_gravity_smtp_path(path), f"unexpected match: {path}"
+
+
+async def test_dispatch_gravity_smtp_subdir_install_routes_to_handler(flux_client, monkeypatch):
+    """`/blog/wp-json/gravitysmtp/v1/config` (WordPress under `/blog/`)
+    should land on the same dispatch as the bare path and embed the
+    AWS canary."""
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/blog/wp-json/gravitysmtp/v1/config",
+        headers={"X-Forwarded-For": "203.0.113.150", "Host": "victim.example"},
+    )
+    assert resp.status == 200
+    payload = json.loads(await resp.text())
+    assert payload["amazonses"]["aws_access_key_id"] == "AKIAFAKEEXAMPLE01"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "gravitysmtp-config"
+    # Raw path is logged verbatim so triage can see the sub-dir placement.
+    assert entry["gravitysmtpPath"] == "/blog/wp-json/gravitysmtp/v1/config"
+
+
 def test_gravity_smtp_config_embeds_aws_canary_and_per_hit_synthetics():
     body = tbenv.render_gravity_smtp_config(FAKE_TRACEBIT, "victim.example").decode("utf-8")
     payload = json.loads(body)

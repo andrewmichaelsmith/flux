@@ -2436,6 +2436,32 @@ def is_liferay_path(path: str) -> bool:
     return lp.startswith("/api/jsonws/")
 
 
+# Sub-directory placements WordPress is commonly installed at. The
+# WP-REST namespace prefix `/wp-json/gravitysmtp/v1/...` shifts to
+# `/<dir>/wp-json/gravitysmtp/v1/...` for these installs; scanner
+# dictionaries enumerate both shapes. Mirrors the same dictionary
+# wp-login / wp-config harvesters walk and the env-webroot prefix
+# list at `_ENV_WEBROOT_PREFIXES`.
+_GRAVITY_SMTP_WP_SUBDIR_PREFIXES = (
+    "blog", "wordpress", "wp", "site", "news", "cms", "press",
+)
+
+
+def _gravity_smtp_strip_subdir(lp: str) -> str:
+    """Return `lp` with an optional WordPress install sub-directory
+    (`/blog/wp-json/...`, `/wordpress/wp-json/...`, …) stripped off
+    so the predicate + handler both see the canonical
+    `/wp-json/gravitysmtp/v1[/...]` form. Returns the unchanged
+    input when no sub-directory prefix matched."""
+    for prefix in _GRAVITY_SMTP_WP_SUBDIR_PREFIXES:
+        head = f"/{prefix}{GRAVITY_SMTP_PATH_PREFIX}"
+        if lp == head or lp == head + "/":
+            return GRAVITY_SMTP_PATH_PREFIX + lp[len(head):]
+        if lp.startswith(head + "/"):
+            return GRAVITY_SMTP_PATH_PREFIX + lp[len(head):]
+    return lp
+
+
 def is_gravity_smtp_path(path: str) -> bool:
     """Match the Gravity SMTP WordPress plugin REST namespace under
     `/wp-json/gravitysmtp/v1/...`. Strip any query string before
@@ -2445,10 +2471,17 @@ def is_gravity_smtp_path(path: str) -> bool:
     Bare `/wp-json/gravitysmtp/v1` (no trailing slash) and the trailing-
     slash variant both land — real WP-REST returns the namespace index
     on either form.
+
+    Common WordPress install sub-directories (`/blog/`, `/wordpress/`,
+    `/wp/`, `/site/`, `/news/`, `/cms/`, `/press/`) are normalised to
+    the canonical bare path before matching — scanners walking
+    `/blog/wp-json/gravitysmtp/v1/config` should land on the same
+    dispatch as the root-install form.
     """
     if not GRAVITY_SMTP_ENABLED:
         return False
     lp = path.lower().split("?", 1)[0]
+    lp = _gravity_smtp_strip_subdir(lp)
     if lp in {GRAVITY_SMTP_PATH_PREFIX, GRAVITY_SMTP_PATH_PREFIX + "/"}:
         return True
     return lp.startswith(GRAVITY_SMTP_PATH_PREFIX + "/")
@@ -16486,6 +16519,11 @@ async def _handle_gravity_smtp(
     (when a `/connector/<name>` request resolves), `result`,
     `canaryTypes`, and `bytes`."""
     lpath = path.lower().split("?", 1)[0]
+    # Sub-directory placements (`/blog/wp-json/...`, `/wordpress/wp-json/...`)
+    # normalise to the bare WP-REST namespace before the trailing-component
+    # dispatch — keeps a single trailing-switch path that doesn't care
+    # whether WordPress is mounted at the webroot or under a sub-dir.
+    lpath = _gravity_smtp_strip_subdir(lpath)
     method = request.method
     host = str(log_context.get("host", ""))
     request_id = str(log_context.get("requestId", ""))
