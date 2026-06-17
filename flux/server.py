@@ -1863,6 +1863,72 @@ _GRAVITY_SMTP_KNOWN_CONNECTORS = frozenset({
 })
 
 
+# --- Fake Laravel Telescope debug-panel surface ------------------------
+# `/telescope/...` is the path the Laravel Telescope debug package
+# (laravel/telescope) installs itself at. Telescope is a development
+# tool — when `APP_DEBUG=true` and the Telescope authorisation gate
+# (`Telescope::auth(...)` in `app/Providers/TelescopeServiceProvider.php`)
+# is misconfigured or left at its default empty closure, the entire
+# panel is reachable unauthenticated. That panel exposes captured
+# HTTP requests (including POST bodies and headers — `Authorization`,
+# `X-API-Key`), executed DB queries with bindings, dispatched mails,
+# raised exceptions with the full `$_ENV` block, and the application
+# log stream. Scanner dictionaries probe `/telescope/requests`,
+# `/telescope/queries`, `/telescope/exceptions`, `/telescope/logs`
+# and the matching `/telescope/telescope-api/<panel>` JSON endpoints
+# the Vue SPA calls. Sub-directory placements like
+# `/admin/telescope/...` mirror reverse-proxy rewrite rules that
+# mount Laravel under an admin path.
+#
+# Scanner shapes observed against the surface:
+#   1. **SPA enumeration.** GET `/telescope/`, `/telescope/requests`,
+#      `/telescope/queries`, etc. fetch the Vue SPA shell. A 200 with
+#      Telescope-shaped HTML keeps the scanner on the page and is the
+#      fingerprint marker that gates the next step.
+#   2. **JSON API harvest.** The SPA calls
+#      `/telescope/telescope-api/<panel>` (and `/api/<panel>` on
+#      some proxy placements) for the entry list. The `requests`
+#      panel leaks captured POST bodies/headers, the `queries`
+#      panel leaks the executed SQL plus the connection config, the
+#      `exceptions` panel leaks the `$_ENV` dump on each thrown
+#      `QueryException`, the `mail` panel leaks the SMTP/SES
+#      backend config from the swift/symfony transport.
+#   3. **Direct credential harvest.** Bytes-grep harvesters scrape
+#      the JSON responses for `AKIA…` literals, `DB_PASSWORD=`,
+#      `password=`, `Authorization: Bearer …` — the canary slot
+#      fires the same way regardless of which panel-JSON they
+#      grepped.
+#
+# Returning shape-correct Telescope JSON on each panel keeps each
+# probe alive past fingerprint and harvests an AWS-replayable canary
+# from the `requests` (captured POST payload), `queries` (executed
+# `INSERT INTO settings` row), `exceptions` (env dump), `mail`
+# (SES transport), and `logs` (log-context dict) endpoints. Other
+# panels (cache, redis, gates, dumps, schedule, jobs, batches,
+# views, models, events, commands, notifications, monitored-tags,
+# clients) return an empty `entries[]` — they're fingerprint slots
+# scanners walk after `requests`, and an empty result is more
+# realistic than a synthesised credential on every cell.
+TELESCOPE_ENABLED = _env_bool("HONEYPOT_TELESCOPE_ENABLED")
+# Known Telescope panel names — matches `Watchers` in the Telescope
+# config (see https://laravel.com/docs/telescope#watchers). Anything
+# else under `/telescope/...` falls into the `telescope-shell` HTML
+# branch (real Telescope mounts the SPA on any unknown panel path
+# and the front-end does its own client-side routing).
+_TELESCOPE_PANELS = frozenset({
+    "requests", "commands", "schedule", "jobs", "batches", "exceptions",
+    "logs", "dumps", "mail", "notifications", "queries", "models", "events",
+    "cache", "redis", "gates", "views", "clients", "monitored-tags",
+})
+# Sub-directory placements scanners probe in addition to the bare
+# `/telescope/`. Mirror the reverse-proxy rewrite-rule patterns the
+# Ignition + Drupal traps already cover for the same scanner shapes.
+_TELESCOPE_PREFIX_DIRS = (
+    "admin", "dashboard", "panel", "backend", "app", "laravel",
+    "monitor", "dev", "internal",
+)
+
+
 # --- Backup-archive canary trap ----------------------------------------
 # Scanner dictionaries enumerate the cross product `<base>.<ext>` of a
 # 60+-name base list and ~15 compressed-archive extensions hunting for
@@ -2386,6 +2452,35 @@ def is_gravity_smtp_path(path: str) -> bool:
     if lp in {GRAVITY_SMTP_PATH_PREFIX, GRAVITY_SMTP_PATH_PREFIX + "/"}:
         return True
     return lp.startswith(GRAVITY_SMTP_PATH_PREFIX + "/")
+
+
+def _telescope_strip_prefix(lp: str) -> str:
+    """Return the path with an optional webroot prefix
+    (`/admin/`, `/dashboard/`, …) stripped off so the predicate
+    + handler both see a canonical `/telescope[/...]` form. Returns
+    the unchanged input when no prefix matched."""
+    for prefix in _TELESCOPE_PREFIX_DIRS:
+        head = f"/{prefix}/telescope"
+        if lp == head or lp == head + "/":
+            return "/telescope" + lp[len(head):]
+        if lp.startswith(head + "/"):
+            return "/telescope" + lp[len(head):]
+    return lp
+
+
+def is_telescope_path(path: str) -> bool:
+    """Match Laravel Telescope SPA + telescope-api JSON surface under
+    `/telescope/...` (or a `/<prefix>/telescope/...` placement). Strips
+    any query string before comparing — Telescope's Vue SPA appends
+    `?page=...&type=...` filters to the JSON-API URLs and the bare
+    path should dispatch the same way."""
+    if not TELESCOPE_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    lp = _telescope_strip_prefix(lp)
+    if lp in {"/telescope", "/telescope/"}:
+        return True
+    return lp.startswith("/telescope/")
 
 
 def _liferay_has_marshaller(body_bytes: bytes) -> bool:
@@ -5306,6 +5401,416 @@ def render_gravity_smtp_debug(host: str) -> bytes:
         ],
     }
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+# ----- Laravel Telescope renderers -------------------------------------
+
+def _telescope_uuid() -> str:
+    # Real Telescope entries carry RFC4122 UUIDs in the `id` field. Per-hit
+    # unique so the JSON doesn't fingerprint the fleet by sharing values.
+    return str(uuid.uuid4())
+
+
+def _telescope_family_hash() -> str:
+    # Telescope groups related entries by `family_hash` (32-hex MD5 over a
+    # canonical key set). Per-hit unique.
+    return secrets.token_hex(16)
+
+
+def _telescope_sequence() -> int:
+    # Monotone-ish entry sequence the Vue SPA uses for pagination.
+    # Random per-hit so two scanners see different numbers.
+    return secrets.randbelow(900000) + 100000
+
+
+def _telescope_created_at() -> str:
+    # Telescope timestamps look like `2026-01-15 12:34:56`. Use a fixed
+    # recent date so the response feels like a live install without leaking
+    # the sensor clock.
+    return "2026-01-15 12:34:56"
+
+
+def render_telescope_shell_html(host: str) -> bytes:
+    """`/telescope/<panel>` HTML SPA shell.
+
+    Real Telescope mounts a Vue SPA at every `/telescope/*` route — the
+    server returns the same HTML wrapper for every panel and the Vue
+    router handles the in-page routing. Scanners walking
+    `/telescope/requests`, `/telescope/queries`, etc. land here as the
+    fingerprint marker; the credential harvest happens via the
+    `telescope-api/<panel>` JSON endpoints the SPA then calls."""
+    safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
+    csrf = secrets.token_hex(20)
+    return (
+        "<!DOCTYPE html>\n"
+        "<html lang=\"en\">\n<head>\n"
+        "    <meta charset=\"utf-8\">\n"
+        "    <meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">\n"
+        "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        f"    <meta name=\"csrf-token\" content=\"{csrf}\">\n"
+        f"    <title>Telescope - {safe_host}</title>\n"
+        "    <link rel=\"icon\" type=\"image/svg+xml\" href=\"/vendor/telescope/favicon.svg\">\n"
+        "    <link href=\"/vendor/telescope/app-dark.css\" rel=\"stylesheet\">\n"
+        "</head>\n<body>\n"
+        "    <div id=\"telescope\">\n"
+        "        <div class=\"loading\">Loading Telescope...</div>\n"
+        "    </div>\n"
+        "    <script>\n"
+        "        window.Telescope = " + json.dumps({
+            "path": "telescope",
+            "timezone": "UTC",
+            "recording": True,
+        }) + ";\n"
+        "    </script>\n"
+        "    <script src=\"/vendor/telescope/app.js\"></script>\n"
+        "</body>\n</html>\n"
+    ).encode("utf-8")
+
+
+def render_telescope_api_requests(r: dict[str, object], host: str) -> bytes:
+    """`/telescope/telescope-api/requests` — captured HTTP requests panel.
+
+    Each entry mirrors a real Telescope `RequestWatcher` row: URI, method,
+    controller_action, request payload (decoded form/JSON body), headers,
+    session, response status, response headers, response payload. The
+    bait slot is the captured POST payload of a fake "admin S3-upload"
+    request — Telescope stores the payload verbatim, so a scanner that
+    grabs the JSON sees `AWS_ACCESS_KEY_ID=<canary>` exactly as the
+    application would have logged it. Per-hit random IDs everywhere
+    avoid fleet-fingerprinting."""
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "") or ""
+    secret_key = aws.get("awsSecretAccessKey", "") or ""
+    safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
+    bearer = secrets.token_urlsafe(40)
+    session_id = secrets.token_hex(20)
+    db_password = _fake_db_password()
+    entries = [
+        {
+            "id": _telescope_uuid(),
+            "sequence": _telescope_sequence(),
+            "batch_id": _telescope_uuid(),
+            "family_hash": _telescope_family_hash(),
+            "type": "request",
+            "content": {
+                "uri": "/admin/settings/s3",
+                "method": "POST",
+                "controller_action": "App\\Http\\Controllers\\Admin\\SettingsController@updateS3",
+                "middleware": ["web", "auth", "verified", "admin"],
+                "headers": {
+                    "host": safe_host,
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0",
+                    "authorization": f"Bearer {bearer}",
+                    "x-csrf-token": secrets.token_hex(20),
+                    "content-type": "application/x-www-form-urlencoded",
+                    "cookie": f"laravel_session={session_id}",
+                },
+                "payload": {
+                    "_token": secrets.token_hex(20),
+                    "AWS_ACCESS_KEY_ID": access_key,
+                    "AWS_SECRET_ACCESS_KEY": secret_key,
+                    "AWS_DEFAULT_REGION": "us-east-1",
+                    "AWS_BUCKET": f"{safe_host.replace('.', '-')}-uploads",
+                },
+                "session": {},
+                "response_status": 302,
+                "response_headers": {
+                    "location": "/admin/settings/s3",
+                    "content-type": "text/html; charset=UTF-8",
+                },
+                "response": "",
+                "duration": 142,
+                "memory": 18.0,
+                "hostname": safe_host,
+                "user": {
+                    "id": 1,
+                    "name": "Administrator",
+                    "email": f"admin@{safe_host}",
+                },
+            },
+            "tags": ["App\\Models\\User:1"],
+            "created_at": _telescope_created_at(),
+        },
+        {
+            "id": _telescope_uuid(),
+            "sequence": _telescope_sequence(),
+            "batch_id": _telescope_uuid(),
+            "family_hash": _telescope_family_hash(),
+            "type": "request",
+            "content": {
+                "uri": "/api/v1/login",
+                "method": "POST",
+                "controller_action": "App\\Http\\Controllers\\Api\\AuthController@login",
+                "middleware": ["api", "throttle:60,1"],
+                "headers": {
+                    "host": safe_host,
+                    "user-agent": "axios/1.6.0",
+                    "content-type": "application/json",
+                    "accept": "application/json",
+                },
+                "payload": {
+                    "email": f"deploy@{safe_host}",
+                    "password": db_password,
+                },
+                "session": [],
+                "response_status": 200,
+                "response_headers": {
+                    "content-type": "application/json",
+                },
+                "response": {
+                    "token": secrets.token_urlsafe(40),
+                    "expires_in": 86400,
+                },
+                "duration": 89,
+                "memory": 16.0,
+                "hostname": safe_host,
+            },
+            "tags": [],
+            "created_at": _telescope_created_at(),
+        },
+    ]
+    return json.dumps({"entries": entries}, separators=(",", ":")).encode("utf-8")
+
+
+def render_telescope_api_queries(r: dict[str, object], host: str) -> bytes:
+    """`/telescope/telescope-api/queries` — executed DB queries panel.
+
+    The bait is an `INSERT INTO settings` row that materialises the
+    Tracebit AWS canary in a captured SQL binding (the way an
+    application that persists "S3 credentials" to a settings table
+    would have done it). Plus a regular `select * from users` shape
+    so the panel reads like a live app. Connection name and
+    per-binding hashes are per-hit unique."""
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "") or ""
+    secret_key = aws.get("awsSecretAccessKey", "") or ""
+    safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
+    entries = [
+        {
+            "id": _telescope_uuid(),
+            "sequence": _telescope_sequence(),
+            "batch_id": _telescope_uuid(),
+            "family_hash": _telescope_family_hash(),
+            "type": "query",
+            "content": {
+                "connection": "mysql",
+                "bindings": [access_key, secret_key, "us-east-1"],
+                "sql": (
+                    "insert into `settings` (`key`, `value`, `updated_at`) "
+                    "values "
+                    "('aws_access_key_id', ?, '2026-01-15 12:34:56'), "
+                    "('aws_secret_access_key', ?, '2026-01-15 12:34:56'), "
+                    "('aws_default_region', ?, '2026-01-15 12:34:56')"
+                ),
+                "time": 3.21,
+                "slow": False,
+                "file": "/var/www/html/app/Http/Controllers/Admin/SettingsController.php",
+                "line": 142,
+                "hash": secrets.token_hex(16),
+            },
+            "tags": [],
+            "created_at": _telescope_created_at(),
+        },
+        {
+            "id": _telescope_uuid(),
+            "sequence": _telescope_sequence(),
+            "batch_id": _telescope_uuid(),
+            "family_hash": _telescope_family_hash(),
+            "type": "query",
+            "content": {
+                "connection": "mysql",
+                "bindings": [1],
+                "sql": "select * from `users` where `users`.`id` = ? limit 1",
+                "time": 0.45,
+                "slow": False,
+                "file": "/var/www/html/app/Http/Controllers/UserController.php",
+                "line": 38,
+                "hash": secrets.token_hex(16),
+            },
+            "tags": ["App\\Models\\User:1"],
+            "created_at": _telescope_created_at(),
+        },
+    ]
+    return json.dumps({"entries": entries}, separators=(",", ":")).encode("utf-8")
+
+
+def render_telescope_api_exceptions(r: dict[str, object], host: str) -> bytes:
+    """`/telescope/telescope-api/exceptions` — captured exceptions panel.
+
+    Telescope stores the full Laravel exception envelope: class, message,
+    code, file, line, and a JSON-encoded stack trace. The bait slot is
+    a `QueryException` whose `context` carries the application's `$_ENV`
+    snapshot at throw time — that's the same slot Ignition leaks via
+    HTML, mapped into JSON for the SPA. Per-hit random `app_key` and
+    `db_password`."""
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "") or ""
+    secret_key = aws.get("awsSecretAccessKey", "") or ""
+    safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
+    app_key = "base64:" + base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+    db_password = _fake_db_password()
+    redis_password = _fake_db_password()
+    entries = [
+        {
+            "id": _telescope_uuid(),
+            "sequence": _telescope_sequence(),
+            "batch_id": _telescope_uuid(),
+            "family_hash": _telescope_family_hash(),
+            "type": "exception",
+            "content": {
+                "class": "Illuminate\\Database\\QueryException",
+                "message": (
+                    "SQLSTATE[HY000] [2002] Connection refused "
+                    "(SQL: select * from `users` where `users`.`id` = 1 limit 1)"
+                ),
+                "code": "HY000",
+                "file": "/var/www/html/vendor/laravel/framework/src/Illuminate/Database/Connection.php",
+                "line": 759,
+                "trace": [
+                    "/var/www/html/app/Http/Controllers/UserController.php:38",
+                    "/var/www/html/vendor/laravel/framework/src/Illuminate/Routing/Controller.php:54",
+                ],
+                "line_preview": {},
+                "context": {
+                    "env": {
+                        "APP_NAME": "Laravel",
+                        "APP_ENV": "production",
+                        "APP_KEY": app_key,
+                        "APP_DEBUG": "true",
+                        "APP_URL": f"https://{safe_host}",
+                        "DB_CONNECTION": "mysql",
+                        "DB_HOST": "db.internal",
+                        "DB_PORT": "3306",
+                        "DB_DATABASE": "prod",
+                        "DB_USERNAME": "laravel",
+                        "DB_PASSWORD": db_password,
+                        "REDIS_HOST": "redis.internal",
+                        "REDIS_PASSWORD": redis_password,
+                        "AWS_ACCESS_KEY_ID": access_key,
+                        "AWS_SECRET_ACCESS_KEY": secret_key,
+                        "AWS_DEFAULT_REGION": "us-east-1",
+                        "AWS_BUCKET": f"{safe_host.replace('.', '-')}-uploads",
+                        "MAIL_MAILER": "ses",
+                    },
+                },
+                "hostname": safe_host,
+            },
+            "tags": [],
+            "created_at": _telescope_created_at(),
+        },
+    ]
+    return json.dumps({"entries": entries}, separators=(",", ":")).encode("utf-8")
+
+
+def render_telescope_api_mail(r: dict[str, object], host: str) -> bytes:
+    """`/telescope/telescope-api/mail` — captured outbound mail panel.
+
+    Telescope captures every mail dispatch with the rendered headers,
+    HTML body, and raw MIME. The bait slot is the `X-SES-CONFIGURATION-SET`
+    + `X-SES-SOURCE-ARN` header set + the SES transport config the
+    Telescope `MailWatcher` shipping log shows when the mailer is `ses`.
+    AWS canary lands in the transport config; per-hit synthetic SMTP
+    password elsewhere."""
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "") or ""
+    secret_key = aws.get("awsSecretAccessKey", "") or ""
+    safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
+    entries = [
+        {
+            "id": _telescope_uuid(),
+            "sequence": _telescope_sequence(),
+            "batch_id": _telescope_uuid(),
+            "family_hash": _telescope_family_hash(),
+            "type": "mail",
+            "content": {
+                "mailable": "App\\Mail\\PasswordResetMail",
+                "queued": False,
+                "from": [{"address": f"noreply@{safe_host}", "name": safe_host}],
+                "replyTo": [],
+                "to": [{"address": f"u***@{safe_host}", "name": None}],
+                "cc": [],
+                "bcc": [],
+                "subject": f"Reset your {safe_host} password",
+                "headers": [
+                    f"From: noreply@{safe_host}",
+                    f"To: u***@{safe_host}",
+                    "Content-Type: text/html; charset=UTF-8",
+                    "X-SES-CONFIGURATION-SET: laravel-transactional",
+                    f"X-SES-SOURCE-ARN: arn:aws:ses:us-east-1:123456789012:identity/{safe_host}",
+                ],
+                "transport": {
+                    "driver": "ses",
+                    "key": access_key,
+                    "secret": secret_key,
+                    "region": "us-east-1",
+                },
+                "html": (
+                    "<!DOCTYPE html><html><body>"
+                    f"<h1>Reset your {safe_host} password</h1>"
+                    "<p>Click the link below to reset your password.</p>"
+                    "</body></html>"
+                ),
+                "raw": "",
+                "hostname": safe_host,
+            },
+            "tags": [],
+            "created_at": _telescope_created_at(),
+        },
+    ]
+    return json.dumps({"entries": entries}, separators=(",", ":")).encode("utf-8")
+
+
+def render_telescope_api_logs(r: dict[str, object], host: str) -> bytes:
+    """`/telescope/telescope-api/logs` — captured log entries panel.
+
+    Telescope stores each Laravel log call with level, message, and
+    context dict. The bait slot is the log entry's `context` carrying
+    the AWS canary the way a real application would have called
+    `Log::error('S3 upload failed', ['AWS_ACCESS_KEY_ID' => ...])`."""
+    aws = _aws(r)
+    access_key = aws.get("awsAccessKeyId", "") or ""
+    secret_key = aws.get("awsSecretAccessKey", "") or ""
+    safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
+    entries = [
+        {
+            "id": _telescope_uuid(),
+            "sequence": _telescope_sequence(),
+            "batch_id": _telescope_uuid(),
+            "family_hash": _telescope_family_hash(),
+            "type": "log",
+            "content": {
+                "level": "error",
+                "message": "S3 upload failed: PutObject access denied",
+                "context": {
+                    "AWS_ACCESS_KEY_ID": access_key,
+                    "AWS_SECRET_ACCESS_KEY": secret_key,
+                    "AWS_DEFAULT_REGION": "us-east-1",
+                    "AWS_BUCKET": f"{safe_host.replace('.', '-')}-uploads",
+                    "exception": "Aws\\S3\\Exception\\S3Exception",
+                },
+                "hostname": safe_host,
+            },
+            "tags": [],
+            "created_at": _telescope_created_at(),
+        },
+    ]
+    return json.dumps({"entries": entries}, separators=(",", ":")).encode("utf-8")
+
+
+def render_telescope_api_empty() -> bytes:
+    """Fingerprint-only Telescope panels — return an empty entries list
+    (the same shape the SPA expects), no credentials. Real Telescope
+    panels on a freshly-installed app return empty lists for cache /
+    redis / gates / models until the app emits an event of that
+    family; an empty result is more realistic than synthesising data
+    on a panel scanners only hit for fingerprinting."""
+    return b'{"entries":[]}'
 
 
 def render_coldfusion_public_page(path: str, host: str, version: str) -> bytes:
@@ -16140,6 +16645,160 @@ async def _handle_gravity_smtp(
     )
 
 
+async def _handle_telescope(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+) -> web.Response:
+    """Laravel Telescope debug-panel surface (`/telescope/...`). Routes:
+
+      - `/telescope`, `/telescope/`, `/telescope/<panel>` → SPA HTML
+        shell (`telescope-shell` result tag).
+      - `/telescope/telescope-api/<panel>` (and `/api/<panel>` proxy
+        placement) → panel JSON. The `requests`, `queries`,
+        `exceptions`, `mail`, `logs` panels each mint a per-request
+        AWS canary and embed it in the credential slot a real
+        Telescope install would have shown there. Other known
+        panels return an empty `entries[]` (`telescope-api-empty`
+        result tag). Unknown panel names take the
+        `telescope-api-miss` 404 branch.
+      - Any other `/telescope/<...>` path falls through to the SPA
+        HTML shell — real Telescope mounts the Vue router on every
+        unknown sub-path.
+
+    The `/admin/`, `/dashboard/`, `/panel/`, `/backend/`, `/app/`,
+    `/laravel/`, `/monitor/`, `/dev/`, `/internal/` prefix
+    placements are accepted by the predicate; the trailing
+    `/telescope/...` is what dispatches here. Logs `telescopePath`,
+    `telescopePanel`, `telescopeMethod`, `result`, `canaryTypes`,
+    and `bytes`."""
+    lpath = path.lower().split("?", 1)[0]
+    canonical = _telescope_strip_prefix(lpath)
+    method = request.method
+    host = str(log_context.get("host", ""))
+    request_id = str(log_context.get("requestId", ""))
+    client_ip = str(log_context.get("clientIp", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+
+    # Strip the `/telescope` namespace prefix to get the trailing
+    # component. `/telescope` and `/telescope/` both collapse to "".
+    trailing = ""
+    if canonical.startswith("/telescope/"):
+        trailing = canonical[len("/telescope/"):]
+    elif canonical == "/telescope":
+        trailing = ""
+    trailing = trailing.rstrip("/")
+
+    log_extra: dict[str, object] = {
+        "telescopePath": path,
+        "telescopeMethod": method,
+    }
+
+    common_headers = {
+        "Server": "nginx/1.24.0",
+        "X-Powered-By": "PHP/8.2.15",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+    }
+    json_ct = "application/json; charset=utf-8"
+    html_ct = "text/html; charset=utf-8"
+
+    # Telescope JSON API — real path is `telescope-api/<panel>`; some
+    # reverse-proxy rewrites map it as `api/<panel>`. Both shapes hit
+    # the same dispatch (the front-end SPA does the request via the
+    # axios instance the page's bootstrap script configures).
+    api_panel = ""
+    api_prefix = ""
+    for prefix in ("telescope-api/", "api/"):
+        if trailing.startswith(prefix):
+            api_panel = trailing[len(prefix):].split("/", 1)[0]
+            api_prefix = prefix
+            break
+
+    if api_panel:
+        log_extra["telescopePanel"] = api_panel
+        if api_panel in _TELESCOPE_PANELS:
+            tracebit_response: dict[str, object] = {}
+            canary_types: list[str] = []
+            # Panels that materialise an AWS canary in their entry
+            # content mint the canary on first request; the rest of
+            # the known panel set returns an empty entries[] and
+            # never burns a canary.
+            credential_panels = {"requests", "queries", "exceptions", "mail", "logs"}
+            if api_panel in credential_panels and API_KEY:
+                issued = await _get_or_issue_canary(
+                    ("aws",), client_ip, request_id, host, user_agent, path, proto,
+                )
+                if issued is not None:
+                    tracebit_response = issued
+            canary_types = [k for k, v in tracebit_response.items() if v]
+
+            if api_panel == "requests":
+                body = render_telescope_api_requests(tracebit_response, host)
+                result_tag = "telescope-api-requests"
+            elif api_panel == "queries":
+                body = render_telescope_api_queries(tracebit_response, host)
+                result_tag = "telescope-api-queries"
+            elif api_panel == "exceptions":
+                body = render_telescope_api_exceptions(tracebit_response, host)
+                result_tag = "telescope-api-exceptions"
+            elif api_panel == "mail":
+                body = render_telescope_api_mail(tracebit_response, host)
+                result_tag = "telescope-api-mail"
+            elif api_panel == "logs":
+                body = render_telescope_api_logs(tracebit_response, host)
+                result_tag = "telescope-api-logs"
+            else:
+                body = render_telescope_api_empty()
+                result_tag = f"telescope-api-{api_panel}"
+            append_log({
+                **log_context,
+                "status": 200,
+                "result": result_tag,
+                **log_extra,
+                "canaryTypes": canary_types,
+                "bytes": len(body),
+            })
+            return web.Response(
+                status=200, body=body,
+                headers={**common_headers, "Content-Type": json_ct},
+            )
+        # Unknown API panel — Telescope's router returns 404 here.
+        envelope = b'{"message":"Not Found."}'
+        append_log({
+            **log_context,
+            "status": 404,
+            "result": "telescope-api-miss",
+            **log_extra,
+            "canaryTypes": [],
+            "bytes": len(envelope),
+        })
+        return web.Response(
+            status=404, body=envelope,
+            headers={**common_headers, "Content-Type": json_ct},
+        )
+
+    # Anything else under `/telescope/...` (bare, trailing-slash, or a
+    # known/unknown panel name without the api prefix) → SPA HTML
+    # shell. Real Telescope serves the same HTML for every Vue route.
+    if trailing and trailing.split("/", 1)[0] in _TELESCOPE_PANELS:
+        log_extra["telescopePanel"] = trailing.split("/", 1)[0]
+    body = render_telescope_shell_html(host)
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": "telescope-shell",
+        **log_extra,
+        "canaryTypes": [],
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200, body=body,
+        headers={**common_headers, "Content-Type": html_ct},
+    )
+
+
 async def _handle_coldfusion(
     request: web.Request,
     log_context: dict[str, object],
@@ -17866,6 +18525,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_gravity_smtp_path(path):
         return await _handle_gravity_smtp(request, log_context, path, query_string)
 
+    if is_telescope_path(path):
+        return await _handle_telescope(request, log_context, path, query_string)
+
     if is_coldfusion_path(path):
         return await _handle_coldfusion(request, log_context, path, request_body)
 
@@ -18053,6 +18715,8 @@ def main() -> int:
         active.append("wp-login")
     if GRAVITY_SMTP_ENABLED:
         active.append("gravity-smtp")
+    if TELESCOPE_ENABLED:
+        active.append("telescope")
     print(
         f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
         file=sys.stderr,

@@ -579,6 +579,7 @@ def test_all_trap_families_default_on():
     assert tbenv.BACKUP_ARCHIVE_ENABLED
     assert tbenv.WP_LOGIN_ENABLED
     assert tbenv.GRAPHQL_ENABLED
+    assert tbenv.TELESCOPE_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -10523,3 +10524,301 @@ def test_log_context_picks_real_client_through_two_proxy_hops():
     )
     ctx = tbenv._log_context_from_request(req, "req-1", 0, "")
     assert ctx["clientIp"] == "206.189.115.96"
+
+
+# ============================================================================
+# Laravel Telescope debug-panel trap
+# ============================================================================
+
+
+def test_telescope_enabled_by_default():
+    assert tbenv.TELESCOPE_ENABLED
+
+
+def test_telescope_path_matches_observed_endpoints():
+    must_match = [
+        "/telescope",
+        "/telescope/",
+        "/telescope/requests",
+        "/telescope/queries",
+        "/telescope/exceptions",
+        "/telescope/logs",
+        "/telescope/mail",
+        "/telescope/notifications",
+        "/telescope/commands",
+        "/telescope/jobs",
+        "/telescope/cache",
+        # Telescope-api JSON endpoints (the SPA's data source)
+        "/telescope/telescope-api/requests",
+        "/telescope/telescope-api/queries",
+        "/telescope/telescope-api/exceptions",
+        # `/api/<panel>` proxy-rewrite placement seen in the field
+        "/telescope/api/requests",
+        "/telescope/api/queries",
+        "/telescope/api/mail",
+        # Webroot-prefix variants (reverse-proxy rewrites that mount
+        # Laravel under an admin / dashboard sub-path)
+        "/admin/telescope/api/requests",
+        "/admin/telescope/api/logs",
+        "/admin/telescope/requests",
+        "/dashboard/telescope/requests",
+        "/laravel/telescope/queries",
+        # Mixed case
+        "/TELESCOPE/REQUESTS",
+    ]
+    for path in must_match:
+        assert tbenv.is_telescope_path(path), f"expected match: {path}"
+
+
+def test_telescope_path_does_not_match_unrelated_paths():
+    for path in [
+        "/",
+        "/telescopex",                 # no slash boundary
+        "/telescope-monitor",          # no slash boundary
+        "/admin/telescopex/requests",  # no slash boundary
+        "/api/_ignition/health-check", # different Laravel-debug trap
+        "/.env",
+        "/wp-json/wp/v2/users",
+    ]:
+        assert not tbenv.is_telescope_path(path), f"unexpected match: {path}"
+
+
+def test_telescope_path_strips_query_string():
+    # Real Telescope SPA appends `?period=…&type=…` filters to the JSON-API URL.
+    assert tbenv.is_telescope_path(
+        "/telescope/telescope-api/requests?period=1_hour&type=ajax",
+    )
+
+
+def test_telescope_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "TELESCOPE_ENABLED", False)
+    assert not tbenv.is_telescope_path("/telescope/requests")
+
+
+def test_telescope_strip_prefix_preserves_unprefixed_paths():
+    assert tbenv._telescope_strip_prefix("/telescope") == "/telescope"
+    assert tbenv._telescope_strip_prefix("/telescope/requests") == "/telescope/requests"
+    # Admin prefix is stripped to the canonical form so the handler
+    # dispatches identically on /admin/telescope/<panel> and
+    # /telescope/<panel>.
+    assert tbenv._telescope_strip_prefix("/admin/telescope/requests") == "/telescope/requests"
+    assert tbenv._telescope_strip_prefix("/dashboard/telescope") == "/telescope"
+
+
+def test_telescope_api_requests_embeds_aws_canary_in_payload_slot():
+    body = tbenv.render_telescope_api_requests(FAKE_TRACEBIT, "victim.example").decode("utf-8")
+    payload = json.loads(body)
+    assert "entries" in payload
+    # The first entry is the bait — captured admin S3-settings POST.
+    bait = payload["entries"][0]
+    assert bait["type"] == "request"
+    assert bait["content"]["payload"]["AWS_ACCESS_KEY_ID"] == "AKIAFAKEEXAMPLE01"
+    assert (
+        bait["content"]["payload"]["AWS_SECRET_ACCESS_KEY"]
+        == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    )
+    # The user.email and host are per-sensor (no fleet-wide fixed literal).
+    assert bait["content"]["user"]["email"] == "admin@victim.example"
+    assert bait["content"]["hostname"] == "victim.example"
+
+
+def test_telescope_api_requests_synthetic_bearer_rotates_per_hit():
+    """Bearer / session_id / csrf in the captured headers must be per-hit
+    unique so the JSON doesn't fingerprint the fleet by sharing strings."""
+    a = json.loads(tbenv.render_telescope_api_requests(FAKE_TRACEBIT, "victim.example"))
+    b = json.loads(tbenv.render_telescope_api_requests(FAKE_TRACEBIT, "victim.example"))
+    assert (
+        a["entries"][0]["content"]["headers"]["authorization"]
+        != b["entries"][0]["content"]["headers"]["authorization"]
+    )
+    assert (
+        a["entries"][0]["content"]["headers"]["cookie"]
+        != b["entries"][0]["content"]["headers"]["cookie"]
+    )
+    # The /api/v1/login password slot must also rotate.
+    assert (
+        a["entries"][1]["content"]["payload"]["password"]
+        != b["entries"][1]["content"]["payload"]["password"]
+    )
+
+
+def test_telescope_api_queries_embeds_aws_canary_in_bindings():
+    body = tbenv.render_telescope_api_queries(FAKE_TRACEBIT, "victim.example").decode("utf-8")
+    payload = json.loads(body)
+    bait = payload["entries"][0]
+    assert bait["type"] == "query"
+    assert bait["content"]["bindings"][0] == "AKIAFAKEEXAMPLE01"
+    assert bait["content"]["bindings"][1] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert "insert into `settings`" in bait["content"]["sql"]
+
+
+def test_telescope_api_exceptions_embeds_aws_canary_in_env_dump():
+    body = tbenv.render_telescope_api_exceptions(FAKE_TRACEBIT, "victim.example").decode("utf-8")
+    payload = json.loads(body)
+    bait = payload["entries"][0]
+    assert bait["type"] == "exception"
+    env = bait["content"]["context"]["env"]
+    assert env["AWS_ACCESS_KEY_ID"] == "AKIAFAKEEXAMPLE01"
+    assert env["AWS_SECRET_ACCESS_KEY"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    # APP_KEY and DB_PASSWORD must be per-hit synthetics, not fixed
+    # literals (rotating value asserted below).
+    assert env["APP_KEY"].startswith("base64:")
+
+
+def test_telescope_api_exceptions_synthetics_rotate_per_hit():
+    a = json.loads(tbenv.render_telescope_api_exceptions(FAKE_TRACEBIT, "victim.example"))
+    b = json.loads(tbenv.render_telescope_api_exceptions(FAKE_TRACEBIT, "victim.example"))
+    assert (
+        a["entries"][0]["content"]["context"]["env"]["APP_KEY"]
+        != b["entries"][0]["content"]["context"]["env"]["APP_KEY"]
+    )
+    assert (
+        a["entries"][0]["content"]["context"]["env"]["DB_PASSWORD"]
+        != b["entries"][0]["content"]["context"]["env"]["DB_PASSWORD"]
+    )
+
+
+def test_telescope_api_mail_embeds_aws_canary_in_ses_transport():
+    body = tbenv.render_telescope_api_mail(FAKE_TRACEBIT, "victim.example").decode("utf-8")
+    payload = json.loads(body)
+    bait = payload["entries"][0]
+    assert bait["type"] == "mail"
+    assert bait["content"]["transport"]["driver"] == "ses"
+    assert bait["content"]["transport"]["key"] == "AKIAFAKEEXAMPLE01"
+    assert bait["content"]["transport"]["secret"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+def test_telescope_api_logs_embeds_aws_canary_in_context():
+    body = tbenv.render_telescope_api_logs(FAKE_TRACEBIT, "victim.example").decode("utf-8")
+    payload = json.loads(body)
+    bait = payload["entries"][0]
+    assert bait["type"] == "log"
+    assert bait["content"]["level"] == "error"
+    assert bait["content"]["context"]["AWS_ACCESS_KEY_ID"] == "AKIAFAKEEXAMPLE01"
+    assert (
+        bait["content"]["context"]["AWS_SECRET_ACCESS_KEY"]
+        == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    )
+
+
+def test_telescope_api_empty_returns_no_credentials():
+    body = tbenv.render_telescope_api_empty()
+    payload = json.loads(body)
+    assert payload == {"entries": []}
+
+
+def test_telescope_shell_html_no_fixed_credential_literals():
+    body = tbenv.render_telescope_shell_html("victim.example").decode("utf-8")
+    # Must not bake AWS keys into the HTML shell (the JSON-API is where
+    # canaries live).
+    assert "AKIA" not in body
+    assert "aws_secret" not in body.lower()
+    # CSRF token must be per-hit unique.
+    a = tbenv.render_telescope_shell_html("victim.example").decode("utf-8")
+    b = tbenv.render_telescope_shell_html("victim.example").decode("utf-8")
+    assert a != b
+    # The Vue-app bootstrap marker should be present so scanners
+    # treating the response as a real Telescope install keep walking.
+    assert 'id="telescope"' in body
+
+
+async def test_dispatch_telescope_shell_returns_html(flux_client):
+    """`/telescope/requests` (HTML SPA shell) should return 200 with
+    Telescope-shaped HTML and a `telescope-shell` result tag — even
+    on keyless deployments (no canary needed for the HTML)."""
+    resp = await flux_client.get(
+        "/telescope/requests",
+        headers={"X-Forwarded-For": "203.0.113.140", "Host": "victim.example"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Content-Type", "").startswith("text/html")
+    text = await resp.text()
+    assert 'id="telescope"' in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "telescope-shell"
+    assert entry["telescopePath"] == "/telescope/requests"
+    assert entry["telescopePanel"] == "requests"
+
+
+async def test_dispatch_telescope_api_requests_embeds_canary(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/telescope/telescope-api/requests",
+        headers={"X-Forwarded-For": "203.0.113.141", "Host": "victim.example"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Content-Type", "").startswith("application/json")
+    payload = json.loads(await resp.text())
+    assert payload["entries"][0]["content"]["payload"]["AWS_ACCESS_KEY_ID"] == "AKIAFAKEEXAMPLE01"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "telescope-api-requests"
+    assert entry["telescopePanel"] == "requests"
+    assert "aws" in entry["canaryTypes"]
+
+
+async def test_dispatch_telescope_api_admin_prefix_dispatches_same(flux_client, monkeypatch):
+    """`/admin/telescope/api/requests` should hit the same handler and
+    embed the AWS canary, matching the proxy-rewrite placement
+    scanners walk in addition to the bare path."""
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/admin/telescope/api/requests",
+        headers={"X-Forwarded-For": "203.0.113.142", "Host": "victim.example"},
+    )
+    assert resp.status == 200
+    payload = json.loads(await resp.text())
+    assert payload["entries"][0]["content"]["payload"]["AWS_ACCESS_KEY_ID"] == "AKIAFAKEEXAMPLE01"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "telescope-api-requests"
+
+
+async def test_dispatch_telescope_api_unknown_panel_returns_404(flux_client):
+    resp = await flux_client.get(
+        "/telescope/telescope-api/no-such-panel",
+        headers={"X-Forwarded-For": "203.0.113.143"},
+    )
+    assert resp.status == 404
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "telescope-api-miss"
+    assert entry["telescopePanel"] == "no-such-panel"
+
+
+async def test_dispatch_telescope_api_known_no_credential_panel_returns_empty(flux_client):
+    """Fingerprint-only panels (cache, redis, gates, …) return an empty
+    entries[] and never burn an AWS canary — the SPA renders the same
+    'no events captured' empty state a fresh install would show."""
+    resp = await flux_client.get(
+        "/telescope/telescope-api/cache",
+        headers={"X-Forwarded-For": "203.0.113.144"},
+    )
+    assert resp.status == 200
+    payload = json.loads(await resp.text())
+    assert payload == {"entries": []}
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "telescope-api-cache"
+    assert entry["canaryTypes"] == []
+
+
+async def test_dispatch_telescope_disabled_falls_through(flux_client, monkeypatch):
+    """When TELESCOPE_ENABLED=False the dispatcher must NOT hit
+    `_handle_telescope`. A `/telescope/requests` GET should bypass the
+    handler entirely and the per-request log entry must not carry a
+    `telescope-*` result tag."""
+    monkeypatch.setattr(tbenv, "TELESCOPE_ENABLED", False)
+
+    resp = await flux_client.get(
+        "/telescope/requests",
+        headers={"X-Forwarded-For": "203.0.113.145"},
+    )
+    # Falls into the tarpit / not-handled tail.
+    if _log_entries(flux_client.log_path):
+        entry = _log_entries(flux_client.log_path)[-1]
+        assert not str(entry.get("result", "")).startswith("telescope")
