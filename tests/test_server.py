@@ -7242,6 +7242,33 @@ def test_confluence_has_ognl_indicators():
     assert not tbenv._confluence_has_ognl("/pages/", "os_username=admin", "")
 
 
+def test_confluence_has_ognl_detects_struts_s2_payloads():
+    # Apache Struts S2-053/S2-061/S2-066 redirect:${...ProcessBuilder...} shape
+    # carried in the query string. The `#`-rooted OGNL variable form drives the
+    # xwork.MethodAccessor#denyMethodExecution=false bypass.
+    raw_query = (
+        "redirect:${#a=(new java.lang.ProcessBuilder(new java.lang.String[]"
+        "{'sh','-c','id'})).start(),#b=#a.getInputStream(),#c=new java.io"
+        ".InputStreamReader(#b)}"
+    )
+    assert tbenv._confluence_has_ognl("/index.action", raw_query, "")
+    encoded_query = (
+        "redirectAction%3A%24%7B%23context%5B%22xwork.MethodAccessor"
+        ".denyMethodExecution%22%5D%3Dfalse%2C%23f%3D%23%5FmemberAccess"
+    )
+    assert tbenv._confluence_has_ognl("/index.action", encoded_query, "")
+    # Body-carried variant (some scanners POST the OGNL instead of GET).
+    assert tbenv._confluence_has_ognl(
+        "/login.action", "",
+        "method:#_memberAccess=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS,#res=...",
+    )
+
+
+def test_confluence_default_paths_include_bare_index_action():
+    assert tbenv.is_confluence_path("/index.action")
+    assert tbenv.is_confluence_path("/login.action")
+
+
 def test_confluence_extract_oast_callback_url_encoded():
     payload = (
         "/%24%7B%40java.lang.Runtime%40getRuntime%28%29.exec%28%22"
@@ -7747,6 +7774,32 @@ async def test_dispatch_confluence_ognl_path_extracts_oast_callback(flux_client)
     assert entry["confluenceHasOgnl"] is True
     assert entry["confluenceOastCallback"] == "probe123.oast.me"
     assert "confluencePayloadPreview" in entry
+
+
+async def test_dispatch_struts_s2_ognl_on_index_action(flux_client):
+    # Multi-target scanners ship Struts S2-053/S2-061/S2-066 OGNL
+    # `redirect:${#a=(new ProcessBuilder(...)).start()...}` against bare
+    # `/index.action`. Must route to the confluence handler, tag the log as an
+    # ognl-probe (not generic confluence-login), preserve the payload preview,
+    # and return the login HTML so the scanner believes execution succeeded.
+    resp = await flux_client.get(
+        "/index.action"
+        "?redirect:${%23a%3d(new%20java.lang.ProcessBuilder("
+        "new%20java.lang.String[]{'sh'%2c'-c'%2c'id'}))"
+        ".start()%2c%23b%3d%23a.getInputStream()%2c%23c"
+        "%3d%40org.apache.commons.io.IOUtils%40toString(%23b)}",
+        headers={"X-Forwarded-For": "203.0.113.74", "Host": "struts.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Confluence" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "confluence-ognl-probe"
+    assert entry["confluencePath"] == "/index.action"
+    assert entry["confluenceHasOgnl"] is True
+    assert "confluencePayloadPreview" in entry
+    assert "ProcessBuilder" in entry["confluencePayloadPreview"]
 
 
 async def test_dispatch_confluence_createpage_post_extracts_body_callback(flux_client):

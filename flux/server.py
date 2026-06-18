@@ -1182,6 +1182,12 @@ _CONFLUENCE_DEFAULT_PATHS = ",".join([
     "/login.action",
     "/confluence/login.action",
     "/wiki/login.action",
+    # Bare Struts entry points. Multi-target scanners ship Struts S2-053
+    # / S2-066 OGNL `redirect:${...ProcessBuilder...}` against `/index.action`
+    # and `/login.action` regardless of the underlying webapp; the OGNL
+    # detection downstream tags the malicious query into the same
+    # confluence-ognl-probe bucket.
+    "/index.action",
 ])
 CONFLUENCE_PATHS = {
     value.strip().lower()
@@ -1197,13 +1203,29 @@ CONFLUENCE_VERSION = (os.environ.get("HONEYPOT_CONFLUENCE_VERSION") or "7.18.1")
 # `${@java.lang.Runtime@getRuntime().exec("...")}` URL-encoded as
 # `%24%7B%40...%7D`. Real Confluence traffic never contains these.
 _CONFLUENCE_OGNL_INDICATORS = (
-    "${@",            # raw OGNL
+    "${@",            # raw OGNL (CVE-2022-26134 shape)
     "%24%7b%40",      # URL-encoded OGNL (case-insensitive, normalised)
     "@java.lang.runtime",
     "getruntime()",
     "ognl.runtime",
     ".getmethods(",
     ".getsuperclass(",
+    # Apache Struts2 S2-053 / S2-061 / S2-066 OGNL shape: `${#a=(new
+    # ProcessBuilder(...)).start()...}` carried via `redirect:`, `redirectAction:`,
+    # `action:`, or `method:` query/body params. The `#`-rooted variable form is
+    # how the xwork.MethodAccessor#denyMethodExecution=false bypass is built.
+    "${#",
+    "%24%7b%23",
+    "redirect:${",
+    "redirectaction:",
+    "redirect%3a%24%7b",
+    "redirectaction%3a",
+    "processbuilder",
+    "xwork.methodaccessor",
+    "denymethodexecution",
+    "_memberaccess",
+    "%23_memberaccess",
+    "ognlcontext",
 )
 
 
@@ -16968,14 +16990,18 @@ async def _handle_confluence(
         # Plain login-form POSTs etc. — keep the preview short.
         log_extra["bodyPreview"] = body_preview[:400]
 
-    # OGNL-injection paths and `*-entervariables.action` / `doenterpagevariables.action`
-    # both render the login HTML — that response body is what real
-    # Confluence returns when the OGNL expression executes successfully.
+    # OGNL-injection paths, `*-entervariables.action` /
+    # `doenterpagevariables.action`, and any `.action` whose query/body
+    # carries an S2-* OGNL payload (Struts redirect/redirectAction/method
+    # with `${#...ProcessBuilder...}`) all render the login HTML — that
+    # response body is what real Confluence returns when the OGNL
+    # expression evaluates successfully.
     if (
         "${@" in lpath
         or "%24%7b%40" in lpath
         or "createpage-entervariables.action" in lpath
         or "doenterpagevariables.action" in lpath
+        or (has_ognl and lpath.endswith(".action"))
     ):
         result_tag = "confluence-ognl-probe" if has_ognl else "confluence-action"
         body = render_confluence_login_html(host, CONFLUENCE_VERSION)
