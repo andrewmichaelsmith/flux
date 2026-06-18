@@ -1951,6 +1951,53 @@ _TELESCOPE_PREFIX_DIRS = (
 )
 
 
+# --- Fake OIDC / OAuth discovery endpoint -------------------------------
+# RFC-8414 / OpenID-Connect-Discovery defines
+# `/.well-known/openid-configuration` (and the OAuth-only sibling
+# `/.well-known/oauth-authorization-server`) as the canonical JSON
+# document an IdP serves to advertise its issuer, token / authorization
+# / userinfo / jwks / introspection / revocation / end-session
+# endpoints, supported response/grant types, claims, and signing algs.
+# Scanners walk it as:
+#   1. A liveness + identity-provider fingerprint (Keycloak vs Auth0 vs
+#      Authentik vs custom — the `issuer` and supported algorithms give
+#      enough product fingerprint to gate the follow-on exploit).
+#   2. A pre-probe before credential / session replay against
+#      `/oauth/token`, `/oauth/authorize`, `/p/u/doAuthentication.do`,
+#      `/cgi/login`, `/oauth/idp/...` — the document tells the harvester
+#      which sub-paths to ship the next POST at.
+#   3. A canary-harvest surface: cloud-native-secret scanners grep the
+#      JSON body for `AKIA…` access-key prefixes, plus any non-standard
+#      `_admin*` / `_signing*` / `_test_client*` keys IdPs sometimes
+#      embed for SDK examples — the JSON gets fed into a credential
+#      harvester pipeline regardless of whether the format is RFC-shape.
+# Path matrix covers bare, `/oauth/`, `/oauth/idp/`, `/oauth2/`,
+# `/auth/realms/<realm>/`, `/realms/<realm>/`, and `/idp/` prefixes,
+# the underscore typo (`openid_configuration`), the RFC-8414 OAuth
+# Authorization Server Metadata sibling, and the suffix junk
+# scanners append (`%00`, `%20`, `.txt`, `?v=1`) when fuzzing
+# null-byte / extension-confusion bypasses. URL-encoded leading
+# slashes (`%2F`, `%252F`) are normalised so `/%2F.well-known/...`
+# routes to the same handler.
+OIDC_DISCOVERY_ENABLED = _env_bool("HONEYPOT_OIDC_DISCOVERY_ENABLED")
+# Mimic a Keycloak 24.x install — common in the wild and gates a wide
+# swath of CVE-2024 / CVE-2023 follow-on exploits (CVE-2023-6927 open
+# redirect, CVE-2024-1132 cross-realm). Scanner gating off
+# `issuer.endswith("/auth/realms/<realm>")` works whether the trap is
+# hit at the bare or Keycloak-style path.
+OIDC_DISCOVERY_VERSION = (
+    os.environ.get("HONEYPOT_OIDC_DISCOVERY_VERSION") or "24.0.5"
+).strip()
+_OIDC_DISCOVERY_SUFFIXES = (
+    "/.well-known/openid-configuration",
+    "/.well-known/openid_configuration",  # underscore typo seen in scanner dicts
+    "/.well-known/oauth-authorization-server",  # RFC-8414 sibling
+)
+_OIDC_DISCOVERY_NOISE_SUFFIXES = (
+    "%00", "%20", ".txt", "~",
+)
+
+
 # --- Backup-archive canary trap ----------------------------------------
 # Scanner dictionaries enumerate the cross product `<base>.<ext>` of a
 # 60+-name base list and ~15 compressed-archive extensions hunting for
@@ -2536,6 +2583,63 @@ def is_telescope_path(path: str) -> bool:
     if lp in {"/telescope", "/telescope/"}:
         return True
     return lp.startswith("/telescope/")
+
+
+def _oidc_discovery_normalise(path: str) -> str:
+    """Normalise URL-encoded leading slashes and scanner-noise suffixes
+    so `/%2F.well-known/...`, `/%2f.well-known/...`,
+    `/%252F.well-known/...`, `/.well-known/openid-configuration%00`, and
+    `/.well-known/openid-configuration.txt` all collapse to the canonical
+    form before the suffix check.
+
+    Lowercases first so the percent-encoding match is
+    case-insensitive (scanners mix `%2F` / `%2f` / `%252F` / `%252f`).
+    """
+    p = path.lower()
+    # Collapse repeated URL-encoded leading slashes (`%252F` is `%2F`
+    # double-encoded; some reverse-proxy layouts re-encode once before
+    # the request reaches us).
+    for enc in ("%252f", "%2f"):
+        while p.startswith("/" + enc):
+            p = "/" + p[1 + len(enc):]
+    for noise in _OIDC_DISCOVERY_NOISE_SUFFIXES:
+        if p.endswith(noise):
+            p = p[: -len(noise)]
+    return p
+
+
+def is_oidc_discovery_path(path: str) -> bool:
+    """Match `/.well-known/openid-configuration` (+ RFC-8414 OAuth sibling,
+    + underscore-typo variant) under any of the deployment prefixes
+    scanners enumerate: bare, `/oauth/`, `/oauth2/`, `/oauth/idp/`,
+    `/auth/`, `/auth/realms/<realm>/`, `/realms/<realm>/`, `/idp/`.
+    Tolerates leading-slash URL-encoding (`%2F` / `%252F`) and
+    null-byte / `.txt` / `?v=1` suffix noise."""
+    if not OIDC_DISCOVERY_ENABLED:
+        return False
+    p = _oidc_discovery_normalise(path)
+    # `?v=1` style cache-buster strips
+    p = p.split("?", 1)[0]
+    return any(p.endswith(s) for s in _OIDC_DISCOVERY_SUFFIXES)
+
+
+def _oidc_discovery_realm(path: str) -> str:
+    """Extract the realm name from a Keycloak-style path
+    (`/auth/realms/<realm>/.well-known/...` or
+    `/realms/<realm>/.well-known/...`) for logging. Returns an empty
+    string for bare / `/oauth*` / `/idp/` placements."""
+    p = _oidc_discovery_normalise(path).split("?", 1)[0]
+    # Strip the suffix so the segment immediately before `.well-known`
+    # is the realm (if any).
+    for s in _OIDC_DISCOVERY_SUFFIXES:
+        if p.endswith(s):
+            p = p[: -len(s)]
+            break
+    segs = [seg for seg in p.split("/") if seg]
+    # Keycloak shape: `[..., 'realms', <realm>]`
+    if len(segs) >= 2 and segs[-2] == "realms":
+        return segs[-1][:64]
+    return ""
 
 
 def _liferay_has_marshaller(body_bytes: bytes) -> bool:
@@ -5866,6 +5970,119 @@ def render_telescope_api_empty() -> bytes:
     family; an empty result is more realistic than synthesising data
     on a panel scanners only hit for fingerprinting."""
     return b'{"entries":[]}'
+
+
+def render_oidc_discovery_json(
+    r: dict[str, object],
+    host: str,
+    realm: str,
+    is_oauth_sibling: bool,
+    version: str,
+) -> bytes:
+    """RFC-8414 / OpenID-Connect-Discovery JSON. When called for the
+    OAuth-only `.well-known/oauth-authorization-server` sibling, drops
+    the OIDC-only fields (id_token_*, userinfo_endpoint, claims_supported).
+
+    Canary placement: non-standard `_aws_metadata_signing_*` extension
+    fields carry the Tracebit AWS canary. Cloud-native-secret scanners
+    grep JSON bodies for the `AKIA…` access-key prefix regardless of
+    whether the surrounding schema is RFC-shape; on replay against AWS
+    those creds fire the canary.
+    """
+    safe_host = host or "idp.internal"
+    # Build the issuer to match the deployment shape the request landed
+    # on so scanner gating-on-issuer keeps working.
+    if realm:
+        issuer = f"https://{safe_host}/realms/{realm}"
+        base = f"https://{safe_host}/realms/{realm}/protocol/openid-connect"
+    else:
+        issuer = f"https://{safe_host}"
+        base = f"https://{safe_host}/oauth"
+
+    aws = _aws(r)
+    payload: dict[str, object] = {
+        "issuer": issuer,
+        "authorization_endpoint": f"{base}/auth",
+        "token_endpoint": f"{base}/token",
+        "introspection_endpoint": f"{base}/token/introspect",
+        "revocation_endpoint": f"{base}/revoke",
+        "jwks_uri": f"{base}/certs",
+        "registration_endpoint": f"{base}/clients-registrations/openid-connect",
+        "response_types_supported": [
+            "code", "none", "id_token", "token", "id_token token",
+            "code id_token", "code token", "code id_token token",
+        ],
+        "response_modes_supported": ["query", "fragment", "form_post"],
+        "grant_types_supported": [
+            "authorization_code", "implicit", "refresh_token",
+            "client_credentials", "password",
+            "urn:ietf:params:oauth:grant-type:device_code",
+            "urn:openid:params:grant-type:ciba",
+        ],
+        "subject_types_supported": ["public", "pairwise"],
+        "token_endpoint_auth_methods_supported": [
+            "private_key_jwt", "client_secret_basic", "client_secret_post",
+            "tls_client_auth", "client_secret_jwt",
+        ],
+        "token_endpoint_auth_signing_alg_values_supported": [
+            "PS384", "RS384", "EdDSA", "ES384", "HS256", "HS512", "ES256",
+            "RS256", "HS384", "ES512", "PS256", "PS512", "RS512",
+        ],
+        "scopes_supported": [
+            "openid", "profile", "email", "offline_access", "phone",
+            "address", "microprofile-jwt", "roles", "web-origins",
+        ],
+        "code_challenge_methods_supported": ["plain", "S256"],
+        "tls_client_certificate_bound_access_tokens": True,
+        "request_parameter_supported": True,
+        "request_object_signing_alg_values_supported": [
+            "PS384", "RS384", "EdDSA", "ES384", "HS256", "HS512", "ES256",
+            "RS256", "HS384", "ES512", "PS256", "PS512", "RS512", "none",
+        ],
+        # Non-standard extension slot — IdPs sometimes embed SDK
+        # bootstrapping hints / signing-vendor key IDs here. The Tracebit
+        # AWS canary lands in this slot so harvesters that grep the
+        # discovery JSON for `AKIA…` pick it up.
+        "_aws_metadata_signing_key_id": aws.get("awsAccessKeyId", ""),
+        "_aws_metadata_signing_secret": aws.get("awsSecretAccessKey", ""),
+        "_aws_metadata_session_token": aws.get("awsSessionToken", ""),
+        "_aws_metadata_region": "us-east-1",
+        "_vendor": "keycloak",
+        "_vendor_version": version,
+    }
+    if not is_oauth_sibling:
+        # OIDC-only fields. RFC-8414 OAuth metadata documents don't
+        # carry id_token signing algs / userinfo / claims.
+        payload.update({
+            "userinfo_endpoint": f"{base}/userinfo",
+            "end_session_endpoint": f"{base}/logout",
+            "frontchannel_logout_session_supported": True,
+            "frontchannel_logout_supported": True,
+            "id_token_signing_alg_values_supported": [
+                "PS384", "RS384", "EdDSA", "ES384", "HS256", "HS512", "ES256",
+                "RS256", "HS384", "ES512", "PS256", "PS512", "RS512",
+            ],
+            "id_token_encryption_alg_values_supported": [
+                "RSA-OAEP", "RSA-OAEP-256", "RSA1_5",
+            ],
+            "id_token_encryption_enc_values_supported": [
+                "A256GCM", "A192GCM", "A128GCM", "A128CBC-HS256",
+                "A192CBC-HS384", "A256CBC-HS512",
+            ],
+            "userinfo_signing_alg_values_supported": [
+                "PS384", "RS384", "EdDSA", "ES384", "HS256", "HS512", "ES256",
+                "RS256", "HS384", "ES512", "PS256", "PS512", "RS512", "none",
+            ],
+            "claims_supported": [
+                "aud", "sub", "iss", "auth_time", "name", "given_name",
+                "family_name", "preferred_username", "email", "acr",
+            ],
+            "claims_parameter_supported": True,
+            "claim_types_supported": ["normal"],
+            "backchannel_logout_supported": True,
+            "backchannel_logout_session_supported": True,
+        })
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
 def render_coldfusion_public_page(path: str, host: str, version: str) -> bytes:
@@ -16859,6 +17076,70 @@ async def _handle_telescope(
     )
 
 
+async def _handle_oidc_discovery(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    """OIDC / OAuth discovery JSON. Always 200 with the RFC-shaped doc;
+    the embedded Tracebit AWS canary fires on credential replay.
+
+    Realm name (Keycloak `/realms/<realm>/` placement) is logged for
+    cross-sensor correlation — campaigns frequently target specific
+    realm conventions (`master`, `default`, `<org>`, `<product>`). The
+    method is logged because GET vs POST split distinguishes plain
+    fingerprint walks from dynamic-client-registration probe flows."""
+    host = str(log_context.get("host", ""))
+    request_id = str(log_context.get("requestId", ""))
+    client_ip = str(log_context.get("clientIp", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+    method = request.method
+
+    normalised = _oidc_discovery_normalise(path).split("?", 1)[0]
+    is_oauth_sibling = normalised.endswith(
+        "/.well-known/oauth-authorization-server"
+    )
+    realm = _oidc_discovery_realm(path)
+
+    log_extra: dict[str, object] = {
+        "oidcDiscoveryPath": path,
+        "oidcDiscoveryMethod": method,
+        "oidcDiscoveryRealm": realm,
+        "oidcDiscoveryKind": (
+            "oauth-authorization-server" if is_oauth_sibling
+            else "openid-configuration"
+        ),
+    }
+
+    tracebit_response: dict[str, object] = {}
+    if API_KEY:
+        issued = await _get_or_issue_canary(
+            ("aws",), client_ip, request_id, host, user_agent, path, proto,
+        )
+        if issued is not None:
+            tracebit_response = issued
+    canary_types = [k for k, v in tracebit_response.items() if v]
+
+    body = render_oidc_discovery_json(
+        tracebit_response, host, realm, is_oauth_sibling, OIDC_DISCOVERY_VERSION,
+    )
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Server": "nginx/1.24.0",
+    }
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": "oidc-discovery",
+        **log_extra,
+        "canaryTypes": canary_types,
+        "bytes": len(body),
+    })
+    return web.Response(status=200, body=body, headers=headers)
+
+
 async def _handle_coldfusion(
     request: web.Request,
     log_context: dict[str, object],
@@ -18591,6 +18872,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_telescope_path(path):
         return await _handle_telescope(request, log_context, path, query_string)
+
+    if API_KEY and is_oidc_discovery_path(path):
+        return await _handle_oidc_discovery(request, log_context, path)
 
     if is_coldfusion_path(path):
         return await _handle_coldfusion(request, log_context, path, request_body)

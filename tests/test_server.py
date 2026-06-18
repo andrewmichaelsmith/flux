@@ -580,6 +580,7 @@ def test_all_trap_families_default_on():
     assert tbenv.WP_LOGIN_ENABLED
     assert tbenv.GRAPHQL_ENABLED
     assert tbenv.TELESCOPE_ENABLED
+    assert tbenv.OIDC_DISCOVERY_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -10936,3 +10937,223 @@ async def test_dispatch_telescope_disabled_falls_through(flux_client, monkeypatc
     if _log_entries(flux_client.log_path):
         entry = _log_entries(flux_client.log_path)[-1]
         assert not str(entry.get("result", "")).startswith("telescope")
+
+
+# --- OIDC / OAuth discovery trap -----------------------------------------
+
+def test_oidc_discovery_enabled_by_default():
+    assert tbenv.OIDC_DISCOVERY_ENABLED
+
+
+def test_oidc_discovery_path_matches_observed_probes():
+    """Every prefix shape from the scanner-dictionary tail must route."""
+    for path in (
+        "/.well-known/openid-configuration",
+        "/.well-known/openid_configuration",          # underscore typo
+        "/.well-known/oauth-authorization-server",     # RFC-8414 sibling
+        "/oauth/.well-known/openid-configuration",
+        "/oauth2/.well-known/openid-configuration",
+        "/oauth/idp/.well-known/openid-configuration",
+        "/auth/.well-known/openid-configuration",
+        "/auth/realms/master/.well-known/openid-configuration",
+        "/auth/realms/myorg/.well-known/openid-configuration",
+        "/realms/master/.well-known/openid-configuration",
+        "/idp/.well-known/openid-configuration",
+        # URL-encoded leading slash (scanner WAF-bypass variants)
+        "/%2F.well-known/openid-configuration",
+        "/%2f.well-known/openid-configuration",
+        "/%252F.well-known/openid-configuration",
+        # Noise suffixes (null-byte, .txt, ~ fuzz)
+        "/.well-known/openid-configuration%00",
+        "/.well-known/openid-configuration.txt",
+        "/.well-known/openid-configuration~",
+        # Cache-buster query strings
+        "/.well-known/openid-configuration?v=1",
+    ):
+        assert tbenv.is_oidc_discovery_path(path), f"expected match: {path}"
+
+
+def test_oidc_discovery_path_non_match():
+    for path in (
+        "/",
+        "/index.html",
+        "/.env",
+        "/.well-known/security.txt",
+        "/.well-known/jwks.json",
+        "/openid-configuration",          # missing /.well-known/
+        "/oauth/token",
+        "/realms/master/account",
+    ):
+        assert not tbenv.is_oidc_discovery_path(path), f"unexpected match: {path}"
+
+
+def test_oidc_discovery_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "OIDC_DISCOVERY_ENABLED", False)
+    assert not tbenv.is_oidc_discovery_path(
+        "/.well-known/openid-configuration",
+    )
+
+
+def test_oidc_discovery_realm_extraction():
+    assert tbenv._oidc_discovery_realm(
+        "/auth/realms/master/.well-known/openid-configuration",
+    ) == "master"
+    assert tbenv._oidc_discovery_realm(
+        "/realms/myorg/.well-known/openid-configuration",
+    ) == "myorg"
+    # Bare placement carries no realm.
+    assert tbenv._oidc_discovery_realm(
+        "/.well-known/openid-configuration",
+    ) == ""
+    # `/oauth/idp/...` is not a Keycloak realm shape.
+    assert tbenv._oidc_discovery_realm(
+        "/oauth/idp/.well-known/openid-configuration",
+    ) == ""
+
+
+def test_oidc_discovery_json_embeds_aws_canary_in_extension_slot():
+    body = tbenv.render_oidc_discovery_json(
+        FAKE_TRACEBIT, "idp.example", realm="master",
+        is_oauth_sibling=False, version="24.0.5",
+    )
+    payload = json.loads(body)
+    # Canary placement — the AKIA literal must land in the JSON body.
+    assert payload["_aws_metadata_signing_key_id"] == "AKIAFAKEEXAMPLE01"
+    assert payload["_aws_metadata_signing_secret"].startswith("wJalrXUt")
+    # Standard OIDC fields present + issuer reflects realm.
+    assert payload["issuer"] == "https://idp.example/realms/master"
+    assert payload["token_endpoint"].endswith("/token")
+    assert payload["userinfo_endpoint"].endswith("/userinfo")  # OIDC-only
+    assert "id_token_signing_alg_values_supported" in payload
+    assert "claims_supported" in payload
+
+
+def test_oidc_discovery_json_oauth_sibling_drops_oidc_only_fields():
+    body = tbenv.render_oidc_discovery_json(
+        FAKE_TRACEBIT, "idp.example", realm="",
+        is_oauth_sibling=True, version="24.0.5",
+    )
+    payload = json.loads(body)
+    # RFC-8414 OAuth metadata documents don't carry OIDC-only fields.
+    assert "userinfo_endpoint" not in payload
+    assert "id_token_signing_alg_values_supported" not in payload
+    assert "claims_supported" not in payload
+    # But the OAuth core fields + canary are still present.
+    assert payload["token_endpoint"].endswith("/token")
+    assert payload["_aws_metadata_signing_key_id"] == "AKIAFAKEEXAMPLE01"
+    # Bare placement → bare issuer.
+    assert payload["issuer"] == "https://idp.example"
+
+
+def test_oidc_discovery_json_no_fixed_credential_literals():
+    """The trap must never ship the same secret across sensors. With an
+    empty Tracebit response (no AWS canary issued), the credential slots
+    must be empty strings — never a hardcoded literal."""
+    body = tbenv.render_oidc_discovery_json(
+        {}, "idp.example", realm="", is_oauth_sibling=False, version="24.0.5",
+    )
+    payload = json.loads(body)
+    assert payload["_aws_metadata_signing_key_id"] == ""
+    assert payload["_aws_metadata_signing_secret"] == ""
+    assert payload["_aws_metadata_session_token"] == ""
+
+
+async def test_dispatch_oidc_discovery_embeds_canary(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/.well-known/openid-configuration",
+        headers={"X-Forwarded-For": "203.0.113.151", "Host": "idp.example"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Content-Type", "").startswith("application/json")
+    payload = json.loads(await resp.text())
+    assert payload["_aws_metadata_signing_key_id"] == "AKIAFAKEEXAMPLE01"
+    assert payload["issuer"] == "https://idp.example"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "oidc-discovery"
+    assert entry["oidcDiscoveryKind"] == "openid-configuration"
+    assert entry["oidcDiscoveryRealm"] == ""
+    assert "aws" in entry["canaryTypes"]
+
+
+async def test_dispatch_oidc_discovery_keycloak_realm_path(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/auth/realms/master/.well-known/openid-configuration",
+        headers={"X-Forwarded-For": "203.0.113.152", "Host": "idp.example"},
+    )
+    assert resp.status == 200
+    payload = json.loads(await resp.text())
+    assert payload["issuer"] == "https://idp.example/realms/master"
+    # Token endpoint should reflect the realm structure.
+    assert "/realms/master/protocol/openid-connect/token" in payload["token_endpoint"]
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "oidc-discovery"
+    assert entry["oidcDiscoveryRealm"] == "master"
+
+
+async def test_dispatch_oidc_discovery_oauth_sibling_variant(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/.well-known/oauth-authorization-server",
+        headers={"X-Forwarded-For": "203.0.113.153", "Host": "idp.example"},
+    )
+    assert resp.status == 200
+    payload = json.loads(await resp.text())
+    # RFC-8414 — no OIDC-only fields.
+    assert "userinfo_endpoint" not in payload
+    assert "claims_supported" not in payload
+    assert payload["token_endpoint"].endswith("/token")
+    assert payload["_aws_metadata_signing_key_id"] == "AKIAFAKEEXAMPLE01"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["oidcDiscoveryKind"] == "oauth-authorization-server"
+
+
+async def test_dispatch_oidc_discovery_url_encoded_slash_prefix(flux_client, monkeypatch):
+    """`/%2F.well-known/...` is a common scanner WAF-bypass variant — it
+    must collapse to the canonical path and route to the same handler."""
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/%2F.well-known/openid-configuration",
+        headers={"X-Forwarded-For": "203.0.113.154", "Host": "idp.example"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "oidc-discovery"
+
+
+async def test_dispatch_oidc_discovery_disabled_falls_through(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "OIDC_DISCOVERY_ENABLED", False)
+    resp = await flux_client.get(
+        "/.well-known/openid-configuration",
+        headers={"X-Forwarded-For": "203.0.113.155"},
+    )
+    if _log_entries(flux_client.log_path):
+        entry = _log_entries(flux_client.log_path)[-1]
+        assert entry.get("result") != "oidc-discovery"
+
+
+async def test_dispatch_oidc_discovery_no_api_key_skips_trap(flux_client, monkeypatch):
+    """Without TRACEBIT_API_KEY the trap must not claim the path —
+    every other canary-backed trap follows this convention so the
+    keyless smoke deployment doesn't emit credential-shaped 200s with
+    empty AKIA fields that would burn the deception on first hit."""
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    resp = await flux_client.get(
+        "/.well-known/openid-configuration",
+        headers={"X-Forwarded-For": "203.0.113.156"},
+    )
+    if _log_entries(flux_client.log_path):
+        entry = _log_entries(flux_client.log_path)[-1]
+        assert entry.get("result") != "oidc-discovery"
