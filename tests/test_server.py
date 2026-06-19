@@ -581,6 +581,7 @@ def test_all_trap_families_default_on():
     assert tbenv.GRAPHQL_ENABLED
     assert tbenv.TELESCOPE_ENABLED
     assert tbenv.OIDC_DISCOVERY_ENABLED
+    assert tbenv.PHPMYADMIN_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -11157,3 +11158,202 @@ async def test_dispatch_oidc_discovery_no_api_key_skips_trap(flux_client, monkey
     if _log_entries(flux_client.log_path):
         entry = _log_entries(flux_client.log_path)[-1]
         assert entry.get("result") != "oidc-discovery"
+
+
+# --- Fake phpMyAdmin login trap ------------------------------------------
+
+def test_phpmyadmin_enabled_by_default():
+    assert tbenv.PHPMYADMIN_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    # Canonical install dirs (the four highest-volume misses in the
+    # corpus walkthrough that motivated the trap).
+    "/phpmyadmin/",
+    "/phpMyAdmin/",
+    "/PMA/",
+    "/pma/",
+    "/myadmin/",
+    "/phpmyadmin",
+    # Deep paths scanner dictionaries walk inside the install dir.
+    "/phpmyadmin/index.php",
+    "/phpMyAdmin/index.php",
+    "/PMA/index.php",
+    "/myadmin/index.php",
+    "/phpmyadmin/sql.php",
+    "/phpmyadmin/setup/index.php",
+    "/PMA/setup/",
+    # Less-common aliases that still show up in dictionaries.
+    "/dbadmin/",
+    "/mysql/",
+    "/mysqladmin/",
+    "/sqladmin/",
+    "/admin/phpmyadmin/",
+    "/admin/pma/",
+    "/web/phpmyadmin/",
+    # Per-version directories — scanners blindly walk every minor
+    # release suffix because some installs leave them in place.
+    "/phpmyadmin4.8.1/",
+    "/phpmyadmin-5.2.1/",
+    "/phpMyAdmin4.7.0/",
+    "/PMA2018/",
+    "/pma_5.2/",
+])
+def test_phpmyadmin_path_matches_observed_probes(path):
+    assert tbenv.is_phpmyadmin_path(path), f"expected match: {path}"
+
+
+@pytest.mark.parametrize("path", [
+    "/",
+    "/index.php",
+    "/wp-login.php",
+    "/admin/",
+    "/phpunit/",
+    "/phpinfo.php",
+    "/db.sql",
+    "/database.sql",
+    # Word boundary — `/myadminpanel/` is not a PMA alias.
+    "/myadminpanel/",
+])
+def test_phpmyadmin_path_non_match(path):
+    assert not tbenv.is_phpmyadmin_path(path), f"unexpected match: {path}"
+
+
+def test_phpmyadmin_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "PHPMYADMIN_ENABLED", False)
+    assert not tbenv.is_phpmyadmin_path("/phpmyadmin/index.php")
+
+
+def test_phpmyadmin_login_html_no_fixed_credential_literals():
+    """Per the flux design principle, every credential-shaped field must
+    be per-hit unique. The login HTML carries a hidden form token + a
+    session cookie; the token in the rendered body must be the one we
+    pass in, not a hardcoded literal."""
+    body_a = tbenv.render_phpmyadmin_login_html(version="5.2.1", token="aaaaaaaa")
+    body_b = tbenv.render_phpmyadmin_login_html(version="5.2.1", token="bbbbbbbb")
+    assert b'name="token" value="aaaaaaaa"' in body_a
+    assert b'name="token" value="bbbbbbbb"' in body_b
+    assert body_a != body_b
+
+
+def test_phpmyadmin_login_html_echoes_submitted_user_safely():
+    """On a re-render after a failed POST, the submitted username gets
+    echoed back into the form field — real PMA does this, and it makes
+    the trap look stateful. Reflected user input MUST be HTML-escaped."""
+    body = tbenv.render_phpmyadmin_login_html(
+        version="5.2.1", token="t", submitted_user='<script>x</script>',
+    )
+    assert b'&lt;script&gt;x&lt;/script&gt;' in body
+    assert b'<script>x</script>' not in body
+
+
+def test_phpmyadmin_extract_creds_records_no_plaintext_password():
+    """We log the username + password length, never the password itself."""
+    body = b"pma_username=root&pma_password=hunter2&server=1&token=abc"
+    fields = tbenv.extract_phpmyadmin_creds(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert fields["pma_username"] == "root"
+    assert fields["hasPwd"] == "true"
+    assert fields["pwdLen"] == "7"
+    assert fields["server"] == "1"
+    assert fields["token"] == "abc"
+    # Password value itself is not stored.
+    assert "pma_password" not in fields
+
+
+async def test_dispatch_phpmyadmin_get_renders_login(flux_client, monkeypatch):
+    resp = await flux_client.get(
+        "/phpmyadmin/",
+        headers={"X-Forwarded-For": "203.0.113.200"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b'name="pma_username"' in body
+    assert b'name="pma_password"' in body
+    # Per-hit token + session cookie.
+    cookie = resp.headers.get("Set-Cookie", "")
+    assert cookie.startswith("phpMyAdmin=")
+    assert "HttpOnly" in cookie
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "phpmyadmin-login"
+    assert entry["phpMyAdminMethod"] == "GET"
+    assert entry["phpMyAdminPath"] == "/phpmyadmin/"
+    assert entry["clientIp"] == "203.0.113.200"
+
+
+async def test_dispatch_phpmyadmin_setup_probe_gets_distinct_result(flux_client):
+    resp = await flux_client.get(
+        "/phpmyadmin/setup/index.php",
+        headers={"X-Forwarded-For": "203.0.113.201"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "phpmyadmin-setup-probe"
+
+
+async def test_dispatch_phpmyadmin_post_captures_credentials(flux_client):
+    body = b"pma_username=admin&pma_password=correcthorsebatterystaple&server=1&token=xyz"
+    resp = await flux_client.post(
+        "/PMA/index.php",
+        data=body,
+        headers={
+            "X-Forwarded-For": "203.0.113.202",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": "phpMyAdmin=oldsession",
+        },
+    )
+    assert resp.status == 200
+    page = await resp.read()
+    # The error message renders on the re-served form.
+    assert b"Cannot log in to the MySQL server" in page
+    # And the submitted username is echoed back into the value attribute.
+    assert b'value="admin"' in page
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "phpmyadmin-credential-post"
+    assert entry["phpMyAdminUsername"] == "admin"
+    assert entry["phpMyAdminHasPwd"] is True
+    assert entry["phpMyAdminPwdLen"] == "25"
+    assert entry["phpMyAdminServer"] == "1"
+    assert entry["phpMyAdminSessionCookiePresent"] is True
+
+
+async def test_dispatch_phpmyadmin_disabled_falls_through(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "PHPMYADMIN_ENABLED", False)
+    resp = await flux_client.get(
+        "/phpmyadmin/",
+        headers={"X-Forwarded-For": "203.0.113.203"},
+    )
+    assert resp.status == 404
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "not-handled"
+
+
+async def test_dispatch_phpmyadmin_head_returns_empty_body(flux_client):
+    resp = await flux_client.head(
+        "/phpmyadmin/",
+        headers={"X-Forwarded-For": "203.0.113.204"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert body == b""
+    # Content-Length still reflects the GET body size — same as real PMA.
+    assert int(resp.headers.get("Content-Length", "0")) > 0
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "phpmyadmin-login"
+    assert entry["phpMyAdminMethod"] == "HEAD"
+
+
+async def test_dispatch_phpmyadmin_no_api_key_still_serves(flux_client, monkeypatch):
+    """Unlike the canary-backed traps, phpMyAdmin doesn't need the
+    Tracebit API key — the trap captures already-submitted creds and
+    issues no canary, so keyless deployments still get the credential-
+    capture signal."""
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    resp = await flux_client.get(
+        "/phpmyadmin/",
+        headers={"X-Forwarded-For": "203.0.113.205"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "phpmyadmin-login"

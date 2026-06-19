@@ -1998,6 +1998,64 @@ _OIDC_DISCOVERY_NOISE_SUFFIXES = (
 )
 
 
+# --- Fake phpMyAdmin login page ----------------------------------------
+# Scanner dictionaries fan out across the classic phpMyAdmin install-
+# path aliases (`/phpmyadmin/`, `/phpMyAdmin/`, `/PMA/`, `/myadmin/`,
+# `/dbadmin/`, plus per-version directories like `/phpmyadmin4.8.1/`).
+# Every hit currently 404s — credential-brute scanners walking the list
+# bail before POSTing any login bytes, and we lose the username +
+# password material plus the chance to plant a per-hit session-cookie
+# canary. Returning a believable PMA 5.x login HTML at the front door
+# (with a per-hit `phpMyAdmin` session cookie and a per-hit hidden
+# form token) lets the brute fleets actually submit creds, which we
+# capture and log. Real PMA returns 200 on bare GET and 200 on a
+# failed POST too, so the trap doesn't have to fabricate an exotic
+# status to look legitimate.
+PHPMYADMIN_ENABLED = _env_bool("HONEYPOT_PHPMYADMIN_ENABLED")
+PHPMYADMIN_VERSION = (os.environ.get("HONEYPOT_PHPMYADMIN_VERSION") or "5.2.1").strip()
+PHPMYADMIN_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_PHPMYADMIN_BODY_DECODE_LIMIT") or "4096").strip() or "4096"),
+    256,
+)
+# Path PREFIXES — any path starting with `<prefix>/` (or equalling
+# the prefix or `<prefix>/`) matches. Per-version directory aliases
+# (`/phpmyadmin4.8.1/`, `/phpmyadmin-5.2.1/`) caught by the regex
+# below. Override via CSV for site-specific dictionaries.
+_PHPMYADMIN_DEFAULT_PATHS = ",".join([
+    "/phpmyadmin",
+    "/phpMyAdmin",
+    "/pma",
+    "/PMA",
+    "/myadmin",
+    "/MyAdmin",
+    "/dbadmin",
+    "/mysql",
+    "/mysqladmin",
+    "/sqladmin",
+    "/sqlmanager",
+    "/admin/phpmyadmin",
+    "/admin/pma",
+    "/admin/mysql",
+    "/_phpmyadmin",
+    "/db",
+    "/database",
+    "/web/phpmyadmin",
+])
+PHPMYADMIN_PATH_PREFIXES = tuple(
+    value.strip().lower().rstrip("/")
+    for value in (os.environ.get("HONEYPOT_PHPMYADMIN_PATHS_CSV") or _PHPMYADMIN_DEFAULT_PATHS).split(",")
+    if value.strip()
+)
+# Match per-version aliases like `/phpmyadmin4.8.1/` or
+# `/phpmyadmin-2024.04/` against any of the base names above. Compiled
+# once at import time.
+_PHPMYADMIN_VERSIONED_RE = re.compile(
+    r"^/(?:phpmyadmin|phpMyAdmin|pma|PMA|myadmin|MyAdmin|dbadmin|mysql|mysqladmin)"
+    r"[-_]?[0-9][0-9._\-]*/?$",
+    re.IGNORECASE,
+)
+
+
 # --- Backup-archive canary trap ----------------------------------------
 # Scanner dictionaries enumerate the cross product `<base>.<ext>` of a
 # 60+-name base list and ~15 compressed-archive extensions hunting for
@@ -2647,6 +2705,22 @@ def _liferay_has_marshaller(body_bytes: bytes) -> bool:
         return False
     haystack = body_bytes[:LIFERAY_BODY_DECODE_LIMIT].lower()
     return any(needle in haystack for needle in _LIFERAY_MARSHALLER_INDICATORS)
+
+
+def is_phpmyadmin_path(path: str) -> bool:
+    """Match phpMyAdmin install-path aliases. Accepts bare
+    `/<base>`, `/<base>/`, and `/<base>/<anything>` so the trap
+    catches both the directory probe and the various deep paths
+    scanners walk (`/phpmyadmin/index.php`, `/PMA/sql.php`,
+    `/phpmyadmin/setup/`). Also matches per-version aliases like
+    `/phpmyadmin4.8.1/` via `_PHPMYADMIN_VERSIONED_RE`."""
+    if not PHPMYADMIN_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    for prefix in PHPMYADMIN_PATH_PREFIXES:
+        if lp == prefix or lp == prefix + "/" or lp.startswith(prefix + "/"):
+            return True
+    return bool(_PHPMYADMIN_VERSIONED_RE.match(lp))
 
 
 def is_cmd_injection_path(path: str) -> bool:
@@ -5196,6 +5270,112 @@ def render_geoserver_capabilities(service: str, version: str) -> bytes:
 </{svc}_Capabilities>
 """
     return body.encode("utf-8")
+
+
+def render_phpmyadmin_login_html(
+    *,
+    version: str,
+    token: str,
+    error: str = "",
+    submitted_user: str = "",
+) -> bytes:
+    """phpMyAdmin 5.x cookie-auth login page. Field names match the real
+    project so brute fleets walking PMA dictionaries POST their creds
+    into the expected slots (`pma_username`, `pma_password`, `server`,
+    `token`). Optional `error` renders the standard
+    "Cannot log in to the MySQL server" notice after a credential POST,
+    and the submitted username is echoed back into the form field the
+    way real PMA does so banner-grab scanners see realistic state."""
+    safe_token = (
+        token.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )
+    safe_user = (
+        submitted_user.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )[:120]
+    safe_version = (
+        version.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )[:32]
+    error_html = ""
+    if error:
+        safe_error = (
+            error.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )[:200]
+        error_html = (
+            '<div class="error"><img src="themes/dot.gif" title="" alt="" />'
+            f'  {safe_error}</div>\n'
+        )
+    body = f"""<!DOCTYPE HTML>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8" />
+<meta name="referrer" content="no-referrer" />
+<meta name="robots" content="noindex,nofollow" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0,minimum-scale=0.5,maximum-scale=2.0" />
+<meta http-equiv="X-UA-Compatible" content="IE=Edge" />
+<meta name="generator" content="phpMyAdmin {safe_version}" />
+<title>phpMyAdmin</title>
+<link rel="icon" href="favicon.ico" type="image/x-icon" />
+<link rel="stylesheet" type="text/css" href="index.php?route=/themes/pmahomme/css/theme.css&amp;v={safe_version}" />
+</head>
+<body class="loginform">
+<div class="container">
+  <a href="https://www.phpmyadmin.net/" target="_blank" rel="noopener noreferrer" class="logo">
+    phpMyAdmin
+  </a>
+  <h1>Welcome to <bdo dir="ltr" lang="en">phpMyAdmin</bdo></h1>
+  <noscript><div class="error">Javascript must be enabled past this point!</div></noscript>
+{error_html}  <div class="hide" id="js-https-mismatch"></div>
+  <form method="post" action="index.php?route=/" name="login_form" id="login_form" class="login hide js-show" autocomplete="off">
+    <fieldset>
+      <legend>Log in <a href="./url.php?url=https%3A%2F%2Fdocs.phpmyadmin.net%2Fen%2Flatest%2Fsetup.html%23authentication-modes" target="_blank" rel="noopener noreferrer" class="logo-info">Information</a></legend>
+      <div class="item">
+        <label for="input_username">Username:</label>
+        <input type="text" name="pma_username" id="input_username" value="{safe_user}" size="24" class="textfield" autocomplete="username" spellcheck="false" />
+      </div>
+      <div class="item">
+        <label for="input_password">Password:</label>
+        <input type="password" name="pma_password" id="input_password" value="" size="24" class="textfield" autocomplete="current-password" spellcheck="false" />
+      </div>
+      <div class="item">
+        <label for="select_server">Server Choice:</label>
+        <select name="server" id="select_server">
+          <option value="1" selected="selected">localhost</option>
+        </select>
+      </div>
+      <input type="hidden" name="set_session" value="" />
+      <input type="hidden" name="token" value="{safe_token}" />
+      <input type="hidden" name="target" value="index.php" />
+    </fieldset>
+    <fieldset class="tblFooters">
+      <input class="btn btn-primary" value="Log in" type="submit" id="input_go" />
+    </fieldset>
+  </form>
+</div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def extract_phpmyadmin_creds(body: bytes, content_type: str) -> dict[str, str]:
+    """Pull the four PMA login fields off a `application/x-www-form-urlencoded`
+    or `multipart/form-data` POST body. Mirrors `extract_wp_login_creds`:
+    we record the username, server, token, and whether a password was
+    present, but never store the password itself."""
+    parsed = parse_form_body(body, content_type)
+    result: dict[str, str] = {}
+    for key in ("pma_username", "pma_password", "server", "token", "target", "set_session"):
+        values = parsed.get(key)
+        if values and values[0]:
+            if key == "pma_password":
+                result["hasPwd"] = "true"
+                result["pwdLen"] = str(len(values[0]))[:6]
+            else:
+                result[key] = values[0][:200]
+    return result
 
 
 def render_liferay_jsonws_landing(host: str, aws: dict, version: str, build: str) -> bytes:
@@ -17076,6 +17256,116 @@ async def _handle_telescope(
     )
 
 
+async def _handle_phpmyadmin(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """phpMyAdmin cookie-auth login page. GET (or HEAD) on any
+    `/<pma-alias>/...` path renders the canonical PMA login HTML with
+    a per-hit hidden token + a per-hit `phpMyAdmin` session cookie,
+    and POSTs that supply `pma_username` / `pma_password` are captured
+    as a `phpmyadmin-credential-post` event before the same login HTML
+    is re-served with the standard "Cannot log in to the MySQL server"
+    error notice. Real PMA returns 200 in both cases, so the trap
+    matches the on-the-wire shape banner-grab + brute clients expect.
+
+    No fixed credential literals are ever emitted — the token + session
+    cookie are per-hit synthetics (random 32-hex), per the flux
+    every-credential-per-hit-unique design principle. The trap deliberately
+    has no canary issuance call: it captures already-submitted creds, it
+    does not issue replay-fireable secrets, so it stays cheap to run."""
+    method = request.method
+    lp = path.lower().split("?", 1)[0]
+    content_type_req = request.headers.get("Content-Type", "")
+    cookie_header = request.headers.get("Cookie", "")
+    cookies = parse_cookies(cookie_header)
+    submitted_session = cookies.get("phpMyAdmin", "") or cookies.get("phpmyadmin", "")
+
+    token = uuid.uuid4().hex[:32]
+    session_id = uuid.uuid4().hex
+
+    common_headers = {
+        "Server": "Apache/2.4.41 (Ubuntu)",
+        "X-Powered-By": f"PHP/8.1.27 phpMyAdmin/{PHPMYADMIN_VERSION}",
+        "X-Frame-Options": "DENY",
+        "Cache-Control": "no-store, no-cache, must-revalidate, pre-check=0, post-check=0, max-age=0",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+    }
+    set_cookie = (
+        f"phpMyAdmin={session_id}; Path=/; HttpOnly; SameSite=Strict"
+    )
+
+    if method == "POST":
+        creds = extract_phpmyadmin_creds(request_body, content_type_req)
+        body_preview = ""
+        if request_body:
+            body_preview = request_body[:PHPMYADMIN_BODY_DECODE_LIMIT].decode(
+                "utf-8", errors="replace",
+            )
+        log_entry = {
+            **log_context,
+            "result": "phpmyadmin-credential-post",
+            "status": 200,
+            "phpMyAdminPath": path,
+            "phpMyAdminUsername": creds.get("pma_username", ""),
+            "phpMyAdminHasPwd": creds.get("hasPwd", "") == "true",
+            "phpMyAdminPwdLen": creds.get("pwdLen", ""),
+            "phpMyAdminServer": creds.get("server", ""),
+            "phpMyAdminTokenSubmitted": creds.get("token", "")[:48],
+            "phpMyAdminSessionCookiePresent": bool(submitted_session),
+            "contentType": content_type_req[:120],
+        }
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview
+        html = render_phpmyadmin_login_html(
+            version=PHPMYADMIN_VERSION,
+            token=token,
+            error="Cannot log in to the MySQL server",
+            submitted_user=creds.get("pma_username", ""),
+        )
+        log_entry["bytes"] = len(html)
+        append_log(log_entry)
+        return web.Response(
+            status=200, body=html,
+            headers={
+                **common_headers,
+                "Content-Type": "text/html; charset=utf-8",
+                "Set-Cookie": set_cookie,
+                "Content-Length": str(len(html)),
+            },
+        )
+
+    # GET / HEAD — render the bare login page. A `/setup/` probe gets
+    # the same login since real PMA installs typically lock /setup/ to
+    # disabled or redirect to the main login.
+    is_setup = "/setup/" in lp or lp.endswith("/setup")
+    result_tag = "phpmyadmin-setup-probe" if is_setup else "phpmyadmin-login"
+    html = render_phpmyadmin_login_html(version=PHPMYADMIN_VERSION, token=token)
+    response_body = b"" if method == "HEAD" else html
+    log_entry = {
+        **log_context,
+        "result": result_tag,
+        "status": 200,
+        "phpMyAdminPath": path,
+        "phpMyAdminMethod": method,
+        "phpMyAdminSessionCookiePresent": bool(submitted_session),
+        "bytes": len(html),
+    }
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=response_body,
+        headers={
+            **common_headers,
+            "Content-Type": "text/html; charset=utf-8",
+            "Set-Cookie": set_cookie,
+            "Content-Length": str(len(html)),
+        },
+    )
+
+
 async def _handle_oidc_discovery(
     request: web.Request,
     log_context: dict[str, object],
@@ -18875,6 +19165,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if API_KEY and is_oidc_discovery_path(path):
         return await _handle_oidc_discovery(request, log_context, path)
+
+    if is_phpmyadmin_path(path):
+        return await _handle_phpmyadmin(request, log_context, path, request_body)
 
     if is_coldfusion_path(path):
         return await _handle_coldfusion(request, log_context, path, request_body)

@@ -314,6 +314,26 @@ The handler always advertises `Server: Spring Cloud Gateway/3.1.0` —
 pinned inside the CVE-2022-22947 public-disclosure window so scanners
 deciding whether to ship the SpEL body don't bail on a patched banner.
 
+## Fake phpMyAdmin login page
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_PHPMYADMIN_ENABLED` | on | Master switch. Covers the classic install-path aliases (`/phpmyadmin/`, `/phpMyAdmin/`, `/PMA/`, `/myadmin/`, `/dbadmin/`, `/mysql/`, `/admin/phpmyadmin/`, …) plus per-version directories (`/phpmyadmin4.8.1/`). Keyless — the trap captures already-submitted creds and issues no canary, so it adds no Tracebit API cost. |
+| `HONEYPOT_PHPMYADMIN_PATHS_CSV` | *(built-in alias list — see `_PHPMYADMIN_DEFAULT_PATHS` in `flux/server.py`)* | Path PREFIXES (not exact paths). Any request equal to a prefix, equal to `<prefix>/`, or starting with `<prefix>/` dispatches here. Per-version aliases (`/phpmyadminN.N/`, `/pmaYYYY/`) are matched separately by regex. |
+| `HONEYPOT_PHPMYADMIN_VERSION` | `5.2.1` | Version string advertised in the page `<meta name="generator">`, theme CSS query string, and `X-Powered-By` header. Pinned to a recent PMA release so brute fleets don't bail on a patched banner. |
+| `HONEYPOT_PHPMYADMIN_BODY_DECODE_LIMIT` | `4096` | Max bytes of the credential POST body decoded into `bodyPreview`. Larger values are wasteful — PMA login bodies are typically under 200 bytes. |
+
+The handler logs `phpmyadmin-login` (bare GET/HEAD), `phpmyadmin-setup-probe`
+(any `/setup/` GET — separable so the setup-page fanout doesn't drown
+the main login signal), and `phpmyadmin-credential-post` (POST). On
+credential POST it records `phpMyAdminUsername`, `phpMyAdminHasPwd`,
+`phpMyAdminPwdLen` (length only — never the password value), the
+submitted `token`, the `server` selector, and whether a prior
+`phpMyAdmin` session cookie was replayed. Both the per-request hidden
+form `token` and the issued `phpMyAdmin=<session>` cookie are
+`uuid4().hex` randomness so no fixed credential-shaped literal is ever
+shipped across the sensor fleet.
+
 ## Bind address / port
 
 Flux listens on `127.0.0.1:18081` (aiohttp). To change, edit
