@@ -796,6 +796,20 @@ FAKE_TRACEBIT = {
     ("/@vite/env", b"context.define"),
     ("/@vite/env", b'"import.meta.env.VITE_API_KEY":"AKIAFAKEEXAMPLE01"'),
     ("/@vite/env", b'"import.meta.env.VITE_AWS_ACCESS_KEY_ID":"AKIAFAKEEXAMPLE01"'),
+    # `vercel.json` — Vercel project-config file. Scanner harvesters
+    # grep `env`, `build.env`, and `headers[]` slots for AWS/AKIA, so
+    # the canary access key + secret sit in all three. Webroot-prefix
+    # variants share one renderer.
+    ("/vercel.json", b'"AWS_ACCESS_KEY_ID": "AKIAFAKEEXAMPLE01"'),
+    ("/vercel.json", b'"x-aws-access-key-id"'),
+    ("/vercel.json", b'"framework": "nextjs"'),
+    ("/app/vercel.json", b'"AWS_ACCESS_KEY_ID": "AKIAFAKEEXAMPLE01"'),
+    ("/var/task/vercel.json", b'"AWS_ACCESS_KEY_ID": "AKIAFAKEEXAMPLE01"'),
+    ("/usr/src/app/vercel.json", b'"AWS_ACCESS_KEY_ID": "AKIAFAKEEXAMPLE01"'),
+    ("/srv/app/vercel.json", b'"AWS_ACCESS_KEY_ID": "AKIAFAKEEXAMPLE01"'),
+    ("/home/node/app/vercel.json", b'"AWS_ACCESS_KEY_ID": "AKIAFAKEEXAMPLE01"'),
+    ("/opt/app/vercel.json", b'"AWS_ACCESS_KEY_ID": "AKIAFAKEEXAMPLE01"'),
+    ("/workspace/vercel.json", b'"AWS_ACCESS_KEY_ID": "AKIAFAKEEXAMPLE01"'),
     ("/debug/pprof/", b"heap profile:"),
     ("/debug/pprof/heap", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/debug/pprof/cmdline", b"AWS_SECRET_ACCESS_KEY="),

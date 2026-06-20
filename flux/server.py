@@ -10120,6 +10120,79 @@ def render_vite_env(r: dict[str, object]) -> bytes:
     return body.encode("utf-8")
 
 
+def render_vercel_json(r: dict[str, object]) -> bytes:
+    # `vercel.json` is the project-config file Vercel deployments commit
+    # at the repo root. Scanner dictionaries walk it under several
+    # webroot prefixes (`/app/`, `/var/task/`, `/usr/src/app/`,
+    # `/srv/app/`, `/home/node/app/`, `/opt/app/`) because those are
+    # the paths a misconfigured static-file route on a Next.js / Nuxt /
+    # SvelteKit deploy commonly exposes. The fields scanner harvesters
+    # grep are `env`, `build.env`, and the per-route `headers[]`
+    # blocks — each is a documented place where a real Vercel project
+    # surfaces build-time env vars or backend tokens.
+    #
+    # The renderer places the per-request Tracebit AWS canary in all
+    # three slots (`env`, `build.env`, plus `headers[].headers[]` so a
+    # grep that only walks the routes array also exfils the canary)
+    # and per-hit synthetics for non-AWS fields (`NEXTAUTH_SECRET`,
+    # `DATABASE_URL`, `REDIS_URL`) so the body can't be fingerprinted
+    # across the fleet.
+    aws = _aws(r)
+    nextauth_secret = _fake_db_password()
+    db_password = _fake_db_password()
+    redis_password = _fake_db_password()
+    project_id = secrets.token_hex(12)
+    canary_access = aws.get("awsAccessKeyId", "")
+    canary_secret = aws.get("awsSecretAccessKey", "")
+    canary_session = aws.get("awsSessionToken", "")
+    body = {
+        "version": 2,
+        "name": "internal-app",
+        "buildCommand": "npm run build",
+        "installCommand": "npm ci",
+        "outputDirectory": ".next",
+        "framework": "nextjs",
+        "regions": ["iad1"],
+        "env": {
+            "NODE_ENV": "production",
+            "AWS_REGION": "us-east-1",
+            "AWS_ACCESS_KEY_ID": canary_access,
+            "AWS_SECRET_ACCESS_KEY": canary_secret,
+            "AWS_SESSION_TOKEN": canary_session,
+            "NEXTAUTH_SECRET": nextauth_secret,
+            "NEXTAUTH_URL": "https://app.internal.example.com",
+            "DATABASE_URL": (
+                f"postgresql://prod_rw:{db_password}@db.internal:5432/prod"
+            ),
+            "REDIS_URL": f"redis://:{redis_password}@redis.internal:6379/0",
+            "VERCEL_PROJECT_ID": f"prj_{project_id}",
+        },
+        "build": {
+            "env": {
+                "AWS_ACCESS_KEY_ID": canary_access,
+                "AWS_SECRET_ACCESS_KEY": canary_secret,
+                "AWS_SESSION_TOKEN": canary_session,
+                "AWS_REGION": "us-east-1",
+                "SENTRY_AUTH_TOKEN": _fake_db_password(),
+            },
+        },
+        "headers": [
+            {
+                "source": "/api/(.*)",
+                "headers": [
+                    {"key": "x-aws-access-key-id", "value": canary_access},
+                    {"key": "x-aws-secret-access-key", "value": canary_secret},
+                    {"key": "x-internal-deploy", "value": "true"},
+                ],
+            },
+        ],
+        "rewrites": [
+            {"source": "/api/:path*", "destination": "/api/:path*"},
+        ],
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
 def render_env_vault(r: dict[str, object]) -> bytes:
     # `.env.vault` is the dotenv-vault file format: per-environment
     # encrypted ciphertext entries that need a `DOTENV_KEY` decryption
@@ -13159,6 +13232,34 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_vite_env,
         "application/javascript; charset=utf-8",
+    ),
+    # `vercel.json` — the project-config file Vercel deployments commit
+    # at the repo root. Real Vercel `env`, `build.env`, and per-route
+    # `headers[]` blocks are documented places where build-time AWS
+    # creds / Sentry tokens / database URLs leak when a frontend dev
+    # commits a populated config instead of relying on the dashboard
+    # env-var UI. Scanner dictionaries walk webroot-prefix variants
+    # (`/app/`, `/var/task/` for AWS Lambda-style deploys,
+    # `/usr/src/app/` for the Node Docker base image, etc.) because
+    # those are the runtime working-directories where misconfigured
+    # static-file routes commonly expose the file.
+    CanaryTrap(
+        "vercel-json",
+        (
+            "/vercel.json",
+            # Webroot-prefix variants — the working-directories common
+            # serverless / container deploys put the project at.
+            "/app/vercel.json",
+            "/var/task/vercel.json",
+            "/usr/src/app/vercel.json",
+            "/srv/app/vercel.json",
+            "/home/node/app/vercel.json",
+            "/opt/app/vercel.json",
+            "/workspace/vercel.json",
+        ),
+        ("aws",),
+        render_vercel_json,
+        "application/json; charset=utf-8",
     ),
     # Go `net/http/pprof` debug endpoints. `/debug/pprof/heap` and
     # `/debug/pprof/cmdline` are the highest-value scanner targets
