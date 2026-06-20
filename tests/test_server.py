@@ -680,6 +680,14 @@ FAKE_TRACEBIT = {
 
 @pytest.mark.parametrize("path,needle", [
     ("/.aws/credentials", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    # Home-dir + webroot-prefix variants — same INI render shape; the
+    # scanner-dict matrix walks these alongside `.boto`, `.bash_history`.
+    ("/root/.aws/credentials", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    ("/home/ubuntu/.aws/credentials", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    ("/home/ec2-user/.aws/credentials", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    ("/home/app/.aws/credentials", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
+    # Bare `/credentials` — webroot-dropped AWS INI shape.
+    ("/credentials", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
     ("/.aws/config", b"aws_access_key_id = AKIAFAKEEXAMPLE01"),
     # `.boto` is the AWS Python SDK / `gsutil` legacy config; same canary in
     # the `[Credentials]` section as `.aws/credentials`. Includes a per-profile
@@ -712,6 +720,11 @@ FAKE_TRACEBIT = {
     ("/wp-config.php::$data", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/wp-config-backup.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/backup/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    # Absolute-webroot path-traversal variants — scanner dicts walk
+    # canonical Apache / nginx install paths.
+    ("/var/www/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/var/www/html/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/srv/www/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/%77%70%2d%63%6f%6e%66%69%67.%70%68%70.%62%61%6b", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/backup.sql", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/config.json", b'"access_key_id": "AKIAFAKEEXAMPLE01"'),
@@ -866,6 +879,11 @@ FAKE_TRACEBIT = {
     ("/.ssh/id_dsa", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/root/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/home/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
+    # User-named home-dir variants — mirror the bash-history /
+    # aws-credentials-file expansion matrix.
+    ("/home/ubuntu/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/home/ec2-user/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/home/node/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/authorized_keys", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
     ("/.ssh/authorized_keys2", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
     ("/static/.ssh/authorized_keys", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
@@ -7575,6 +7593,45 @@ def test_drupal_settings_php_is_a_canary_trap():
     assert "/sites/default/settings.php.bak" in tbenv._TRAP_BY_PATH
     assert "/sites/default/default.settings.php" in tbenv._TRAP_BY_PATH
     assert "/drupal/sites/default/settings.php" in tbenv._TRAP_BY_PATH
+    # Absolute-webroot path-traversal variants
+    assert "/var/www/sites/default/settings.php" in tbenv._TRAP_BY_PATH
+    assert "/var/www/html/sites/default/settings.php" in tbenv._TRAP_BY_PATH
+    assert "/srv/www/sites/default/settings.php" in tbenv._TRAP_BY_PATH
+
+
+def test_proc_environ_is_a_canary_trap():
+    """`/proc/<pid>/environ`, `/etc/environment`, bare `/environ`
+    and `/environment` are CanaryTrap entries — env-leak surfaces
+    that LFI / path-traversal chains target alongside .env files."""
+    for path in (
+        "/proc/self/environ",
+        "/proc/1/environ",
+        "/proc/curproc/environ",
+        "/etc/environment",
+        "/environ",
+        "/environment",
+    ):
+        trap = tbenv._TRAP_BY_PATH.get(path)
+        assert trap is not None, f"{path!r} should be a CanaryTrap entry"
+        assert trap.name == "proc-environ"
+
+
+def test_render_proc_environ_carries_canary():
+    """NUL-separated env-block carries the canary in raw-byte slots
+    that harvesters grep regardless of separator."""
+    r = {
+        "aws": {
+            "awsAccessKeyId": "AKIAFAKEEXAMPLE01",
+            "awsSecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "awsSessionToken": "FQoGZX...EXAMPLE",
+        },
+    }
+    body = tbenv.render_proc_environ(r)
+    assert b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
+    assert b"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    # NUL-separated; no newlines.
+    assert b"\x00" in body
+    assert b"\n" not in body
 
 
 async def test_dispatch_drupal_register_get_returns_form(flux_client):

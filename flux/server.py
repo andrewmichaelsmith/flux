@@ -9724,6 +9724,40 @@ def render_env_production(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_proc_environ(r: dict[str, object]) -> bytes:
+    """`/proc/<pid>/environ`, `/etc/environment`, bare `/environ` /
+    `/environment` — process / system environment-variable leaks
+    scanners pull via LFI / path-traversal chains (CVE-2018-1133-style
+    Wikka-PHP LFI, CVE-2024-3400 GlobalProtect SSRF, plus the generic
+    `/static../proc/self/environ` traversal that the env-hunter
+    families walk alongside `.env` siblings).
+    Body shape: NUL-separated KEY=value entries, matching the on-disk
+    Linux representation. Harvester loops grep raw bytes for AKIA /
+    AWS_SECRET_ACCESS_KEY substrings — they don't tokenize on
+    separator. Per-hit synthetics for non-canary fields keep the
+    response from acting as a fleet fingerprint."""
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    redis_password = _fake_db_password()
+    # NUL-separated env-block — the real shape `/proc/<pid>/environ`
+    # serves. Each line terminated by `\0` (no trailing newline).
+    fields = (
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME=/root",
+        "PWD=/var/www/html",
+        "NODE_ENV=production",
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}",
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}",
+        f"AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}",
+        "AWS_REGION=us-east-1",
+        f"DATABASE_URL=postgresql://prod_rw:{db_password}@db.internal:5432/prod",
+        f"REDIS_URL=redis://:{redis_password}@redis.internal:6379/0",
+        "SHELL=/bin/bash",
+        "USER=root",
+    )
+    return ("\x00".join(fields) + "\x00").encode("utf-8")
+
+
 # `.env*` file siblings the off-the-shelf env-checker dictionaries walk for
 # every prefix. The empty string covers the bare `/<prefix>/.env`. The
 # canonical four-env tier (`.production` / `.local` / `.dev` / `.staging`)
@@ -12532,6 +12566,27 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # regardless of suffix.
             "/.aws/credentials.bak",
             "/.aws/credentials.old",
+            # Webroot / home-dir prefixes — scanner dictionaries walk
+            # the home-dir variants alongside `.boto`, `.ssh/id_rsa`,
+            # and `.bash_history`. A path-traversal-style misconfigured
+            # static route exposes these via the absolute home-dir
+            # path. Same INI renderer; harvester greps for AKIA bytes.
+            "/root/.aws/credentials",
+            "/home/.aws/credentials",
+            "/home/ubuntu/.aws/credentials",
+            "/home/ec2-user/.aws/credentials",
+            "/home/admin/.aws/credentials",
+            "/home/app/.aws/credentials",
+            "/home/node/.aws/credentials",
+            "/home/deploy/.aws/credentials",
+            "/home/www-data/.aws/credentials",
+            # Bare `/credentials` — scanner dictionaries enumerate the
+            # filename without the `.aws/` directory prefix because
+            # operators occasionally drop the AWS INI directly in the
+            # webroot as a "backup" before deleting the original.
+            # Treated as the AWS-INI shape rather than the CSV shape;
+            # the CSV form is owned by the `aws-credentials-csv` trap.
+            "/credentials",
         ),
         ("aws",),
         render_aws_credentials_ini,
@@ -12780,6 +12835,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # most often for Drupal-under-subpath installs.
             "/drupal/sites/default/settings.php",
             "/cms/sites/default/settings.php",
+            # Absolute-webroot path-traversal variants — same shape as
+            # the wp-config additions: scanner dictionaries enumerate
+            # canonical Apache / nginx Drupal install paths on the
+            # assumption that a misconfigured static-file route exposes
+            # them.
+            "/var/www/sites/default/settings.php",
+            "/var/www/html/sites/default/settings.php",
+            "/srv/www/sites/default/settings.php",
         ),
         ("aws",),
         render_drupal_settings_php,
@@ -12806,6 +12869,18 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/wp-config.txt",
             "/wp-config-backup.php",
             "/backup/wp-config.php",
+            # Absolute-webroot path-traversal variants — scanner
+            # dictionaries enumerate the canonical WordPress install
+            # paths on Apache/nginx default layouts because a
+            # misconfigured static-file route at `root /` exposes
+            # them.
+            "/var/www/wp-config.php",
+            "/var/www/html/wp-config.php",
+            "/srv/www/wp-config.php",
+            "/srv/http/wp-config.php",
+            "/usr/share/nginx/html/wp-config.php",
+            "/var/www/html/wp/wp-config.php",
+            "/var/www/html/wordpress/wp-config.php",
             # Double-encoded scanners normalize once to a still-encoded
             # path before dispatch, e.g. `%2577%2570...` -> `%77%70...`.
             "/%77%70%2d%63%6f%6e%66%69%67.%70%68%70.%62%61%6b",
@@ -13132,6 +13207,31 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_env_production,
         "text/plain; charset=utf-8",
     ),
+    # `/proc/<pid>/environ`, `/etc/environment`, bare `/environ` and
+    # `/environment` — process / system environment-variable leaks
+    # that LFI / path-traversal chains target alongside `.env` files.
+    # The `/static../environ` and `/static../proc/self/environ` shapes
+    # (URL-traversal that some buggy servers normalise back to
+    # `/environ` / `/proc/self/environ`) come in via `normalize_path`'s
+    # collapse step. NUL-separated body is the on-disk
+    # `/proc/<pid>/environ` shape — a harvester grepping for `AKIA…`
+    # or `AWS_SECRET_ACCESS_KEY` bytes still harvests the canary.
+    CanaryTrap(
+        "proc-environ",
+        (
+            "/proc/self/environ",
+            "/proc/1/environ",
+            "/proc/curproc/environ",
+            "/etc/environment",
+            "/environ",
+            "/environment",
+        ),
+        ("aws",),
+        render_proc_environ,
+        # `application/octet-stream` matches what Apache/nginx serve
+        # for a static `/proc/<pid>/environ` due to the NUL bytes.
+        "application/octet-stream",
+    ),
     *(
         CanaryTrap(
             "mail-service-env",
@@ -13340,9 +13440,20 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/id_ecdsa",
             # `/root/.ssh/id_rsa` and `/home/.ssh/id_rsa` are common
             # path-prefix variants — scanners hunt for home-dir leakage
-            # below a misconfigured webroot.
+            # below a misconfigured webroot. The user-named home-dir
+            # set (`ubuntu`, `ec2-user`, `admin`, …) mirrors the
+            # bash-history / aws-credentials-file expansions, since
+            # scanner dictionaries walk the same prefix matrix across
+            # every dotfile family.
             "/root/.ssh/id_rsa",
             "/home/.ssh/id_rsa",
+            "/home/ubuntu/.ssh/id_rsa",
+            "/home/ec2-user/.ssh/id_rsa",
+            "/home/admin/.ssh/id_rsa",
+            "/home/app/.ssh/id_rsa",
+            "/home/node/.ssh/id_rsa",
+            "/home/deploy/.ssh/id_rsa",
+            "/home/www-data/.ssh/id_rsa",
         ),
         ("ssh",),
         render_ssh_private_key,
