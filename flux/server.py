@@ -2040,6 +2040,13 @@ _PHPMYADMIN_DEFAULT_PATHS = ",".join([
     "/db",
     "/database",
     "/web/phpmyadmin",
+    # Hyphenated-base variants — scanner dictionaries split the canonical
+    # base name across `-` even though no upstream install ships these.
+    # Catches `/php-my-admin/index.php`, `/php-myadmin/index.php`,
+    # `/mysql-admin/index.php` that fan out from the same dictionaries.
+    "/php-my-admin",
+    "/php-myadmin",
+    "/mysql-admin",
 ])
 PHPMYADMIN_PATH_PREFIXES = tuple(
     value.strip().lower().rstrip("/")
@@ -2047,11 +2054,12 @@ PHPMYADMIN_PATH_PREFIXES = tuple(
     if value.strip()
 )
 # Match per-version aliases like `/phpmyadmin4.8.1/` or
-# `/phpmyadmin-2024.04/` against any of the base names above. Compiled
-# once at import time.
+# `/phpmyadmin-2024.04/` against any of the base names above, and the
+# deep paths scanners walk under them (`/phpMyAdmin-2/index.php`,
+# `/phpmyadmin2/sql.php`). Compiled once at import time.
 _PHPMYADMIN_VERSIONED_RE = re.compile(
     r"^/(?:phpmyadmin|phpMyAdmin|pma|PMA|myadmin|MyAdmin|dbadmin|mysql|mysqladmin)"
-    r"[-_]?[0-9][0-9._\-]*/?$",
+    r"[-_]?[0-9][0-9._\-]*(?:/.*)?$",
     re.IGNORECASE,
 )
 
@@ -9758,6 +9766,110 @@ def render_proc_environ(r: dict[str, object]) -> bytes:
     return ("\x00".join(fields) + "\x00").encode("utf-8")
 
 
+def render_laravel_log(r: dict[str, object]) -> bytes:
+    """`storage/logs/laravel.log` — the Monolog daily-file Laravel writes
+    when `LOG_CHANNEL=single` (or `daily` at the un-suffixed `laravel.log`
+    symlink). Scanner dictionaries walk the file under the bare project
+    path and the canonical webroot-prefix variants because misconfigured
+    static-file routes (`location / { root /var/www/html; }` without an
+    `/storage` exclusion) expose it directly, and `php artisan` apps in
+    `APP_DEBUG=true` mode log full `$_ENV` dumps inside the
+    `\\Illuminate\\Foundation\\Bootstrap\\HandleExceptions` stack-trace
+    context when an uncaught exception fires.
+
+    The body shape mirrors a real Laravel debug log: a few INFO / NOTICE
+    lines from healthy request handling, then a `QueryException`
+    stack-trace with the full `$_ENV` block in the Monolog "context"
+    dict. Scanner grep loops walking the file for `AWS_ACCESS_KEY_ID=`
+    or `AKIA` substrings harvest the per-request Tracebit AWS canary
+    from the env dump; the surrounding stack trace is fixed (line
+    numbers / file paths from Illuminate framework internals) so the
+    convincing parts come from the env block. Per-hit synthetic
+    `APP_KEY`, `DB_PASSWORD`, `REDIS_PASSWORD`, `MAIL_PASSWORD`, and
+    timestamps keep the body from acting as a fleet fingerprint."""
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    db_password = _fake_db_password()
+    redis_password = _fake_db_password()
+    mail_password = _fake_db_password()
+    app_key = secrets.token_urlsafe(32)
+    # Three timestamps in a believable late-prod-day sequence; epoch
+    # base randomised per render so the ordering looks live and not
+    # fleet-shared.
+    base_epoch = 1_762_000_000 + secrets.randbelow(6_000_000)
+    ts1 = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(base_epoch))
+    ts2 = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(base_epoch + 30 + secrets.randbelow(120)))
+    ts3 = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(base_epoch + 200 + secrets.randbelow(400)))
+    # Monolog default formatter is one line per record. The exception
+    # context is a JSON-encoded dict; we embed the env dump in the
+    # `$_ENV` slot the
+    # `Illuminate\Foundation\Exceptions\Handler::context()` helper
+    # surfaces inside the context payload.
+    env_dump = {
+        "APP_NAME": "Laravel",
+        "APP_ENV": "production",
+        "APP_KEY": f"base64:{app_key}",
+        "APP_DEBUG": "true",
+        "APP_URL": "https://app.internal",
+        "LOG_CHANNEL": "single",
+        "DB_CONNECTION": "pgsql",
+        "DB_HOST": "db.internal",
+        "DB_PORT": "5432",
+        "DB_DATABASE": "prod",
+        "DB_USERNAME": "prod_rw",
+        "DB_PASSWORD": db_password,
+        "REDIS_HOST": "redis.internal",
+        "REDIS_PASSWORD": redis_password,
+        "REDIS_PORT": "6379",
+        "AWS_ACCESS_KEY_ID": ak,
+        "AWS_SECRET_ACCESS_KEY": sk,
+        "AWS_SESSION_TOKEN": st,
+        "AWS_DEFAULT_REGION": "us-east-1",
+        "AWS_BUCKET": "prod-app-uploads",
+        "MAIL_MAILER": "smtp",
+        "MAIL_HOST": "email-smtp.us-east-1.amazonaws.com",
+        "MAIL_PORT": "587",
+        "MAIL_USERNAME": ak,
+        "MAIL_PASSWORD": mail_password,
+        "MAIL_ENCRYPTION": "tls",
+    }
+    context = {
+        "userId": 1 + secrets.randbelow(900),
+        "exception": (
+            "[object] (Illuminate\\Database\\QueryException(code: 7): "
+            "SQLSTATE[08006] could not connect to server: Connection refused\n"
+            "Is the server running on host \"db.internal\" (10.0.0.42) and accepting\n"
+            "\tTCP/IP connections on port 5432? "
+            "(SQL: select * from \"users\" where \"id\" = ?) at "
+            "/var/www/html/vendor/laravel/framework/src/Illuminate/Database/Connection.php:813)\n"
+            "[stacktrace]\n"
+            "#0 /var/www/html/vendor/laravel/framework/src/Illuminate/Database/Connection.php(763): Illuminate\\Database\\Connection->runQueryCallback()\n"
+            "#1 /var/www/html/vendor/laravel/framework/src/Illuminate/Database/Connection.php(412): Illuminate\\Database\\Connection->run()\n"
+            "#2 /var/www/html/vendor/laravel/framework/src/Illuminate/Database/Connection.php(388): Illuminate\\Database\\Connection->select()\n"
+            "#3 /var/www/html/vendor/laravel/framework/src/Illuminate/Database/Query/Builder.php(2792): Illuminate\\Database\\Connection->select()\n"
+            "#4 /var/www/html/app/Http/Controllers/UserController.php(42): Illuminate\\Database\\Query\\Builder->get()\n"
+            "#5 {main}"
+        ),
+        "$_ENV": env_dump,
+    }
+    # `json.dumps` for the context block — Monolog's
+    # `JsonFormatter`-style trail in the default `LineFormatter` quotes
+    # the context with `json_encode` when it falls back to JSON for
+    # non-scalar fields. Keep the surrounding line shape (timestamp,
+    # channel, level, message, context, extra) so a `grep AKIA` walks
+    # the file the same way.
+    ctx_json = json.dumps(context, separators=(",", ":"))
+    lines = (
+        f"[{ts1}] production.INFO: User logged in. {{\"userId\":42,\"ip\":\"203.0.113.5\"}}\n"
+        f"[{ts2}] production.NOTICE: cache.set('user.42.session', ttl=1800)\n"
+        f"[{ts3}] production.ERROR: SQLSTATE[08006] could not connect to server: Connection refused"
+        f" (SQL: select * from \"users\" where \"id\" = ?) {ctx_json} []\n"
+    )
+    return lines.encode("utf-8")
+
+
 # `.env*` file siblings the off-the-shelf env-checker dictionaries walk for
 # every prefix. The empty string covers the bare `/<prefix>/.env`. The
 # canonical four-env tier (`.production` / `.local` / `.dev` / `.staging`)
@@ -13232,6 +13344,36 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         # for a static `/proc/<pid>/environ` due to the NUL bytes.
         "application/octet-stream",
     ),
+    # `storage/logs/laravel.log` — Monolog-shaped Laravel debug log
+    # exposed when a misconfigured static-file route lets `/storage/*`
+    # past the public webroot guard. Real `APP_DEBUG=true` Laravel apps
+    # log full `$_ENV` dumps inside `QueryException` / `HandleExceptions`
+    # context blocks, so the renderer ships a believable
+    # INFO + NOTICE + ERROR sequence whose ERROR line carries the AWS
+    # canary in the JSON `context.$_ENV` slot a `grep AKIA` walks.
+    CanaryTrap(
+        "laravel-log",
+        (
+            "/storage/logs/laravel.log",
+            # Editor backup / log-rotate sibling names harvesters walk
+            # alongside the bare path.
+            "/storage/logs/laravel.log.bak",
+            "/storage/logs/laravel.log.old",
+            # Absolute webroot prefixes — Laravel deploys at
+            # `/var/www/html/<app>` and the standard Docker base image
+            # working dir `/var/www`. Misconfigured static-file routes
+            # (`root /var/www/html` without an `/storage` exclusion)
+            # expose the file at the absolute path.
+            "/var/www/html/storage/logs/laravel.log",
+            "/var/www/storage/logs/laravel.log",
+            "/srv/www/html/storage/logs/laravel.log",
+            "/app/storage/logs/laravel.log",
+            "/home/laravel/storage/logs/laravel.log",
+        ),
+        ("aws",),
+        render_laravel_log,
+        "text/plain; charset=utf-8",
+    ),
     *(
         CanaryTrap(
             "mail-service-env",
@@ -13742,6 +13884,16 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/mcp_settings.json",
             "/mcp.json",
             "/.mcp/mcp.json",
+            # Filename variants scanner dictionaries walk alongside the
+            # canonical names — `config.json` and `settings.json` are
+            # the two common alternate filenames a self-hosted MCP
+            # daemon might pick (the protocol spec leaves the on-disk
+            # filename up to the host application), so harvester
+            # dictionaries fan out across both. `/.cursor/mcp_config.json`
+            # is the `_config` underscore variant of `/.cursor/mcp.json`.
+            "/.mcp/config.json",
+            "/.mcp/settings.json",
+            "/.cursor/mcp_config.json",
         ),
         ("aws",),
         render_cursor_mcp_json,

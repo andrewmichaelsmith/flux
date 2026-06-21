@@ -7634,6 +7634,68 @@ def test_render_proc_environ_carries_canary():
     assert b"\n" not in body
 
 
+def test_laravel_log_is_a_canary_trap():
+    """`/storage/logs/laravel.log` plus the editor-backup + absolute-
+    webroot variants are all CanaryTrap entries that resolve to the
+    `laravel-log` renderer."""
+    for path in (
+        "/storage/logs/laravel.log",
+        "/storage/logs/laravel.log.bak",
+        "/storage/logs/laravel.log.old",
+        "/var/www/html/storage/logs/laravel.log",
+        "/var/www/storage/logs/laravel.log",
+        "/srv/www/html/storage/logs/laravel.log",
+        "/app/storage/logs/laravel.log",
+        "/home/laravel/storage/logs/laravel.log",
+    ):
+        trap = tbenv._TRAP_BY_PATH.get(path)
+        assert trap is not None, f"{path!r} should be a CanaryTrap entry"
+        assert trap.name == "laravel-log"
+
+
+def test_render_laravel_log_carries_canary_in_env_dump():
+    """Monolog-shaped Laravel debug log embeds the AWS canary inside
+    the QueryException context `$_ENV` JSON block — the slot a real
+    APP_DEBUG=true app surfaces via Illuminate's HandleExceptions
+    bootstrap when an uncaught exception fires."""
+    r = {
+        "aws": {
+            "awsAccessKeyId": "AKIAFAKEEXAMPLE01",
+            "awsSecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "awsSessionToken": "FQoGZX...EXAMPLE",
+        },
+    }
+    body = tbenv.render_laravel_log(r)
+    text = body.decode("utf-8")
+    # Canary AWS triple ends up inside the JSON-encoded $_ENV dump.
+    assert "AWS_ACCESS_KEY_ID" in text
+    assert "AKIAFAKEEXAMPLE01" in text
+    assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in text
+    # Monolog log-line shape: bracketed timestamp + channel.LEVEL + msg.
+    assert "production.ERROR" in text
+    # The exception class is the real Laravel symbol harvesters key on
+    # (`json.dumps` doubles each backslash, so the literal in the
+    # serialized body has `\\\\` between the namespace segments).
+    assert "QueryException" in text
+    assert "Illuminate" in text
+
+
+def test_render_laravel_log_is_per_hit_unique():
+    """Per-hit synthetic APP_KEY / DB_PASSWORD / MAIL_PASSWORD /
+    timestamps keep the body from acting as a cross-sensor fingerprint
+    a scanner can pivot on. Two adjacent renders must differ."""
+    r = {
+        "aws": {
+            "awsAccessKeyId": "AKIAFAKEEXAMPLE01",
+            "awsSecretAccessKey": "secret-key",
+            "awsSessionToken": "tok",
+        },
+    }
+    a = tbenv.render_laravel_log(r)
+    b = tbenv.render_laravel_log(r)
+    assert a != b, "laravel-log renderer must vary per request"
+
+
 async def test_dispatch_drupal_register_get_returns_form(flux_client):
     resp = await flux_client.get(
         "/user/register",
@@ -8821,6 +8883,14 @@ def test_ai_toolchain_config_paths_registered():
         "/mcp_settings.json": "mcp-config",
         "/mcp.json": "mcp-config",
         "/.mcp/mcp.json": "mcp-config",
+        # Filename variants — scanner dictionaries fan out across
+        # `config.json` and `settings.json` alongside the canonical
+        # `mcp.json` because the MCP protocol leaves the on-disk
+        # filename up to the host application. `mcp_config.json`
+        # is the underscore variant of `mcp.json`.
+        "/.mcp/config.json": "mcp-config",
+        "/.mcp/settings.json": "mcp-config",
+        "/.cursor/mcp_config.json": "mcp-config",
         "/.continue/config.json": "continue-config",
         "/.sourcegraph/cody.json": "cody-config",
         "/.aider.conf.yml": "aider-conf",
@@ -11269,6 +11339,16 @@ def test_phpmyadmin_enabled_by_default():
     "/phpMyAdmin4.7.0/",
     "/PMA2018/",
     "/pma_5.2/",
+    # Deep paths under per-version directories — the regex used to
+    # stop at `/?$` and let `/phpMyAdmin-2/index.php` fall through.
+    "/phpMyAdmin-2/index.php",
+    "/phpmyadmin2/index.php",
+    "/phpMyAdmin2/sql.php",
+    "/PMA2018/setup/",
+    # Hyphenated-base aliases scanner dictionaries fan out across.
+    "/php-my-admin/index.php",
+    "/php-myadmin/index.php",
+    "/mysql-admin/index.php",
 ])
 def test_phpmyadmin_path_matches_observed_probes(path):
     assert tbenv.is_phpmyadmin_path(path), f"expected match: {path}"
