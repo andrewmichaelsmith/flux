@@ -1386,6 +1386,44 @@ _DRUPAL_RCE_PAYLOAD_INDICATORS = (
 )
 
 
+# --- Fake Joomla 4 public-config disclosure trap (CVE-2023-23752) --------
+# Joomla 4.0.0–4.2.7 ships an unauthenticated WebService endpoint at
+# `/api/index.php/v1/config/application` that, when reached with
+# `?public=true`, returns the full `configuration.php` JSON — DB
+# credentials, mailer/SMTP password, secret/site-secret, S3 storage
+# creds — without any auth header. Scanner populations actively walk
+# the path: bare `/api/index.php/v1/config/application`, the
+# `?public=true` query, and per-component variants like
+# `/api/index.php/v1/config/com_users`. Flux mimics a Joomla 4
+# WebService JSON envelope with the canary AWS triple in the
+# `filesystem.s3.access_key` / `secret_key` slots a real `s3`
+# storage-driver config exposes, plus per-hit synthetic
+# `secret` / `mailer.password` so the body looks like a real leak.
+JOOMLA4_CONFIG_ENABLED = _env_bool("HONEYPOT_JOOMLA4_CONFIG_ENABLED")
+JOOMLA4_CONFIG_VERSION = (
+    os.environ.get("HONEYPOT_JOOMLA4_CONFIG_VERSION") or "4.2.6"
+).strip()
+
+
+# --- Tomcat `/..;/` path-normalization-bypass + env.* canary -------------
+# Tomcat treats `;name=value` as a path-parameter — a security-filter
+# bypass when a fronting proxy normalizes the request before forwarding
+# but Tomcat does not. The CVE-2020-1938 ("Ghostcat") era surfaced the
+# bypass; modern scanner populations still walk `/..;/<sensitive>` to
+# probe for any fronted Java application that gates auth on a URL prefix.
+# Observed shape: `/..;/env.js`, `/..;/env.dev.js`, `/..;/env.prod.js`,
+# `/..;/env.production.js`, `/..;/env.development.js` — frontend-bundle
+# env files that React / Vue / Vite dev builds emit and that frontend
+# devs sometimes commit populated with cloud creds. The combination
+# (bypass-shape path + env-file harvest) is a high-signal evasion-aware
+# scanner indicator. Flux returns a plausible JS env-config object with
+# the canary AWS triple in `REACT_APP_AWS_*` and `VITE_AWS_*` slots
+# scrapers grep on, plus per-hit synthetic Sentry/Firebase/Stripe-shaped
+# values; the path-normalization-bypass shape is logged as a separate
+# flag so triage can sort it from regular env-file canary hits.
+TOMCAT_PATH_BYPASS_ENABLED = _env_bool("HONEYPOT_TOMCAT_PATH_BYPASS_ENABLED")
+
+
 # --- Fake Spring Cloud Gateway Actuator extension (CVE-2022-22947) -------
 # `/actuator/gateway/routes` is the route-management surface for Spring
 # Cloud Gateway 3.0.x / 3.1.0. CVE-2022-22947 (Spring4Shell-adjacent) is
@@ -3047,6 +3085,54 @@ def is_drupal_path(path: str) -> bool:
         "/drupal/user/register",
         "/cms/user/register",
     }
+
+
+def is_joomla4_config_path(path: str) -> bool:
+    """Match the Joomla 4 unauth WebService config-disclosure endpoint
+    (CVE-2023-23752).
+
+    Real exploit URL is
+    `/api/index.php/v1/config/application?public=true`; the `?public=true`
+    is the disclosure trigger but the path itself is what routes — query
+    parsing happens in the handler. We also match the per-component
+    variants `config/com_users` / `config/com_config` because the same
+    endpoint family lists each component's config, and scanner
+    dictionaries walk every one.
+    """
+    if not JOOMLA4_CONFIG_ENABLED:
+        return False
+    p = path.lower().rstrip("/")
+    return (
+        p == "/api/index.php/v1/config/application"
+        or p.startswith("/api/index.php/v1/config/")
+    )
+
+
+def is_tomcat_path_bypass_path(path: str) -> bool:
+    """Match Tomcat-style path-normalization-bypass requests (`/..;/`
+    segment) targeting frontend-bundle env files.
+
+    The `/..;/` sequence is a Tomcat path-parameter that some upstream
+    proxies normalize away before forwarding, defeating prefix-based
+    auth gates. Observed targets: `/..;/env.js`, `/..;/env.dev.js`,
+    `/..;/env.prod.js`, `/..;/env.production.js`,
+    `/..;/env.development.js`. Match case-insensitively on the bypass
+    segment plus the `env*.js` filename family. The F5 BIG-IP TMUI
+    `/..;/` handler already owns `/tmui/login.jsp/..;/...` — keep that
+    routing intact by gating on the `env*.js` filename specifically.
+    """
+    if not TOMCAT_PATH_BYPASS_ENABLED:
+        return False
+    p = path.lower()
+    if "/..;/" not in p:
+        return False
+    tail = p.rsplit("/", 1)[-1]
+    if not tail.startswith("env") or not tail.endswith(".js"):
+        return False
+    # F5 TMUI bypass shapes carry `/tmui/` — leave them with the F5 handler.
+    if "/tmui/" in p:
+        return False
+    return True
 
 
 def is_spring_gateway_path(path: str) -> bool:
@@ -6618,6 +6704,179 @@ def render_drupal_settings_php(r: dict[str, object]) -> bytes:
         "  include $app_root . '/' . $site_path . '/settings.local.php';\n"
         "}\n"
     ).encode("utf-8")
+
+
+def render_joomla4_config_application(
+    r: dict[str, object], component: str, public: bool,
+) -> bytes:
+    """Joomla 4 WebService `config/application` JSON. Real disclosure
+    (CVE-2023-23752) returns the full `configuration.php` flat-mapped to
+    a JSON envelope with one `attributes` object per setting; harvesters
+    grep the body for `secret`, `password`, `s3.*`, and `mailer.*`
+    slots. Embed Tracebit AWS canary in the filesystem.s3 block (the
+    documented Joomla 4 S3 storage-driver config slot) and per-hit
+    synthetic mailer/secret values so the body looks like a real leak.
+    """
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    mailer_password = _fake_db_password()
+    site_secret = secrets.token_urlsafe(32)
+    # `public=true` is the actual disclosure flag — without it Joomla
+    # WebService returns a `{"errors":[{"title":"Access denied"}]}`
+    # envelope. Both shapes are interesting to log; the access-denied
+    # envelope still tells the scanner the path exists.
+    if not public:
+        envelope = {
+            "errors": [
+                {
+                    "title": (
+                        "Access is not permitted because user is not "
+                        "authenticated."
+                    ),
+                    "code": "401",
+                }
+            ],
+        }
+        return json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+
+    safe_component = component if component.replace("_", "").isalnum() else "application"
+
+    attributes = {
+        "offline": "0",
+        "offline_message": (
+            "This site is down for maintenance.<br>Please check back again soon."
+        ),
+        "display_offline_message": "1",
+        "offline_image": "",
+        "sitename": "Production",
+        "editor": "tinymce",
+        "captcha": "0",
+        "list_limit": "20",
+        "access": "1",
+        "debug": "0",
+        "debug_lang": "0",
+        "dbtype": "mysqli",
+        "host": "db.internal",
+        "user": "joomla_app",
+        "password": db_password,
+        "db": "joomla_prod",
+        "dbprefix": "j4_",
+        "dbencryption": "0",
+        "live_site": "",
+        "secret": site_secret,
+        "gzip": "0",
+        "error_reporting": "default",
+        "helpurl": "https://help.joomla.org/proxy?keyref=Help{major}{minor}:{keyref}",
+        "offset": "UTC",
+        "mailonline": "1",
+        "mailer": "smtp",
+        "mailfrom": "noreply@example.com",
+        "fromname": "Joomla Site",
+        "sendmail": "/usr/sbin/sendmail",
+        "smtpauth": "1",
+        "smtpuser": "joomla_smtp@example.com",
+        "smtppass": mailer_password,
+        "smtphost": "smtp.internal:587",
+        "smtpsecure": "tls",
+        "smtpport": "587",
+        # CVE-2023-23752 disclosure includes the filesystem.s3 storage
+        # driver config — the documented slot a Joomla 4 site that uses
+        # the AWS S3 storage driver leaks. Scanner grep loops keying on
+        # `s3` / `access_key` / `secret_key` land here.
+        "filesystem.s3.driver": "s3",
+        "filesystem.s3.access_key": aws.get("awsAccessKeyId", ""),
+        "filesystem.s3.secret_key": aws.get("awsSecretAccessKey", ""),
+        "filesystem.s3.session_token": aws.get("awsSessionToken", ""),
+        "filesystem.s3.region": "us-east-1",
+        "filesystem.s3.bucket": "joomla-media-prod",
+        "filesystem.s3.endpoint": "",
+        "caching": "0",
+        "cache_handler": "file",
+        "cachetime": "15",
+        "MetaDesc": "",
+        "MetaKeys": "",
+        "MetaTitle": "1",
+        "MetaAuthor": "1",
+        "MetaVersion": "0",
+        "robots": "",
+        "sef": "1",
+        "sef_rewrite": "0",
+        "sef_suffix": "0",
+        "unicodeslugs": "0",
+        "session_handler": "database",
+        "shared_session": "0",
+        "session_metadata": "1",
+    }
+    envelope = {
+        "links": {
+            "self": f"http://example.com/api/index.php/v1/config/{safe_component}?public=true",
+        },
+        "data": [
+            {
+                "type": "application",
+                "id": safe_component,
+                "attributes": attributes,
+            }
+        ],
+    }
+    return json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+
+
+def render_tomcat_path_bypass_env_js(r: dict[str, object], filename: str) -> bytes:
+    """JS env-config object — the shape React / Vite / Vue dev builds
+    emit as `env.js` (or `env.prod.js`, `env.development.js`) so
+    frontend code can read runtime env without a rebuild. Real bundles
+    sometimes ship populated with cloud creds when a dev commits a
+    populated config; an attacker reaching this file via Tomcat's
+    `/..;/` path-normalization bypass walks away with whatever the
+    bundle exposed. Embed Tracebit AWS canary in REACT_APP_AWS_*,
+    VITE_AWS_*, and NEXT_PUBLIC_AWS_* slots scrapers grep on, plus
+    per-hit synthetic Sentry DSN / Firebase / Stripe-shaped values so
+    the file looks like a real leaky build rather than a stub.
+    """
+    aws = _aws(r)
+    sentry_org_id = 1_000_000 + secrets.randbelow(900_000)
+    sentry_project_id = 1_000_000 + secrets.randbelow(9_000_000)
+    sentry_public_key = secrets.token_hex(16)
+    firebase_app_id = (
+        f"1:{secrets.randbelow(10**12):012d}:web:{secrets.token_hex(8)}"
+    )
+    stripe_pk = "pk_live_" + secrets.token_urlsafe(24).replace("-", "").replace("_", "")[:24]
+    env_obj = {
+        "NODE_ENV": "production",
+        "API_BASE_URL": "https://api.internal.example.com",
+        # React (CRA) `REACT_APP_*` slot.
+        "REACT_APP_AWS_REGION": "us-east-1",
+        "REACT_APP_AWS_ACCESS_KEY_ID": aws.get("awsAccessKeyId", ""),
+        "REACT_APP_AWS_SECRET_ACCESS_KEY": aws.get("awsSecretAccessKey", ""),
+        "REACT_APP_AWS_SESSION_TOKEN": aws.get("awsSessionToken", ""),
+        # Vite `VITE_*` slot.
+        "VITE_AWS_REGION": "us-east-1",
+        "VITE_AWS_ACCESS_KEY_ID": aws.get("awsAccessKeyId", ""),
+        "VITE_AWS_SECRET_ACCESS_KEY": aws.get("awsSecretAccessKey", ""),
+        # Next.js `NEXT_PUBLIC_*` slot.
+        "NEXT_PUBLIC_AWS_REGION": "us-east-1",
+        "NEXT_PUBLIC_AWS_ACCESS_KEY_ID": aws.get("awsAccessKeyId", ""),
+        "NEXT_PUBLIC_API_KEY": aws.get("awsAccessKeyId", ""),
+        # Sentry / Firebase / Stripe synthetics — non-credential filler
+        # so the body looks like a real frontend env config.
+        "REACT_APP_SENTRY_DSN": (
+            f"https://{sentry_public_key}@o{sentry_org_id}.ingest.sentry.io/"
+            f"{sentry_project_id}"
+        ),
+        "REACT_APP_FIREBASE_APP_ID": firebase_app_id,
+        "REACT_APP_STRIPE_PUBLISHABLE_KEY": stripe_pk,
+        "REACT_APP_S3_BUCKET": "internal-app-uploads-prod",
+    }
+    safe_filename = filename[:64]
+    body = (
+        f"// {safe_filename} — runtime config, generated at build time\n"
+        "// DO NOT COMMIT WITH POPULATED CREDENTIALS\n"
+        "window.__APP_ENV__ = "
+        + json.dumps(env_obj, separators=(",", ":"))
+        + ";\n"
+    )
+    return body.encode("utf-8")
 
 
 def render_spring_gateway_routes_get(r: dict[str, object]) -> bytes:
@@ -18246,6 +18505,139 @@ async def _handle_drupal(
     )
 
 
+async def _handle_joomla4_config(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+) -> web.Response:
+    """Joomla 4 `/api/index.php/v1/config/application` — CVE-2023-23752
+    unauth WebService config-disclosure trap.
+
+    The `?public=true` query flips the vulnerability from
+    `{"errors":[...access denied...]}` to a full JSON dump of
+    `configuration.php`; we mirror both shapes so non-trigger probes
+    still get a plausible auth-failure envelope and exploit probes get
+    a configuration-shaped JSON with a replay-fireable canary.
+    """
+    method = request.method
+    host = str(log_context.get("host", ""))
+    request_id = str(log_context.get("requestId", ""))
+    client_ip = str(log_context.get("clientIp", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+
+    # The Joomla WebService endpoint accepts `?public=true` as the
+    # disclosure trigger. Match the presence of `public=true` anywhere
+    # in the query string — scanners often tack on additional params.
+    public = "public=true" in (query_string or "").lower()
+    # Pull the component slug from the trailing path segment so
+    # `/api/index.php/v1/config/com_users` reflects back as `com_users`
+    # in the response (real Joomla 4 WebService behavior).
+    lpath = path.lower().rstrip("/")
+    component = lpath.rsplit("/", 1)[-1] or "application"
+
+    tracebit_response: dict[str, object] | None = None
+    if API_KEY and public:
+        tracebit_response = await _get_or_issue_canary(
+            ("aws",), client_ip, request_id, host, user_agent, path, proto,
+        )
+    if tracebit_response is None:
+        tracebit_response = {}
+
+    body = render_joomla4_config_application(tracebit_response, component, public)
+
+    if public:
+        result_tag = "joomla4-config-disclosure"
+    else:
+        result_tag = "joomla4-config-access-denied"
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "joomla4ConfigPath": path,
+        "joomla4ConfigMethod": method,
+        "joomla4ConfigComponent": component,
+        "joomla4ConfigPublic": public,
+        "joomla4ConfigVersion": JOOMLA4_CONFIG_VERSION,
+        "bytes": len(body),
+    }
+    if query_string:
+        log_entry["queryPreview"] = query_string[:400]
+    append_log(log_entry)
+
+    headers = {
+        # Real Joomla 4 ships behind PHP — `X-Powered-By` is the
+        # fingerprint slot scanners diff. Pinned version inside the
+        # CVE-2023-23752 public-disclosure window so version-gated
+        # scanners don't bail.
+        "X-Powered-By": "PHP/8.1.27",
+        "Cache-Control": "no-store, private",
+        "Content-Type": "application/vnd.api+json",
+    }
+    return web.Response(status=200, body=body, headers=headers)
+
+
+async def _handle_tomcat_path_bypass(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+) -> web.Response:
+    """Tomcat `/..;/env.*` path-normalization bypass + env-file harvest.
+
+    Returns a plausible frontend env-config JS body with the Tracebit
+    AWS canary embedded in `REACT_APP_AWS_*` / `VITE_AWS_*` /
+    `NEXT_PUBLIC_AWS_*` slots scrapers grep on. Logs
+    `tomcatHasPathNormBypass=true` so the evasion-aware scanner shape
+    is separately triageable from generic env-file canary hits.
+    """
+    method = request.method
+    host = str(log_context.get("host", ""))
+    request_id = str(log_context.get("requestId", ""))
+    client_ip = str(log_context.get("clientIp", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+
+    # Extract the filename for the body comment + log.
+    filename = path.rsplit("/", 1)[-1] or "env.js"
+
+    tracebit_response: dict[str, object] | None = None
+    if API_KEY:
+        tracebit_response = await _get_or_issue_canary(
+            ("aws",), client_ip, request_id, host, user_agent, path, proto,
+        )
+    if tracebit_response is None:
+        tracebit_response = {}
+
+    body = render_tomcat_path_bypass_env_js(tracebit_response, filename)
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": "tomcat-path-bypass-env",
+        "tomcatBypassPath": path,
+        "tomcatBypassMethod": method,
+        "tomcatBypassFilename": filename,
+        "tomcatHasPathNormBypass": True,
+        "bytes": len(body),
+    }
+    if query_string:
+        log_entry["queryPreview"] = query_string[:400]
+    append_log(log_entry)
+
+    headers = {
+        # Real Tomcat sets the `Server` header; pin a recent 9.x build
+        # inside the public-disclosure window for the path-parameter
+        # bypass family so version-gated scanners don't bail.
+        "Server": "Apache-Coyote/1.1",
+        "Cache-Control": "no-store, private",
+        "Content-Type": "application/javascript; charset=utf-8",
+    }
+    return web.Response(status=200, body=body, headers=headers)
+
+
 async def _handle_graphql(
     request: web.Request,
     log_context: dict[str, object],
@@ -19485,6 +19877,15 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_barracuda_vpn_path(path):
         return await _handle_barracuda_vpn(request, log_context, path, request_body)
 
+    # Tomcat `/..;/env.*` path-normalization bypass. Match before F5
+    # BIG-IP so the bypass-shape env-file harvest goes to the dedicated
+    # handler; `is_tomcat_path_bypass_path` already excludes `/tmui/`
+    # paths (which the F5 handler owns).
+    if API_KEY and is_tomcat_path_bypass_path(path):
+        return await _handle_tomcat_path_bypass(
+            request, log_context, path, query_string,
+        )
+
     if is_f5_bigip_path(path):
         return await _handle_f5_bigip(request, log_context, path, request_body)
 
@@ -19544,6 +19945,11 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_drupal_path(path):
         return await _handle_drupal(request, log_context, path, query_string, request_body)
+
+    if is_joomla4_config_path(path):
+        return await _handle_joomla4_config(
+            request, log_context, path, query_string,
+        )
 
     if API_KEY and is_spring_gateway_path(path):
         return await _handle_spring_gateway(
@@ -19706,6 +20112,10 @@ def main() -> int:
         active.append("sap-metadatauploader")
     if DRUPAL_ENABLED:
         active.append("drupal")
+    if JOOMLA4_CONFIG_ENABLED:
+        active.append("joomla4-config")
+    if TOMCAT_PATH_BYPASS_ENABLED and API_KEY:
+        active.append("tomcat-path-bypass")
     if SPRING_GATEWAY_ENABLED and API_KEY:
         active.append("spring-gateway")
     if NEXTJS_ENABLED:

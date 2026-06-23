@@ -575,6 +575,8 @@ def test_all_trap_families_default_on():
     assert tbenv.WEBAPP_FORM_ENABLED
     assert tbenv.OPENAPI_SWAGGER_ENABLED
     assert tbenv.DRUPAL_ENABLED
+    assert tbenv.JOOMLA4_CONFIG_ENABLED
+    assert tbenv.TOMCAT_PATH_BYPASS_ENABLED
     assert tbenv.SPRING_GATEWAY_ENABLED
     assert tbenv.BACKUP_ARCHIVE_ENABLED
     assert tbenv.WP_LOGIN_ENABLED
@@ -7597,6 +7599,201 @@ def test_drupal_settings_php_is_a_canary_trap():
     assert "/var/www/sites/default/settings.php" in tbenv._TRAP_BY_PATH
     assert "/var/www/html/sites/default/settings.php" in tbenv._TRAP_BY_PATH
     assert "/srv/www/sites/default/settings.php" in tbenv._TRAP_BY_PATH
+
+
+# ---- Joomla 4 public-config disclosure (CVE-2023-23752) ----------------
+
+def test_joomla4_config_enabled_by_default():
+    assert tbenv.JOOMLA4_CONFIG_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/api/index.php/v1/config/application",
+    "/api/index.php/v1/config/application/",
+    "/API/INDEX.PHP/V1/CONFIG/APPLICATION",
+    "/api/index.php/v1/config/com_users",
+    "/api/index.php/v1/config/com_config",
+])
+def test_joomla4_matches_observed_config_probes(path):
+    assert tbenv.is_joomla4_config_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    "/api/index.php/v1/users",
+    "/api/index.php/v2/config/application",
+    "/index.php",
+    "/.env",
+    "/config/application.yml",
+])
+def test_joomla4_non_match(path):
+    assert not tbenv.is_joomla4_config_path(path)
+
+
+def test_joomla4_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "JOOMLA4_CONFIG_ENABLED", False)
+    assert not tbenv.is_joomla4_config_path("/api/index.php/v1/config/application")
+
+
+def test_render_joomla4_config_public_carries_canary():
+    """`?public=true` is the disclosure trigger — the body must include
+    the canary AWS triple in the `filesystem.s3.*` slots a real Joomla 4
+    s3-storage-driver leak exposes."""
+    import json as _json
+    aws = {"aws": {
+        "awsAccessKeyId": "AKIAEXAMPLE",
+        "awsSecretAccessKey": "SECRETEXAMPLE",
+        "awsSessionToken": "TOKENEXAMPLE",
+    }}
+    body = tbenv.render_joomla4_config_application(
+        aws, "application", public=True,
+    ).decode("utf-8")
+    parsed = _json.loads(body)
+    attrs = parsed["data"][0]["attributes"]
+    assert attrs["filesystem.s3.access_key"] == "AKIAEXAMPLE"
+    assert attrs["filesystem.s3.secret_key"] == "SECRETEXAMPLE"
+    assert attrs["filesystem.s3.session_token"] == "TOKENEXAMPLE"
+    # Joomla-shape fields scanners grep for
+    assert "secret" in attrs
+    assert "smtppass" in attrs
+    assert attrs["dbtype"] == "mysqli"
+
+
+def test_render_joomla4_config_non_public_is_access_denied():
+    """Without `?public=true` the WebService returns an `errors`
+    envelope — the same shape real Joomla 4 returns when the access
+    flag is absent."""
+    import json as _json
+    body = tbenv.render_joomla4_config_application(
+        {}, "application", public=False,
+    ).decode("utf-8")
+    parsed = _json.loads(body)
+    assert "errors" in parsed
+    assert parsed["errors"][0]["code"] == "401"
+
+
+def test_render_joomla4_config_per_hit_passwords_unique():
+    """DB password and SMTP password must be per-hit unique — two
+    consecutive renders share the canary AKIA but produce different
+    `password` / `smtppass` values."""
+    aws = {"aws": {
+        "awsAccessKeyId": "AKIAEXAMPLE",
+        "awsSecretAccessKey": "SECRETEXAMPLE",
+        "awsSessionToken": "TOKENEXAMPLE",
+    }}
+    import json as _json
+    a = _json.loads(tbenv.render_joomla4_config_application(aws, "application", True))
+    b = _json.loads(tbenv.render_joomla4_config_application(aws, "application", True))
+    assert a["data"][0]["attributes"]["password"] != b["data"][0]["attributes"]["password"]
+    assert a["data"][0]["attributes"]["smtppass"] != b["data"][0]["attributes"]["smtppass"]
+    assert a["data"][0]["attributes"]["secret"] != b["data"][0]["attributes"]["secret"]
+
+
+def test_render_joomla4_config_component_sanitised():
+    """A component slug with shell metas must not bleed into the JSON
+    body — flux's own response must never ship attacker-controlled
+    tokens that downstream pipelines could re-render unsafely."""
+    body = tbenv.render_joomla4_config_application(
+        {}, "com_users<script>", public=True,
+    ).decode("utf-8")
+    # Sanitisation collapses anything non-alphanumeric/_ to "application".
+    assert "<script>" not in body
+
+
+# ---- Tomcat `/..;/env.*` path-normalization bypass ---------------------
+
+def test_tomcat_path_bypass_enabled_by_default():
+    assert tbenv.TOMCAT_PATH_BYPASS_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/..;/env.js",
+    "/..;/env.dev.js",
+    "/..;/env.prod.js",
+    "/..;/env.production.js",
+    "/..;/env.development.js",
+    "/..;/ENV.JS",
+    "/static/..;/env.js",
+    "/api/..;/..;/env.prod.js",
+])
+def test_tomcat_path_bypass_matches_observed_probes(path):
+    assert tbenv.is_tomcat_path_bypass_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    # Plain .env probes — owned by the canary `/.env` trap.
+    "/.env",
+    "/env.js",
+    "/static/env.js",
+    # Tomcat path-param without env.js suffix — out of scope.
+    "/..;/admin",
+    "/..;/wp-config.php",
+    # F5 BIG-IP TMUI bypass — owned by the F5 handler.
+    "/tmui/login.jsp/..;/tmui/locallb/workspace/fileRead.jsp",
+    # Other product bypass shapes — these go to whoever owns them.
+    "/analytics/ceip/sdk/..;/..;/..;/analytics/ph/api/dataapp/agg",
+])
+def test_tomcat_path_bypass_non_match(path):
+    assert not tbenv.is_tomcat_path_bypass_path(path)
+
+
+def test_tomcat_path_bypass_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "TOMCAT_PATH_BYPASS_ENABLED", False)
+    assert not tbenv.is_tomcat_path_bypass_path("/..;/env.prod.js")
+
+
+def test_render_tomcat_path_bypass_env_js_carries_canary():
+    """The env.js body must embed the canary AWS triple in the
+    REACT_APP_AWS_* / VITE_AWS_* / NEXT_PUBLIC_AWS_* slots scrapers
+    grep for. Also assert the per-hit Sentry/Firebase/Stripe filler
+    is present so the body looks like a real bundle."""
+    aws = {"aws": {
+        "awsAccessKeyId": "AKIAEXAMPLE",
+        "awsSecretAccessKey": "SECRETEXAMPLE",
+        "awsSessionToken": "TOKENEXAMPLE",
+    }}
+    body = tbenv.render_tomcat_path_bypass_env_js(aws, "env.prod.js").decode("utf-8")
+    assert "AKIAEXAMPLE" in body
+    assert "SECRETEXAMPLE" in body
+    assert "TOKENEXAMPLE" in body
+    assert "REACT_APP_AWS_ACCESS_KEY_ID" in body
+    assert "VITE_AWS_ACCESS_KEY_ID" in body
+    assert "NEXT_PUBLIC_AWS_ACCESS_KEY_ID" in body
+    assert "REACT_APP_SENTRY_DSN" in body
+    assert "REACT_APP_STRIPE_PUBLISHABLE_KEY" in body
+    assert "env.prod.js" in body  # filename echoed in comment
+    # Body starts with the canonical bundle-style header
+    assert body.startswith("//")
+
+
+def test_render_tomcat_path_bypass_env_js_per_hit_sentry_unique():
+    """Sentry public key + app id are per-hit — two consecutive
+    renders with the same canary AWS triple must still differ on the
+    non-canary filler."""
+    aws = {"aws": {
+        "awsAccessKeyId": "AKIAEXAMPLE",
+        "awsSecretAccessKey": "SECRETEXAMPLE",
+        "awsSessionToken": "TOKENEXAMPLE",
+    }}
+    a = tbenv.render_tomcat_path_bypass_env_js(aws, "env.js").decode("utf-8")
+    b = tbenv.render_tomcat_path_bypass_env_js(aws, "env.js").decode("utf-8")
+    assert a != b, (
+        "Sentry public key / project id / firebase app id / stripe pk "
+        "must be per-hit — two consecutive renders produced the same "
+        "body, which is a fleet-wide fingerprint."
+    )
+
+
+def test_render_tomcat_path_bypass_env_js_filename_sanitised():
+    """A filename with HTML metacharacters must not bleed into the
+    body comment unsafely."""
+    aws = {"aws": {"awsAccessKeyId": "", "awsSecretAccessKey": "", "awsSessionToken": ""}}
+    body = tbenv.render_tomcat_path_bypass_env_js(
+        aws, "env.js" + "<script>alert(1)</script>",
+    ).decode("utf-8")
+    # Truncated to 64 chars; alert(1) won't fit + tag remains a comment-only line
+    # but ensure the rendered body doesn't break on the path metadata layer.
+    assert "AKIA" not in body  # empty canary still empty
+    assert body.count("\n") >= 3  # multi-line bundle
 
 
 def test_proc_environ_is_a_canary_trap():

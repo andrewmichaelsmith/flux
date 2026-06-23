@@ -300,6 +300,33 @@ Settings.php canary requires `TRACEBIT_API_KEY`; the
 | `HONEYPOT_DRUPAL_VERSION` | `9.5.11` | Version string emitted in the `X-Generator` response header and `<meta>` tag. Drupal-specific scanners check this to decide whether to ship the Drupalgeddon2 payload. |
 | `HONEYPOT_DRUPAL_BODY_DECODE_LIMIT` | `8192` | Max bytes of the request body decoded into `bodyPreview` and scanned for the Drupalgeddon2 / PHP-exec indicator flags. The full body is still hashed via `bodySha256`. |
 
+### Fake Joomla 4 public-config disclosure
+
+Per-hit AWS canary in the `filesystem.s3.*` slots requires
+`TRACEBIT_API_KEY`. Without the key the access-denied branch and the
+disclosure branch both still render; the s3 slots just go empty.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_JOOMLA4_CONFIG_ENABLED` | on | Master switch. Covers `/api/index.php/v1/config/application` plus the per-component `/api/index.php/v1/config/com_*` variants (CVE-2023-23752 unauth WebService config disclosure). |
+| `HONEYPOT_JOOMLA4_CONFIG_VERSION` | `4.2.6` | Logged in `joomla4ConfigVersion`; not embedded in the response body. Pinned inside the CVE-2023-23752 public-disclosure window. |
+
+The handler always advertises `X-Powered-By: PHP/8.1.27` so
+version-gated scanners that diff the PHP banner don't bail.
+
+### Tomcat `/..;/env.*` path-normalization bypass
+
+Requires `TRACEBIT_API_KEY` — the env.js body embeds an AWS canary in
+`REACT_APP_AWS_*` / `VITE_AWS_*` / `NEXT_PUBLIC_AWS_*` slots scrapers
+grep on.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_TOMCAT_PATH_BYPASS_ENABLED` | on | Master switch. Matches `/..;/env.{js,dev.js,prod.js,production.js,development.js}` (case-insensitive, any depth) — the Tomcat-style path-parameter bypass shape combined with a frontend env-file harvest. F5 BIG-IP TMUI `/..;/` bypass shapes (`/tmui/...`) continue to route to the F5 handler. |
+
+The handler always advertises `Server: Apache-Coyote/1.1` so
+version-gated Tomcat scanners don't bail.
+
 ### Fake Spring Cloud Gateway Actuator extension
 
 Requires `TRACEBIT_API_KEY` — the route-list response embeds an AWS
