@@ -14114,7 +14114,15 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "claude-credentials",
-        ("/.claude/.credentials.json",),
+        (
+            "/.claude/.credentials.json",
+            # XDG_CONFIG_HOME variant — some Claude Code builds default
+            # to ~/.config/claude over ~/.claude. Scanner dictionaries
+            # observed in June 2026 walk both alongside the bare
+            # /.credentials.json webroot variant from the same fleet.
+            "/.config/claude/.credentials.json",
+            "/.credentials.json",
+        ),
         ("aws",),
         render_claude_credentials_json,
         "application/json; charset=utf-8",
@@ -14388,7 +14396,10 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "claude-credentials-root",
-        ("/root/.claude/.credentials.json",),
+        (
+            "/root/.claude/.credentials.json",
+            "/root/.config/claude/.credentials.json",
+        ),
         ("aws",),
         render_claude_credentials_json,
         "application/json; charset=utf-8",
