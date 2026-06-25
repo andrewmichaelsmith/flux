@@ -378,6 +378,51 @@ WP_LOGIN_ADMIN_PATHS: set[str] = {
     "/wp-admin/install.php",
 }
 
+# --- Fake WordPress user-enumeration trap ---------------------------------
+# WordPress exposes three families of public username-disclosure surfaces
+# that credential-stuffing scanners walk before hitting `/wp-login.php`:
+#
+#   1. `/wp-json/wp/v2/users[?per_page=...]` — core REST endpoint, returns
+#      a JSON array of every author/editor/admin slug.
+#   2. `/wp-sitemap-users-1.xml` — WordPress 5.5+ core sitemap; lists
+#      author archive URLs (the slug is in the path).
+#   3. `/author-sitemap.xml` — Yoast SEO author sitemap variant; same
+#      shape, same disclosure.
+#
+# Returning a plausible list of fake usernames here lures the scanner into
+# brute-forcing those names against `/wp-login.php`, where the existing
+# wp-login trap captures the credential POST. The two traps form a chain:
+# enumerate → brute-force POST → captured credentials.
+#
+# Usernames are non-credential filler (no secret-shape leakage), so they
+# can be fixed across hosts — see the design principle in the README.
+WP_USER_ENUM_ENABLED = _env_bool("HONEYPOT_WP_USER_ENUM_ENABLED")
+_WP_USER_ENUM_REST_PATHS: set[str] = {
+    "/wp-json/wp/v2/users",
+    "/wp-json/wp/v2/users/",
+}
+# Numbered sitemap variants WordPress core emits (page-sharded for large
+# installs); we serve the same fake user list for any index.
+_WP_USER_ENUM_SITEMAP_RE = re.compile(
+    r"^/wp-sitemap-users-\d{1,4}\.xml$"
+)
+# Yoast SEO + RankMath author-sitemap variants. Yoast emits the bare
+# `/author-sitemap.xml`; RankMath uses `/author-sitemap.xml` too. A few
+# plugins emit numbered shards (`/author-sitemap1.xml`).
+_WP_USER_ENUM_YOAST_RE = re.compile(
+    r"^/author-sitemap\d{0,4}\.xml$"
+)
+# Fake user list. Plausible WP role distribution (one admin, one editor,
+# one author). Slugs are realistic non-credentials; matches CLAUDE.md
+# guidance that usernames may be fixed but credential-shaped fields may
+# not. The display name spaces (`Site Admin` vs slug `admin`) mirror what
+# wp_insert_user does by default.
+_WP_USER_ENUM_FAKE_USERS: tuple[dict[str, str], ...] = (
+    {"id": "1", "slug": "admin",     "name": "Site Admin"},
+    {"id": "2", "slug": "editor",    "name": "Editor"},
+    {"id": "3", "slug": "webmaster", "name": "Webmaster"},
+)
+
 # --- Fake LLM-API endpoint (Ollama / OpenAI / Anthropic-proxy shape) ---
 # Motivated by scanner fleets observed probing AI-inference endpoints
 # in April 2026 — Ollama-native paths, OpenAI-compatible paths, and
@@ -2387,6 +2432,34 @@ def is_wp_admin_path(path: str) -> bool:
     if not WP_LOGIN_ENABLED:
         return False
     return path.lower() in WP_LOGIN_ADMIN_PATHS
+
+
+def is_wp_user_enum_path(path: str) -> bool:
+    """Match WordPress public username-disclosure endpoints: the
+    `/wp-json/wp/v2/users` REST surface (with or without trailing slash,
+    with or without query string), the core `wp-sitemap-users-N.xml`
+    shards, and the Yoast/RankMath `author-sitemap[N].xml` variants.
+
+    Strips the query string before comparing so `?per_page=100` and
+    `?context=embed` variants both dispatch.
+    """
+    if not WP_USER_ENUM_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    if lp in _WP_USER_ENUM_REST_PATHS:
+        return True
+    # Indexed REST: `/wp-json/wp/v2/users/<id>` — accept numeric id only,
+    # so unrelated `/wp-json/wp/v2/users/me` (auth required, different
+    # surface) still falls through.
+    if lp.startswith("/wp-json/wp/v2/users/"):
+        tail = lp[len("/wp-json/wp/v2/users/"):]
+        if tail.isdigit():
+            return True
+    if _WP_USER_ENUM_SITEMAP_RE.match(lp):
+        return True
+    if _WP_USER_ENUM_YOAST_RE.match(lp):
+        return True
+    return False
 
 
 def is_sonicwall_path(path: str) -> bool:
@@ -7175,6 +7248,123 @@ def extract_wp_login_creds(body: bytes, content_type: str) -> dict[str, str]:
             else:
                 result[key] = values[0][:200]
     return result
+
+
+# --- WordPress user-enum renderers ----------------------------------------
+# Three response shapes match the three observed enumeration surfaces:
+#   - JSON array for `/wp-json/wp/v2/users`
+#   - Sitemap XML for `/wp-sitemap-users-N.xml`
+#   - Yoast/RankMath author-sitemap variant
+# A single fake user object renderer is shared between the array and
+# indexed-id REST handlers so the shape is identical.
+
+def _wp_user_enum_host_url(host: str) -> str:
+    """Construct an `https://<host>` base URL for embedding fake author
+    archive links. Strips any explicit port and trims whitespace; falls
+    back to `example.com` when host is empty/unparseable so the JSON
+    payload still validates."""
+    h = (host or "").strip().split(":", 1)[0]
+    # Reject obviously bogus characters that would corrupt the URL/JSON.
+    if not h or any(c in h for c in (" ", "\n", "\r", '"', "<", ">")):
+        h = "example.com"
+    return f"https://{h}"
+
+
+def _wp_user_enum_fake_user(slot: dict[str, str], host_url: str) -> dict[str, object]:
+    """Build a single WP REST user object matching wp-json/wp/v2/users
+    shape exactly. avatar_urls are pointed at Gravatar with a
+    placeholder hash — the same shape WP serves for any user that has
+    not configured an avatar."""
+    slug = slot["slug"]
+    # Deterministic 32-hex placeholder so the URL is well-formed; this
+    # is not a credential and not sensor-specific (per design principle).
+    avatar_hash = hashlib.md5(slug.encode("utf-8")).hexdigest()
+    avatar_base = f"https://secure.gravatar.com/avatar/{avatar_hash}"
+    return {
+        "id": int(slot["id"]),
+        "name": slot["name"],
+        "url": "",
+        "description": "",
+        "link": f"{host_url}/author/{slug}/",
+        "slug": slug,
+        "avatar_urls": {
+            "24": f"{avatar_base}?s=24&d=mm&r=g",
+            "48": f"{avatar_base}?s=48&d=mm&r=g",
+            "96": f"{avatar_base}?s=96&d=mm&r=g",
+        },
+        "meta": [],
+        "_links": {
+            "self": [{"href": f"{host_url}/wp-json/wp/v2/users/{slot['id']}"}],
+            "collection": [{"href": f"{host_url}/wp-json/wp/v2/users"}],
+        },
+    }
+
+
+def render_wp_user_enum_rest_list(host: str) -> bytes:
+    """`/wp-json/wp/v2/users` — JSON array of every fake user."""
+    base = _wp_user_enum_host_url(host)
+    users = [_wp_user_enum_fake_user(slot, base) for slot in _WP_USER_ENUM_FAKE_USERS]
+    return json.dumps(users, separators=(",", ":")).encode("utf-8")
+
+
+def render_wp_user_enum_rest_single(host: str, user_id: int) -> bytes:
+    """`/wp-json/wp/v2/users/<id>` — single user object, or a 404-shape
+    error JSON when the id is out of range. Real WP returns a
+    `rest_user_invalid_id` payload for unknown ids; we mirror that so a
+    scanner walking ids `1..50` sees the expected envelope and stops at
+    the first miss, instead of hammering until rate-limited."""
+    base = _wp_user_enum_host_url(host)
+    for slot in _WP_USER_ENUM_FAKE_USERS:
+        if int(slot["id"]) == user_id:
+            return json.dumps(
+                _wp_user_enum_fake_user(slot, base),
+                separators=(",", ":"),
+            ).encode("utf-8")
+    # WordPress's stock not-found envelope:
+    body = {
+        "code": "rest_user_invalid_id",
+        "message": "Invalid user ID.",
+        "data": {"status": 404},
+    }
+    return json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+
+def render_wp_user_enum_sitemap_xml(host: str) -> bytes:
+    """`/wp-sitemap-users-N.xml` — WordPress 5.5+ core sitemap shape.
+    Includes the XSL stylesheet PI that real WP emits so curl/wget
+    captures + browser views both look authentic."""
+    base = _wp_user_enum_host_url(host)
+    lines = [
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        f"<?xml-stylesheet type=\"text/xsl\" href=\"{base}/wp-sitemap.xsl\" ?>".encode("utf-8"),
+        b"<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" "
+        b"xmlns:xhtml=\"http://www.w3.org/1999/xhtml\">",
+    ]
+    for slot in _WP_USER_ENUM_FAKE_USERS:
+        loc = f"{base}/author/{slot['slug']}/"
+        lines.append(b"<url><loc>" + loc.encode("utf-8") + b"</loc></url>")
+    lines.append(b"</urlset>")
+    return b"\n".join(lines)
+
+
+def render_wp_user_enum_yoast_xml(host: str) -> bytes:
+    """`/author-sitemap.xml` — Yoast SEO author sitemap. Same shape as
+    the core sitemap but with the Yoast XSL stylesheet."""
+    base = _wp_user_enum_host_url(host)
+    lines = [
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        f"<?xml-stylesheet type=\"text/xsl\" href=\"{base}/main-sitemap.xsl\" ?>".encode("utf-8"),
+        b"<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" "
+        b"xmlns:image=\"http://www.google.com/schemas/sitemap-image/1.1\">",
+    ]
+    for slot in _WP_USER_ENUM_FAKE_USERS:
+        loc = f"{base}/author/{slot['slug']}/"
+        lines.append(
+            b"<url><loc>" + loc.encode("utf-8") + b"</loc>"
+            b"<lastmod>2026-01-01T00:00:00+00:00</lastmod></url>"
+        )
+    lines.append(b"</urlset>")
+    return b"\n".join(lines)
 
 
 # Multipart Content-Disposition header tokens used by file-upload trap.
@@ -15341,6 +15531,72 @@ async def _handle_wp_admin_redirect(
     )
 
 
+async def _handle_wp_user_enum(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    """Dispatch the three WordPress user-enumeration variants. Picks
+    renderer + content-type by path family, logs result + variant for
+    later attribution against `wp-login` POST follow-ups."""
+    host = str(log_context.get("host", "") or "")
+    method = request.method
+    lp = path.lower().split("?", 1)[0]
+
+    indexed_id: int | None = None
+    if lp.startswith("/wp-json/wp/v2/users/"):
+        tail = lp[len("/wp-json/wp/v2/users/"):]
+        if tail.isdigit():
+            indexed_id = int(tail)
+
+    if indexed_id is not None:
+        body = render_wp_user_enum_rest_single(host, indexed_id)
+        # WP itself returns 404 + the `rest_user_invalid_id` envelope for
+        # unknown ids; mirror that so the scanner believes the wall.
+        is_hit = any(int(s["id"]) == indexed_id for s in _WP_USER_ENUM_FAKE_USERS)
+        status = 200 if is_hit else 404
+        result_tag = "wp-user-enum-rest-single"
+        content_type = "application/json; charset=utf-8"
+        variant = "rest-single"
+    elif lp in _WP_USER_ENUM_REST_PATHS:
+        body = render_wp_user_enum_rest_list(host)
+        status = 200
+        result_tag = "wp-user-enum-rest-list"
+        content_type = "application/json; charset=utf-8"
+        variant = "rest-list"
+    elif _WP_USER_ENUM_YOAST_RE.match(lp):
+        body = render_wp_user_enum_yoast_xml(host)
+        status = 200
+        result_tag = "wp-user-enum-yoast-sitemap"
+        content_type = "application/xml; charset=utf-8"
+        variant = "yoast-sitemap"
+    else:
+        # Falls through to the core wp-sitemap-users-N.xml shard.
+        body = render_wp_user_enum_sitemap_xml(host)
+        status = 200
+        result_tag = "wp-user-enum-core-sitemap"
+        content_type = "application/xml; charset=utf-8"
+        variant = "core-sitemap"
+
+    response_body = b"" if method == "HEAD" else body
+    append_log({
+        **log_context,
+        "result": result_tag,
+        "status": status,
+        "wpUserEnumVariant": variant,
+        "wpUserEnumPath": path[:200],
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=status, body=response_body,
+        headers={
+            "Content-Type": content_type,
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
 async def _handle_sonicwall(
     request: web.Request,
     log_context: dict[str, object],
@@ -19996,6 +20252,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_wp_admin_path(path):
         return await _handle_wp_admin_redirect(request, log_context, path)
 
+    if is_wp_user_enum_path(path):
+        return await _handle_wp_user_enum(request, log_context, path)
+
     # Web-app form responder runs before the tarpit/fingerprint check so
     # that paths in both lists (e.g. `/`) stay with tarpit; the form trap
     # only matches its own concrete path set, never `/`.
@@ -20139,6 +20398,8 @@ def main() -> int:
         active.append("webapp-form")
     if WP_LOGIN_ENABLED:
         active.append("wp-login")
+    if WP_USER_ENUM_ENABLED:
+        active.append("wp-user-enum")
     if GRAVITY_SMTP_ENABLED:
         active.append("gravity-smtp")
     if TELESCOPE_ENABLED:

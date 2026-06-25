@@ -580,6 +580,7 @@ def test_all_trap_families_default_on():
     assert tbenv.SPRING_GATEWAY_ENABLED
     assert tbenv.BACKUP_ARCHIVE_ENABLED
     assert tbenv.WP_LOGIN_ENABLED
+    assert tbenv.WP_USER_ENUM_ENABLED
     assert tbenv.GRAPHQL_ENABLED
     assert tbenv.TELESCOPE_ENABLED
     assert tbenv.OIDC_DISCOVERY_ENABLED
@@ -10871,6 +10872,178 @@ async def test_dispatch_wp_login_disabled_returns_404(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "WP_LOGIN_ENABLED", False)
     resp = await flux_client.get(
         "/wp-login.php", headers={"X-Forwarded-For": "203.0.113.74"},
+    )
+    assert resp.status == 404
+
+
+# --- WordPress user-enumeration trap ---
+
+
+def test_wp_user_enum_enabled_by_default():
+    assert tbenv.WP_USER_ENUM_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/wp-json/wp/v2/users",
+    "/wp-json/wp/v2/users/",
+    "/wp-json/wp/v2/users?per_page=100",
+    "/wp-json/wp/v2/users?context=embed",
+    "/wp-json/wp/v2/users/1",
+    "/wp-json/wp/v2/users/2",
+    "/wp-json/wp/v2/users/3",
+    "/wp-json/WP/v2/Users",
+    "/wp-sitemap-users-1.xml",
+    "/wp-sitemap-users-2.xml",
+    "/wp-sitemap-users-12.xml",
+    "/author-sitemap.xml",
+    "/author-sitemap1.xml",
+    "/author-sitemap2.xml",
+])
+def test_wp_user_enum_path_match(path):
+    assert tbenv.is_wp_user_enum_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    # Adjacent WP REST namespaces but NOT the user list.
+    "/wp-json/wp/v2/users/me",
+    "/wp-json/wp/v2/users/me/",
+    "/wp-json/wp/v2/posts",
+    "/wp-json/gravitysmtp/v1/config",
+    # Sitemaps that aren't user shards.
+    "/wp-sitemap.xml",
+    "/wp-sitemap-posts-post-1.xml",
+    "/sitemap.xml",
+    # Generic noise.
+    "/wp-login.php",
+    "/.env",
+    "/",
+])
+def test_wp_user_enum_path_no_match(path):
+    assert not tbenv.is_wp_user_enum_path(path)
+
+
+def test_wp_user_enum_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "WP_USER_ENUM_ENABLED", False)
+    assert not tbenv.is_wp_user_enum_path("/wp-json/wp/v2/users")
+    assert not tbenv.is_wp_user_enum_path("/wp-sitemap-users-1.xml")
+    assert not tbenv.is_wp_user_enum_path("/author-sitemap.xml")
+
+
+def test_wp_user_enum_rest_list_returns_full_user_array():
+    body = tbenv.render_wp_user_enum_rest_list("example.com")
+    parsed = json.loads(body.decode("utf-8"))
+    assert isinstance(parsed, list)
+    assert len(parsed) == len(tbenv._WP_USER_ENUM_FAKE_USERS)
+    # First user must look admin-shaped at id 1 (matches stock WP).
+    assert parsed[0]["id"] == 1
+    assert parsed[0]["slug"] == "admin"
+    assert parsed[0]["link"] == "https://example.com/author/admin/"
+    assert "avatar_urls" in parsed[0]
+    for slot, rendered in zip(tbenv._WP_USER_ENUM_FAKE_USERS, parsed):
+        assert rendered["slug"] == slot["slug"]
+
+
+def test_wp_user_enum_rest_single_known_id_returns_user():
+    body = tbenv.render_wp_user_enum_rest_single("example.com", 1)
+    parsed = json.loads(body.decode("utf-8"))
+    assert parsed["id"] == 1
+    assert parsed["slug"] == "admin"
+    assert "avatar_urls" in parsed
+
+
+def test_wp_user_enum_rest_single_unknown_id_returns_wp_error_envelope():
+    body = tbenv.render_wp_user_enum_rest_single("example.com", 999)
+    parsed = json.loads(body.decode("utf-8"))
+    # Mirrors stock WordPress's not-found envelope shape.
+    assert parsed["code"] == "rest_user_invalid_id"
+    assert parsed["data"]["status"] == 404
+
+
+def test_wp_user_enum_sitemap_xml_lists_each_fake_author():
+    body = tbenv.render_wp_user_enum_sitemap_xml("example.com")
+    assert body.startswith(b"<?xml")
+    assert b"<urlset" in body
+    for slot in tbenv._WP_USER_ENUM_FAKE_USERS:
+        assert f"/author/{slot['slug']}/".encode("utf-8") in body
+
+
+def test_wp_user_enum_yoast_xml_lists_each_fake_author():
+    body = tbenv.render_wp_user_enum_yoast_xml("example.com")
+    assert body.startswith(b"<?xml")
+    for slot in tbenv._WP_USER_ENUM_FAKE_USERS:
+        assert f"/author/{slot['slug']}/".encode("utf-8") in body
+    # Yoast's lastmod marker is part of its sitemap shape.
+    assert b"<lastmod>" in body
+
+
+@pytest.mark.parametrize("bad_host", [
+    "", "host with space", "host\nwith\nnewline", "host\"injected",
+])
+def test_wp_user_enum_host_falls_back_for_bad_host(bad_host):
+    """Invalid Host header must not corrupt JSON / XML output."""
+    body = tbenv.render_wp_user_enum_rest_list(bad_host)
+    parsed = json.loads(body.decode("utf-8"))
+    assert parsed[0]["link"].startswith("https://example.com/")
+
+
+async def test_dispatch_routes_wp_user_enum_rest_list_to_json(flux_client):
+    resp = await flux_client.get(
+        "/wp-json/wp/v2/users",
+        headers={"X-Forwarded-For": "203.0.113.75", "Host": "example.com"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("application/json")
+    body = await resp.read()
+    parsed = json.loads(body.decode("utf-8"))
+    assert isinstance(parsed, list) and parsed[0]["slug"] == "admin"
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "wp-user-enum-rest-list"
+    assert entries[-1]["wpUserEnumVariant"] == "rest-list"
+
+
+async def test_dispatch_routes_wp_user_enum_rest_single_unknown_id_404s(flux_client):
+    resp = await flux_client.get(
+        "/wp-json/wp/v2/users/999",
+        headers={"X-Forwarded-For": "203.0.113.76", "Host": "example.com"},
+    )
+    assert resp.status == 404
+    body = await resp.read()
+    parsed = json.loads(body.decode("utf-8"))
+    assert parsed["code"] == "rest_user_invalid_id"
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "wp-user-enum-rest-single"
+
+
+async def test_dispatch_routes_wp_user_enum_core_sitemap_to_xml(flux_client):
+    resp = await flux_client.get(
+        "/wp-sitemap-users-1.xml",
+        headers={"X-Forwarded-For": "203.0.113.77", "Host": "example.com"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("application/xml")
+    body = await resp.read()
+    assert b"<urlset" in body and b"/author/admin/" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "wp-user-enum-core-sitemap"
+
+
+async def test_dispatch_routes_wp_user_enum_yoast_sitemap_to_xml(flux_client):
+    resp = await flux_client.get(
+        "/author-sitemap.xml",
+        headers={"X-Forwarded-For": "203.0.113.78", "Host": "example.com"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"<lastmod>" in body and b"/author/admin/" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "wp-user-enum-yoast-sitemap"
+
+
+async def test_dispatch_wp_user_enum_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "WP_USER_ENUM_ENABLED", False)
+    resp = await flux_client.get(
+        "/wp-json/wp/v2/users",
+        headers={"X-Forwarded-For": "203.0.113.79", "Host": "example.com"},
     )
     assert resp.status == 404
 
