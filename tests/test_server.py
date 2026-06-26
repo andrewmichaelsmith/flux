@@ -7797,6 +7797,114 @@ def test_render_tomcat_path_bypass_env_js_filename_sanitised():
     assert body.count("\n") >= 3  # multi-line bundle
 
 
+# ---- Webapp runtime-config bundle (`/env.js`, `/config.production.js`,
+# `/config.production.json`, …) ------------------------------------------
+
+@pytest.mark.parametrize("path", [
+    # Bare leaves
+    "/env.js", "/config.js", "/app.js", "/main.js", "/index.js",
+    "/env.production.js", "/env.development.js", "/env.dev.js", "/env.prod.js",
+    "/config.production.js", "/config.local.js",
+    # Build-pipeline prefixes
+    "/src/config.js", "/web/config.js", "/app/config.js", "/api/config.js",
+    "/public/config.js", "/assets/config.js", "/static/config.js",
+    "/src/api/config.js", "/web/api/config.js",
+    "/static/js/config.js", "/public/js/config.js",
+    "/config/config.js",
+])
+def test_webapp_config_bundle_js_is_a_canary_trap(path):
+    trap = tbenv._TRAP_BY_PATH.get(path)
+    assert trap is not None, f"{path!r} should be a CanaryTrap entry"
+    assert trap.name == "webapp-config-bundle-js"
+    assert trap.content_type.startswith("application/javascript")
+
+
+@pytest.mark.parametrize("path", [
+    # Bare leaves
+    "/configuration.json", "/production.json", "/configs.json",
+    "/config.production.json", "/config.development.json",
+    "/config.dev.json", "/config.prod.json", "/config.local.json",
+    # Prefixed variants the lockstep scanner walks
+    "/assets/config.production.json", "/assets/configs.json",
+    "/src/config.production.json", "/static/configuration.json",
+])
+def test_webapp_config_bundle_json_is_a_canary_trap(path):
+    trap = tbenv._TRAP_BY_PATH.get(path)
+    assert trap is not None, f"{path!r} should be a CanaryTrap entry"
+    assert trap.name == "webapp-config-bundle-json"
+    assert trap.content_type.startswith("application/json")
+
+
+@pytest.mark.parametrize("path", [
+    # These have their own dedicated traps and MUST NOT be claimed by
+    # the webapp-config-bundle traps (which would change the response
+    # shape and the result tag).
+    "/config.json", "/settings.json", "/credentials.json", "/secrets.json",
+    # The Next.js / Vite / Tomcat env.js bypass shape stays with the
+    # tomcat-path-bypass handler.
+    "/..;/env.js", "/..;/env.production.js",
+    # Real WordPress / app paths must not be swallowed.
+    "/wp-config.php",
+    "/.env",
+    "/.git/config",
+])
+def test_webapp_config_bundle_does_not_clobber_other_traps(path):
+    trap = tbenv._TRAP_BY_PATH.get(path)
+    if trap is not None:
+        assert not trap.name.startswith("webapp-config-bundle-"), (
+            f"{path!r} should NOT be a webapp-config-bundle trap"
+        )
+
+
+def test_render_webapp_config_bundle_js_carries_canary():
+    aws = {"aws": {
+        "awsAccessKeyId": "AKIAEXAMPLE",
+        "awsSecretAccessKey": "SECRETEXAMPLE",
+        "awsSessionToken": "TOKENEXAMPLE",
+    }}
+    body = tbenv.render_webapp_config_bundle_js(aws).decode("utf-8")
+    assert "AKIAEXAMPLE" in body
+    assert "SECRETEXAMPLE" in body
+    assert "TOKENEXAMPLE" in body
+    assert "REACT_APP_AWS_ACCESS_KEY_ID" in body
+    assert "VITE_AWS_ACCESS_KEY_ID" in body
+    assert "NEXT_PUBLIC_AWS_ACCESS_KEY_ID" in body
+    assert "REACT_APP_SENTRY_DSN" in body
+    assert "REACT_APP_STRIPE_PUBLISHABLE_KEY" in body
+    assert "window.__APP_ENV__" in body
+    assert body.startswith("//")
+
+
+def test_render_webapp_config_bundle_json_carries_canary_and_is_valid_json():
+    aws = {"aws": {
+        "awsAccessKeyId": "AKIAEXAMPLE",
+        "awsSecretAccessKey": "SECRETEXAMPLE",
+        "awsSessionToken": "TOKENEXAMPLE",
+    }}
+    body = tbenv.render_webapp_config_bundle_json(aws).decode("utf-8")
+    # Must parse as JSON (the JS sibling deliberately doesn't — it's a
+    # `window.__APP_ENV__ = {...}` assignment).
+    parsed = json.loads(body)
+    assert parsed["REACT_APP_AWS_ACCESS_KEY_ID"] == "AKIAEXAMPLE"
+    assert parsed["VITE_AWS_SECRET_ACCESS_KEY"] == "SECRETEXAMPLE"
+    assert parsed["NEXT_PUBLIC_AWS_ACCESS_KEY_ID"] == "AKIAEXAMPLE"
+    assert "REACT_APP_SENTRY_DSN" in parsed
+    assert "REACT_APP_STRIPE_PUBLISHABLE_KEY" in parsed
+
+
+def test_render_webapp_config_bundle_js_per_hit_filler_unique():
+    """Sentry / Firebase / Stripe non-canary fields must be per-hit so
+    the body isn't a fleet-wide fingerprint."""
+    aws = {"aws": {
+        "awsAccessKeyId": "AKIAEXAMPLE",
+        "awsSecretAccessKey": "SECRETEXAMPLE",
+        "awsSessionToken": "TOKENEXAMPLE",
+    }}
+    a = tbenv.render_webapp_config_bundle_js(aws).decode("utf-8")
+    b = tbenv.render_webapp_config_bundle_js(aws).decode("utf-8")
+    assert a != b
+
+
 def test_proc_environ_is_a_canary_trap():
     """`/proc/<pid>/environ`, `/etc/environment`, bare `/environ`
     and `/environment` are CanaryTrap entries — env-leak surfaces
@@ -8280,6 +8388,73 @@ def test_nextjs_normalize_path_strips_encoded_slashes():
         tbenv._nextjs_normalize_path("/__nextjs_action%2fsub")
         == "/__nextjs_action%2fsub"
     )
+
+
+@pytest.mark.parametrize("raw,want", [
+    # Baseline — no traversal, no change.
+    ("/", "/"),
+    ("", "/"),
+    ("/.aws/credentials", "/.aws/credentials"),
+    ("/.well-known/security.txt", "/.well-known/security.txt"),
+    ("/.git/config", "/.git/config"),
+    ("/blog/.git/config", "/blog/.git/config"),
+    ("/x.php", "/x.php"),
+    # Slash collapse — pre-existing behaviour, must stay correct.
+    ("//foo//bar", "/foo/bar"),
+    # Standard `..` traversal: `/files/../wp-config.php` → `/wp-config.php`.
+    # Scanner dictionaries walk this shape against parsers that don't
+    # canonicalise before dispatch.
+    ("/files/../wp-config.php", "/wp-config.php"),
+    ("/foo/./bar", "/foo/bar"),
+    ("/foo/../bar", "/bar"),
+    ("/..", "/"),
+    ("/../wp-config.php", "/wp-config.php"),
+    # No-slash traversal-bypass: `<seg>..` is treated as a traversal
+    # token by some buggy parsers (Apache/PHP register_globals era).
+    # Repaired to `<seg>/..` then collapsed.
+    ("/assets../wp-config.php", "/wp-config.php"),
+    ("/assets../../wp-config.php", "/wp-config.php"),
+    ("/files../wp-config.php", "/wp-config.php"),
+    ("/files../../wp-config.php", "/wp-config.php"),
+    # The `/static../proc/self/environ` shape the env-hunter family
+    # walks alongside `.env` — must land on the proc-environ handler.
+    ("/static../environ", "/environ"),
+    ("/static../proc/self/environ", "/proc/self/environ"),
+    # URL-encoded `..` (`%2e%2e`) gets unquoted first, then normalized.
+    ("/%2e%2e/wp-config.php", "/wp-config.php"),
+    ("/files/%2e%2e/wp-config.php", "/wp-config.php"),
+    # Trailing `..` collapses to root or parent.
+    ("/foo/bar/..", "/foo"),
+    # Legit filenames with trailing dots (not followed by `/`) MUST NOT
+    # be repaired — `foo..` is a valid Unix filename, not a traversal.
+    ("/foo..", "/foo.."),
+    ("/foo./", "/foo./"),
+])
+def test_normalize_path_resolves_traversal(raw, want):
+    assert tbenv.normalize_path(raw) == want
+
+
+def test_normalize_path_traversal_lands_on_canary_trap():
+    """End-to-end: a traversal-bypass request for wp-config / proc-environ
+    must resolve to the canonical path AND match the existing
+    canary-trap dispatch dict. Otherwise the normalize_path fix is dead
+    code at the dispatch layer."""
+    for raw in (
+        "/files/../wp-config.php",
+        "/assets../wp-config.php",
+        "/assets../../wp-config.php",
+        "/files../wp-config.php",
+    ):
+        canonical = tbenv.normalize_path(raw)
+        assert canonical == "/wp-config.php"
+        assert canonical.lower() in tbenv._TRAP_BY_PATH, raw
+    for raw in (
+        "/static../environ",
+        "/static../proc/self/environ",
+        "/%2e%2e/proc/1/environ",
+    ):
+        canonical = tbenv.normalize_path(raw)
+        assert canonical.lower() in tbenv._TRAP_BY_PATH, raw
 
 
 def test_nextjs_extract_devmode_query_picks_interesting_keys():

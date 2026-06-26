@@ -272,6 +272,82 @@ async def test_integration_aws_credentials_file(live_server):
             assert b"[default]" in body
 
 
+@pytest.mark.parametrize("traversal_path,result_tag,canary_marker", [
+    # Standard `..` traversal — should land on the wp-config trap.
+    ("/files/../wp-config.php", "wp-config", b"AKIAFAKEINTEG01"),
+    # No-slash traversal-bypass: `<seg>..` (no slash before `..`).
+    ("/assets../wp-config.php", "wp-config", b"AKIAFAKEINTEG01"),
+    # The env-hunter family's `/static../proc/self/environ` shape.
+    ("/static../proc/self/environ", "proc-environ", b"AKIAFAKEINTEG01"),
+])
+async def test_integration_path_traversal_normalises_to_canary(
+    live_server, traversal_path, result_tag, canary_marker,
+):
+    """Path-traversal-bypass shapes (`/files/../X`, `/assets../X`,
+    `/static../X`) must normalise to the canonical X before dispatch
+    so the existing canary trap fires. Over the wire — confirms the
+    fix is wired into the real request path, not just a unit-level
+    bypass."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}{traversal_path}",
+            headers={"X-Forwarded-For": "203.0.113.24"},
+        ) as resp:
+            assert resp.status == 200, traversal_path
+            body = await resp.read()
+            assert canary_marker in body, traversal_path
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    matching = [e for e in entries if e.get("result") == result_tag]
+    assert matching, (
+        f"no log row for {traversal_path!r} resolved as {result_tag!r}"
+    )
+
+
+async def test_integration_webapp_config_bundle_js(live_server):
+    """`/env.production.js` (and its prefixed siblings) returns a
+    `window.__APP_ENV__` assignment with the canary AWS triple in
+    the REACT_APP_* / VITE_* / NEXT_PUBLIC_* slots."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/env.production.js",
+            headers={"X-Forwarded-For": "203.0.113.25"},
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("application/javascript")
+            body = await resp.read()
+            assert b"window.__APP_ENV__" in body
+            assert b"AKIAFAKEINTEG01" in body
+            assert b"REACT_APP_AWS_ACCESS_KEY_ID" in body
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    matching = [e for e in entries if e.get("result") == "webapp-config-bundle-js"]
+    assert matching
+
+
+async def test_integration_webapp_config_bundle_json(live_server):
+    """`/config.production.json` returns a parseable JSON manifest
+    with the canary AWS triple."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/assets/config.production.json",
+            headers={"X-Forwarded-For": "203.0.113.26"},
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("application/json")
+            body = await resp.read()
+            payload = json.loads(body)
+            assert payload["REACT_APP_AWS_ACCESS_KEY_ID"] == "AKIAFAKEINTEG01"
+            assert payload["VITE_AWS_SECRET_ACCESS_KEY"] == "integSecretExampleKey"
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    matching = [e for e in entries if e.get("result") == "webapp-config-bundle-json"]
+    assert matching
+
+
 async def test_integration_actuator_env_serves_json_canary(live_server):
     """Spring Boot Actuator /env round-trip: 200, Spring content-type,
     JSON shape with activeProfiles + propertySources, embedded canary."""

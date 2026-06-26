@@ -11,6 +11,7 @@ import ipaddress
 import json
 import lzma
 import os
+import posixpath
 import re
 import secrets
 import string
@@ -2296,12 +2297,45 @@ def header_subset(headers: object) -> dict[str, str]:
     return values
 
 
+_NO_SLASH_TRAVERSAL_RE = re.compile(r"([^/])\.\.(/)")
+
+
 def normalize_path(raw_path: str) -> str:
+    """Canonicalise a request URL path before handler dispatch.
+
+    Steps:
+      1. URL-decode percent-escapes
+      2. Collapse runs of `/`
+      3. Repair the no-slash traversal-bypass shape: `xxx../yyy` →
+         `xxx/../yyy`. Scanners use this against parsers that treat
+         `..` as a path-up token even without a leading slash; without
+         the repair, `/assets../wp-config.php` and friends would 404.
+      4. Resolve `.` / `..` segments via `posixpath.normpath` so the
+         canonical destination of a traversal lands on the existing
+         handler dictionary. `/files/../wp-config.php` → `/wp-config.php`,
+         `/static../proc/self/environ` → `/proc/self/environ`.
+
+    Trailing slash is preserved across normpath (which strips it).
+    """
     if not raw_path:
         return "/"
     decoded = unquote(raw_path)
     collapsed = re.sub(r"/+", "/", decoded)
-    return collapsed if collapsed.startswith("/") else f"/{collapsed}"
+    if not collapsed.startswith("/"):
+        collapsed = "/" + collapsed
+    repaired = _NO_SLASH_TRAVERSAL_RE.sub(r"\1/..\2", collapsed)
+    while repaired != collapsed:
+        collapsed = repaired
+        repaired = _NO_SLASH_TRAVERSAL_RE.sub(r"\1/..\2", collapsed)
+    if "/.." in collapsed or "/./" in collapsed or collapsed.endswith("/.."):
+        trailing_slash = collapsed.endswith("/")
+        resolved = posixpath.normpath(collapsed)
+        if resolved in ("", "."):
+            resolved = "/"
+        if trailing_slash and not resolved.endswith("/"):
+            resolved += "/"
+        collapsed = resolved
+    return collapsed
 
 
 def extract_git_path(path: str) -> str | None:
@@ -6950,6 +6984,79 @@ def render_tomcat_path_bypass_env_js(r: dict[str, object], filename: str) -> byt
         + ";\n"
     )
     return body.encode("utf-8")
+
+
+def _build_webapp_config_bundle_env_obj(r: dict[str, object]) -> dict[str, object]:
+    """Shared env-config dict used by both webapp-config-bundle renderers.
+
+    Same React / Vite / Next slot layout as the tomcat-path-bypass body
+    (scrapers grep for `REACT_APP_AWS_*`, `VITE_AWS_*`, `NEXT_PUBLIC_*`),
+    plus per-hit Sentry/Firebase/Stripe synthetics so the body looks like
+    a real leaky build rather than a stub. Pulled out into a helper so
+    the JS and JSON renderers stay in sync — and so the body is per-hit
+    unique end-to-end (no fixed credential filler)."""
+    aws = _aws(r)
+    sentry_org_id = 1_000_000 + secrets.randbelow(900_000)
+    sentry_project_id = 1_000_000 + secrets.randbelow(9_000_000)
+    sentry_public_key = secrets.token_hex(16)
+    firebase_app_id = (
+        f"1:{secrets.randbelow(10**12):012d}:web:{secrets.token_hex(8)}"
+    )
+    stripe_pk = "pk_live_" + secrets.token_urlsafe(24).replace("-", "").replace("_", "")[:24]
+    return {
+        "NODE_ENV": "production",
+        "API_BASE_URL": "https://api.internal.example.com",
+        "REACT_APP_AWS_REGION": "us-east-1",
+        "REACT_APP_AWS_ACCESS_KEY_ID": aws.get("awsAccessKeyId", ""),
+        "REACT_APP_AWS_SECRET_ACCESS_KEY": aws.get("awsSecretAccessKey", ""),
+        "REACT_APP_AWS_SESSION_TOKEN": aws.get("awsSessionToken", ""),
+        "VITE_AWS_REGION": "us-east-1",
+        "VITE_AWS_ACCESS_KEY_ID": aws.get("awsAccessKeyId", ""),
+        "VITE_AWS_SECRET_ACCESS_KEY": aws.get("awsSecretAccessKey", ""),
+        "NEXT_PUBLIC_AWS_REGION": "us-east-1",
+        "NEXT_PUBLIC_AWS_ACCESS_KEY_ID": aws.get("awsAccessKeyId", ""),
+        "NEXT_PUBLIC_API_KEY": aws.get("awsAccessKeyId", ""),
+        "REACT_APP_SENTRY_DSN": (
+            f"https://{sentry_public_key}@o{sentry_org_id}.ingest.sentry.io/"
+            f"{sentry_project_id}"
+        ),
+        "REACT_APP_FIREBASE_APP_ID": firebase_app_id,
+        "REACT_APP_STRIPE_PUBLISHABLE_KEY": stripe_pk,
+        "REACT_APP_S3_BUCKET": "internal-app-uploads-prod",
+    }
+
+
+def render_webapp_config_bundle_js(r: dict[str, object]) -> bytes:
+    """Frontend runtime-config JS bundle — the shape React / Vite / Vue /
+    Next build pipelines emit as `env.js`, `config.js`, `app.js`,
+    `env.production.js`, `config.production.js`, etc. when an operator
+    wants runtime env without a rebuild. Scanner populations walk a wide
+    set of bare and prefixed variants (`/config.js`, `/env.production.js`,
+    `/src/api/config.js`, `/static/js/config.js`, …) looking for builds
+    where a dev committed populated credentials. Returns a plausible
+    config object with the Tracebit AWS canary in `REACT_APP_AWS_*` /
+    `VITE_AWS_*` / `NEXT_PUBLIC_AWS_*` slots. Sibling JSON form lives in
+    `render_webapp_config_bundle_json`."""
+    env_obj = _build_webapp_config_bundle_env_obj(r)
+    body = (
+        "// runtime webapp config bundle — generated at build time\n"
+        "// DO NOT COMMIT WITH POPULATED CREDENTIALS\n"
+        "window.__APP_ENV__ = "
+        + json.dumps(env_obj, separators=(",", ":"))
+        + ";\n"
+    )
+    return body.encode("utf-8")
+
+
+def render_webapp_config_bundle_json(r: dict[str, object]) -> bytes:
+    """JSON-shaped sibling of `render_webapp_config_bundle_js`. Same
+    scanner fleet walks the `.json` form of every leaf name (e.g.
+    `/config.production.json`, `/assets/config.production.json`,
+    `/configuration.json`) because some build pipelines emit the
+    runtime config as a JSON manifest the SPA fetches at boot rather
+    than a `window.__APP_ENV__` assignment."""
+    env_obj = _build_webapp_config_bundle_env_obj(r)
+    return json.dumps(env_obj, separators=(",", ":"), indent=2).encode("utf-8")
 
 
 def render_spring_gateway_routes_get(r: dict[str, object]) -> bytes:
@@ -13771,10 +13878,10 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     # `/proc/<pid>/environ`, `/etc/environment`, bare `/environ` and
     # `/environment` — process / system environment-variable leaks
     # that LFI / path-traversal chains target alongside `.env` files.
-    # The `/static../environ` and `/static../proc/self/environ` shapes
-    # (URL-traversal that some buggy servers normalise back to
-    # `/environ` / `/proc/self/environ`) come in via `normalize_path`'s
-    # collapse step. NUL-separated body is the on-disk
+    # The `/static../environ` and `/static../proc/self/environ`
+    # traversal-bypass shapes land here after `normalize_path` repairs
+    # the no-slash form (`<seg>..` → `<seg>/..`) and `posixpath.normpath`
+    # collapses the `..` segment. NUL-separated body is the on-disk
     # `/proc/<pid>/environ` shape — a harvester grepping for `AKIA…`
     # or `AWS_SECRET_ACCESS_KEY` bytes still harvests the canary.
     CanaryTrap(
@@ -15012,6 +15119,78 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_headscale_config_yaml,
         "application/x-yaml; charset=utf-8",
+    ),
+    # Frontend webapp runtime-config bundle — JS form. One scanner family
+    # walks ~20 path variants per sensor (bare `/config.js`, `/env.js`,
+    # `/app.js`, `/main.js`, `/index.js`, environment-suffixed
+    # `/env.production.js` / `/env.development.js` / `/env.dev.js` /
+    # `/env.prod.js` / `/env.local.js`, build-pipeline-prefixed
+    # `/src/api/config.js`, `/web/api/config.js`, `/static/js/config.js`,
+    # `/public/js/config.js`, …) looking for SPA bundles where a
+    # developer committed populated cloud creds. Single render shape
+    # covers the lot: a `window.__APP_ENV__` assignment with the
+    # Tracebit AWS canary in the `REACT_APP_AWS_*` / `VITE_AWS_*` /
+    # `NEXT_PUBLIC_AWS_*` slots scrapers grep on, plus per-hit synthetic
+    # Sentry / Firebase / Stripe-shaped filler so the body looks like a
+    # real leaky build. Path list is the cross-product of an observed
+    # leaf-name set and an observed webroot-prefix set; new prefixes that
+    # become common can be added without code changes elsewhere.
+    CanaryTrap(
+        "webapp-config-bundle-js",
+        tuple(
+            f"{prefix}{leaf}"
+            for prefix in (
+                "/",
+                "/src/", "/web/", "/app/", "/api/",
+                "/public/", "/assets/", "/static/",
+                "/dist/", "/build/",
+                "/src/api/", "/web/api/",
+                "/src/config/", "/web/config/", "/config/",
+                "/static/js/", "/public/js/", "/static/config/",
+            )
+            for leaf in (
+                "config.js", "env.js", "app.js", "main.js", "index.js",
+                "settings.js", "runtime-config.js",
+                "env.dev.js", "env.development.js",
+                "env.prod.js", "env.production.js", "env.local.js",
+                "config.dev.js", "config.development.js",
+                "config.prod.js", "config.production.js", "config.local.js",
+            )
+        ),
+        ("aws",),
+        render_webapp_config_bundle_js,
+        "application/javascript; charset=utf-8",
+    ),
+    # JSON sibling of the above — same scanner walks the `.json` form
+    # for build pipelines that emit the runtime config as a JSON manifest
+    # the SPA fetches at boot. Leaf names excluded from the existing
+    # `config-json` trap (which owns `/config.json`, `/settings.json`,
+    # `/credentials.json`, `/secrets.json` only); the rest land here.
+    CanaryTrap(
+        "webapp-config-bundle-json",
+        tuple(
+            f"{prefix}{leaf}"
+            for prefix in (
+                "/",
+                "/src/", "/web/", "/app/", "/api/",
+                "/public/", "/assets/", "/static/",
+                "/dist/", "/build/",
+                "/src/api/", "/web/api/",
+                "/src/config/", "/web/config/", "/config/",
+            )
+            for leaf in (
+                "configuration.json",
+                "configs.json",
+                "production.json",
+                "runtime-config.json",
+                "config.dev.json", "config.development.json",
+                "config.prod.json", "config.production.json",
+                "config.local.json",
+            )
+        ),
+        ("aws",),
+        render_webapp_config_bundle_json,
+        "application/json; charset=utf-8",
     ),
 )
 
