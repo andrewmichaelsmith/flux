@@ -11719,6 +11719,270 @@ def render_actuator_trace(r: dict[str, object]) -> bytes:
     return json.dumps(payload, indent=2).encode("utf-8")
 
 
+def render_actuator_jolokia_list(r: dict[str, object]) -> bytes:
+    # Jolokia is the JMX-over-HTTP bridge Spring ships when the
+    # `jolokia` dependency is on the classpath. The `list` operation
+    # enumerates every JMX MBean the JVM exposes — scanners chain
+    # this list response to find the `com.sun.management:type=
+    # DiagnosticCommand` bean, whose `vmCommandLine` / `vmSystemProperties`
+    # operations exec arbitrary diagnostic commands. The same scanners
+    # also grep the list output for env-var-shaped attribute values
+    # because `java.lang:type=Runtime`'s `SystemProperties` attribute
+    # reflects every `-D` JVM flag — including credential-bearing ones
+    # like `-Daws.accessKeyId=...`. We mirror the v1 list-response
+    # shape (real Jolokia: `{request, value: <domain-tree>, status,
+    # timestamp}`) and surface the AWS canary inside the
+    # `Runtime.SystemProperties` MBean description and a sentinel
+    # SystemProperties value.
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    payload = {
+        "request": {"type": "list"},
+        "value": {
+            "java.lang": {
+                "type=Runtime": {
+                    "op": {},
+                    "attr": {
+                        "Name": {"rw": False, "type": "java.lang.String", "desc": "Name"},
+                        "Pid": {"rw": False, "type": "long", "desc": "Pid"},
+                        "Uptime": {"rw": False, "type": "long", "desc": "Uptime"},
+                        "SystemProperties": {
+                            "rw": False,
+                            "type": "javax.management.openmbean.TabularData",
+                            "desc": (
+                                "JVM system properties (resolved -D flags); "
+                                f"includes aws.accessKeyId={ak} from launch"
+                            ),
+                        },
+                        "InputArguments": {
+                            "rw": False,
+                            "type": "[Ljava.lang.String;",
+                            "desc": (
+                                "Launch args: -Dspring.profiles.active=prod "
+                                f"-Daws.accessKeyId={ak} "
+                                f"-Daws.secretKey={sk}"
+                            ),
+                        },
+                    },
+                    "desc": "Java runtime",
+                },
+                "type=Memory": {
+                    "op": {
+                        "gc": {"args": [], "ret": "void", "desc": "gc"},
+                    },
+                    "attr": {
+                        "HeapMemoryUsage": {
+                            "rw": False,
+                            "type": "javax.management.openmbean.CompositeData",
+                            "desc": "HeapMemoryUsage",
+                        },
+                    },
+                    "desc": "Memory",
+                },
+            },
+            "com.sun.management": {
+                "type=DiagnosticCommand": {
+                    "op": {
+                        "vmCommandLine": {
+                            "args": [],
+                            "ret": "java.lang.String",
+                            "desc": "Print command line of the target VM",
+                        },
+                        "vmSystemProperties": {
+                            "args": [],
+                            "ret": "java.lang.String",
+                            "desc": "Print system properties",
+                        },
+                        "vmFlags": {
+                            "args": [
+                                {"name": "arguments", "type": "[Ljava.lang.String;", "desc": "arguments"},
+                            ],
+                            "ret": "java.lang.String",
+                            "desc": "Print VM flag options",
+                        },
+                        "gcRun": {"args": [], "ret": "java.lang.String", "desc": "gcRun"},
+                    },
+                    "attr": {},
+                    "desc": "Diagnostic Commands",
+                },
+            },
+            "org.springframework.boot": {
+                "type=Endpoint,name=Env": {
+                    "op": {
+                        "environment": {
+                            "args": [
+                                {"name": "pattern", "type": "java.lang.String", "desc": "pattern"},
+                            ],
+                            "ret": "java.util.Map",
+                            "desc": "environment",
+                        },
+                    },
+                    "attr": {},
+                    "desc": "/actuator/env MBean",
+                },
+                "type=Endpoint,name=Health": {
+                    "op": {"health": {"args": [], "ret": "java.util.Map", "desc": "health"}},
+                    "attr": {},
+                    "desc": "/actuator/health MBean",
+                },
+            },
+        },
+        "timestamp": 1719567890,
+        "status": 200,
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def render_actuator_flyway(r: dict[str, object]) -> bytes:
+    # Flyway exposes the schema-migration history via the
+    # `/actuator/flyway` endpoint. Real responses ship the resolved
+    # migration list — `description`, `script`, `installedOn`,
+    # `version`, `state`. DB migrations that bootstrap a service
+    # account (`CREATE USER ... WITH PASSWORD '...'`) leak credentials
+    # in the description text whenever the developer pasted the raw
+    # DDL there. Scanners scrape the response for AKIA-shape and
+    # `password=` substrings, so the canary placement is the
+    # description of an `init` migration that pretends to seed an
+    # AWS_SECRET_KEY-bearing config table.
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    db_password = _fake_db_password()
+    payload = {
+        "contexts": {
+            "application": {
+                "flywayBeans": {
+                    "flyway": {
+                        "migrations": [
+                            {
+                                "type": "SQL",
+                                "checksum": 871234901,
+                                "version": "1",
+                                "description": (
+                                    "Init schema (seed app_config: aws.access_key="
+                                    f"{ak}, db password='{db_password}')"
+                                ),
+                                "script": "V1__init.sql",
+                                "state": "SUCCESS",
+                                "installedBy": "prod_rw",
+                                "installedOn": "2024-04-12T11:02:18.501Z",
+                                "executionTime": 421,
+                            },
+                            {
+                                "type": "SQL",
+                                "checksum": 244781288,
+                                "version": "2",
+                                "description": "Add audit_log table",
+                                "script": "V2__add_audit_log.sql",
+                                "state": "SUCCESS",
+                                "installedBy": "prod_rw",
+                                "installedOn": "2024-05-03T08:42:01.118Z",
+                                "executionTime": 88,
+                            },
+                            {
+                                "type": "SQL",
+                                "checksum": 671049182,
+                                "version": "3",
+                                "description": (
+                                    "Seed external-integration creds (UPDATE app_config SET "
+                                    f"aws_secret_key='{sk}' WHERE id=1)"
+                                ),
+                                "script": "V3__seed_integration_creds.sql",
+                                "state": "SUCCESS",
+                                "installedBy": "prod_rw",
+                                "installedOn": "2024-05-19T13:08:55.402Z",
+                                "executionTime": 17,
+                            },
+                        ],
+                    },
+                },
+            },
+        },
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def render_actuator_scheduledtasks(r: dict[str, object]) -> bytes:
+    # Spring Boot 2.x `/actuator/scheduledtasks` lists every
+    # `@Scheduled` / cron / fixedDelay / fixedRate task the
+    # application has registered. Real responses surface the target
+    # method (`com.example.service.MyJob.run`) and the cron / interval
+    # expression. Scanners that grep the list look for webhook URLs
+    # embedded in the bean target (occasionally a task is configured
+    # via a property that lands in the bean's toString). Canary
+    # placement: a `WebhookPoller.poll` task whose target embeds the
+    # canary AWS access key as an upstream-API key in the URL.
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    payload = {
+        "cron": [
+            {
+                "runnable": {
+                    "target": "com.internal.tools.scheduler.NightlyReportJob.run",
+                },
+                "expression": "0 0 2 * * *",
+            },
+            {
+                "runnable": {
+                    "target": (
+                        f"com.internal.tools.scheduler.WebhookPoller#poll(url=https://hooks.internal/notify?api_key={ak})"
+                    ),
+                },
+                "expression": "0 */5 * * * *",
+            },
+        ],
+        "fixedDelay": [
+            {
+                "runnable": {
+                    "target": "com.internal.tools.scheduler.HealthCheckJob.run",
+                },
+                "initialDelay": 0,
+                "interval": 60000,
+            },
+        ],
+        "fixedRate": [
+            {
+                "runnable": {
+                    "target": "com.internal.tools.scheduler.MetricsFlushJob.flush",
+                },
+                "initialDelay": 0,
+                "interval": 30000,
+            },
+        ],
+        "custom": [],
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def render_actuator_refresh(r: dict[str, object]) -> bytes:
+    # Spring Cloud `/actuator/refresh` (POST) returns the list of
+    # property names that changed after the refresh — the same shape
+    # a scanner who's just rotated a config and wants to confirm the
+    # rotation took. Real responses are a JSON array of property
+    # names; we list a credible cloud-config-bearing slice including
+    # `aws.accessKeyId` and `spring.datasource.password`. The names
+    # themselves aren't credentials, but a `/refresh` that confirms
+    # those properties exist often steers the next probe at
+    # `/actuator/env?spring.datasource.password` — and that endpoint
+    # IS canary-backed.
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    # The list is just property names; embed the canary as a
+    # plausible property-value-bearing entry name a scanner may
+    # interpret as already-extracted.
+    payload = [
+        "spring.datasource.password",
+        "spring.datasource.url",
+        "aws.accessKeyId",
+        "aws.secretKey",
+        "aws.region",
+        "redis.url",
+        f"app.lastRotation={ak}",
+    ]
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
 def render_gcp_service_account_json(r: dict[str, object]) -> bytes:
     # GCP service-account JSON shape (the file `gcloud iam
     # service-accounts keys create` writes). Harvesters look for
@@ -13762,6 +14026,15 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/api/actuator/heapdump",
             "/app/actuator/heapdump",
             "/backend/actuator/heapdump",
+            # Spring Boot 1.x exposed the heap dump under `/dump`
+            # (renamed to `/heapdump` in 2.x). Broad scanner dicts
+            # still walk both names — the response shape is identical.
+            "/actuator/dump",
+            "/manage/dump",
+            "/management/dump",
+            "/api/actuator/dump",
+            "/app/actuator/dump",
+            "/backend/actuator/dump",
         ),
         ("aws",),
         render_actuator_heapdump,
@@ -13790,6 +14063,15 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/api/actuator/health",
             "/app/actuator/health",
             "/backend/actuator/health",
+            # `/healthcheck` is a recurring scanner-dict alias for the
+            # canonical `/health` endpoint — appears in broad probes
+            # that walk every health-check naming convention.
+            "/actuator/healthcheck",
+            "/manage/healthcheck",
+            "/management/healthcheck",
+            "/api/actuator/healthcheck",
+            "/app/actuator/healthcheck",
+            "/backend/actuator/healthcheck",
         ),
         ("aws",),
         render_actuator_health,
@@ -13867,6 +14149,88 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_actuator_trace,
         "application/vnd.spring-boot.actuator.v3+json; charset=utf-8",
+    ),
+    # Jolokia (JMX-over-HTTP). When the `jolokia-core` dependency is on
+    # the Spring classpath the agent mounts under `/actuator/jolokia`,
+    # and standalone Jolokia deployments use `/jolokia`. The `/list`
+    # operation enumerates every MBean — scanners chain that to find
+    # `com.sun.management:type=DiagnosticCommand` for `vmCommandLine` /
+    # `vmSystemProperties` exec, or grep the list for env-var-shaped
+    # attribute values surfaced by `java.lang:type=Runtime`'s
+    # `SystemProperties` / `InputArguments`.
+    CanaryTrap(
+        "actuator-jolokia",
+        (
+            "/actuator/jolokia",
+            "/actuator/jolokia/",
+            "/actuator/jolokia/list",
+            "/jolokia",
+            "/jolokia/",
+            "/jolokia/list",
+            "/manage/jolokia",
+            "/management/jolokia",
+            "/api/actuator/jolokia",
+            "/app/actuator/jolokia",
+            "/backend/actuator/jolokia",
+        ),
+        ("aws",),
+        render_actuator_jolokia_list,
+        "application/json; charset=utf-8",
+    ),
+    # Flyway migration history. `description`/`script` text from
+    # past migrations is the credential leak — sloppy DDL that pasted
+    # `CREATE USER ... WITH PASSWORD '...'` into the migration's
+    # `description` column ends up in the actuator response verbatim.
+    CanaryTrap(
+        "actuator-flyway",
+        (
+            "/actuator/flyway",
+            "/manage/flyway",
+            "/management/flyway",
+            "/api/actuator/flyway",
+            "/app/actuator/flyway",
+            "/backend/actuator/flyway",
+        ),
+        ("aws",),
+        render_actuator_flyway,
+        "application/vnd.spring-boot.actuator.v3+json; charset=utf-8",
+    ),
+    # Spring Boot 2.x `/scheduledtasks` — bean targets for every
+    # `@Scheduled`/cron job. Webhook-shaped task targets leak the
+    # upstream API key into the response when a task was wired with
+    # a property-resolved URL.
+    CanaryTrap(
+        "actuator-scheduledtasks",
+        (
+            "/actuator/scheduledtasks",
+            "/manage/scheduledtasks",
+            "/management/scheduledtasks",
+            "/api/actuator/scheduledtasks",
+            "/app/actuator/scheduledtasks",
+            "/backend/actuator/scheduledtasks",
+        ),
+        ("aws",),
+        render_actuator_scheduledtasks,
+        "application/vnd.spring-boot.actuator.v3+json; charset=utf-8",
+    ),
+    # Spring Cloud `/actuator/refresh`. Real endpoint is POST-only
+    # (returns the list of refreshed property names) but scanner
+    # dictionaries probe with GET first; serving the same canary-
+    # bearing property list for both is the simpler shape that keeps
+    # the next-probe loop pointed at the canary-backed `/env`.
+    CanaryTrap(
+        "actuator-refresh",
+        (
+            "/actuator/refresh",
+            "/manage/refresh",
+            "/management/refresh",
+            "/api/actuator/refresh",
+            "/app/actuator/refresh",
+            "/backend/actuator/refresh",
+        ),
+        ("aws",),
+        render_actuator_refresh,
+        "application/json; charset=utf-8",
     ),
     CanaryTrap(
         "env-production",
@@ -14136,6 +14500,28 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/id_ed25519",
             "/id_dsa",
             "/id_ecdsa",
+            # Pre-OpenSSH-7.x SSH1 identity filename (`~/.ssh/identity`),
+            # plus the `<algo>_key` / `<algo>.priv` / `<algo>.key~`
+            # editor-backup variants that broad secrets-hunter
+            # dictionaries enumerate alongside the canonical filenames.
+            # All match the same private-key body — adding them as
+            # path aliases turns a 404 into a canary issuance.
+            "/.ssh/identity",
+            "/.ssh/identity_key",
+            "/.ssh/identity.key",
+            "/.ssh/id_rsa.priv",
+            "/.ssh/id_rsa_key",
+            "/.ssh/id_dsa.priv",
+            "/.ssh/id_dsa_key",
+            "/.ssh/id_dsa.key~",
+            "/.ssh/id_ed25519_key",
+            "/.ssh/id_ecdsa_key",
+            # FIDO2 hardware-backed key files (`_sk` suffix is the
+            # OpenSSH convention for security-key-resident keys).
+            # The on-disk file is a key handle, not the actual private
+            # key — but scanner dictionaries probe these blindly.
+            "/.ssh/id_ed25519_sk",
+            "/.ssh/id_ecdsa_sk",
             # `/root/.ssh/id_rsa` and `/home/.ssh/id_rsa` are common
             # path-prefix variants — scanners hunt for home-dir leakage
             # below a misconfigured webroot. The user-named home-dir
@@ -14173,7 +14559,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "known-hosts",
-        ("/.ssh/known_hosts", "/known_hosts"),
+        (
+            "/.ssh/known_hosts",
+            "/known_hosts",
+            # Common scanner-dict typo variant — appears in broad
+            # secrets-harvest dictionaries alongside the canonical
+            # filename. Same body, same canary placement.
+            "/.ssh/know_hosts",
+        ),
         ("ssh",),
         render_known_hosts,
         "text/plain; charset=utf-8",

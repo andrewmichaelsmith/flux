@@ -769,6 +769,31 @@ FAKE_TRACEBIT = {
     ("/actuator/mappings", b"dispatcherServlets"),
     ("/actuator/threaddump", b"AKIAFAKEEXAMPLE01"),
     ("/actuator/threaddump", b'"threadState"'),
+    # actuator-heapdump 1.x alias `/dump` — same render as `/heapdump`.
+    ("/actuator/dump", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
+    ("/manage/dump", b"JAVA PROFILE 1.0.2"),
+    # actuator-health alias `/healthcheck` — same render as `/health`.
+    ("/actuator/healthcheck", b'"status": "UP"'),
+    ("/api/actuator/healthcheck", b"jdbc:postgresql://prod_rw:"),
+    # actuator-jolokia (Jolokia v1 list response). Canary lands in
+    # Runtime MBean's InputArguments / SystemProperties description.
+    ("/actuator/jolokia", b"AKIAFAKEEXAMPLE01"),
+    ("/actuator/jolokia/list", b"DiagnosticCommand"),
+    ("/jolokia", b"AKIAFAKEEXAMPLE01"),
+    ("/jolokia/list", b"vmCommandLine"),
+    ("/management/jolokia", b"AKIAFAKEEXAMPLE01"),
+    # actuator-flyway — canary in init/seed migration description text.
+    ("/actuator/flyway", b"AKIAFAKEEXAMPLE01"),
+    ("/actuator/flyway", b"V1__init.sql"),
+    ("/api/actuator/flyway", b"AKIAFAKEEXAMPLE01"),
+    # actuator-scheduledtasks — canary in WebhookPoller task target.
+    ("/actuator/scheduledtasks", b"AKIAFAKEEXAMPLE01"),
+    ("/actuator/scheduledtasks", b"WebhookPoller"),
+    ("/manage/scheduledtasks", b"AKIAFAKEEXAMPLE01"),
+    # actuator-refresh — canary in last-rotation property entry.
+    ("/actuator/refresh", b"AKIAFAKEEXAMPLE01"),
+    ("/actuator/refresh", b"spring.datasource.password"),
+    ("/management/refresh", b"AKIAFAKEEXAMPLE01"),
     ("/application.properties", b"aws.access.key.id=AKIAFAKEEXAMPLE01"),
     ("/application.yml", b"access-key-id: AKIAFAKEEXAMPLE01"),
     ("/.env.production", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
@@ -887,6 +912,21 @@ FAKE_TRACEBIT = {
     ("/home/ubuntu/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/home/ec2-user/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/home/node/.ssh/id_rsa", b"BEGIN OPENSSH PRIVATE KEY"),
+    # SSH1 / FIDO2 / editor-backup variants — same render shape.
+    ("/.ssh/identity", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/identity_key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/identity.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_rsa.priv", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_rsa_key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_dsa.priv", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_dsa_key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_dsa.key~", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_ed25519_key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_ed25519_sk", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_ecdsa_key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_ecdsa_sk", b"BEGIN OPENSSH PRIVATE KEY"),
+    # Common scanner-dict typo for known_hosts — same render as the canonical.
+    ("/.ssh/know_hosts", b"203.0.113.99 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
     ("/authorized_keys", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
     ("/.ssh/authorized_keys2", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
     ("/static/.ssh/authorized_keys", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
@@ -1564,6 +1604,61 @@ def test_render_actuator_logfile_carries_canary_and_per_hit_unique():
     body2 = tbenv.render_actuator_logfile(FAKE_TRACEBIT).decode("utf-8")
     pw2 = re.search(r"jdbc:postgresql://prod_rw:([^@]+)@db\.internal", body2).group(1)
     assert pw1 != pw2, "DB password must be per-hit unique"
+
+
+def test_render_actuator_jolokia_list_is_valid_and_carries_canary():
+    body = tbenv.render_actuator_jolokia_list(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body)
+    # Jolokia v1 response shape — scanners filter on these fields.
+    assert payload["status"] == 200
+    assert payload["request"] == {"type": "list"}
+    assert "value" in payload
+    # DiagnosticCommand MBean — the JMX RCE primitive scanners chase.
+    diag = payload["value"]["com.sun.management"]["type=DiagnosticCommand"]
+    assert "vmCommandLine" in diag["op"]
+    # AWS canary embedded in the Runtime MBean's InputArguments description.
+    runtime = payload["value"]["java.lang"]["type=Runtime"]
+    assert "AKIAFAKEEXAMPLE01" in runtime["attr"]["InputArguments"]["desc"]
+    assert "AKIAFAKEEXAMPLE01" in runtime["attr"]["SystemProperties"]["desc"]
+
+
+def test_render_actuator_flyway_is_valid_and_carries_canary():
+    body = tbenv.render_actuator_flyway(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body)
+    migrations = payload["contexts"]["application"]["flywayBeans"]["flyway"]["migrations"]
+    # Init migration's description leaks the canary AWS access key id.
+    assert any(
+        "AKIAFAKEEXAMPLE01" in m.get("description", "") for m in migrations
+    ), "at least one migration must carry the canary in its description"
+    # Per-hit DB password — never a fixed literal across two renders.
+    import re
+    m1 = re.search(r"db password='([^']+)'", body)
+    assert m1, "init migration must embed a per-hit DB password"
+    body2 = tbenv.render_actuator_flyway(FAKE_TRACEBIT).decode("utf-8")
+    m2 = re.search(r"db password='([^']+)'", body2)
+    assert m1.group(1) != m2.group(1), "DB password must be per-hit unique"
+
+
+def test_render_actuator_scheduledtasks_is_valid_and_carries_canary():
+    body = tbenv.render_actuator_scheduledtasks(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body)
+    # Spring 2.x scheduledtasks shape — scanners filter on these buckets.
+    for bucket in ("cron", "fixedDelay", "fixedRate", "custom"):
+        assert bucket in payload
+    # Canary in the WebhookPoller task target URL.
+    targets = [c["runnable"]["target"] for c in payload["cron"]]
+    assert any("AKIAFAKEEXAMPLE01" in t for t in targets)
+
+
+def test_render_actuator_refresh_is_valid_and_carries_canary():
+    body = tbenv.render_actuator_refresh(FAKE_TRACEBIT).decode("utf-8")
+    payload = json.loads(body)
+    # Real /refresh returns a JSON array of property names.
+    assert isinstance(payload, list)
+    # The list steers the next probe at `/actuator/env` by listing
+    # credential-bearing property names.
+    assert "spring.datasource.password" in payload
+    assert any("AKIAFAKEEXAMPLE01" in p for p in payload)
 
 
 def test_render_actuator_trace_is_valid_and_carries_canary():

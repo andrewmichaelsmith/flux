@@ -1,22 +1,27 @@
 # Spring Boot Actuator surface canary traps
 
-Flux serves plausible Spring Boot Actuator responses on seven endpoints
-beyond `/actuator/env`: `heapdump`, `configprops`, `health`, `mappings`,
-`threaddump`, `logfile`, and `trace` (plus the 2.x `httptrace` rename).
-Each embeds a Tracebit AWS canary in a place a credential harvester
-would grep raw bytes for.
+Flux serves plausible Spring Boot Actuator responses on eleven endpoints
+beyond `/actuator/env`: `heapdump` (+ 1.x `dump` alias), `configprops`,
+`health` (+ `healthcheck` alias), `mappings`, `threaddump`, `logfile`,
+`trace` (plus the 2.x `httptrace` rename), `jolokia`, `flyway`,
+`scheduledtasks`, and `refresh`. Each embeds a Tracebit AWS canary in
+a place a credential harvester would grep raw bytes for.
 
 ## Routed paths
 
 | Path | Method | Response |
 | --- | --- | --- |
-| `/actuator/heapdump`     | `GET`, `HEAD`, `POST` | HPROF-shaped binary, canary AWS creds inline as Java string constants |
+| `/actuator/heapdump` (+ 1.x `/actuator/dump`) | `GET`, `HEAD`, `POST` | HPROF-shaped binary, canary AWS creds inline as Java string constants |
 | `/actuator/configprops`  | `GET`, `HEAD`, `POST` | `@ConfigurationProperties` JSON; canary AWS creds in `cloud.aws.credentials.accessKey` / `secretKey`, per-hit DB password in `spring.datasource.password` |
-| `/actuator/health`       | `GET`, `HEAD`, `POST` | `show-details=always` JSON; per-hit DB password embedded in `components.db.details.url` (user-info-bearing JDBC URL form) |
+| `/actuator/health` (+ `/healthcheck` alias) | `GET`, `HEAD`, `POST` | `show-details=always` JSON; per-hit DB password embedded in `components.db.details.url` (user-info-bearing JDBC URL form) |
 | `/actuator/mappings`     | `GET`, `HEAD`, `POST` | `dispatcherServlets` JSON; canary access-key id embedded in a `/api/v1/webhook/<key>/event` request mapping pattern |
 | `/actuator/threaddump`   | `GET`, `HEAD`, `POST` | thread state JSON; canary access-key id embedded in worker thread names (`s3-transfer-manager-worker-<key>-prod`) |
 | `/actuator/logfile`      | `GET`, `HEAD`, `POST` | Spring Boot startup log; canary AWS creds inline as `AmazonAwsCredentialsProviderChain` lines + JDBC URL with per-hit DB password in HikariCP startup line |
 | `/actuator/trace` (+ 2.x `/actuator/httptrace`) | `GET`, `HEAD`, `POST` | recent HTTP exchanges JSON; canary access-key id inside an AWS SigV4 `Authorization` header on one trace + as a query parameter on an outbound webhook URL |
+| `/actuator/jolokia` (+ `/jolokia`, `/jolokia/list`) | `GET`, `HEAD`, `POST` | Jolokia v1 `list` response — MBean tree including `com.sun.management:type=DiagnosticCommand` for the `vmCommandLine` / `vmSystemProperties` JMX-RCE primitive; canary access-key id embedded in `java.lang:type=Runtime` MBean's `InputArguments` / `SystemProperties` attribute descriptions |
+| `/actuator/flyway`       | `GET`, `HEAD`, `POST` | Flyway migration history JSON; canary AWS creds + per-hit DB password embedded in `V1__init.sql` / `V3__seed_integration_creds.sql` migration descriptions (sloppy-DDL pattern) |
+| `/actuator/scheduledtasks` | `GET`, `HEAD`, `POST` | Spring 2.x scheduled tasks JSON; canary access-key id embedded in a `WebhookPoller.poll` cron task target as the upstream-API key query parameter |
+| `/actuator/refresh`      | `GET`, `HEAD`, `POST` | Spring Cloud refresh JSON array of changed property names; canary access-key id embedded as an `app.lastRotation` property name — steers the next probe at `/actuator/env?spring.datasource.password`, which IS canary-backed |
 
 Each path is also routed at the `/manage`, `/management`,
 `/api/actuator`, `/app/actuator`, and `/backend/actuator`
@@ -33,7 +38,8 @@ Standard request metadata plus:
 
 - `result` = `actuator-heapdump` / `actuator-configprops` /
   `actuator-health` / `actuator-mappings` / `actuator-threaddump` /
-  `actuator-logfile` / `actuator-trace`
+  `actuator-logfile` / `actuator-trace` / `actuator-jolokia` /
+  `actuator-flyway` / `actuator-scheduledtasks` / `actuator-refresh`
 - canary issuance metadata (canary id, expiration) recorded against the
   source IP
 
@@ -81,11 +87,14 @@ real misconfigured app:
 
 - `heapdump` — JVM `String` interns of `getenv()`-loaded credentials
   land in the heap profile and get harvested by raw-bytes greppers.
+  Spring Boot 1.x exposed the same content under `/dump`; broad
+  scanner dicts still walk both names.
 - `configprops` — `@ConfigurationProperties` beans expose
   `spring.datasource.password` and `cloud.aws.credentials.*` unmasked
   on `show-values=ALWAYS`.
 - `health` — `show-details=always` exposes the JDBC URL with embedded
-  user info, which is a recurring sloppy-config pattern.
+  user info, which is a recurring sloppy-config pattern. `/healthcheck`
+  is a recurring scanner-dict alias for the same endpoint.
 - `mappings` — webhook handler URLs sometimes carry the API key as a
   path segment, which the response surfaces verbatim.
 - `threaddump` — SDK-allocated worker thread names sometimes embed the
@@ -99,6 +108,27 @@ real misconfigured app:
   headers carry the access-key id in their `Credential=` segment,
   and outbound webhook URLs sometimes pass the API key as a query
   parameter that the trace logs in full.
+- `jolokia` — the JMX-over-HTTP bridge Spring ships when the
+  `jolokia-core` dependency is on the classpath. The `list` operation
+  enumerates every JMX MBean; scanners chain that to find the
+  `com.sun.management:type=DiagnosticCommand` bean for the
+  `vmCommandLine` / `vmSystemProperties` exec primitive. They also
+  grep the listing for env-var-shaped attribute values surfaced by
+  `java.lang:type=Runtime`'s `SystemProperties` and `InputArguments`.
+- `flyway` — Flyway's actuator endpoint exposes the schema-migration
+  history; sloppy DDL that pasted `CREATE USER ... WITH PASSWORD '...'`
+  into a migration's `description` column ends up in the response
+  verbatim. Per-hit DB passwords prevent the body from becoming a
+  fleet fingerprint.
+- `scheduledtasks` — Spring Boot 2.x lists every `@Scheduled` / cron /
+  fixedDelay task with its bean target. Webhook-shaped task targets
+  leak the upstream API key when a task was wired with a
+  property-resolved URL.
+- `refresh` — Spring Cloud's POST-only refresh endpoint returns the
+  list of property names that changed after the refresh. The names
+  themselves aren't credentials but the list (`spring.datasource.password`,
+  `aws.accessKeyId`, …) steers the next probe at `/actuator/env`,
+  which IS canary-backed.
 
 Returning a plausible body in each shape keeps the scanner's
 filter-on-shape branch alive long enough to harvest the canary; the
