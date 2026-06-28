@@ -11318,6 +11318,338 @@ async def test_dispatch_wp_user_enum_disabled_returns_404(flux_client, monkeypat
     assert resp.status == 404
 
 
+# --- WordPress XML-RPC trap (/xmlrpc.php) ---
+
+
+def test_wp_xmlrpc_enabled_by_default():
+    assert tbenv.WP_XMLRPC_ENABLED
+
+
+@pytest.mark.parametrize("path", ["/xmlrpc.php", "/XMLRPC.PHP"])
+def test_wp_xmlrpc_path_match(path):
+    assert tbenv.is_wp_xmlrpc_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    "/xmlrpc", "/xmlrpc.php.bak", "/foo/xmlrpc.php",
+])
+def test_wp_xmlrpc_path_no_match(path):
+    assert not tbenv.is_wp_xmlrpc_path(path)
+
+
+def test_wp_xmlrpc_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "WP_XMLRPC_ENABLED", False)
+    assert not tbenv.is_wp_xmlrpc_path("/xmlrpc.php")
+
+
+def test_render_xmlrpc_fault_escapes_string():
+    body = tbenv.render_xmlrpc_fault(fault_code=403, fault_string='Bad <"&> input')
+    assert b"<int>403</int>" in body
+    assert b"&lt;" in body and b"&amp;" in body and b"&gt;" in body
+    assert b"<methodResponse>" in body and b"</methodResponse>" in body
+
+
+def test_render_xmlrpc_get_landing_matches_wordpress_literal():
+    assert tbenv.render_xmlrpc_get_landing() == b"XML-RPC server accepts POST requests only.\n"
+
+
+async def test_dispatch_xmlrpc_get_returns_landing(flux_client):
+    resp = await flux_client.get(
+        "/xmlrpc.php",
+        headers={"X-Forwarded-For": "203.0.113.80"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/plain")
+    body = await resp.read()
+    assert b"XML-RPC server accepts POST requests only." in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "wp-xmlrpc-get"
+
+
+async def test_dispatch_xmlrpc_post_captures_body_and_returns_fault(flux_client):
+    payload = (
+        b"<?xml version=\"1.0\"?>\n"
+        b"<methodCall><methodName>wp.getUsersBlogs</methodName>\n"
+        b"<params><param><value><string>admin</string></value></param>\n"
+        b"<param><value><string>hunter2</string></value></param></params>\n"
+        b"</methodCall>"
+    )
+    resp = await flux_client.post(
+        "/xmlrpc.php",
+        data=payload,
+        headers={
+            "X-Forwarded-For": "203.0.113.81",
+            "Content-Type": "text/xml",
+        },
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"<fault>" in body
+    assert b"<int>403</int>" in body
+    entries = _log_entries(flux_client.log_path)
+    last = entries[-1]
+    assert last["result"] == "wp-xmlrpc-post"
+    assert "wp.getUsersBlogs" in last["bodyPreview"]
+    assert "hunter2" in last["bodyPreview"]
+
+
+async def test_dispatch_xmlrpc_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "WP_XMLRPC_ENABLED", False)
+    resp = await flux_client.get(
+        "/xmlrpc.php", headers={"X-Forwarded-For": "203.0.113.82"},
+    )
+    assert resp.status == 404
+
+
+# --- WordPress wlwmanifest.xml fingerprint trap ---
+
+
+def test_wp_wlw_manifest_enabled_by_default():
+    assert tbenv.WP_WLW_MANIFEST_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/wp-includes/wlwmanifest.xml",
+    "/blog/wp-includes/wlwmanifest.xml",
+    "/wp/wp-includes/wlwmanifest.xml",
+    "/wp1/wp-includes/wlwmanifest.xml",
+    "/wp2/wp-includes/wlwmanifest.xml",
+    "/wordpress/wp-includes/wlwmanifest.xml",
+    "/site/wp-includes/wlwmanifest.xml",
+    "/shop/wp-includes/wlwmanifest.xml",
+    "/news/wp-includes/wlwmanifest.xml",
+    "/test/wp-includes/wlwmanifest.xml",
+    "/cms/wp-includes/wlwmanifest.xml",
+    "/web/wp-includes/wlwmanifest.xml",
+    "/media/wp-includes/wlwmanifest.xml",
+    "/sito/wp-includes/wlwmanifest.xml",
+    "/website/wp-includes/wlwmanifest.xml",
+    "/2018/wp-includes/wlwmanifest.xml",
+    "/2019/wp-includes/wlwmanifest.xml",
+    "/2020/wp-includes/wlwmanifest.xml",
+    "/2021/wp-includes/wlwmanifest.xml",
+    "/WP-INCLUDES/WLWMANIFEST.XML",
+])
+def test_wp_wlwmanifest_path_match(path):
+    assert tbenv.is_wp_wlwmanifest_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    "/wp-includes/wlwmanifest.xml.bak",
+    "/wp-includes/",
+    "/wlwmanifest.xml",
+    "/random/wp-includes/wlwmanifest.xml",
+])
+def test_wp_wlwmanifest_path_no_match(path):
+    assert not tbenv.is_wp_wlwmanifest_path(path)
+
+
+def test_wp_wlwmanifest_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "WP_WLW_MANIFEST_ENABLED", False)
+    assert not tbenv.is_wp_wlwmanifest_path("/wp-includes/wlwmanifest.xml")
+
+
+def test_render_wp_wlwmanifest_xml_shape():
+    body = tbenv.render_wp_wlwmanifest_xml("example.com")
+    assert body.startswith(b"<?xml")
+    assert b"<manifest xmlns=\"http://schemas.microsoft.com/wlw/manifest/weblog\">" in body
+    assert b"<serviceName>WordPress</serviceName>" in body
+    assert b"https://example.com/wp-admin/" in body
+
+
+def test_render_wp_wlwmanifest_xml_bad_host_falls_back():
+    body = tbenv.render_wp_wlwmanifest_xml("")
+    assert b"https://example.com/wp-admin/" in body
+
+
+@pytest.mark.parametrize("path", [
+    "/wp-includes/wlwmanifest.xml",
+    "/blog/wp-includes/wlwmanifest.xml",
+    "/wordpress/wp-includes/wlwmanifest.xml",
+])
+async def test_dispatch_wlwmanifest_serves_manifest(flux_client, path):
+    resp = await flux_client.get(
+        path, headers={"X-Forwarded-For": "203.0.113.83", "Host": "example.com"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("application/wlwmanifest+xml")
+    body = await resp.read()
+    assert b"<serviceName>WordPress</serviceName>" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "wp-wlwmanifest"
+    assert entries[-1]["wpWlwManifestPath"] == path
+
+
+async def test_dispatch_wlwmanifest_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "WP_WLW_MANIFEST_ENABLED", False)
+    resp = await flux_client.get(
+        "/wp-includes/wlwmanifest.xml",
+        headers={"X-Forwarded-For": "203.0.113.84"},
+    )
+    assert resp.status == 404
+
+
+# --- Bare git dotfile traps (.gitconfig, .gitignore) ---
+
+
+def test_git_dotfiles_enabled_by_default():
+    assert tbenv.GIT_DOTFILES_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/.gitconfig",
+    "/.gitignore",
+    "/root/.gitconfig",
+    "/root/.gitignore",
+    "/home/.gitconfig",
+    "/home/.gitignore",
+    "/home/ubuntu/.gitconfig",
+    "/home/ec2-user/.gitconfig",
+    "/.GITCONFIG",
+])
+def test_git_dotfile_path_match(path):
+    assert tbenv.is_git_dotfile_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    "/.git/config", "/.git/", "/.gitconfig.bak",
+    "/foo/.gitconfig", "/.gitignore.bak",
+])
+def test_git_dotfile_path_no_match(path):
+    assert not tbenv.is_git_dotfile_path(path)
+
+
+def test_git_dotfiles_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "GIT_DOTFILES_ENABLED", False)
+    assert not tbenv.is_git_dotfile_path("/.gitconfig")
+
+
+def test_render_gitconfig_has_per_hit_unique_token():
+    a = tbenv.render_gitconfig()
+    b = tbenv.render_gitconfig()
+    # Both look like a real ~/.gitconfig
+    assert b"[user]" in a and b"[credential]" in a
+    assert b"\textraheader = Authorization: Bearer ghp_" in a
+    # Per-hit unique (no fixed credential literal across hits)
+    assert a != b
+
+
+def test_render_gitignore_lists_secret_patterns():
+    body = tbenv.render_gitignore()
+    assert b".env\n" in body
+    assert b".aws/credentials\n" in body
+    assert b"*.pem\n" in body
+    assert b"node_modules/\n" in body
+
+
+async def test_dispatch_gitconfig_serves_canary(flux_client):
+    resp = await flux_client.get(
+        "/.gitconfig",
+        headers={"X-Forwarded-For": "203.0.113.85"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"\textraheader = Authorization: Bearer ghp_" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "gitconfig"
+    assert entries[-1]["gitDotfilePath"] == "/.gitconfig"
+
+
+@pytest.mark.parametrize("path", [
+    "/root/.gitconfig", "/home/ubuntu/.gitconfig",
+])
+async def test_dispatch_gitconfig_webroot_variants(flux_client, path):
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.86"})
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"Bearer ghp_" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "gitconfig"
+
+
+async def test_dispatch_gitignore_serves_listing(flux_client):
+    resp = await flux_client.get(
+        "/.gitignore",
+        headers={"X-Forwarded-For": "203.0.113.87"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b".aws/credentials\n" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "gitignore"
+
+
+async def test_dispatch_git_dotfiles_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "GIT_DOTFILES_ENABLED", False)
+    resp = await flux_client.get(
+        "/.gitconfig", headers={"X-Forwarded-For": "203.0.113.88"},
+    )
+    assert resp.status == 404
+
+
+# --- aws.env / aws.json canary traps ---
+
+
+async def test_dispatch_routes_aws_env_to_trap(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(
+        "/aws.env", headers={"X-Forwarded-For": "203.0.113.89"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
+    assert b"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "aws-env"
+
+
+@pytest.mark.parametrize("path", [
+    "/aws.env", "/aws.env.bak", "/aws.env.local",
+    "/aws-credentials.env", "/aws_credentials.env",
+])
+async def test_aws_env_path_variants_routed(flux_client, monkeypatch, path):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.90"})
+    assert resp.status == 200
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "aws-env"
+
+
+async def test_dispatch_routes_aws_json_to_trap(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(
+        "/aws.json", headers={"X-Forwarded-For": "203.0.113.91"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("application/json")
+    body = await resp.read()
+    parsed = json.loads(body.decode("utf-8"))
+    assert parsed["Credentials"]["AccessKeyId"] == "AKIAFAKEEXAMPLE01"
+    assert parsed["Credentials"]["SecretAccessKey"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "aws-credentials-json"
+
+
+@pytest.mark.parametrize("path", [
+    "/aws.json", "/aws-credentials.json", "/aws_credentials.json",
+    "/.aws/credentials.json",
+])
+async def test_aws_json_path_variants_routed(flux_client, monkeypatch, path):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.92"})
+    assert resp.status == 200
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "aws-credentials-json"
+
+
 # --- Django debug-toolbar canary ---
 
 

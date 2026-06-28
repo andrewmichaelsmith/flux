@@ -379,6 +379,57 @@ WP_LOGIN_ADMIN_PATHS: set[str] = {
     "/wp-admin/install.php",
 }
 
+# --- WordPress XML-RPC trap (xmlrpc.php) ---------------------------------
+# `/xmlrpc.php` is the historical WordPress brute-force / pingback
+# amplification vector. Scanner dictionaries POST `wp.getUsersBlogs` and
+# `system.multicall` payloads that carry plaintext WP credentials; we
+# accept the POST, capture the body, and reply with a real-looking
+# XML-RPC fault so the scanner believes the endpoint exists. Bare GETs
+# get the canonical "XML-RPC server accepts POST requests only." text
+# that real WP 6.x serves.
+WP_XMLRPC_ENABLED = _env_bool("HONEYPOT_WP_XMLRPC_ENABLED")
+WP_XMLRPC_BODY_PREVIEW_LIMIT = max(
+    int((os.environ.get("HONEYPOT_WP_XMLRPC_BODY_PREVIEW_LIMIT") or "400").strip() or "400"),
+    64,
+)
+WP_XMLRPC_PATHS: set[str] = {"/xmlrpc.php"}
+
+# --- WordPress wlwmanifest.xml fingerprint trap --------------------------
+# Windows Live Writer manifest XML — a WP-bundled discovery file scanners
+# GET to fingerprint a host as WordPress. Returning the canonical XML on
+# the root path AND on each common multi-install subdirectory variant
+# (`/blog/`, `/wp/`, `/2020/`, `/cms/`, …) convinces the scanner that the
+# install exists, which then routes it into wp-login / wp-user-enum.
+WP_WLW_MANIFEST_ENABLED = _env_bool("HONEYPOT_WP_WLW_MANIFEST_ENABLED")
+_WP_WLW_MANIFEST_PREFIXES: tuple[str, ...] = (
+    "", "blog", "wp", "wp1", "wp2", "wordpress", "site", "shop", "news",
+    "test", "cms", "web", "media", "sito", "website",
+    "2018", "2019", "2020", "2021",
+)
+_WP_WLW_MANIFEST_PATHS: set[str] = {
+    f"/{(prefix + '/') if prefix else ''}wp-includes/wlwmanifest.xml"
+    for prefix in _WP_WLW_MANIFEST_PREFIXES
+}
+
+# --- Bare git dotfile traps (.gitconfig, .gitignore) ---------------------
+# `~/.gitconfig` exposes `[user] email` + `[credential]` indirection; some
+# scanner dictionaries walk the bare-webroot variant for misconfigured
+# static-file servers that expose the home dir. `/.gitignore` is a
+# WordPress/Node-style project gitignore — pure deception, but a 200 on
+# the bare path convinces the scanner that the webroot is a checked-out
+# git tree (pairing with fake-git on `/.git/...`).
+GIT_DOTFILES_ENABLED = _env_bool("HONEYPOT_GIT_DOTFILES_ENABLED")
+GIT_DOTFILE_PATHS: set[str] = {
+    "/.gitconfig",
+    "/root/.gitconfig",
+    "/home/.gitconfig",
+    "/home/ubuntu/.gitconfig",
+    "/home/ec2-user/.gitconfig",
+    "/.gitignore",
+    "/root/.gitignore",
+    "/home/.gitignore",
+}
+
 # --- Fake WordPress user-enumeration trap ---------------------------------
 # WordPress exposes three families of public username-disclosure surfaces
 # that credential-stuffing scanners walk before hitting `/wp-login.php`:
@@ -2494,6 +2545,24 @@ def is_wp_user_enum_path(path: str) -> bool:
     if _WP_USER_ENUM_YOAST_RE.match(lp):
         return True
     return False
+
+
+def is_wp_xmlrpc_path(path: str) -> bool:
+    if not WP_XMLRPC_ENABLED:
+        return False
+    return path.lower() in WP_XMLRPC_PATHS
+
+
+def is_wp_wlwmanifest_path(path: str) -> bool:
+    if not WP_WLW_MANIFEST_ENABLED:
+        return False
+    return path.lower() in _WP_WLW_MANIFEST_PATHS
+
+
+def is_git_dotfile_path(path: str) -> bool:
+    if not GIT_DOTFILES_ENABLED:
+        return False
+    return path.lower() in GIT_DOTFILE_PATHS
 
 
 def is_sonicwall_path(path: str) -> bool:
@@ -7344,6 +7413,159 @@ def render_wp_login_html(*, nonce: str, redirect_to: str) -> bytes:
     return body.encode("utf-8")
 
 
+def render_xmlrpc_fault(*, fault_code: int, fault_string: str) -> bytes:
+    """Minimal XML-RPC fault response. Mirrors the WP 6.x error envelope:
+    `<methodResponse><fault><value><struct>…</struct></value></fault></methodResponse>`.
+    Strings are XML-escaped so a captured-body that scanners echo back as
+    `faultString` cannot inject markup."""
+    safe = (
+        fault_string.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    return (
+        '<?xml version="1.0"?>\n'
+        '<methodResponse>\n'
+        '  <fault>\n'
+        '    <value>\n'
+        '      <struct>\n'
+        '        <member><name>faultCode</name>'
+        f'<value><int>{int(fault_code)}</int></value></member>\n'
+        '        <member><name>faultString</name>'
+        f'<value><string>{safe}</string></value></member>\n'
+        '      </struct>\n'
+        '    </value>\n'
+        '  </fault>\n'
+        '</methodResponse>\n'
+    ).encode("utf-8")
+
+
+def render_xmlrpc_get_landing() -> bytes:
+    """The literal body real WordPress returns for `GET /xmlrpc.php`."""
+    return b"XML-RPC server accepts POST requests only.\n"
+
+
+def render_wp_wlwmanifest_xml(host: str) -> bytes:
+    """The Windows Live Writer manifest WordPress core serves at
+    `/wp-includes/wlwmanifest.xml`. The shape is fixed across WP
+    versions; we point the imageUrl / adminUrl at the request host so
+    a scanner that follows the embedded URLs lands back on the sensor's
+    wp-admin / wp-login traps."""
+    base = _wp_user_enum_host_url(host)
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<manifest xmlns="http://schemas.microsoft.com/wlw/manifest/weblog">\n'
+        '  <options>\n'
+        '    <supportsKeywords>Yes</supportsKeywords>\n'
+        '    <supportsFileUpload>Yes</supportsFileUpload>\n'
+        '    <supportsExtendedEntries>Yes</supportsExtendedEntries>\n'
+        '    <supportsCustomDate>Yes</supportsCustomDate>\n'
+        '    <supportsCategories>Yes</supportsCategories>\n'
+        '    <supportsCategoriesInline>Yes</supportsCategoriesInline>\n'
+        '    <supportsMultipleCategories>Yes</supportsMultipleCategories>\n'
+        '    <supportsHierarchicalCategories>Yes</supportsHierarchicalCategories>\n'
+        '    <supportsNewCategories>Yes</supportsNewCategories>\n'
+        '    <supportsCommentPolicy>Yes</supportsCommentPolicy>\n'
+        '    <supportsPingPolicy>Yes</supportsPingPolicy>\n'
+        '    <supportsAuthor>Yes</supportsAuthor>\n'
+        '    <supportsSlug>Yes</supportsSlug>\n'
+        '    <supportsPassword>Yes</supportsPassword>\n'
+        '    <supportsExcerpt>Yes</supportsExcerpt>\n'
+        '    <supportsTrackbacks>Yes</supportsTrackbacks>\n'
+        '    <supportsPostAsDraft>Yes</supportsPostAsDraft>\n'
+        '    <supportsPages>Yes</supportsPages>\n'
+        '    <supportsPageParent>Yes</supportsPageParent>\n'
+        '    <supportsPageOrder>Yes</supportsPageOrder>\n'
+        '    <supportsAutoUpdate>No</supportsAutoUpdate>\n'
+        '    <supportsImageUpload>Yes</supportsImageUpload>\n'
+        '  </options>\n'
+        '  <weblog>\n'
+        '    <serviceName>WordPress</serviceName>\n'
+        f'    <imageUrl>{base}/wp-includes/images/wlw/WordPress-wlw.png</imageUrl>\n'
+        f'    <watermarkImageUrl>{base}/wp-includes/images/wlw/WordPress-watermark.png</watermarkImageUrl>\n'
+        '    <homepageLinkText>View site</homepageLinkText>\n'
+        '    <adminLinkText>Admin Console</adminLinkText>\n'
+        f'    <adminUrl>{base}/wp-admin/</adminUrl>\n'
+        '    <postEditingUrl></postEditingUrl>\n'
+        '  </weblog>\n'
+        '</manifest>\n'
+    )
+    return body.encode("utf-8")
+
+
+def render_gitconfig() -> bytes:
+    """User-level `~/.gitconfig`. Carries a per-hit synthetic
+    `Authorization: Bearer ghp_<random>` in the `[http "..."] extraheader`
+    slot — a real-looking GitHub token shape (`ghp_` prefix, 40 chars)
+    that harvesters grep for. NOT a Tracebit canary; per-hit unique so
+    a fleet-wide replay still shows up as N different tokens rather than
+    one fixed literal. The `[credential] helper = store` line is the
+    chain the scanner follows next (to `/.git-credentials`)."""
+    fake_token = "ghp_" + secrets.token_urlsafe(32)[:36]
+    fake_email = f"deploy+{secrets.token_hex(4)}@internal-tools.lan"
+    return (
+        "[user]\n"
+        f"\temail = {fake_email}\n"
+        "\tname = Deploy Bot\n"
+        "[credential]\n"
+        "\thelper = store\n"
+        "[credential \"https://github.com\"]\n"
+        "\tusername = deploy-bot\n"
+        "[http \"https://github.com/\"]\n"
+        f"\textraheader = Authorization: Bearer {fake_token}\n"
+        "[core]\n"
+        "\tautocrlf = input\n"
+        "\teditor = vim\n"
+        "[pull]\n"
+        "\trebase = true\n"
+        "[init]\n"
+        "\tdefaultBranch = main\n"
+    ).encode("utf-8")
+
+
+def render_gitignore() -> bytes:
+    """Project `.gitignore`. Pure deception — listing typical Node +
+    Python + Terraform + secret-file patterns convinces a scanner that
+    the webroot is a checked-out git tree, which keeps it walking the
+    fake-git surface next. Also: some scanners walk every entry in
+    `.gitignore` as a target dictionary (`*.pem`, `.env`, ...), so the
+    listing doubles as a hint sheet that lands those probes on existing
+    canary traps (`.env.*`, `.aws/credentials`, `service-account.json`)."""
+    return (
+        "# git ls-files --others --exclude-from=.gitignore\n"
+        "node_modules/\n"
+        ".next/\n"
+        ".cache/\n"
+        "dist/\n"
+        "build/\n"
+        "coverage/\n"
+        "*.log\n"
+        "npm-debug.log*\n"
+        "yarn-debug.log*\n"
+        ".DS_Store\n"
+        "Thumbs.db\n"
+        "\n"
+        "# env / secrets\n"
+        ".env\n"
+        ".env.*\n"
+        "!.env.example\n"
+        "*.pem\n"
+        "*.key\n"
+        ".aws/credentials\n"
+        "credentials.json\n"
+        "service-account.json\n"
+        "\n"
+        "# python\n"
+        "__pycache__/\n"
+        "*.pyc\n"
+        ".venv/\n"
+        ".pytest_cache/\n"
+        "\n"
+        "# terraform\n"
+        "*.tfstate\n"
+        "*.tfstate.backup\n"
+        ".terraform/\n"
+    ).encode("utf-8")
+
+
 def extract_wp_login_creds(body: bytes, content_type: str) -> dict[str, str]:
     parsed = parse_form_body(body, content_type)
     result: dict[str, str] = {}
@@ -8747,6 +8969,46 @@ def render_aws_credentials_ini(r: dict[str, object]) -> bytes:
         f"aws_session_token = {aws.get('awsSessionToken', '')}\n"
         "region = us-east-1\n"
     ).encode("utf-8")
+
+
+def render_aws_env_dotenv(r: dict[str, object]) -> bytes:
+    """`/aws.env` — dotenv-shaped AWS credentials export. Same canary
+    surface as env-production but a focused 'just AWS' file: matches the
+    scanner-dictionary shape where operators dump `aws sts
+    get-session-token` output into a bare `aws.env` for a tool that
+    couldn't read `~/.aws/credentials` directly. Harvesters grep raw
+    bytes for the AKIA / SECRET pair."""
+    aws = _aws(r)
+    return (
+        "# AWS credentials (exported)\n"
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "AWS_DEFAULT_REGION=us-east-1\n"
+        "AWS_REGION=us-east-1\n"
+    ).encode("utf-8")
+
+
+def render_aws_credentials_json(r: dict[str, object]) -> bytes:
+    """`/aws.json` — JSON-shaped AWS credentials object matching the
+    `aws sts get-session-token --output json` envelope (capitalised
+    keys: `AccessKeyId` / `SecretAccessKey` / `SessionToken` /
+    `Expiration`). Several boto3 session caches, container-credential
+    helpers, and ad-hoc `aws sts` redirects drop this exact shape;
+    scanner dictionaries walk `/aws.json` and `/credentials.json`
+    expecting the IAM CLI envelope."""
+    aws = _aws(r)
+    body = {
+        "Version": 1,
+        "Credentials": {
+            "AccessKeyId": aws.get("awsAccessKeyId", ""),
+            "SecretAccessKey": aws.get("awsSecretAccessKey", ""),
+            "SessionToken": aws.get("awsSessionToken", ""),
+            "Expiration": aws.get("awsExpiration", "2099-12-31T23:59:59Z"),
+        },
+        "Region": "us-east-1",
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
 
 
 def render_openapi_spec(
@@ -13531,6 +13793,41 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_aws_config_ini,
         "text/plain; charset=utf-8",
     ),
+    # `/aws.env` — dotenv-shaped AWS credentials. Different from
+    # `env-production` (which carries app config alongside the AWS
+    # block): this is the bare "I exported `aws sts get-session-token`
+    # to a .env for a tool" shape. Scanner dictionaries walk this
+    # filename in webroot alongside `.aws/credentials`.
+    CanaryTrap(
+        "aws-env",
+        (
+            "/aws.env",
+            "/aws.env.bak",
+            "/aws.env.local",
+            "/aws-credentials.env",
+            "/aws_credentials.env",
+        ),
+        ("aws",),
+        render_aws_env_dotenv,
+        "text/plain; charset=utf-8",
+    ),
+    # `/aws.json` — `aws sts get-session-token --output json` envelope
+    # (capitalised `AccessKeyId` / `SecretAccessKey` / `SessionToken` /
+    # `Expiration`). Several boto3 session caches and container-credential
+    # helpers drop this exact shape; scanner dictionaries walk
+    # `/aws.json` alongside `/credentials.json` for the IAM CLI envelope.
+    CanaryTrap(
+        "aws-credentials-json",
+        (
+            "/aws.json",
+            "/aws-credentials.json",
+            "/aws_credentials.json",
+            "/.aws/credentials.json",
+        ),
+        ("aws",),
+        render_aws_credentials_json,
+        "application/json; charset=utf-8",
+    ),
     # `~/.boto` — AWS Python SDK / `gsutil` legacy config file. Carries
     # `aws_access_key_id` / `aws_secret_access_key` in plaintext INI;
     # field-keyed scanners hit this alongside `.aws/credentials`.
@@ -16161,6 +16458,135 @@ async def _handle_wp_user_enum(
     })
     return web.Response(
         status=status, body=response_body,
+        headers={
+            "Content-Type": content_type,
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
+async def _handle_wp_xmlrpc(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """WordPress XML-RPC endpoint. GET returns the canonical landing
+    text; POST captures the request body (`<methodCall>` with
+    `wp.getUsersBlogs` brute or `system.multicall` amplification
+    payload) and replies with an `XML-RPC fault 403 — Incorrect
+    username or password.` envelope. Real WordPress returns the same
+    envelope for every bad credential, so the scanner can't distinguish
+    a real install from the trap on the failure case."""
+    method = request.method
+    content_type_req = request.headers.get("Content-Type", "")
+    if method == "POST":
+        body_preview = ""
+        if request_body:
+            body_preview = request_body[:WP_XMLRPC_BODY_PREVIEW_LIMIT].decode(
+                "utf-8", errors="replace",
+            )
+        body = render_xmlrpc_fault(
+            fault_code=403,
+            fault_string="Incorrect username or password.",
+        )
+        log_entry: dict[str, object] = {
+            **log_context,
+            "result": "wp-xmlrpc-post",
+            "status": 200,
+            "bytes": len(body),
+            "contentType": content_type_req[:120],
+        }
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview
+        append_log(log_entry)
+        return web.Response(
+            status=200, body=body,
+            headers={
+                "Content-Type": "text/xml; charset=UTF-8",
+                "Content-Length": str(len(body)),
+            },
+        )
+    body = render_xmlrpc_get_landing()
+    response_body = b"" if method == "HEAD" else body
+    append_log({
+        **log_context,
+        "result": "wp-xmlrpc-get",
+        "status": 200,
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200, body=response_body,
+        headers={
+            "Content-Type": "text/plain; charset=UTF-8",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
+async def _handle_wp_wlwmanifest(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    """Serve the Windows Live Writer manifest XML for both the root
+    `/wp-includes/wlwmanifest.xml` and every subdirectory-install
+    variant. Same body across variants; the variant path itself is
+    logged so a follow-up pass can attribute the scanner's multi-install
+    walk shape."""
+    method = request.method
+    host = str(log_context.get("host", "") or "")
+    body = render_wp_wlwmanifest_xml(host)
+    response_body = b"" if method == "HEAD" else body
+    append_log({
+        **log_context,
+        "result": "wp-wlwmanifest",
+        "status": 200,
+        "wpWlwManifestPath": path[:200],
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200, body=response_body,
+        headers={
+            "Content-Type": "application/wlwmanifest+xml; charset=utf-8",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
+async def _handle_git_dotfile(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    """Serve `/.gitconfig` (per-hit synthetic bearer) or `/.gitignore`
+    (pure deception). Lookup is by basename — webroot / home-dir prefix
+    variants share the same body. No Tracebit canary is issued — the
+    `.gitconfig` token is a per-hit ghp_-shaped synthetic, fleet-unique
+    by construction so a replay across sensors fingerprints the
+    harvester rather than the fleet."""
+    method = request.method
+    lp = path.lower()
+    leaf = lp.rsplit("/", 1)[-1] or lp
+    if leaf == ".gitconfig":
+        body = render_gitconfig()
+        result_tag = "gitconfig"
+        content_type = "text/plain; charset=utf-8"
+    else:
+        body = render_gitignore()
+        result_tag = "gitignore"
+        content_type = "text/plain; charset=utf-8"
+    response_body = b"" if method == "HEAD" else body
+    append_log({
+        **log_context,
+        "result": result_tag,
+        "status": 200,
+        "gitDotfilePath": path[:200],
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200, body=response_body,
         headers={
             "Content-Type": content_type,
             "Cache-Control": "no-store",
@@ -20827,6 +21253,15 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_wp_user_enum_path(path):
         return await _handle_wp_user_enum(request, log_context, path)
 
+    if is_wp_xmlrpc_path(path):
+        return await _handle_wp_xmlrpc(request, log_context, path, request_body)
+
+    if is_wp_wlwmanifest_path(path):
+        return await _handle_wp_wlwmanifest(request, log_context, path)
+
+    if is_git_dotfile_path(path):
+        return await _handle_git_dotfile(request, log_context, path)
+
     # Web-app form responder runs before the tarpit/fingerprint check so
     # that paths in both lists (e.g. `/`) stay with tarpit; the form trap
     # only matches its own concrete path set, never `/`.
@@ -20972,6 +21407,12 @@ def main() -> int:
         active.append("wp-login")
     if WP_USER_ENUM_ENABLED:
         active.append("wp-user-enum")
+    if WP_XMLRPC_ENABLED:
+        active.append("wp-xmlrpc")
+    if WP_WLW_MANIFEST_ENABLED:
+        active.append("wp-wlwmanifest")
+    if GIT_DOTFILES_ENABLED:
+        active.append("git-dotfiles")
     if GRAVITY_SMTP_ENABLED:
         active.append("gravity-smtp")
     if TELESCOPE_ENABLED:
