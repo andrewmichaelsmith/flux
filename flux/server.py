@@ -2355,7 +2355,12 @@ def normalize_path(raw_path: str) -> str:
     """Canonicalise a request URL path before handler dispatch.
 
     Steps:
-      1. URL-decode percent-escapes
+      1. URL-decode percent-escapes — repeat until the result is stable so
+         double-encoded traversal (`/%252e%252e/etc/passwd`, where the `%`
+         signs themselves are encoded) collapses to plain `..`. Scanners
+         that target single-decode parsers walk this shape specifically.
+         Capped at 4 passes so a pathological `%2525252525…` chain can't
+         spin.
       2. Collapse runs of `/`
       3. Repair the no-slash traversal-bypass shape: `xxx../yyy` →
          `xxx/../yyy`. Scanners use this against parsers that treat
@@ -2370,7 +2375,12 @@ def normalize_path(raw_path: str) -> str:
     """
     if not raw_path:
         return "/"
-    decoded = unquote(raw_path)
+    decoded = raw_path
+    for _ in range(4):
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
     collapsed = re.sub(r"/+", "/", decoded)
     if not collapsed.startswith("/"):
         collapsed = "/" + collapsed
@@ -2560,9 +2570,19 @@ def is_wp_wlwmanifest_path(path: str) -> bool:
 
 
 def is_git_dotfile_path(path: str) -> bool:
+    """`/.gitconfig` is a home-dir file — match only the enumerated webroot /
+    home-dir variants. `/.gitignore` is a project-tree file that scanners walk
+    under subpath prefixes (`/api/.gitignore`, `/wp-content/.gitignore`,
+    `/v1/.gitignore`, …) the same way they walk `/<prefix>/.git/config`. Match
+    any path whose basename is `.gitignore` so the same dictionary lands on
+    the dotfile handler instead of falling through to not-handled."""
     if not GIT_DOTFILES_ENABLED:
         return False
-    return path.lower() in GIT_DOTFILE_PATHS
+    lower = path.lower()
+    if lower in GIT_DOTFILE_PATHS:
+        return True
+    leaf = lower.rsplit("/", 1)[-1]
+    return leaf == ".gitignore"
 
 
 def is_sonicwall_path(path: str) -> bool:

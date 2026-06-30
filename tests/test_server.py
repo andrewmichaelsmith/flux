@@ -8518,6 +8518,15 @@ def test_nextjs_normalize_path_strips_encoded_slashes():
     # URL-encoded `..` (`%2e%2e`) gets unquoted first, then normalized.
     ("/%2e%2e/wp-config.php", "/wp-config.php"),
     ("/files/%2e%2e/wp-config.php", "/wp-config.php"),
+    # Double-encoded `%252e%252e` — the `%` itself is encoded. Targets
+    # parsers that only single-decode; the loop in normalize_path peels
+    # layers until stable so `/%252e%252e/wp-config.php` lands on the
+    # same handler as the plain `..` form. Observed in the wild from
+    # cred-scanner clusters that rotate their TLS stack and start
+    # double-encoding to evade single-decode normalization.
+    ("/%252e%252e/wp-config.php", "/wp-config.php"),
+    ("/%25252e%25252e/wp-config.php", "/wp-config.php"),
+    ("/%252e%252e/proc/self/environ", "/proc/self/environ"),
     # Trailing `..` collapses to root or parent.
     ("/foo/bar/..", "/foo"),
     # Legit filenames with trailing dots (not followed by `/`) MUST NOT
@@ -8547,6 +8556,9 @@ def test_normalize_path_traversal_lands_on_canary_trap():
         "/static../environ",
         "/static../proc/self/environ",
         "/%2e%2e/proc/1/environ",
+        # Double-encoded variants land on the same trap dict.
+        "/%252e%252e/proc/self/environ",
+        "/%25252e%25252e/proc/self/environ",
     ):
         canonical = tbenv.normalize_path(raw)
         assert canonical.lower() in tbenv._TRAP_BY_PATH, raw
@@ -11506,6 +11518,18 @@ def test_git_dotfiles_enabled_by_default():
     "/home/ubuntu/.gitconfig",
     "/home/ec2-user/.gitconfig",
     "/.GITCONFIG",
+    # Project-tree `.gitignore` enumeration — scanners walk the same
+    # subpath dictionary they use for `/<prefix>/.git/config` against
+    # `/<prefix>/.gitignore` as well. Match on basename so the
+    # dictionary lands on the dotfile handler.
+    "/api/.gitignore",
+    "/wp-content/.gitignore",
+    "/v1/.gitignore",
+    "/dist/.gitignore",
+    "/backend/.gitignore",
+    "/laravel/.gitignore",
+    "/symfony/.gitignore",
+    "/api/.GITIGNORE",
 ])
 def test_git_dotfile_path_match(path):
     assert tbenv.is_git_dotfile_path(path)
@@ -11513,7 +11537,11 @@ def test_git_dotfile_path_match(path):
 
 @pytest.mark.parametrize("path", [
     "/.git/config", "/.git/", "/.gitconfig.bak",
-    "/foo/.gitconfig", "/.gitignore.bak",
+    # `/foo/.gitconfig` stays a no-match: `.gitconfig` is a home-dir
+    # file, not a project-tree file, so only the enumerated webroot /
+    # home-dir variants count. `.gitignore` is the opposite — see
+    # the match list.
+    "/foo/.gitconfig", "/.gitignore.bak", "/api/.gitignore.bak",
 ])
 def test_git_dotfile_path_no_match(path):
     assert not tbenv.is_git_dotfile_path(path)
@@ -11577,6 +11605,24 @@ async def test_dispatch_gitignore_serves_listing(flux_client):
     assert b".aws/credentials\n" in body
     entries = _log_entries(flux_client.log_path)
     assert entries[-1]["result"] == "gitignore"
+
+
+@pytest.mark.parametrize("path", [
+    "/api/.gitignore", "/wp-content/.gitignore", "/v1/.gitignore",
+    "/laravel/.gitignore", "/symfony/.gitignore", "/dist/.gitignore",
+])
+async def test_dispatch_gitignore_project_subpath(flux_client, path):
+    """`<prefix>/.gitignore` enumeration — same scanner dictionary that
+    walks `/<prefix>/.git/config` walks `<prefix>/.gitignore`. Must land
+    on the dotfile handler so it logs `result=gitignore` instead of
+    falling through to `not-handled`."""
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.99"})
+    assert resp.status == 200
+    body = await resp.read()
+    assert b".aws/credentials\n" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "gitignore"
+    assert entries[-1]["gitDotfilePath"] == path
 
 
 async def test_dispatch_git_dotfiles_disabled_returns_404(flux_client, monkeypatch):
