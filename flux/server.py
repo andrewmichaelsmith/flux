@@ -10708,6 +10708,149 @@ def render_laravel_log(r: dict[str, object]) -> bytes:
     return lines.encode("utf-8")
 
 
+def render_kubeconfig_yaml(r: dict[str, object]) -> bytes:
+    """`~/.kube/config` — the kubectl config file. Scanner dictionaries
+    walk this filename alongside the other `~/.aws/*`, `~/.docker/*`,
+    `~/.terraform.d/*` cred siblings because a webroot leak of it hands
+    the harvester either a bearer token, a client-cert pair, or (via the
+    `aws-iam-authenticator` exec plugin) an AWS access-key pair aimed at
+    an EKS cluster.
+
+    The body is a plausible EKS kubeconfig — one cluster, one user, one
+    current-context. The user stanza has:
+
+    - a bearer `token` — a per-hit random string (not Tracebit-backed;
+      a bearer replay against a random k8s API isn't something Tracebit
+      alerts on today, but shipping a fixed literal would fingerprint
+      the fleet, so it's per-hit random).
+    - an `exec` block invoking `aws-iam-authenticator` with the Tracebit
+      AWS canary set as `env: AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
+      Real EKS bootstrap flows set the exec env this way; a harvester
+      pulling `kube/config` and greping for `AKIA` walks straight into
+      the canary block. That's the primary alerting surface.
+    - per-hit random `certificate-authority-data`, `client-certificate-data`,
+      `client-key-data` base64 blobs so the file isn't a cross-sensor
+      fingerprint.
+    """
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    # Per-hit random blobs — kubeconfig CA / client cert / client key are
+    # base64-encoded PEMs. Real base64 shapes vary, so a token_urlsafe of
+    # a random length in the plausible-cert range is enough to defeat a
+    # literal-string cross-sensor match without pretending to be a valid
+    # certificate (a scanner grepping for AKIA doesn't parse the PEM).
+    ca_b64 = secrets.token_urlsafe(1024).replace("_", "").replace("-", "")
+    ccert_b64 = secrets.token_urlsafe(1024).replace("_", "").replace("-", "")
+    ckey_b64 = secrets.token_urlsafe(1024).replace("_", "").replace("-", "")
+    bearer = secrets.token_urlsafe(48)
+    cluster_id = secrets.token_hex(4)
+    account_id = 100000000000 + secrets.randbelow(900000000000)
+    return (
+        "apiVersion: v1\n"
+        "kind: Config\n"
+        "clusters:\n"
+        f"- name: arn:aws:eks:us-east-1:{account_id}:cluster/prod-{cluster_id}\n"
+        "  cluster:\n"
+        f"    server: https://{secrets.token_hex(16)}.gr7.us-east-1.eks.amazonaws.com\n"
+        f"    certificate-authority-data: {ca_b64}\n"
+        "contexts:\n"
+        f"- name: arn:aws:eks:us-east-1:{account_id}:cluster/prod-{cluster_id}\n"
+        "  context:\n"
+        f"    cluster: arn:aws:eks:us-east-1:{account_id}:cluster/prod-{cluster_id}\n"
+        f"    user: arn:aws:eks:us-east-1:{account_id}:cluster/prod-{cluster_id}\n"
+        "    namespace: default\n"
+        f"current-context: arn:aws:eks:us-east-1:{account_id}:cluster/prod-{cluster_id}\n"
+        "users:\n"
+        f"- name: arn:aws:eks:us-east-1:{account_id}:cluster/prod-{cluster_id}\n"
+        "  user:\n"
+        f"    token: {bearer}\n"
+        f"    client-certificate-data: {ccert_b64}\n"
+        f"    client-key-data: {ckey_b64}\n"
+        "    exec:\n"
+        "      apiVersion: client.authentication.k8s.io/v1beta1\n"
+        "      command: aws-iam-authenticator\n"
+        "      args:\n"
+        "      - token\n"
+        "      - -i\n"
+        f"      - prod-{cluster_id}\n"
+        "      env:\n"
+        "      - name: AWS_REGION\n"
+        "        value: us-east-1\n"
+        "      - name: AWS_ACCESS_KEY_ID\n"
+        f"        value: {ak}\n"
+        "      - name: AWS_SECRET_ACCESS_KEY\n"
+        f"        value: {sk}\n"
+        "      - name: AWS_SESSION_TOKEN\n"
+        f"        value: {st}\n"
+        "      interactiveMode: Never\n"
+        "      provideClusterInfo: false\n"
+    ).encode("utf-8")
+
+
+def render_wp_debug_log(r: dict[str, object]) -> bytes:
+    """`wp-content/debug.log` — the file WordPress writes when
+    `define('WP_DEBUG_LOG', true)` is left on. Scanner dictionaries
+    walk it alongside `/wp-config.php`, `/.env`, and the WP admin URL
+    matrix because a misconfigured `<Directory /var/www/wp-content>`
+    that drops the `deny from all` shipped with default WP exposes the
+    file as static text over HTTPS.
+
+    The body is a real-shaped WP `debug.log`: a couple of `PHP Notice`
+    lines from theme code, then a `PHP Fatal error` with a stack trace
+    that dumps a `wp-config.php`-style block into the error message.
+    That block holds the Tracebit AWS canary plus per-hit synthetic DB
+    creds — same rationale as the Laravel-log renderer: any fixed
+    literal would fingerprint the sensor fleet."""
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    db_password = _fake_db_password()
+    auth_key = secrets.token_urlsafe(48)
+    secure_auth_key = secrets.token_urlsafe(48)
+    logged_in_key = secrets.token_urlsafe(48)
+    base_epoch = 1_762_000_000 + secrets.randbelow(6_000_000)
+    ts1 = time.strftime("%d-%b-%Y %H:%M:%S UTC", time.gmtime(base_epoch))
+    ts2 = time.strftime("%d-%b-%Y %H:%M:%S UTC", time.gmtime(base_epoch + 15 + secrets.randbelow(120)))
+    ts3 = time.strftime("%d-%b-%Y %H:%M:%S UTC", time.gmtime(base_epoch + 180 + secrets.randbelow(400)))
+    ts4 = time.strftime("%d-%b-%Y %H:%M:%S UTC", time.gmtime(base_epoch + 400 + secrets.randbelow(400)))
+    return (
+        f"[{ts1}] PHP Notice:  Undefined index: HTTP_X_FORWARDED_PROTO in "
+        "/var/www/html/wp-includes/load.php on line 942\n"
+        f"[{ts2}] PHP Notice:  Trying to access array offset on value of type "
+        "null in /var/www/html/wp-content/themes/twentytwentyfour/functions.php "
+        "on line 178\n"
+        f"[{ts3}] PHP Warning:  mysqli_real_connect(): (HY000/2002): Connection "
+        "refused in /var/www/html/wp-includes/class-wpdb.php on line 1987\n"
+        f"[{ts4}] PHP Fatal error:  Uncaught Error: Call to a member function "
+        "prepare() on null in /var/www/html/wp-includes/class-wpdb.php:2413\n"
+        "Stack trace:\n"
+        "#0 /var/www/html/wp-includes/class-wpdb.php(2456): wpdb->_do_query()\n"
+        "#1 /var/www/html/wp-includes/option.php(174): wpdb->get_row()\n"
+        "#2 /var/www/html/wp-includes/plugin.php(465): get_option('siteurl')\n"
+        "#3 /var/www/html/wp-settings.php(414): do_action('plugins_loaded')\n"
+        "#4 /var/www/html/wp-load.php(50): require_once('/var/www/html/wp-settings.php')\n"
+        "#5 {main}\n"
+        "  thrown in /var/www/html/wp-includes/class-wpdb.php on line 2413\n"
+        "  Loaded wp-config.php context:\n"
+        "    DB_NAME       = 'wordpress_prod'\n"
+        "    DB_USER       = 'wp_prod'\n"
+        f"    DB_PASSWORD   = '{db_password}'\n"
+        "    DB_HOST       = 'db.internal:3306'\n"
+        "    table_prefix  = 'wp_'\n"
+        f"    AUTH_KEY      = '{auth_key}'\n"
+        f"    SECURE_AUTH_KEY = '{secure_auth_key}'\n"
+        f"    LOGGED_IN_KEY = '{logged_in_key}'\n"
+        f"    AWS_ACCESS_KEY_ID     = '{ak}'\n"
+        f"    AWS_SECRET_ACCESS_KEY = '{sk}'\n"
+        f"    AWS_SESSION_TOKEN     = '{st}'\n"
+        "    AWS_DEFAULT_REGION    = 'us-east-1'\n"
+        "    S3_UPLOADS_BUCKET     = 'wp-prod-uploads'\n"
+    ).encode("utf-8")
+
+
 # `.env*` file siblings the off-the-shelf env-checker dictionaries walk for
 # every prefix. The empty string covers the bare `/<prefix>/.env`. The
 # canonical four-env tier (`.production` / `.local` / `.dev` / `.staging`)
@@ -14611,6 +14754,90 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_laravel_log,
         "text/plain; charset=utf-8",
     ),
+    # `wp-content/debug.log` — the file WordPress writes with
+    # `WP_DEBUG_LOG=true`. Recurring scanner probe in the wild:
+    # off-the-shelf WP-scanner dictionaries walk it alongside
+    # `/wp-config.php`, `/wp-admin/install.php`, and `/.env` because
+    # sloppy `<Directory wp-content>` guards leak the log as static
+    # text and it very often carries `PHP Fatal error` traces that
+    # dump the wp-config block. Renderer embeds the Tracebit AWS
+    # canary in a wp-config-shaped tail; per-hit random `AUTH_KEY`
+    # / `SECURE_AUTH_KEY` / `LOGGED_IN_KEY` / `DB_PASSWORD` so the
+    # body doesn't fingerprint the fleet.
+    CanaryTrap(
+        "wp-debug-log",
+        (
+            "/wp-content/debug.log",
+            "/wp-content/debug.log.bak",
+            "/wp-content/debug.log.old",
+            # Sibling upload dir — some plugins (Wordfence, WP File
+            # Manager Pro) rotate the debug tail here.
+            "/wp-content/uploads/debug.log",
+            # WP-in-subdirectory installs — mirrors the wlwmanifest
+            # subdirectory matrix. Same handful of prefixes.
+            "/blog/wp-content/debug.log",
+            "/wordpress/wp-content/debug.log",
+            "/wp/wp-content/debug.log",
+            "/news/wp-content/debug.log",
+            "/site/wp-content/debug.log",
+            "/cms/wp-content/debug.log",
+            "/shop/wp-content/debug.log",
+            # Absolute-webroot path-traversal variants — same shape as
+            # the wp-config trap for Apache/nginx default layouts.
+            "/var/www/wp-content/debug.log",
+            "/var/www/html/wp-content/debug.log",
+            "/srv/www/wp-content/debug.log",
+            "/usr/share/nginx/html/wp-content/debug.log",
+            "/var/www/html/wp/wp-content/debug.log",
+            "/var/www/html/wordpress/wp-content/debug.log",
+        ),
+        ("aws",),
+        render_wp_debug_log,
+        "text/plain; charset=utf-8",
+    ),
+    # `~/.kube/config` — kubectl kubeconfig. Scanner dictionaries walk
+    # it alongside `/.aws/credentials`, `/.docker/config.json`, and
+    # `/.terraform.d/credentials.tfrc.json` because a webroot leak of
+    # the file hands the harvester either a bearer token, a client-cert
+    # pair, or (via the `aws-iam-authenticator` exec plugin) an AWS
+    # access-key pair aimed at an EKS cluster. The body's `exec` block
+    # sets the Tracebit AWS canary as the `AWS_ACCESS_KEY_ID` env for
+    # the auth plugin — a harvester grepping the file for `AKIA`
+    # walks straight into the alerting slot.
+    CanaryTrap(
+        "kubeconfig",
+        (
+            "/.kube/config",
+            # Editor/backup siblings — same pattern as the other
+            # dotfile-cred traps.
+            "/.kube/config.bak",
+            "/.kube/config.old",
+            "/.kube/kubeconfig",
+            # Bare webroot filenames operators sometimes drop when
+            # copying a kubeconfig off a bastion. Real dictionaries
+            # walk these too.
+            "/kubeconfig",
+            "/kubeconfig.yaml",
+            "/kubeconfig.yml",
+            "/config.kubeconfig",
+            # Home-dir prefixes — matches the `.aws/credentials`,
+            # `.docker/config.json`, `.bash_history` webroot-prefix
+            # matrix. Misconfigured static-file routes at `root /`
+            # expose the file at the absolute home-dir path.
+            "/root/.kube/config",
+            "/home/.kube/config",
+            "/home/ubuntu/.kube/config",
+            "/home/ec2-user/.kube/config",
+            "/home/admin/.kube/config",
+            "/home/app/.kube/config",
+            "/home/node/.kube/config",
+            "/home/deploy/.kube/config",
+            "/home/www-data/.kube/config",
+        ),
+        ("aws",),
+        render_kubeconfig_yaml,
+        "text/plain; charset=utf-8",
+    ),
     *(
         CanaryTrap(
             "mail-service-env",
@@ -15455,6 +15682,15 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/symfony/_profiler/search",
             "/frontend_dev.php/_profiler/latest",
             "/frontend_dev.php/_profiler/search",
+            # Bare `/_profiler` (no trailing slash) — recurring scanner
+            # probe in the wild. The path resolves to the toolbar-index
+            # in real Symfony (the Profiler controller's default action);
+            # bytes-grep harvesters land on the same env dump either way.
+            # Cover the prefix-variant bares too.
+            "/_profiler",
+            "/app_dev.php/_profiler",
+            "/symfony/_profiler",
+            "/frontend_dev.php/_profiler",
         ),
         ("aws",),
         render_symfony_profiler_phpinfo,

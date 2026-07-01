@@ -984,6 +984,13 @@ FAKE_TRACEBIT = {
     ("/_profiler/latest", b"AKIAFAKEEXAMPLE01"),
     ("/_profiler/search", b"AKIAFAKEEXAMPLE01"),
     ("/_profiler/", b"AKIAFAKEEXAMPLE01"),
+    # Bare `/_profiler` (no trailing slash) — recurring scanner probe;
+    # earlier revisions of the trap only matched the trailing-slash form
+    # so the bare shape fell into `not-handled`. Same render.
+    ("/_profiler", b"AKIAFAKEEXAMPLE01"),
+    ("/app_dev.php/_profiler", b"AKIAFAKEEXAMPLE01"),
+    ("/symfony/_profiler", b"AKIAFAKEEXAMPLE01"),
+    ("/frontend_dev.php/_profiler", b"AKIAFAKEEXAMPLE01"),
     ("/app_dev.php/_profiler/latest", b"AKIAFAKEEXAMPLE01"),
     ("/symfony/_profiler/search", b"AKIAFAKEEXAMPLE01"),
     ("/frontend_dev.php/_profiler/latest", b"AKIAFAKEEXAMPLE01"),
@@ -1086,6 +1093,28 @@ FAKE_TRACEBIT = {
     ("/.azure/config", b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
     ("/.azure/config", b"[storage]"),
     ("/.azure/clouds.config", b"[AzureCloud]"),
+    # `~/.kube/config` — bearer token / client-cert pair / EKS exec
+    # block with the AWS canary in `AWS_ACCESS_KEY_ID` env.
+    ("/.kube/config", b"AKIAFAKEEXAMPLE01"),
+    ("/.kube/config", b"aws-iam-authenticator"),
+    ("/.kube/config", b"client.authentication.k8s.io/v1beta1"),
+    ("/.kube/config", b"AWS_ACCESS_KEY_ID"),
+    ("/root/.kube/config", b"AKIAFAKEEXAMPLE01"),
+    ("/home/ubuntu/.kube/config", b"AKIAFAKEEXAMPLE01"),
+    ("/kubeconfig", b"AKIAFAKEEXAMPLE01"),
+    ("/kubeconfig.yaml", b"AKIAFAKEEXAMPLE01"),
+    ("/.kube/kubeconfig", b"AKIAFAKEEXAMPLE01"),
+    # `wp-content/debug.log` — WP-shaped PHP fatal-error trace with a
+    # wp-config context block; AWS canary in the tail, DB creds are
+    # per-hit synthetic.
+    ("/wp-content/debug.log", b"AKIAFAKEEXAMPLE01"),
+    ("/wp-content/debug.log", b"PHP Fatal error"),
+    ("/wp-content/debug.log", b"DB_PASSWORD"),
+    ("/wp-content/debug.log", b"AUTH_KEY"),
+    ("/wp-content/debug.log", b"wp-config.php"),
+    ("/wordpress/wp-content/debug.log", b"AKIAFAKEEXAMPLE01"),
+    ("/blog/wp-content/debug.log", b"AKIAFAKEEXAMPLE01"),
+    ("/var/www/html/wp-content/debug.log", b"AKIAFAKEEXAMPLE01"),
 ])
 def test_canary_trap_renderers_embed_canary(path, needle):
     trap = tbenv._TRAP_BY_PATH[path]
@@ -1143,6 +1172,15 @@ def test_canary_trap_renderers_embed_canary(path, needle):
     "/.azure/service_principal_entries.json",
     "/.azure/config",
     "/.azure/clouds.config",
+    # kubeconfig bearer token / CA / client-cert / client-key blobs
+    # must be per-hit random; account-id / cluster-id also randomised.
+    "/.kube/config",
+    "/root/.kube/config",
+    "/kubeconfig",
+    # WP debug.log — per-hit DB_PASSWORD / AUTH_KEY / SECURE_AUTH_KEY /
+    # LOGGED_IN_KEY so the body doesn't fingerprint the fleet.
+    "/wp-content/debug.log",
+    "/var/www/html/wp-content/debug.log",
 ])
 def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
     # Regression: the ``h6T!9pq2Wz@LmRnV`` / ``prod_rw`` DB-password literal
