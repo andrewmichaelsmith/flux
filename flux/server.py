@@ -14261,6 +14261,25 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/wp-config.txt",
             "/wp-config-backup.php",
             "/backup/wp-config.php",
+            # Vim / Emacs write hidden swap+backup files as `.<name>.swp`
+            # (leading-dot in the same directory as the file being
+            # edited). Scanner dictionaries walk the leading-dot forms
+            # alongside the plain suffixes because a mid-edit crash
+            # leaves the leading-dot swap in the docroot even if the
+            # bare-name swap was cleaned up.
+            "/.wp-config.php.swp",
+            "/.wp-config.php.swo",
+            "/.wp-config.php.swn",
+            "/.wp-config.php~",
+            # WP ships `wp-config-sample.php` as the config template.
+            # Sloppy deploys leave it in the webroot; scanner walks it
+            # alongside `wp-config.php`. `.dist` / `.default` / `.inc`
+            # are older distribution-template conventions from mixed-
+            # framework deploys — cheap, high-signal path additions.
+            "/wp-config-sample.php",
+            "/wp-config.php.dist",
+            "/wp-config.php.default",
+            "/wp-config.php.inc",
             # Absolute-webroot path-traversal variants — scanner
             # dictionaries enumerate the canonical WordPress install
             # paths on Apache/nginx default layouts because a

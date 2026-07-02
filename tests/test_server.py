@@ -720,6 +720,11 @@ FAKE_TRACEBIT = {
     ("/wp-config.php.txt", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/wp-config.php.swp", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/wp-config.php~", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    # Leading-dot vim swap file — the naming convention real vim uses.
+    ("/.wp-config.php.swp", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    # WP-shipped sample template + distribution-template siblings.
+    ("/wp-config-sample.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    ("/wp-config.php.dist", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/wp-config.php::$data", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/wp-config-backup.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/backup/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
@@ -2269,6 +2274,17 @@ async def test_handle_swallows_body_read_disconnect():
     "/wp-config-backup.php",
     "/backup/wp-config.php",
     "/%2577%2570%252D%2563%256F%256E%2566%2569%2567.%2570%2568%2570.%2562%2561%256B",
+    # Leading-dot vim/emacs swap+backup naming — real vim writes
+    # `.filename.swp` in the same directory as the file being edited.
+    "/.wp-config.php.swp",
+    "/.wp-config.php.swo",
+    "/.wp-config.php.swn",
+    "/.wp-config.php~",
+    # Sample / distribution templates left in the webroot.
+    "/wp-config-sample.php",
+    "/wp-config.php.dist",
+    "/wp-config.php.default",
+    "/wp-config.php.inc",
 ])
 async def test_dispatch_routes_wp_config_backup_variants_to_trap(flux_client, monkeypatch, path):
     monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
