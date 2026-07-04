@@ -1109,6 +1109,32 @@ FAKE_TRACEBIT = {
     ("/kubeconfig", b"AKIAFAKEEXAMPLE01"),
     ("/kubeconfig.yaml", b"AKIAFAKEEXAMPLE01"),
     ("/.kube/kubeconfig", b"AKIAFAKEEXAMPLE01"),
+    # Alias variants observed in the same probe dictionaries — leading-dot,
+    # dash-separated, kubectl-file, subdir-prefix, Rancher-download-endpoint.
+    ("/.kubeconfig", b"AKIAFAKEEXAMPLE01"),
+    ("/kube-config", b"AKIAFAKEEXAMPLE01"),
+    ("/kubectl.yaml", b"AKIAFAKEEXAMPLE01"),
+    ("/config/kubeconfig", b"AKIAFAKEEXAMPLE01"),
+    ("/admin/kubeconfig", b"AKIAFAKEEXAMPLE01"),
+    ("/kubernetes/config", b"AKIAFAKEEXAMPLE01"),
+    ("/api/v1/clusters/kubeconfig/k8s", b"AKIAFAKEEXAMPLE01"),
+    # `/kubernetes/secrets.yaml` and family — Secret manifest with base64
+    # AWS canary in `data:` plus plaintext canary in the Deployment `env:`.
+    # Base64 blob assertions use the encoded form of the fixture AWS key.
+    ("/kubernetes/secrets.yaml", b"AKIAFAKEEXAMPLE01"),
+    ("/kubernetes/secrets.yaml", b"kind: Secret"),
+    ("/kubernetes/secrets.yaml", b"kind: Deployment"),
+    ("/kubernetes/secrets.yaml", b"kind: ConfigMap"),
+    # Base64 of the fixture `AKIAFAKEEXAMPLE01` — proves the Secret `data`
+    # block carries the canary in base64 form as a real Secret does.
+    ("/kubernetes/secrets.yaml", b"QUtJQUZBS0VFWEFNUExFMDE="),
+    ("/kubernetes.yaml", b"AKIAFAKEEXAMPLE01"),
+    ("/kubernetes.yml", b"AKIAFAKEEXAMPLE01"),
+    ("/kubernetes/secret.yaml", b"AKIAFAKEEXAMPLE01"),
+    ("/kubernetes/deployment.yaml", b"AKIAFAKEEXAMPLE01"),
+    ("/kubernetes/configmap.yaml", b"AKIAFAKEEXAMPLE01"),
+    ("/k8s/secrets.yaml", b"AKIAFAKEEXAMPLE01"),
+    ("/k8s/deployment.yaml", b"AKIAFAKEEXAMPLE01"),
     # `wp-content/debug.log` — WP-shaped PHP fatal-error trace with a
     # wp-config context block; AWS canary in the tail, DB creds are
     # per-hit synthetic.
@@ -1757,6 +1783,40 @@ def test_render_terraform_tfvars_json_is_valid_json():
     assert payload["db_password"]
 
 
+def test_render_k8s_secret_manifest_carries_canary_in_both_forms():
+    """Secret `data:` block base64-encodes the canary (real Secret shape);
+    the Deployment `env:` block ALSO carries it as plaintext so a raw-byte
+    grep that skips base64 blobs still finds it. Both must be present."""
+    body = tbenv.render_k8s_secret_manifest(FAKE_TRACEBIT).decode("utf-8")
+    # Plaintext canary in the Deployment env block.
+    assert 'value: "AKIAFAKEEXAMPLE01"' in body
+    assert 'value: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"' in body
+    # Base64-encoded canary in the Secret data block.
+    ak_b64 = base64.b64encode(b"AKIAFAKEEXAMPLE01").decode()
+    sk_b64 = base64.b64encode(b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY").decode()
+    assert f"AWS_ACCESS_KEY_ID: {ak_b64}" in body
+    assert f"AWS_SECRET_ACCESS_KEY: {sk_b64}" in body
+    # Multi-document YAML shape — one Secret, one ConfigMap, one Deployment.
+    assert body.count("---") >= 3
+    assert "kind: Secret" in body
+    assert "kind: ConfigMap" in body
+    assert "kind: Deployment" in body
+
+
+def test_render_k8s_secret_manifest_db_password_is_per_hit_unique():
+    """DB_PASSWORD in the Secret `data:` block is a per-hit synthetic; two
+    consecutive renders must not share the same base64 blob (would let a
+    scanner cross-sensor fingerprint the fleet)."""
+    def _db(body: str) -> str:
+        for line in body.splitlines():
+            if "DB_PASSWORD:" in line:
+                return line.split(":", 1)[1].strip()
+        raise AssertionError("no DB_PASSWORD line in Secret manifest")
+    body1 = tbenv.render_k8s_secret_manifest(FAKE_TRACEBIT).decode("utf-8")
+    body2 = tbenv.render_k8s_secret_manifest(FAKE_TRACEBIT).decode("utf-8")
+    assert _db(body1) != _db(body2)
+
+
 @pytest.mark.parametrize("path", [
     # actuator-logfile family
     "/actuator/logfile",
@@ -1854,6 +1914,32 @@ def test_render_terraform_tfvars_json_is_valid_json():
     "/root-key.csv",
     "/aws-access-keys.csv",
     "/aws_access_keys.csv",
+    # kubeconfig alias variants (leading-dot, dash-separated, kubectl-file,
+    # subdir-prefix, Rancher-download endpoint).
+    "/.kubeconfig",
+    "/kube-config",
+    "/kubectl.yaml",
+    "/kubectl.yml",
+    "/config/kubeconfig",
+    "/admin/kubeconfig",
+    "/kubernetes/config",
+    "/api/v1/clusters/kubeconfig/k8s",
+    # k8s-secret-manifest — Secret / Deployment / ConfigMap YAML paths.
+    "/kubernetes.yaml",
+    "/kubernetes.yml",
+    "/kubernetes/secrets.yaml",
+    "/kubernetes/secrets.yml",
+    "/kubernetes/secret.yaml",
+    "/kubernetes/secret.yml",
+    "/kubernetes/deployment.yaml",
+    "/kubernetes/deployment.yml",
+    "/kubernetes/configmap.yaml",
+    "/kubernetes/configmap.yml",
+    "/k8s/secrets.yaml",
+    "/k8s/secrets.yml",
+    "/k8s/secret.yaml",
+    "/k8s/deployment.yaml",
+    "/k8s/deployment.yml",
 ])
 def test_new_canary_trap_paths_dispatch(path):
     assert path.lower() in tbenv._TRAP_BY_PATH, (

@@ -9031,6 +9031,84 @@ def render_aws_credentials_json(r: dict[str, object]) -> bytes:
     return (json.dumps(body, indent=2) + "\n").encode("utf-8")
 
 
+def render_k8s_secret_manifest(r: dict[str, object]) -> bytes:
+    """Kubernetes multi-document YAML — Secret + ConfigMap + Deployment.
+    The Secret carries the Tracebit AWS canary as base64-encoded `data:`
+    values (real Secret shape: harvesters that base64-decode and grep for
+    `AKIA*` pick it up). The Deployment block ALSO embeds the canary as
+    plaintext `env:` values so raw-byte greppers that skip base64 blobs
+    still see it. Non-credential filler (image, replicas, host, bucket
+    name) is plausible-fixed; the only per-hit unique fields are the
+    canary + a synthetic DB password."""
+    aws = _aws(r)
+    def _b64(s: str) -> str:
+        return base64.b64encode(s.encode("utf-8")).decode("ascii")
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    db_pw = _fake_db_password()
+    return (
+        "---\n"
+        "apiVersion: v1\n"
+        "kind: Secret\n"
+        "metadata:\n"
+        "  name: aws-credentials\n"
+        "  namespace: default\n"
+        "type: Opaque\n"
+        "data:\n"
+        f"  AWS_ACCESS_KEY_ID: {_b64(ak)}\n"
+        f"  AWS_SECRET_ACCESS_KEY: {_b64(sk)}\n"
+        f"  AWS_SESSION_TOKEN: {_b64(st)}\n"
+        f"  DB_PASSWORD: {_b64(db_pw)}\n"
+        "---\n"
+        "apiVersion: v1\n"
+        "kind: ConfigMap\n"
+        "metadata:\n"
+        "  name: app-config\n"
+        "  namespace: default\n"
+        "data:\n"
+        "  AWS_DEFAULT_REGION: us-east-1\n"
+        "  S3_BUCKET: internal-tools-prod\n"
+        "  DB_HOST: db.internal\n"
+        "  DB_NAME: prod\n"
+        "---\n"
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: internal-tools\n"
+        "  namespace: default\n"
+        "spec:\n"
+        "  replicas: 3\n"
+        "  selector:\n"
+        "    matchLabels:\n"
+        "      app: internal-tools\n"
+        "  template:\n"
+        "    metadata:\n"
+        "      labels:\n"
+        "        app: internal-tools\n"
+        "    spec:\n"
+        "      containers:\n"
+        "      - name: web\n"
+        "        image: internal/tools:prod\n"
+        "        ports:\n"
+        "        - containerPort: 8080\n"
+        "        env:\n"
+        "        - name: AWS_ACCESS_KEY_ID\n"
+        f"          value: \"{ak}\"\n"
+        "        - name: AWS_SECRET_ACCESS_KEY\n"
+        f"          value: \"{sk}\"\n"
+        "        - name: AWS_SESSION_TOKEN\n"
+        f"          value: \"{st}\"\n"
+        "        - name: AWS_DEFAULT_REGION\n"
+        "          value: us-east-1\n"
+        "        envFrom:\n"
+        "        - secretRef:\n"
+        "            name: aws-credentials\n"
+        "        - configMapRef:\n"
+        "            name: app-config\n"
+    ).encode("utf-8")
+
+
 def render_openapi_spec(
     r: dict[str, object],
     host: str,
@@ -13991,6 +14069,36 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_aws_credentials_json,
         "application/json; charset=utf-8",
     ),
+    # `/kubernetes/secrets.yaml` and family — real Kubernetes Secret /
+    # Deployment / ConfigMap manifests scanner dictionaries walk when
+    # hunting checked-in-cluster-credentials leaks. The renderer emits
+    # a multi-document YAML: a Secret with base64-encoded canary values
+    # (harvesters that base64-decode and grep for `AKIA*` pick it up)
+    # plus a Deployment with the canary as plaintext `env:` values so
+    # raw-byte greppers that skip base64 blobs still see it.
+    CanaryTrap(
+        "k8s-secret-manifest",
+        (
+            "/kubernetes.yaml",
+            "/kubernetes.yml",
+            "/kubernetes/secrets.yaml",
+            "/kubernetes/secrets.yml",
+            "/kubernetes/secret.yaml",
+            "/kubernetes/secret.yml",
+            "/kubernetes/deployment.yaml",
+            "/kubernetes/deployment.yml",
+            "/kubernetes/configmap.yaml",
+            "/kubernetes/configmap.yml",
+            "/k8s/secrets.yaml",
+            "/k8s/secrets.yml",
+            "/k8s/secret.yaml",
+            "/k8s/deployment.yaml",
+            "/k8s/deployment.yml",
+        ),
+        ("aws",),
+        render_k8s_secret_manifest,
+        "application/yaml; charset=utf-8",
+    ),
     # `~/.boto` — AWS Python SDK / `gsutil` legacy config file. Carries
     # `aws_access_key_id` / `aws_secret_access_key` in plaintext INI;
     # field-keyed scanners hit this alongside `.aws/credentials`.
@@ -14852,6 +14960,23 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/home/node/.kube/config",
             "/home/deploy/.kube/config",
             "/home/www-data/.kube/config",
+            # Leading-dot / dash-separated / kubectl-file aliases scanner
+            # dictionaries walk alongside the canonical name. `/kube-config`
+            # and `/kubectl.yaml` appear in the same probe dictionaries as
+            # `/kubeconfig`; `/.kubeconfig` is the dotfile drop-in some
+            # bootstrap scripts write.
+            "/.kubeconfig",
+            "/kube-config",
+            "/kubectl.yaml",
+            "/kubectl.yml",
+            # Path-prefix aliases operators drop when copying the file
+            # under a subdir. `/kubernetes/config` mirrors the same shape.
+            "/config/kubeconfig",
+            "/admin/kubeconfig",
+            "/kubernetes/config",
+            # Rancher / cluster-manager kubeconfig-download endpoint —
+            # scanner dictionaries walk this alongside the static file.
+            "/api/v1/clusters/kubeconfig/k8s",
         ),
         ("aws",),
         render_kubeconfig_yaml,
