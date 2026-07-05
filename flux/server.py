@@ -117,6 +117,61 @@ FINGERPRINT_PATHS = {
 }
 FINGERPRINT_PATHS_ENABLED = _env_bool("FINGERPRINT_PATHS_ENABLED")
 
+# --- Stable /robots.txt for verified crawlers -------------------------------
+# Well-behaved search-engine crawlers (Googlebot, Bingbot, YandexBot, etc.)
+# fetch /robots.txt on every crawl-frontier expansion. The fingerprint
+# module chain treats /robots.txt like any other first-contact probe --
+# variable drip + rotating cookies + no cache -- which crawlers read as
+# "response unreliable, retry" and refetch-loop endlessly. Observed cost:
+# a single sensor absorbed >1M YandexBot fetches in ~24h once, and >900k
+# Googlebot fetches over 5 days more recently. That volume gates the
+# volume-anomaly triage on unrelated novelty runs.
+#
+# When a request's UA matches a known crawler token and the path is
+# /robots.txt, serve a static Disallow-all body with a long Cache-Control
+# so the crawler stops re-fetching. Scanner UAs still fall through to
+# the fingerprint/tarpit chain (crawler UAs are a narrow allowlist).
+ROBOTS_TXT_STABLE_ENABLED = _env_bool("HONEYPOT_ROBOTS_TXT_STABLE_ENABLED")
+_ROBOTS_TXT_DEFAULT_CRAWLER_UAS = ",".join([
+    "googlebot",
+    "bingbot",
+    "yandexbot",
+    "yandeximages",
+    "yandeximageresizer",
+    "duckduckbot",
+    "baiduspider",
+    "sogou",
+    "applebot",
+    "petalbot",
+    "yisouspider",
+    "mj12bot",
+    "ahrefsbot",
+    "semrushbot",
+    "facebookexternalhit",
+    "twitterbot",
+    "linkedinbot",
+    "slackbot",
+    "discordbot",
+])
+ROBOTS_TXT_CRAWLER_UAS = tuple(sorted({
+    value.strip().lower()
+    for value in (
+        os.environ.get("HONEYPOT_ROBOTS_TXT_CRAWLER_UAS_CSV")
+        or _ROBOTS_TXT_DEFAULT_CRAWLER_UAS
+    ).split(",")
+    if value.strip()
+}))
+ROBOTS_TXT_CACHE_MAX_AGE = max(
+    int((os.environ.get("HONEYPOT_ROBOTS_TXT_CACHE_MAX_AGE") or "86400").strip() or "86400"),
+    60,
+)
+# Default body says "everything is off-limits". Configurable via env for
+# operators who want to keep a specific crawler indexing a subset.
+ROBOTS_TXT_BODY = (
+    os.environ.get("HONEYPOT_ROBOTS_TXT_BODY")
+    or "User-agent: *\nDisallow: /\n"
+).encode("utf-8")
+
 # --- Fake /.git/ tree configuration ---
 # Default-on: flux is a honeypot, and the /.git/ tree is one of the most
 # valuable traps we have. The per-IP cache (FAKE_GIT_CACHE_TTL_SECONDS)
@@ -21557,6 +21612,60 @@ async def _send_fake_git(
         _active_slow_drips -= 1
 
 
+def _match_robots_crawler_ua(user_agent: str) -> str | None:
+    """Return the crawler-token that matched, or None.
+
+    Match is a case-insensitive substring check against a small allowlist
+    of well-known crawler UA tokens (`googlebot`, `bingbot`, ...). The
+    allowlist deliberately mirrors what the tokens look like INSIDE a full
+    UA string, so `Mozilla/5.0 (compatible; Googlebot/2.1; ...)` matches
+    on `googlebot` without needing an exact-string comparison.
+
+    Not a spoof-proof check -- a scanner can trivially set its UA to
+    `Googlebot`. That's fine: the fallout of serving a stable robots.txt
+    to a scanner is losing one probe's worth of fingerprint drip, which
+    is a tiny cost vs. the >900k Googlebot fetches/window the trap
+    absorbs otherwise.
+    """
+    if not user_agent:
+        return None
+    ua_lower = user_agent.lower()
+    for token in ROBOTS_TXT_CRAWLER_UAS:
+        if token in ua_lower:
+            return token
+    return None
+
+
+async def _handle_robots_txt(
+    request: web.Request,
+    log_context: dict[str, object],
+    crawler_token: str,
+) -> web.Response:
+    """Serve a static Disallow-all robots.txt with a long Cache-Control.
+
+    Only invoked when the UA matched the crawler allowlist -- non-crawler
+    UAs continue to hit the fingerprint/tarpit chain so scanner probes on
+    /robots.txt still contribute to fingerprint capture.
+    """
+    method = request.method
+    body = ROBOTS_TXT_BODY if method != "HEAD" else b""
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": "robots-crawler",
+        "robotsCrawler": crawler_token,
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200,
+        body=body,
+        headers={
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": f"public, max-age={ROBOTS_TXT_CACHE_MAX_AGE}",
+        },
+    )
+
+
 async def _send_tarpit(
     request: web.Request,
     request_id: str,
@@ -21930,6 +22039,17 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # only matches its own concrete path set, never `/`.
     if is_webapp_form_path(path):
         return await _handle_webapp_form(request, log_context, path, request_body)
+
+    # /robots.txt from a verified crawler UA gets a stable Disallow-all
+    # response with a long Cache-Control, so Googlebot / YandexBot /
+    # Bingbot / etc. stop refetch-looping. Non-crawler UAs (including
+    # any scanner that hasn't spoofed the UA) fall through to the
+    # tarpit/fingerprint chain so the probe still contributes to
+    # fingerprint capture.
+    if ROBOTS_TXT_STABLE_ENABLED and path.lower() == "/robots.txt":
+        crawler_token = _match_robots_crawler_ua(user_agent)
+        if crawler_token is not None:
+            return await _handle_robots_txt(request, log_context, crawler_token)
 
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)

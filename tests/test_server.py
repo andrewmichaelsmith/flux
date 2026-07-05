@@ -12898,3 +12898,130 @@ def test_append_log_rotation_survives_missing_intermediate_files(tmp_path, monke
     # dropped active-file writes.
     assert log_path.exists()
     assert (tmp_path / "env-canary.jsonl.1").exists()
+
+
+# --- /robots.txt stable-response tests --------------------------------------
+
+
+def test_robots_txt_stable_enabled_by_default():
+    assert tbenv.ROBOTS_TXT_STABLE_ENABLED
+
+
+def test_robots_txt_default_crawler_uas_include_major_bots():
+    for token in ("googlebot", "bingbot", "yandexbot", "duckduckbot", "baiduspider"):
+        assert token in tbenv.ROBOTS_TXT_CRAWLER_UAS, f"expected token: {token}"
+
+
+@pytest.mark.parametrize("user_agent,expected", [
+    ("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)", "googlebot"),
+    ("Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)", "bingbot"),
+    ("Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)", "yandexbot"),
+    ("DuckDuckBot/1.1; (+http://duckduckgo.com/duckduckbot.html)", "duckduckbot"),
+    ("Mozilla/5.0 (compatible; MJ12bot/v2.0.5; http://mj12bot.com/)", "mj12bot"),
+    ("facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)", "facebookexternalhit"),
+])
+def test_match_robots_crawler_ua_matches_known_bots(user_agent, expected):
+    assert tbenv._match_robots_crawler_ua(user_agent) == expected
+
+
+@pytest.mark.parametrize("user_agent", [
+    "",
+    "curl/8.5.0",
+    "python-requests/2.32.5",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "axios/1.7.7",
+    "Go-http-client/1.1",
+    "fasthttp",
+])
+def test_match_robots_crawler_ua_rejects_non_crawler_uas(user_agent):
+    assert tbenv._match_robots_crawler_ua(user_agent) is None
+
+
+async def test_robots_txt_googlebot_gets_stable_response(flux_client):
+    """Googlebot UA on /robots.txt: 200, Disallow body, long Cache-Control,
+    logged as `robots-crawler`."""
+    resp = await flux_client.get(
+        "/robots.txt",
+        headers={
+            "X-Forwarded-For": "203.0.113.10",
+            "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        },
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/plain")
+    cache_ctl = resp.headers.get("Cache-Control", "")
+    assert cache_ctl.startswith("public, max-age=")
+    body = await resp.text()
+    assert "User-agent: *" in body
+    assert "Disallow: /" in body
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "robots-crawler"
+    assert entry["robotsCrawler"] == "googlebot"
+    assert entry["path"] == "/robots.txt"
+
+
+async def test_robots_txt_head_returns_no_body_but_logs(flux_client):
+    """HEAD /robots.txt from a crawler: 200, empty body, still logged."""
+    resp = await flux_client.head(
+        "/robots.txt",
+        headers={
+            "X-Forwarded-For": "203.0.113.11",
+            "User-Agent": "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)",
+        },
+    )
+    assert resp.status == 200
+    assert (await resp.read()) == b""
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "robots-crawler"
+    assert entry["robotsCrawler"] == "yandexbot"
+
+
+async def test_robots_txt_scanner_ua_falls_through_to_tarpit(flux_client, monkeypatch):
+    """Non-crawler UAs on /robots.txt still hit the fingerprint/tarpit
+    chain — the trap value isn't sacrificed for scanner traffic."""
+    monkeypatch.setattr(tbenv, "TARPIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "FINGERPRINT_PATHS_ENABLED", True)
+    resp = await flux_client.get(
+        "/robots.txt",
+        headers={
+            "X-Forwarded-For": "203.0.113.12",
+            "User-Agent": "curl/8.5.0",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] != "robots-crawler"
+
+
+async def test_robots_txt_disabled_falls_through(flux_client, monkeypatch):
+    """When the stable-response trap is off, even Googlebot hits the tarpit."""
+    monkeypatch.setattr(tbenv, "ROBOTS_TXT_STABLE_ENABLED", False)
+    monkeypatch.setattr(tbenv, "TARPIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "FINGERPRINT_PATHS_ENABLED", True)
+    resp = await flux_client.get(
+        "/robots.txt",
+        headers={
+            "X-Forwarded-For": "203.0.113.13",
+            "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] != "robots-crawler"
+
+
+async def test_robots_txt_only_matches_exact_path(flux_client):
+    """`/robots.txt.bak` or `/api/robots.txt` don't get the stable trap
+    — they're scanner variants, not crawler fetches."""
+    for probe_path in ("/robots.txt.bak", "/api/robots.txt", "/subdir/robots.txt"):
+        resp = await flux_client.get(
+            probe_path,
+            headers={
+                "X-Forwarded-For": "203.0.113.14",
+                "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            },
+        )
+        # Even if the response is 200 (tarpit) or 404, it must NOT be
+        # tagged as a crawler robots response.
+        entry = _log_entries(flux_client.log_path)[-1]
+        assert entry["result"] != "robots-crawler", f"unexpected match on {probe_path}"
