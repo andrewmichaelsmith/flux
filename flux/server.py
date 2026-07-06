@@ -586,6 +586,61 @@ LLM_ENDPOINT_PATHS = {
 # bloating the log file.
 LLM_BODY_DECODE_LIMIT = max(int((os.environ.get("HONEYPOT_LLM_BODY_DECODE_LIMIT") or "4096").strip() or "4096"), 512)
 
+# --- Fake MCP (Model Context Protocol) server endpoint ------------------
+# MCP servers speak a JSON-RPC 2.0 protocol over HTTP + SSE. Scanners are
+# now enumerating the runtime endpoints (`/mcp`, `/mcp/messages`, `/sse`)
+# separately from the config files (`/.cursor/mcp.json`, `/mcp.json`,
+# etc.) already covered by the `mcp-config` CanaryTrap. A real MCP server
+# exposes tools (arbitrary functions the LLM can call) and resources
+# (files / env vars / API responses the LLM can read). The intel we want
+# is the `tools/call` name + argument shape and the `resources/read` uri —
+# they show whether the scanner is looking for secret-fetch tools or
+# arbitrary-command execution. Bearer tokens presented against the
+# endpoint are direct intel: same stolen key replayed across IPs is
+# linkable, like the LLM-endpoint bearer-token capture.
+MCP_SERVER_ENABLED = _env_bool("HONEYPOT_MCP_SERVER_ENABLED")
+_MCP_SERVER_DEFAULT_PATHS = ",".join([
+    # JSON-RPC dispatch endpoints (the "Streamable HTTP" transport).
+    "/mcp",
+    "/mcp/",
+    "/mcp/messages",
+    # SSE handshake for the older "HTTP+SSE" transport.
+    "/sse",
+])
+MCP_SERVER_PATHS = {
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_MCP_SERVER_PATHS_CSV") or _MCP_SERVER_DEFAULT_PATHS).split(",")
+    if value.strip()
+}
+# Cap on JSON-RPC argument decode. Scanners that reach `tools/call` may
+# send large tool arguments; we log a bounded preview.
+MCP_SERVER_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_MCP_SERVER_BODY_DECODE_LIMIT") or "2048").strip() or "2048"),
+    256,
+)
+# Tool names that trigger the AWS canary path when passed to `tools/call`.
+# A real MCP server hosting these tools would return credentials or file
+# contents; we mint a canary and embed it in the tool-call result so
+# scrapers walking the response for `AKIA…` harvest a replay-fireable key.
+_MCP_SECRET_TOOL_NAMES = frozenset({
+    "fetch_secret", "get_secret", "read_secret", "read_env",
+    "filesystem_read", "read_file", "fs_read",
+    "list_workspace_files", "workspace_read",
+    "database_query", "db_query", "sql_query",
+    "aws_credentials", "get_aws_credentials",
+})
+# Resource URIs that trigger the AWS canary path when passed to
+# `resources/read`. Match is a case-insensitive substring so scanners
+# that walk `env://AWS_ACCESS_KEY_ID` or `env://AWS_SECRET_ACCESS_KEY`
+# both land on the canary path without listing every variant.
+_MCP_SECRET_RESOURCE_INDICATORS = (
+    "env://aws_",
+    "/workspace/.env",
+    "/etc/mcp/credentials",
+    "/root/.aws/credentials",
+    "/.aws/credentials",
+)
+
 # --- PHPUnit eval-stdin + body-carried RCE probes -----------------------
 # The body-enabled access index showed the largest recent POST/GET-body
 # cluster is PHPUnit CVE-2017-9841-style eval-stdin probes. The same pass
@@ -2588,6 +2643,17 @@ def is_llm_endpoint_path(path: str) -> bool:
     if not LLM_ENDPOINT_ENABLED:
         return False
     return path.lower() in LLM_ENDPOINT_PATHS
+
+
+def is_mcp_server_endpoint_path(path: str) -> bool:
+    """MCP server-runtime endpoints: JSON-RPC dispatch on `/mcp` variants,
+    SSE handshake on `/sse`. Case-insensitive exact match. `/mcp.json`
+    and the other on-disk MCP config files stay with the `mcp-config`
+    CanaryTrap — this matcher covers the wire endpoints, not the config
+    files."""
+    if not MCP_SERVER_ENABLED:
+        return False
+    return path.lower() in MCP_SERVER_PATHS
 
 
 def _file_upload_family(path: str) -> str:
@@ -16825,6 +16891,453 @@ async def _handle_llm_endpoint(
     )
 
 
+def _mcp_error_response(request_id_field: object, code: int, message: str) -> bytes:
+    """Return a JSON-RPC 2.0 error envelope as bytes."""
+    envelope = {
+        "jsonrpc": "2.0",
+        "id": request_id_field if request_id_field is not None else None,
+        "error": {"code": code, "message": message},
+    }
+    return json.dumps(envelope).encode("utf-8")
+
+
+def _mcp_result_response(request_id_field: object, result: object) -> bytes:
+    """Return a JSON-RPC 2.0 result envelope as bytes."""
+    envelope = {
+        "jsonrpc": "2.0",
+        "id": request_id_field if request_id_field is not None else None,
+        "result": result,
+    }
+    return json.dumps(envelope).encode("utf-8")
+
+
+def _mcp_tool_catalog() -> list[dict[str, object]]:
+    """The tool catalog `tools/list` returns. Names chosen to bait the
+    exact scanner grep patterns for secret-fetch / file-read / shell tools
+    without shipping anything scanner-observable that could look like a
+    real capability. Descriptions are intentionally boring so the catalog
+    reads as a plausible internal server rather than a hand-crafted trap."""
+    return [
+        {
+            "name": "fetch_secret",
+            "description": "Fetch a named secret from the workspace secret store.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+        {
+            "name": "filesystem_read",
+            "description": "Read a file from the workspace filesystem.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "list_workspace_files",
+            "description": "List files in the current workspace directory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+            },
+        },
+        {
+            "name": "database_query",
+            "description": "Run a read-only SQL query against the workspace database.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "shell_exec",
+            "description": "Execute a shell command inside the workspace sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    ]
+
+
+def _mcp_resource_catalog() -> list[dict[str, object]]:
+    """The resource catalog `resources/list` returns. URI shapes bait the
+    canary-issue path when the scanner follows up with `resources/read`."""
+    return [
+        {
+            "uri": "env://AWS_ACCESS_KEY_ID",
+            "name": "AWS_ACCESS_KEY_ID",
+            "description": "Workspace AWS access key id (env var).",
+            "mimeType": "text/plain",
+        },
+        {
+            "uri": "env://AWS_SECRET_ACCESS_KEY",
+            "name": "AWS_SECRET_ACCESS_KEY",
+            "description": "Workspace AWS secret access key (env var).",
+            "mimeType": "text/plain",
+        },
+        {
+            "uri": "file:///workspace/.env",
+            "name": ".env",
+            "description": "Workspace dotenv file.",
+            "mimeType": "text/plain",
+        },
+        {
+            "uri": "file:///etc/mcp/credentials.json",
+            "name": "credentials.json",
+            "description": "MCP server credentials.",
+            "mimeType": "application/json",
+        },
+    ]
+
+
+def _mcp_render_tool_secret_text(aws: dict[str, str]) -> str:
+    """Text body a real MCP tool-call result would return when the tool
+    fetched a secret. Mirrors the `.env` renderer shape enough that a
+    scraper walking `content[0].text` for `AKIA…` sees the canary."""
+    return (
+        "AWS_ACCESS_KEY_ID=" + aws.get("awsAccessKeyId", "") + "\n"
+        "AWS_SECRET_ACCESS_KEY=" + aws.get("awsSecretAccessKey", "") + "\n"
+        "AWS_SESSION_TOKEN=" + aws.get("awsSessionToken", "") + "\n"
+        "AWS_DEFAULT_REGION=us-east-1\n"
+    )
+
+
+def _mcp_render_resource_env_text(uri: str, aws: dict[str, str]) -> str:
+    """Body for `resources/read` on an `env://AWS_*` URI — return just the
+    value the scanner asked for."""
+    lower = uri.lower()
+    if "aws_access_key_id" in lower:
+        return aws.get("awsAccessKeyId", "")
+    if "aws_secret_access_key" in lower:
+        return aws.get("awsSecretAccessKey", "")
+    if "aws_session_token" in lower:
+        return aws.get("awsSessionToken", "")
+    return _mcp_render_tool_secret_text(aws)
+
+
+def _mcp_render_resource_file_text(uri: str, aws: dict[str, str]) -> str:
+    """Body for `resources/read` on a `file://` credentials URI."""
+    if uri.lower().endswith("credentials.json"):
+        payload = {
+            "aws_access_key_id": aws.get("awsAccessKeyId", ""),
+            "aws_secret_access_key": aws.get("awsSecretAccessKey", ""),
+            "aws_session_token": aws.get("awsSessionToken", ""),
+            "region": "us-east-1",
+        }
+        return json.dumps(payload, indent=2)
+    # `.env` shape — same as tool-call secret.
+    return _mcp_render_tool_secret_text(aws)
+
+
+def _mcp_secret_tool_matches(tool_name: str) -> bool:
+    return tool_name.lower() in _MCP_SECRET_TOOL_NAMES
+
+
+def _mcp_secret_resource_matches(uri: str) -> bool:
+    lower = uri.lower()
+    return any(indicator in lower for indicator in _MCP_SECRET_RESOURCE_INDICATORS)
+
+
+def extract_mcp_argument_preview(arguments: object) -> str:
+    """Return a bounded preview string of `tools/call` arguments. Scanners
+    that reach `tools/call` may send large tool arguments; the preview
+    keeps the log line short while preserving the scanner's intent."""
+    if arguments is None:
+        return ""
+    try:
+        rendered = json.dumps(arguments, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        rendered = str(arguments)
+    if len(rendered) > MCP_SERVER_BODY_DECODE_LIMIT:
+        return rendered[:MCP_SERVER_BODY_DECODE_LIMIT]
+    return rendered
+
+
+async def _handle_mcp_server_endpoint(
+    request: web.Request,
+    log_context: dict[str, object],
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    request_body: bytes,
+) -> web.StreamResponse:
+    """Dispatch a fake MCP server response.
+
+    `GET /sse` returns the SSE handshake (`event: endpoint` + a POST
+    endpoint) so scanners walking the older HTTP+SSE transport keep
+    reading. `POST` on `/mcp` / `/mcp/` / `/mcp/messages` parses a
+    JSON-RPC 2.0 envelope and dispatches on `method`:
+
+      - `initialize` / `tools/list` / `resources/list` / `prompts/list`
+        / `ping` — plausible catalog / handshake response.
+      - `tools/call` on a secret-fetch tool name — mints a per-request
+        Tracebit AWS canary and returns it as the tool-call text
+        content (the slot scrapers grep for `AKIA…`).
+      - `resources/read` on an `env://AWS_*` / `.env` / MCP-credentials
+        URI — same canary path.
+      - Any other method — returns `{}` so the scanner keeps probing.
+
+    Captures the bearer token (sha256 + preview) presented in the
+    Authorization header for cross-IP replay grouping.
+    """
+    method_http = request.method
+    lpath = path.lower()
+
+    auth_header = request.headers.get("Authorization", "")
+    api_key_header = (
+        request.headers.get("x-api-key", "")
+        or request.headers.get("X-Api-Key", "")
+    )
+    has_auth = bool(auth_header) or bool(api_key_header)
+    token_sha, token_preview = capture_llm_auth_token(auth_header, api_key_header)
+
+    log_base: dict[str, object] = {
+        **log_context,
+        "mcpHasAuth": has_auth,
+        "mcpAuthScheme": auth_header.split(" ", 1)[0].lower() if auth_header else "",
+        "mcpMethod": method_http,
+    }
+    if token_sha:
+        log_base["mcpAuthTokenSha256"] = token_sha
+        log_base["mcpAuthTokenPreview"] = token_preview
+
+    if lpath == "/sse":
+        if method_http != "GET":
+            append_log({**log_base, "status": 405, "result": "mcp-server-sse-method-not-allowed"})
+            return web.Response(
+                status=405, body=b"method not allowed\n",
+                headers={"Content-Type": "text/plain; charset=utf-8"},
+            )
+        append_log({**log_base, "status": 200, "result": "mcp-server-sse-handshake"})
+        body = b"event: endpoint\r\ndata: /mcp/messages\r\n\r\n"
+        return web.Response(
+            status=200, body=body,
+            headers={
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-store",
+                "Connection": "keep-alive",
+            },
+        )
+
+    if method_http != "POST":
+        append_log({**log_base, "status": 405, "result": "mcp-server-method-not-allowed"})
+        body = _mcp_error_response(None, -32600, "Method Not Allowed. This endpoint requires POST.")
+        return web.Response(
+            status=405, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    try:
+        payload = json.loads(request_body.decode("utf-8", errors="replace"))
+    except (ValueError, UnicodeDecodeError):
+        append_log({**log_base, "status": 200, "result": "mcp-server-parse-error"})
+        body = _mcp_error_response(None, -32700, "Parse error")
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if not isinstance(payload, dict):
+        append_log({**log_base, "status": 200, "result": "mcp-server-invalid-request"})
+        body = _mcp_error_response(None, -32600, "Invalid Request")
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    jsonrpc_id = payload.get("id")
+    rpc_method = payload.get("method")
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    log_base["mcpJsonrpcMethod"] = rpc_method if isinstance(rpc_method, str) else ""
+
+    if not isinstance(rpc_method, str) or not rpc_method:
+        append_log({**log_base, "status": 200, "result": "mcp-server-invalid-request"})
+        body = _mcp_error_response(jsonrpc_id, -32600, "Invalid Request")
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if rpc_method == "initialize":
+        client_info = params.get("clientInfo") if isinstance(params, dict) else None
+        if isinstance(client_info, dict):
+            client_name = client_info.get("name")
+            client_version = client_info.get("version")
+            if isinstance(client_name, str):
+                log_base["mcpClientName"] = client_name[:120]
+            if isinstance(client_version, str):
+                log_base["mcpClientVersion"] = client_version[:60]
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {"listChanged": True},
+                "resources": {"listChanged": True, "subscribe": True},
+                "prompts": {"listChanged": True},
+                "logging": {},
+            },
+            "serverInfo": {
+                "name": "internal-mcp-server",
+                "version": "0.1.4",
+            },
+        }
+        append_log({**log_base, "status": 200, "result": "mcp-server-initialize"})
+        body = _mcp_result_response(jsonrpc_id, result)
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if rpc_method == "tools/list":
+        append_log({**log_base, "status": 200, "result": "mcp-server-tools-list"})
+        body = _mcp_result_response(jsonrpc_id, {"tools": _mcp_tool_catalog()})
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if rpc_method == "tools/call":
+        tool_name = params.get("name") if isinstance(params.get("name"), str) else ""
+        arguments = params.get("arguments")
+        log_base["mcpToolName"] = tool_name[:120]
+        args_preview = extract_mcp_argument_preview(arguments)
+        if args_preview:
+            log_base["mcpToolArgsPreview"] = args_preview
+
+        if API_KEY and _mcp_secret_tool_matches(tool_name):
+            tracebit_response = await _get_or_issue_canary(
+                ("aws",), client_ip, request_id, host, user_agent, path, proto,
+            )
+            if tracebit_response is None:
+                append_log({
+                    **log_base, "status": 200, "result": "mcp-server-tools-call-tracebit-error",
+                })
+                body = _mcp_error_response(jsonrpc_id, -32603, "Internal error")
+                return web.Response(
+                    status=200, body=body,
+                    headers={"Content-Type": "application/json; charset=utf-8"},
+                )
+            aws = _aws(tracebit_response)
+            text = _mcp_render_tool_secret_text(aws)
+            result = {
+                "content": [{"type": "text", "text": text}],
+                "isError": False,
+            }
+            append_log({
+                **log_base, "status": 200, "result": "mcp-server-tools-call-issued",
+                "types": [key for key, value in tracebit_response.items() if value],
+            })
+            body = _mcp_result_response(jsonrpc_id, result)
+            return web.Response(
+                status=200, body=body,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+
+        # Non-secret tool (or no API_KEY) — return an error the way a real
+        # server would if the tool doesn't exist or execution failed.
+        append_log({**log_base, "status": 200, "result": "mcp-server-tools-call-other"})
+        result = {
+            "content": [{"type": "text", "text": "tool execution failed: permission denied"}],
+            "isError": True,
+        }
+        body = _mcp_result_response(jsonrpc_id, result)
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if rpc_method == "resources/list":
+        append_log({**log_base, "status": 200, "result": "mcp-server-resources-list"})
+        body = _mcp_result_response(jsonrpc_id, {"resources": _mcp_resource_catalog()})
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if rpc_method == "resources/read":
+        uri = params.get("uri") if isinstance(params.get("uri"), str) else ""
+        log_base["mcpResourceUri"] = uri[:400]
+
+        if API_KEY and _mcp_secret_resource_matches(uri):
+            tracebit_response = await _get_or_issue_canary(
+                ("aws",), client_ip, request_id, host, user_agent, path, proto,
+            )
+            if tracebit_response is None:
+                append_log({
+                    **log_base, "status": 200,
+                    "result": "mcp-server-resources-read-tracebit-error",
+                })
+                body = _mcp_error_response(jsonrpc_id, -32603, "Internal error")
+                return web.Response(
+                    status=200, body=body,
+                    headers={"Content-Type": "application/json; charset=utf-8"},
+                )
+            aws = _aws(tracebit_response)
+            if uri.lower().startswith("env://"):
+                text = _mcp_render_resource_env_text(uri, aws)
+                mime = "text/plain"
+            else:
+                text = _mcp_render_resource_file_text(uri, aws)
+                mime = "application/json" if uri.lower().endswith(".json") else "text/plain"
+            result = {
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": mime,
+                    "text": text,
+                }],
+            }
+            append_log({
+                **log_base, "status": 200, "result": "mcp-server-resources-read-issued",
+                "types": [key for key, value in tracebit_response.items() if value],
+            })
+            body = _mcp_result_response(jsonrpc_id, result)
+            return web.Response(
+                status=200, body=body,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+
+        append_log({**log_base, "status": 200, "result": "mcp-server-resources-read-other"})
+        body = _mcp_error_response(jsonrpc_id, -32602, "Invalid params: resource not found")
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if rpc_method == "prompts/list":
+        append_log({**log_base, "status": 200, "result": "mcp-server-prompts-list"})
+        body = _mcp_result_response(jsonrpc_id, {"prompts": []})
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if rpc_method == "ping":
+        append_log({**log_base, "status": 200, "result": "mcp-server-ping"})
+        body = _mcp_result_response(jsonrpc_id, {})
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    # Unknown method — return an empty success so the scanner keeps
+    # probing. `notifications/*` calls carry no `id` so a bare
+    # `result: {}` is a valid response shape.
+    append_log({**log_base, "status": 200, "result": "mcp-server-other"})
+    body = _mcp_result_response(jsonrpc_id, {})
+    return web.Response(
+        status=200, body=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+
+
 async def _handle_openapi_swagger(
     request: web.Request,
     log_context: dict[str, object],
@@ -21882,6 +22395,12 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_llm_endpoint_path(path):
         return await _handle_llm_endpoint(request, log_context, path, request_body)
 
+    if is_mcp_server_endpoint_path(path):
+        return await _handle_mcp_server_endpoint(
+            request, log_context, request_id, path,
+            client_ip, host, user_agent, proto, request_body,
+        )
+
     if is_openapi_swagger_path(path):
         return await _handle_openapi_swagger(request, log_context, request_id, path)
 
@@ -22128,6 +22647,8 @@ def main() -> int:
         active.append("file-upload")
     if LLM_ENDPOINT_ENABLED:
         active.append("llm-endpoint")
+    if MCP_SERVER_ENABLED:
+        active.append("mcp-server-endpoint")
     if SONICWALL_ENABLED:
         active.append("sonicwall-ssl-vpn")
     if CISCO_WEBVPN_ENABLED:

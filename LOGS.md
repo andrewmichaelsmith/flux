@@ -140,6 +140,50 @@ Extras on every `llm-endpoint-*` line:
 | `bytes` | int | Size of the response body returned (sum across streaming chunks). |
 | `llmPromptPreview` | string | Prefix of the extracted prompt, truncated to `HONEYPOT_LLM_BODY_DECODE_LIMIT`. Omitted if empty. |
 
+### Fake MCP (Model Context Protocol) server endpoint
+
+One log line per hit. Covers the runtime dispatch surface (`/mcp`,
+`/mcp/`, `/mcp/messages`) and the SSE handshake (`/sse`). The on-disk
+MCP config files (`/mcp.json`, `/.cursor/mcp.json`, …) are the
+`mcp-config` CanaryTrap and log under a different `result` tag.
+
+| `result` | `status` | Meaning |
+| --- | --- | --- |
+| `mcp-server-sse-handshake` | 200 | `GET /sse` — SSE handshake, sends one `event: endpoint` frame pointing at `/mcp/messages`. |
+| `mcp-server-sse-method-not-allowed` | 405 | Non-GET on `/sse`. |
+| `mcp-server-method-not-allowed` | 405 | Non-POST on a JSON-RPC endpoint. |
+| `mcp-server-parse-error` | 200 | Body wasn't valid JSON. JSON-RPC `-32700`. |
+| `mcp-server-invalid-request` | 200 | JSON body wasn't a JSON-RPC object or was missing `method`. JSON-RPC `-32600`. |
+| `mcp-server-initialize` | 200 | `initialize` — returns fake `serverInfo` + capabilities. |
+| `mcp-server-tools-list` | 200 | `tools/list` — returns the five-tool catalog. |
+| `mcp-server-tools-call-issued` | 200 | `tools/call` on a secret-fetch tool name — Tracebit AWS canary was minted and returned in `content[0].text`. |
+| `mcp-server-tools-call-other` | 200 | `tools/call` on a non-secret tool (e.g. `shell_exec`) or on any tool when no `TRACEBIT_API_KEY`. Returns `isError: true`. |
+| `mcp-server-tools-call-tracebit-error` | 200 | `tools/call` matched the secret path but the canary issuance failed / timed out. |
+| `mcp-server-resources-list` | 200 | `resources/list` — returns the resource catalog. |
+| `mcp-server-resources-read-issued` | 200 | `resources/read` on `env://AWS_*` / `.env` / MCP-credentials URI — Tracebit AWS canary embedded in `contents[0].text`. |
+| `mcp-server-resources-read-other` | 200 | `resources/read` on any other URI. JSON-RPC `-32602`. |
+| `mcp-server-resources-read-tracebit-error` | 200 | Secret URI matched but canary issuance failed. |
+| `mcp-server-prompts-list` | 200 | `prompts/list` — returns `{"prompts": []}`. |
+| `mcp-server-ping` | 200 | `ping` — heartbeat. |
+| `mcp-server-other` | 200 | Any other JSON-RPC method (`notifications/*`, `logging/*`, …). Returns `{}`. |
+
+Extras on every `mcp-server-*` line:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `mcpMethod` | string | Request method (`GET` / `POST` / `HEAD`). |
+| `mcpJsonrpcMethod` | string | The `method` field from the JSON-RPC body (`initialize`, `tools/call`, `resources/read`, …). `""` on the SSE handshake or malformed bodies. |
+| `mcpHasAuth` | bool | `true` if `Authorization` or `x-api-key` header was present. Stolen MCP access tokens replayed from many IPs are direct intel. |
+| `mcpAuthScheme` | string | Lowercased first token of `Authorization` (`bearer`, `basic`, …); `""` otherwise. |
+| `mcpAuthTokenSha256` | string | sha256 of the raw bearer / x-api-key token. Omitted when no auth was sent. |
+| `mcpAuthTokenPreview` | string | First 12 + last 4 chars of the token with a `...` elision. Omitted when no auth was sent. |
+| `mcpClientName` | string | `params.clientInfo.name` from an `initialize` call (`cursor`, `claude-code`, `cline`, …). Truncated to 120 chars. |
+| `mcpClientVersion` | string | `params.clientInfo.version` from an `initialize` call. Truncated to 60 chars. |
+| `mcpToolName` | string | `params.name` from a `tools/call`. |
+| `mcpToolArgsPreview` | string | JSON-serialised `params.arguments` from a `tools/call`, truncated to `HONEYPOT_MCP_SERVER_BODY_DECODE_LIMIT`. Recovers `shell_exec` / `database_query` payloads without inflating the log line. |
+| `mcpResourceUri` | string | `params.uri` from a `resources/read`, truncated to 400 chars. |
+| `types` | list | `["aws"]` on `mcp-server-tools-call-issued` / `mcp-server-resources-read-issued`. |
+
 ### Fake SonicWall SSL VPN
 
 One log line per hit.

@@ -145,6 +145,20 @@ No Tracebit key required.
 | `HONEYPOT_LLM_ENDPOINT_PATHS_CSV` | *(built-in — `/v1/models`, `/anthropic/v1/models`, `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages`, `/anthropic/v1/messages`)* | Exact, case-insensitive. Override to add/remove without a code change. |
 | `HONEYPOT_LLM_BODY_DECODE_LIMIT` | `4096` | Max chars of the extracted `llmPromptPreview` written to the log. The raw body is still capped by `HONEYPOT_WEBSHELL_BODY_READ_LIMIT` (shared cap, default 64 KiB off the wire). |
 
+## Fake MCP server endpoint
+
+`TRACEBIT_API_KEY` required for the `tools/call` / `resources/read`
+canary responses; without it the trap still serves the JSON-RPC
+`initialize` / `tools/list` / `resources/list` catalogs, but every
+`tools/call` (including the secret-fetch tool names) returns
+`isError: true` and every `resources/read` returns `-32602`.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_MCP_SERVER_ENABLED` | on | Master switch. |
+| `HONEYPOT_MCP_SERVER_PATHS_CSV` | *(built-in — `/mcp`, `/mcp/`, `/mcp/messages`, `/sse`)* | Exact, case-insensitive. Override to add MCP transport paths without a code change. On-disk config files (`/mcp.json`, `/.cursor/mcp.json`, …) stay with the `mcp-config` CanaryTrap. |
+| `HONEYPOT_MCP_SERVER_BODY_DECODE_LIMIT` | `2048` | Max chars of the JSON-serialised `params.arguments` written to `mcpToolArgsPreview`. |
+
 ## Fake GraphQL endpoint
 
 `TRACEBIT_API_KEY` required for the credential-field and auth-mutation

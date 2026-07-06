@@ -546,6 +546,7 @@ def test_all_trap_families_default_on():
     assert tbenv.WEBSHELL_ENABLED
     assert tbenv.FILE_UPLOAD_ENABLED
     assert tbenv.LLM_ENDPOINT_ENABLED
+    assert tbenv.MCP_SERVER_ENABLED
     assert tbenv.SONICWALL_ENABLED
     assert tbenv.CISCO_WEBVPN_ENABLED
     assert tbenv.IVANTI_VPN_ENABLED
@@ -2950,6 +2951,347 @@ def test_capture_llm_auth_token_short_token():
     sha, preview = tbenv.capture_llm_auth_token("Bearer short", "")
     assert sha == hashlib.sha256(b"short").hexdigest()
     assert preview  # non-empty
+
+
+# --- MCP server-endpoint runtime trap ----------------------------------
+
+
+def test_mcp_server_endpoint_enabled_by_default():
+    assert tbenv.MCP_SERVER_ENABLED
+
+
+def test_mcp_server_endpoint_default_paths_cover_observed_probes():
+    """Every runtime-endpoint path observed hitting the fleet's not-handled
+    bucket must match. `/mcp.json` and other on-disk config filenames stay
+    with the `mcp-config` CanaryTrap and are intentionally NOT in this set."""
+    for path in ["/mcp", "/mcp/", "/mcp/messages", "/sse"]:
+        assert tbenv.is_mcp_server_endpoint_path(path), f"expected match: {path}"
+
+
+def test_mcp_server_endpoint_path_case_insensitive():
+    assert tbenv.is_mcp_server_endpoint_path("/MCP")
+    assert tbenv.is_mcp_server_endpoint_path("/SSE")
+
+
+def test_mcp_server_endpoint_path_non_match():
+    for path in ["/", "/mcp/messages/extra", "/mcp.json", "/.cursor/mcp.json", "/sse/foo"]:
+        assert not tbenv.is_mcp_server_endpoint_path(path)
+
+
+def test_mcp_server_endpoint_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "MCP_SERVER_ENABLED", False)
+    assert not tbenv.is_mcp_server_endpoint_path("/mcp")
+    assert not tbenv.is_mcp_server_endpoint_path("/sse")
+
+
+def test_mcp_secret_tool_matches_covers_seed_names():
+    for name in [
+        "fetch_secret", "get_secret", "read_secret", "read_env",
+        "filesystem_read", "read_file", "fs_read",
+        "list_workspace_files", "database_query", "sql_query",
+    ]:
+        assert tbenv._mcp_secret_tool_matches(name), name
+    # Case-insensitive.
+    assert tbenv._mcp_secret_tool_matches("Filesystem_Read")
+
+
+def test_mcp_secret_tool_does_not_match_generic():
+    for name in ["", "shell_exec", "echo", "search_web", "compile_project"]:
+        assert not tbenv._mcp_secret_tool_matches(name), name
+
+
+def test_mcp_secret_resource_matches_env_and_files():
+    for uri in [
+        "env://AWS_ACCESS_KEY_ID",
+        "env://aws_secret_access_key",
+        "file:///workspace/.env",
+        "file:///etc/mcp/credentials.json",
+        "file:///root/.aws/credentials",
+    ]:
+        assert tbenv._mcp_secret_resource_matches(uri), uri
+
+
+def test_mcp_secret_resource_does_not_match_unrelated():
+    for uri in ["", "env://PATH", "file:///workspace/README.md", "https://example.com"]:
+        assert not tbenv._mcp_secret_resource_matches(uri), uri
+
+
+def test_mcp_tool_catalog_contains_secret_tools():
+    catalog = tbenv._mcp_tool_catalog()
+    names = {tool["name"] for tool in catalog}
+    # The catalog must include at least one tool that trips the canary path
+    # so a scanner walking `tools/list` -> `tools/call` finds a live target.
+    assert "fetch_secret" in names
+    assert "filesystem_read" in names
+
+
+def test_mcp_resource_catalog_contains_secret_resources():
+    catalog = tbenv._mcp_resource_catalog()
+    uris = {r["uri"] for r in catalog}
+    assert "env://AWS_ACCESS_KEY_ID" in uris
+    assert "file:///workspace/.env" in uris
+
+
+def test_extract_mcp_argument_preview_bounded(monkeypatch):
+    monkeypatch.setattr(tbenv, "MCP_SERVER_BODY_DECODE_LIMIT", 32)
+    preview = tbenv.extract_mcp_argument_preview({"query": "A" * 500})
+    assert len(preview) == 32
+
+
+def test_extract_mcp_argument_preview_empty():
+    assert tbenv.extract_mcp_argument_preview(None) == ""
+    assert tbenv.extract_mcp_argument_preview({}) == "{}"
+
+
+async def test_dispatch_mcp_get_sse_returns_endpoint_event(flux_client):
+    resp = await flux_client.get(
+        "/sse",
+        headers={"X-Forwarded-For": "203.0.113.60", "User-Agent": "scanner/1.0"},
+    )
+    assert resp.status == 200
+    assert "text/event-stream" in resp.headers.get("Content-Type", "")
+    body = await resp.text()
+    assert "event: endpoint" in body
+    assert "data: /mcp/messages" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "mcp-server-sse-handshake"
+
+
+async def test_dispatch_mcp_initialize_returns_capabilities(flux_client):
+    import json
+    resp = await flux_client.post(
+        "/mcp",
+        headers={
+            "X-Forwarded-For": "203.0.113.61",
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-mcp-stolen-1234567890",
+        },
+        data=json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "clientInfo": {"name": "cursor", "version": "0.42"},
+            },
+        }),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["jsonrpc"] == "2.0"
+    assert body["id"] == 1
+    assert body["result"]["serverInfo"]["name"]
+    assert body["result"]["capabilities"]["tools"]
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "mcp-server-initialize"
+    assert entry["mcpClientName"] == "cursor"
+    assert entry["mcpClientVersion"] == "0.42"
+    assert entry["mcpHasAuth"] is True
+    assert entry["mcpAuthScheme"] == "bearer"
+    assert entry["mcpAuthTokenSha256"] == hashlib.sha256(
+        b"sk-mcp-stolen-1234567890"
+    ).hexdigest()
+
+
+async def test_dispatch_mcp_tools_list_returns_catalog(flux_client):
+    import json
+    resp = await flux_client.post(
+        "/mcp/messages",
+        headers={"X-Forwarded-For": "203.0.113.62", "Content-Type": "application/json"},
+        data=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    names = {t["name"] for t in body["result"]["tools"]}
+    assert "fetch_secret" in names
+    assert "filesystem_read" in names
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "mcp-server-tools-list"
+
+
+async def test_dispatch_mcp_tools_call_secret_tool_issues_canary(flux_client, monkeypatch):
+    """`tools/call` on a secret-fetch tool mints an AWS canary and embeds it
+    in the tool-call result text. This is the money shot."""
+    import json
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.post(
+        "/mcp",
+        headers={"X-Forwarded-For": "203.0.113.63", "Content-Type": "application/json"},
+        data=json.dumps({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "fetch_secret", "arguments": {"name": "AWS_ACCESS_KEY_ID"}},
+        }),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    text = body["result"]["content"][0]["text"]
+    assert "AKIAFAKEEXAMPLE01" in text
+    assert "AWS_SECRET_ACCESS_KEY=" in text
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "mcp-server-tools-call-issued"
+    assert entry["mcpToolName"] == "fetch_secret"
+    assert "aws" in entry["types"]
+
+
+async def test_dispatch_mcp_tools_call_shell_exec_returns_error(flux_client, monkeypatch):
+    """`tools/call` on a non-secret tool (e.g. shell_exec) returns an error
+    envelope — we don't want to imitate real code execution."""
+    import json
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.post(
+        "/mcp",
+        headers={"X-Forwarded-For": "203.0.113.64", "Content-Type": "application/json"},
+        data=json.dumps({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "shell_exec", "arguments": {"command": "id"}},
+        }),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["result"]["isError"] is True
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "mcp-server-tools-call-other"
+    assert entry["mcpToolName"] == "shell_exec"
+    # Argument preview captures the attempted command for triage.
+    assert "id" in entry.get("mcpToolArgsPreview", "")
+
+
+async def test_dispatch_mcp_resources_read_env_aws_issues_canary(flux_client, monkeypatch):
+    import json
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.post(
+        "/mcp",
+        headers={"X-Forwarded-For": "203.0.113.65", "Content-Type": "application/json"},
+        data=json.dumps({
+            "jsonrpc": "2.0", "id": 5, "method": "resources/read",
+            "params": {"uri": "env://AWS_ACCESS_KEY_ID"},
+        }),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    content_text = body["result"]["contents"][0]["text"]
+    assert content_text == "AKIAFAKEEXAMPLE01"
+    entries = _log_entries(flux_client.log_path)
+    entry = entries[-1]
+    assert entry["result"] == "mcp-server-resources-read-issued"
+    assert entry["mcpResourceUri"] == "env://AWS_ACCESS_KEY_ID"
+
+
+async def test_dispatch_mcp_resources_read_workspace_env_file_issues_canary(
+    flux_client, monkeypatch,
+):
+    """The full `.env`-shape body is returned so scrapers walking `contents[].text`
+    for `AKIA…` still harvest the canary."""
+    import json
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.post(
+        "/mcp",
+        headers={"X-Forwarded-For": "203.0.113.66", "Content-Type": "application/json"},
+        data=json.dumps({
+            "jsonrpc": "2.0", "id": 6, "method": "resources/read",
+            "params": {"uri": "file:///workspace/.env"},
+        }),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    content_text = body["result"]["contents"][0]["text"]
+    assert "AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in content_text
+    assert "AWS_SECRET_ACCESS_KEY=" in content_text
+
+
+async def test_dispatch_mcp_resources_read_unknown_uri_returns_error(flux_client):
+    import json
+    resp = await flux_client.post(
+        "/mcp",
+        headers={"X-Forwarded-For": "203.0.113.67", "Content-Type": "application/json"},
+        data=json.dumps({
+            "jsonrpc": "2.0", "id": 7, "method": "resources/read",
+            "params": {"uri": "file:///workspace/README.md"},
+        }),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["error"]["code"] == -32602
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "mcp-server-resources-read-other"
+
+
+async def test_dispatch_mcp_get_on_post_endpoint_returns_405(flux_client):
+    resp = await flux_client.get(
+        "/mcp",
+        headers={"X-Forwarded-For": "203.0.113.68"},
+    )
+    assert resp.status == 405
+    body = await resp.json()
+    assert body["error"]["code"] == -32600
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "mcp-server-method-not-allowed"
+
+
+async def test_dispatch_mcp_malformed_json_still_200(flux_client):
+    """Scanner may send garbage; don't 500 — we want to look live."""
+    resp = await flux_client.post(
+        "/mcp",
+        headers={"X-Forwarded-For": "203.0.113.69", "Content-Type": "application/json"},
+        data=b"{this is not json",
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["error"]["code"] == -32700
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "mcp-server-parse-error"
+
+
+async def test_dispatch_mcp_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "MCP_SERVER_ENABLED", False)
+    resp = await flux_client.post(
+        "/mcp",
+        headers={"X-Forwarded-For": "203.0.113.70", "Content-Type": "application/json"},
+        data=b'{"jsonrpc":"2.0","id":1,"method":"initialize"}',
+    )
+    assert resp.status == 404
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "not-handled"
+
+
+async def test_dispatch_mcp_tools_call_without_api_key_returns_error(flux_client, monkeypatch):
+    """No TRACEBIT_API_KEY -> canary-backed traps stay off; secret tool call
+    still returns the isError envelope so the scanner-visible protocol looks
+    plausible."""
+    import json
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    resp = await flux_client.post(
+        "/mcp",
+        headers={"X-Forwarded-For": "203.0.113.71", "Content-Type": "application/json"},
+        data=json.dumps({
+            "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+            "params": {"name": "fetch_secret", "arguments": {"name": "AWS_ACCESS_KEY_ID"}},
+        }),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["result"]["isError"] is True
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "mcp-server-tools-call-other"
+
+
+async def test_dispatch_mcp_ping_returns_empty_result(flux_client):
+    import json
+    resp = await flux_client.post(
+        "/mcp/messages",
+        headers={"X-Forwarded-For": "203.0.113.72", "Content-Type": "application/json"},
+        data=json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"}),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["result"] == {}
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "mcp-server-ping"
 
 
 def test_render_openai_chat_sse_chunks_shape():
