@@ -728,6 +728,23 @@ FAKE_TRACEBIT = {
     ("/wp-config.php.dist", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/wp-config.php::$data", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/wp-config-backup.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
+    # Magento 2 env.php — AWS canary lands in the `system.default.aws_s3`
+    # slot alongside the S3 bucket name. Grep-based scanners keying on
+    # `access_key` / `secret_key` also match the field names here.
+    ("/app/etc/env.php", b"'access_key' => 'AKIAFAKEEXAMPLE01'"),
+    ("/app/etc/env.php", b"'secret_key' => 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'"),
+    ("/app/etc/env.php.bak", b"'access_key' => 'AKIAFAKEEXAMPLE01'"),
+    ("/magento/app/etc/env.php", b"'access_key' => 'AKIAFAKEEXAMPLE01'"),
+    ("/magento2/app/etc/env.php", b"'access_key' => 'AKIAFAKEEXAMPLE01'"),
+    ("/shop/app/etc/env.php", b"'access_key' => 'AKIAFAKEEXAMPLE01'"),
+    ("/store/app/etc/env.php", b"'access_key' => 'AKIAFAKEEXAMPLE01'"),
+    ("/var/www/html/app/etc/env.php", b"'access_key' => 'AKIAFAKEEXAMPLE01'"),
+    # Sibling Magento 1.x local.xml alias — same render, so the canary
+    # still lands in the AWS-S3 slot regardless of which filename the
+    # scanner dict walks.
+    ("/app/etc/local.xml", b"'access_key' => 'AKIAFAKEEXAMPLE01'"),
+    ("/app/etc/config.php", b"'access_key' => 'AKIAFAKEEXAMPLE01'"),
+    ("/%61%70%70/%65%74%63/%65%6e%76.%70%68%70", b"'access_key' => 'AKIAFAKEEXAMPLE01'"),
     ("/backup/wp-config.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     # Absolute-webroot path-traversal variants — scanner dicts walk
     # canonical Apache / nginx install paths.
@@ -1213,6 +1230,12 @@ def test_canary_trap_renderers_embed_canary(path, needle):
     # LOGGED_IN_KEY so the body doesn't fingerprint the fleet.
     "/wp-content/debug.log",
     "/var/www/html/wp-content/debug.log",
+    # Magento env.php — per-hit crypt.key, DB password, session password,
+    # AMQP password, admin_url_secret, admin frontName all randomised so
+    # nothing pins the fleet to a single fingerprint.
+    "/app/etc/env.php",
+    "/magento/app/etc/env.php",
+    "/var/www/html/app/etc/env.php",
 ])
 def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
     # Regression: the ``h6T!9pq2Wz@LmRnV`` / ``prod_rw`` DB-password literal
@@ -1941,11 +1964,110 @@ def test_render_k8s_secret_manifest_db_password_is_per_hit_unique():
     "/k8s/secret.yaml",
     "/k8s/deployment.yaml",
     "/k8s/deployment.yml",
+    # Magento env.php family — each variant must resolve to a CanaryTrap
+    # entry (owned by `magento-env`, not folded into `env-vault`).
+    "/app/etc/env.php",
+    "/app/etc/env.php.bak",
+    "/app/etc/env.php.old",
+    "/app/etc/env.php.save",
+    "/app/etc/env.php.swp",
+    "/app/etc/env.php.dist",
+    "/app/etc/env.sample.php",
+    "/magento/app/etc/env.php",
+    "/magento2/app/etc/env.php",
+    "/shop/app/etc/env.php",
+    "/store/app/etc/env.php",
+    "/app/etc/local.xml",
+    "/app/etc/config.php",
+    "/var/www/html/app/etc/env.php",
+    "/var/www/app/etc/env.php",
+    "/srv/www/app/etc/env.php",
+    "/usr/share/nginx/html/app/etc/env.php",
+    "/var/www/html/magento/app/etc/env.php",
+    "/var/www/html/magento2/app/etc/env.php",
+    "/%61%70%70/%65%74%63/%65%6e%76.%70%68%70",
 ])
 def test_new_canary_trap_paths_dispatch(path):
     assert path.lower() in tbenv._TRAP_BY_PATH, (
         f"{path!r} should be a CanaryTrap entry"
     )
+
+
+@pytest.mark.parametrize("path", [
+    "/app/etc/env.php",
+    "/magento/app/etc/env.php",
+    "/magento2/app/etc/env.php",
+    "/shop/app/etc/env.php",
+    "/store/app/etc/env.php",
+    "/var/www/html/app/etc/env.php",
+    "/app/etc/local.xml",
+    "/app/etc/config.php",
+])
+def test_magento_env_trap_uses_own_trap_kind(path):
+    """Regression: `/app/etc/env.php` and its siblings must dispatch to
+    the `magento-env` renderer (not fold into the generic `env-vault` or
+    tarpit). Merchant-side leak surface is distinct — grep-based
+    harvesters key off `crypt.key` / `admin_url_secret` / Magento-shaped
+    slots, not just AKIA bytes."""
+    trap = tbenv._TRAP_BY_PATH[path.lower()]
+    assert trap.name == "magento-env", (
+        f"{path!r} routes to {trap.name!r}; expected magento-env"
+    )
+
+
+def test_render_magento_env_php_shape_and_per_hit_uniqueness():
+    """Body must look like a real Magento 2 env.php PHP array — `<?php
+    return array(...)` — and every credential-shaped slot (crypt.key,
+    DB password, session password, AMQP password, admin URL secret,
+    admin frontName) must differ across two consecutive renders so the
+    fleet isn't fingerprintable by a fixed literal."""
+    body_1 = tbenv.render_magento_env_php(FAKE_TRACEBIT).decode("utf-8")
+    body_2 = tbenv.render_magento_env_php(FAKE_TRACEBIT).decode("utf-8")
+    assert body_1.startswith("<?php\nreturn array (\n")
+    assert body_1.rstrip().endswith(");")
+    for marker in (
+        "'crypt' => ",
+        "'key' => '",
+        "'db' => ",
+        "'connection' => ",
+        "'session' => ",
+        "'redis' => ",
+        "'queue' => ",
+        "'amqp' => ",
+        "'aws_s3' => ",
+        "'MAGE_MODE' => 'production'",
+        "'admin_url_secret' => '",
+        "'frontName' => 'admin_",
+    ):
+        assert marker in body_1, f"missing {marker!r} in Magento env.php render"
+    # AWS canary lands in the S3 slot in both renders.
+    assert "'access_key' => 'AKIAFAKEEXAMPLE01'" in body_1
+    assert "'access_key' => 'AKIAFAKEEXAMPLE01'" in body_2
+    # But the two bodies differ — per-hit random fields prevent a fixed
+    # cross-sensor fingerprint.
+    assert body_1 != body_2
+
+
+def test_magento_env_paths_do_not_match_tarpit():
+    """Tarpit dispatch runs before CanaryTrap lookup. Any Magento env.php
+    variant that matched `is_tarpit_path` would drip junk bytes forever
+    without embedding the AWS canary — cover the full path set against
+    the regression."""
+    for path in (
+        "/app/etc/env.php",
+        "/app/etc/env.php.bak",
+        "/magento/app/etc/env.php",
+        "/magento2/app/etc/env.php",
+        "/shop/app/etc/env.php",
+        "/store/app/etc/env.php",
+        "/app/etc/local.xml",
+        "/app/etc/config.php",
+        "/var/www/html/app/etc/env.php",
+    ):
+        assert not tbenv.is_tarpit_path(path), (
+            f"{path!r} matches is_tarpit_path — tarpit would shadow the "
+            f"magento-env canary trap"
+        )
 
 
 @pytest.mark.parametrize("path", [

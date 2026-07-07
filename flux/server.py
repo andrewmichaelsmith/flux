@@ -10565,6 +10565,145 @@ def render_wp_config_php(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_magento_env_php(r: dict[str, object]) -> bytes:
+    """Magento 2 `app/etc/env.php`. Real env.php is the merchant-side
+    config file `bin/magento setup:install` writes — every deploy carries
+    it and misconfigured static routes / backup archives leak it. Real
+    contents: DB credentials, crypt.key (encrypts admin password hashes
+    and stored payment info), session save handler + credentials, cache
+    backend, queue.amqp broker + credentials, admin URL secret. The AMQP
+    slot is where merchants wire in RabbitMQ / AWS-MQ workers, so an
+    S3-backed queue config with AWS creds is idiomatic. Every credential
+    slot is per-hit unique — the crypt.key, DB password, session token,
+    admin frontName, and backend prefix are all randomised so the fleet
+    can't be fingerprinted by a fixed literal."""
+    aws = _aws(r)
+    db_password = _fake_db_password()
+    session_password = _fake_db_password()
+    amqp_password = _fake_db_password()
+    crypt_key = secrets.token_hex(16)
+    admin_url_secret = secrets.token_urlsafe(20)
+    return (
+        "<?php\n"
+        "return array (\n"
+        "  'backend' => \n"
+        "  array (\n"
+        f"    'frontName' => 'admin_{secrets.token_hex(4)}',\n"
+        "  ),\n"
+        "  'db' => \n"
+        "  array (\n"
+        "    'table_prefix' => '',\n"
+        "    'connection' => \n"
+        "    array (\n"
+        "      'default' => \n"
+        "      array (\n"
+        "        'host' => 'db.internal',\n"
+        "        'dbname' => 'magento_prod',\n"
+        "        'username' => 'magento',\n"
+        f"        'password' => '{db_password}',\n"
+        "        'model' => 'mysql4',\n"
+        "        'engine' => 'innodb',\n"
+        "        'initStatements' => 'SET NAMES utf8;',\n"
+        "        'active' => '1',\n"
+        "        'driver_options' => \n"
+        "        array (\n"
+        "          1014 => false,\n"
+        "        ),\n"
+        "      ),\n"
+        "    ),\n"
+        "  ),\n"
+        "  'crypt' => \n"
+        "  array (\n"
+        f"    'key' => '{crypt_key}',\n"
+        "  ),\n"
+        "  'resource' => \n"
+        "  array (\n"
+        "    'default_setup' => \n"
+        "    array (\n"
+        "      'connection' => 'default',\n"
+        "    ),\n"
+        "  ),\n"
+        "  'x-frame-options' => 'SAMEORIGIN',\n"
+        "  'MAGE_MODE' => 'production',\n"
+        "  'session' => \n"
+        "  array (\n"
+        "    'save' => 'redis',\n"
+        "    'redis' => \n"
+        "    array (\n"
+        "      'host' => 'redis.internal',\n"
+        "      'port' => '6379',\n"
+        f"      'password' => '{session_password}',\n"
+        "      'timeout' => '2.5',\n"
+        "      'persistent_identifier' => '',\n"
+        "      'database' => '2',\n"
+        "      'compression_threshold' => '2048',\n"
+        "      'compression_library' => 'gzip',\n"
+        "      'log_level' => '1',\n"
+        "      'max_concurrency' => '6',\n"
+        "      'break_after_frontend' => '5',\n"
+        "      'break_after_adminhtml' => '30',\n"
+        "      'first_lifetime' => '600',\n"
+        "      'bot_first_lifetime' => '60',\n"
+        "      'bot_lifetime' => '7200',\n"
+        "      'disable_locking' => '0',\n"
+        "      'min_lifetime' => '60',\n"
+        "      'max_lifetime' => '2592000',\n"
+        "    ),\n"
+        "  ),\n"
+        "  'cache' => \n"
+        "  array (\n"
+        "    'frontend' => \n"
+        "    array (\n"
+        "      'default' => \n"
+        "      array (\n"
+        "        'backend' => 'Cm_Cache_Backend_Redis',\n"
+        "        'backend_options' => \n"
+        "        array (\n"
+        "          'server' => 'redis.internal',\n"
+        "          'database' => '0',\n"
+        "          'port' => '6379',\n"
+        "        ),\n"
+        "      ),\n"
+        "    ),\n"
+        "  ),\n"
+        "  'lock' => \n"
+        "  array (\n"
+        "    'provider' => 'db',\n"
+        "  ),\n"
+        "  'queue' => \n"
+        "  array (\n"
+        "    'amqp' => \n"
+        "    array (\n"
+        "      'host' => 'mq.internal',\n"
+        "      'port' => '5672',\n"
+        "      'user' => 'magento_mq',\n"
+        f"      'password' => '{amqp_password}',\n"
+        "      'virtualhost' => '/',\n"
+        "    ),\n"
+        "  ),\n"
+        "  'system' => \n"
+        "  array (\n"
+        "    'default' => \n"
+        "    array (\n"
+        "      'aws_s3' => \n"
+        "      array (\n"
+        "        'bucket' => 'magento-media-prod',\n"
+        "        'region' => 'us-east-1',\n"
+        f"        'access_key' => '{aws.get('awsAccessKeyId', '')}',\n"
+        f"        'secret_key' => '{aws.get('awsSecretAccessKey', '')}',\n"
+        f"        'session_token' => '{aws.get('awsSessionToken', '')}',\n"
+        "      ),\n"
+        "    ),\n"
+        "  ),\n"
+        "  'install' => \n"
+        "  array (\n"
+        "    'date' => 'Wed, 03 Jan 2024 15:22:41 +0000',\n"
+        "  ),\n"
+        f"  'admin_url_secret' => '{admin_url_secret}',\n"
+        ");\n"
+    ).encode("utf-8")
+
+
 def render_sql_dump(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
@@ -14772,6 +14911,56 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_sql_dump,
         "application/sql; charset=utf-8",
+    ),
+    # Magento 2 `app/etc/env.php` — the merchant-side config `bin/magento
+    # setup:install` writes to the docroot on every deploy. Distributed
+    # scanner fleets (broad cred-hunters, plus known TLM-Audit-Scanner
+    # middle-hash `cbb2034c60b8` and TECHOFF-NL AS48090 cohorts) walk it
+    # alongside `.env` / `wp-config.php`. Path aliases cover Magento-under-
+    # subpath deploys (/magento/, /magento2/, /shop/, /store/), the common
+    # webroot-prefix layouts, and the `.bak`/`.old` swap variants sloppy
+    # deploys leave behind. Own trap kind (not folded into `env-vault`)
+    # because the surface leaks Magento-specific slots — crypt.key,
+    # backend/frontName, admin_url_secret — that grep-based harvesters key
+    # off separately from generic .env AKIA scraping.
+    CanaryTrap(
+        "magento-env",
+        (
+            "/app/etc/env.php",
+            "/app/etc/env.php.bak",
+            "/app/etc/env.php.old",
+            "/app/etc/env.php.save",
+            "/app/etc/env.php.swp",
+            "/app/etc/env.php~",
+            "/app/etc/env.php.dist",
+            "/app/etc/env.sample.php",
+            # Sub-path Magento installs — reverse-proxy or dedicated
+            # /magento path is a recurring layout for merchants sharing
+            # a domain with a marketing CMS.
+            "/magento/app/etc/env.php",
+            "/magento2/app/etc/env.php",
+            "/shop/app/etc/env.php",
+            "/store/app/etc/env.php",
+            # Config-only backup archives sometimes ship the file at the
+            # local-config path from Magento 1.x for backwards compat.
+            "/app/etc/local.xml",
+            "/app/etc/config.php",
+            # Absolute-webroot path-traversal variants — same rationale as
+            # the wp-config entry above: a misconfigured `root /` static
+            # route exposes these.
+            "/var/www/html/app/etc/env.php",
+            "/var/www/app/etc/env.php",
+            "/srv/www/app/etc/env.php",
+            "/usr/share/nginx/html/app/etc/env.php",
+            "/var/www/html/magento/app/etc/env.php",
+            "/var/www/html/magento2/app/etc/env.php",
+            # Double-encoded variant so scanners that walk %-encoded
+            # dictionaries still land on the trap.
+            "/%61%70%70/%65%74%63/%65%6e%76.%70%68%70",
+        ),
+        ("aws",),
+        render_magento_env_php,
+        "application/x-php; charset=utf-8",
     ),
     CanaryTrap(
         "config-json",
