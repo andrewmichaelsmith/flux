@@ -2057,6 +2057,144 @@ def test_env_production_paths_unique():
     assert len(paths) == len(set(paths)), "env-production paths should be unique"
 
 
+@pytest.mark.parametrize("path", [
+    # Bare-webroot no-leading-dot env variants
+    "/env.production", "/env.prod", "/env.live", "/env.local", "/env.dev",
+    "/env.staging", "/env.php", "/env.example", "/env.sample",
+    # `<prefix>/env<suffix>` — no leading dot cross-product
+    "/storage/env", "/storage/env.production", "/storage/env.php",
+    "/storage/env.txt", "/storage/env.local", "/storage/env.staging",
+    "/app/env", "/app/env.production", "/app/env.php", "/app/env.dev",
+    "/backend/env.production", "/api/env.php", "/config/env",
+    # `<prefix>/<name>.env` — credential-tier bare-name env dictionaries
+    "/secret.env", "/keys.env", "/prod.env", "/dev.env", "/staging.env",
+    "/backup.env", "/credentials.env",
+    "/storage/secret.env", "/storage/keys.env", "/storage/prod.env",
+    "/storage/dev.env", "/storage/staging.env", "/storage/backup.env",
+    "/app/secret.env", "/app/keys.env", "/app/prod.env",
+    "/app/dev.env", "/app/staging.env",
+    # Deep-bare-env variants — `<prefix>/<subdir>/env`
+    "/storage/config/env", "/storage/api/env", "/storage/backup/env",
+    "/app/config/env", "/app/api/env", "/app/backup/env",
+    "/api/env", "/backup/env",
+])
+def test_env_no_dot_and_leaf_env_dispatch_to_env_production(path):
+    trap = tbenv._TRAP_BY_PATH.get(path.lower())
+    assert trap is not None and trap.name == "env-production", (
+        f"{path!r} should dispatch to env-production, got {trap and trap.name!r}"
+    )
+
+
+def test_env_production_does_not_claim_bare_env():
+    # Bare `/env` is the Spring Boot Actuator endpoint, owned by
+    # `actuator-env`. env-production's no-leading-dot Group 5 must skip
+    # the empty-suffix variant or actuator-env is silently shadowed.
+    trap = tbenv._TRAP_BY_PATH.get("/env")
+    assert trap is not None and trap.name == "actuator-env", (
+        f"/env should stay routed to actuator-env, got {trap and trap.name!r}"
+    )
+
+
+@pytest.mark.parametrize("path,expected_trap", [
+    # AWS credentials-file — app-layout prefixed variants
+    ("/storage/.aws/credentials", "aws-credentials-file"),
+    ("/app/.aws/credentials", "aws-credentials-file"),
+    ("/backend/.aws/credentials", "aws-credentials-file"),
+    ("/public/.aws/credentials", "aws-credentials-file"),
+    ("/www/.aws/credentials", "aws-credentials-file"),
+    ("/htdocs/.aws/credentials", "aws-credentials-file"),
+    # AWS config-file
+    ("/storage/.aws/config", "aws-config-file"),
+    ("/app/.aws/config", "aws-config-file"),
+    # s3cfg / passwd-s3fs
+    ("/storage/.s3cfg", "s3cfg"),
+    ("/app/.s3cfg", "s3cfg"),
+    ("/storage/.passwd-s3fs", "passwd-s3fs"),
+    # netrc / _netrc
+    ("/storage/.netrc", "netrc"),
+    ("/storage/_netrc", "netrc"),
+    ("/app/.netrc", "netrc"),
+    ("/app/_netrc", "netrc"),
+    # git-credentials
+    ("/storage/.git-credentials", "git-credentials"),
+    ("/app/.git-credentials", "git-credentials"),
+    # gcp-credentials-json — no-extension bare-dotdir + app-layout
+    ("/.gcp/credentials", "gcp-credentials-json"),
+    ("/root/.gcp/credentials", "gcp-credentials-json"),
+    ("/storage/.gcp/credentials", "gcp-credentials-json"),
+    ("/app/.gcp/credentials", "gcp-credentials-json"),
+    ("/storage/.gcp/credentials.json", "gcp-credentials-json"),
+    ("/app/.gcp/credentials.json", "gcp-credentials-json"),
+    # azure-credentials-file — non-canonical dotdir credential file
+    ("/.azure/credentials", "azure-credentials-file"),
+    ("/root/.azure/credentials", "azure-credentials-file"),
+    ("/storage/.azure/credentials", "azure-credentials-file"),
+    ("/app/.azure/credentials", "azure-credentials-file"),
+    ("/backend/.azure/credentials", "azure-credentials-file"),
+])
+def test_app_layout_credential_prefix_variants(path, expected_trap):
+    trap = tbenv._TRAP_BY_PATH.get(path.lower())
+    assert trap is not None and trap.name == expected_trap, (
+        f"{path!r} should dispatch to {expected_trap}, got {trap and trap.name!r}"
+    )
+
+
+def test_azure_credentials_ini_shape_and_canary():
+    # Render the azure-credentials-file trap directly and confirm the
+    # embedded AWS canary secret lands in the client_secret slot
+    # (byte-grep harvesters looking for AWS secret-access-key bytes
+    # pick up the alert regardless of the surrounding field label).
+    trap = tbenv._TRAP_BY_PATH["/.azure/credentials"]
+    body = trap.render(FAKE_TRACEBIT)
+    assert b"[default]" in body
+    assert b"tenant_id" in body
+    assert b"client_id" in body
+    assert b"client_secret = " in body
+    aws_secret = FAKE_TRACEBIT["aws"]["awsSecretAccessKey"].encode("ascii")
+    assert aws_secret in body
+
+
+def test_azure_credentials_ini_per_hit_uniqueness():
+    # Every rendered response must produce a fresh tenant_id / client_id /
+    # subscription_id triple — otherwise the entire fleet ships one
+    # identity and every canary'd IP looks like the same tenant.
+    trap = tbenv._TRAP_BY_PATH["/.azure/credentials"]
+    a = trap.render(FAKE_TRACEBIT)
+    b = trap.render(FAKE_TRACEBIT)
+    # Extract the UUID after "tenant_id = "
+    def _extract(field, blob):
+        line = next(l for l in blob.decode().splitlines() if l.startswith(field + " "))
+        return line.split("= ", 1)[1]
+    for field in ("tenant_id", "client_id", "subscription_id"):
+        assert _extract(field, a) != _extract(field, b), (
+            f"{field} must be per-hit unique"
+        )
+
+
+@pytest.mark.parametrize("path", [
+    "/.git/config.bak", "/.git/config.old", "/.git/config.local",
+    "/.git/config.orig", "/.git/config.orig.bak", "/.git/config.bak.bak",
+    "/.git/config.save", "/.git/config.swp", "/.git/config~",
+    "/.git/config.personal", "/.git/config.work", "/.git/config.user",
+    "/.git/credentials.bak", "/.git/credentials.old",
+    "/.git/credentials.local", "/.git/credentials~",
+])
+def test_fake_git_config_and_credentials_aliases_populated(path):
+    # These aliases exist so scanner dictionaries walking .bak/.old/
+    # .local/~ variants of `/.git/config` and `/.git/credentials` land
+    # on a canary'd response instead of a fake-git-miss 404.
+    files, _meta = tbenv._build_fake_repo("db_password: hunter2\n", FAKE_TRACEBIT)
+    assert path in files, f"{path} should be aliased in the fake-git tree"
+    if path.startswith("/.git/config"):
+        assert files[path] == files["/.git/config"], (
+            f"{path} should mirror /.git/config exactly"
+        )
+    else:
+        assert files[path] == files["/.git/credentials"], (
+            f"{path} should mirror /.git/credentials exactly"
+        )
+
+
 @pytest.mark.asyncio
 async def test_get_or_issue_canary_coalesces_concurrent_requests(monkeypatch):
     """Concurrent requests for the same (IP, types) tuple must share one

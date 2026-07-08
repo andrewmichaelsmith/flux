@@ -8769,6 +8769,30 @@ def _build_fake_repo(
     for branch in ("main", "master", *_FAKE_GIT_EXTRA_BRANCHES):
         files[f"/.git/refs/wip/index/refs/heads/{branch}"] = f"{commit_sha}\n".encode("utf-8")
         files[f"/.git/refs/wip/wtree/refs/heads/{branch}"] = f"{commit_sha}\n".encode("utf-8")
+
+    # Editor-swap / backup-rotation aliases for `/.git/config` and
+    # `/.git/credentials`. Scanner dictionaries walk `.bak` / `.old` /
+    # `.local` / `.orig` / `~` variants for every dotfile they enumerate;
+    # unaliased, these show up as fake-git-miss noise instead of an
+    # issued canary. `.personal` / `.work` / `.user` are the multi-config
+    # `git config --file <name>` conventions harvester lists commonly
+    # include. Payloads are the exact same body — the on-disk shape a
+    # sloppy edit would leave behind.
+    _config_body = files["/.git/config"]
+    _credentials_body = files["/.git/credentials"]
+    for _alias in (
+        "/.git/config.bak", "/.git/config.old", "/.git/config.local",
+        "/.git/config.orig", "/.git/config.orig.bak", "/.git/config.bak.bak",
+        "/.git/config.save", "/.git/config.swp", "/.git/config.swo",
+        "/.git/config~", "/.git/config.personal", "/.git/config.work",
+        "/.git/config.user",
+    ):
+        files[_alias] = _config_body
+    for _alias in (
+        "/.git/credentials.bak", "/.git/credentials.old",
+        "/.git/credentials.local", "/.git/credentials~",
+    ):
+        files[_alias] = _credentials_body
     meta: dict[str, object] = {
         "commitSha": commit_sha,
         "rootTreeSha": root_tree_sha,
@@ -10158,6 +10182,30 @@ def render_azure_clouds_config(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_azure_credentials_ini(r: dict[str, object]) -> bytes:
+    # `.azure/credentials` — no canonical Azure CLI file at this path,
+    # but harvester dictionaries walk it alongside `.aws/credentials`
+    # and `.gcp/credentials` as the "Azure equivalent" flat-INI
+    # credential store. `azure-sdk-for-python` in particular respects
+    # `AZURE_CREDENTIAL_FILE` and reads a mirror of this INI shape.
+    # `[default]` section carries the SP-style tenant / client_id /
+    # client_secret triple; canary embeds in the `client_secret`
+    # slot so a byte-grepping harvester picks up AKIA regardless of
+    # section label.
+    aws = _aws(r)
+    tenant_id = str(uuid.uuid4())
+    client_id = str(uuid.uuid4())
+    subscription_id = str(uuid.uuid4())
+    return (
+        "[default]\n"
+        f"subscription_id = {subscription_id}\n"
+        f"tenant_id = {tenant_id}\n"
+        f"client_id = {client_id}\n"
+        f"client_secret = {aws.get('awsSecretAccessKey', '')}\n"
+        "cloud_name = AzureCloud\n"
+    ).encode("utf-8")
+
+
 def render_gem_credentials(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     return (
@@ -11008,10 +11056,42 @@ _ENV_DEEP_PREFIXES: tuple[str, ...] = (
 )
 
 
+# Group 5 — no-leading-dot suffix variants harvesters walk under every
+# app-layout prefix (`/storage/env.php`, `/app/env.production`, bare
+# `/env.production`). Keep this smaller than `_ENV_FILE_SUFFIXES` — real
+# no-dot dictionaries stick to the common shipped-tier / editor-backup
+# / interpreter-extension shapes and `.php` in particular is a heavy
+# hitter (drop-in Laravel `env.php` shim pattern).
+_ENV_NO_DOT_SUFFIXES: tuple[str, ...] = (
+    "", ".production", ".prod", ".live",
+    ".local", ".dev", ".staging",
+    ".txt", ".php", ".bak", ".old", ".save", ".backup",
+    ".example", ".sample",
+)
+
+# Group 6 — `<name>.env` credential-tier filenames. Harvester dictionaries
+# walk these under `/`, `/storage/`, `/app/` and every other webroot
+# prefix. `aws` is excluded because `/aws.env` is owned by the dedicated
+# `aws-env` trap upstream (its dotenv renderer carries the AWS-only
+# shape scanners specifically probing `/aws.env` are grepping for).
+_ENV_LEAF_NAMES: tuple[str, ...] = (
+    "secret", "secrets", "keys", "prod", "dev", "staging", "test",
+    "uat", "backup", "credentials", "auth", "app", "api", "database",
+    "db", "config",
+)
+
+# Group 7 — deeper `<prefix>/<subdir>/env` variants. Same scanner
+# cluster walking `/storage/config/env`, `/app/api/env`,
+# `/storage/backup/env`, etc.
+_ENV_INNER_SUBDIRS: tuple[str, ...] = (
+    "config", "api", "backup", "backend", "src", "settings",
+)
+
+
 def _env_production_paths() -> tuple[str, ...]:
     """Generate the path tuple for the env-production canary trap.
 
-    Builds three groups:
+    Builds seven groups:
       1. Bare-dotfile variants — `/.env.production`, `/.env.bak`, etc.
          Cover every entry in `_ENV_FILE_SUFFIXES` plus the legacy
          `_<suffix>` aliases (`/.env_bak`, `/.env2`, `/.environ`).
@@ -11019,6 +11099,20 @@ def _env_production_paths() -> tuple[str, ...]:
          and `_ENV_DEEP_PREFIXES` (deeper than one segment).
       3. `env.*` no-leading-dot variants (`/env.bak`, `/env.txt`) for the
          sloppy-commit shape some dictionaries probe.
+      4. `<prefix>/env<suffix>` no-leading-dot cross-product — the shape
+         harvester dictionaries walk under `/storage/`, `/app/`, and
+         every other webroot prefix (`/storage/env.production`,
+         `/app/env.php`). `env.php` in particular is a common shipped-
+         config-shim pattern in PHP apps.
+      5. Bare-webroot `env<suffix>` for the same no-leading-dot suffix
+         set (`/env.production`, `/env.php`, bare `/env`).
+      6. `<prefix>/<name>.env` cross-product — dictionary-shape variants
+         like `/storage/secret.env`, `/app/keys.env`, bare
+         `/secret.env`. Same render shape; harvesters grep AKIA bytes
+         out of the KEY=VALUE lines regardless of filename.
+      7. `<prefix>/<subdir>/env` deep-bare-env variants observed under
+         `/storage/config/env`, `/app/api/env`, `/storage/backup/env`,
+         etc.
 
     Mail-service prefixes (sendgrid, postmark, …) are excluded — the
     dedicated `mail-service-env` trap below handles them with its own
@@ -11047,6 +11141,40 @@ def _env_production_paths() -> tuple[str, ...]:
     # greps for the AKIA bytes regardless of leading dot.
     for suffix in (".bak", ".txt", ".old", ".save", ".backup"):
         paths.append(f"/env{suffix}")
+
+    # Group 4 — no-leading-dot `<prefix>/env<suffix>` cross-product.
+    # Covers the `/storage/env.production`, `/app/env.php` shape a
+    # widely-walked harvester dictionary tests under every webroot
+    # prefix alongside the leading-dot variants.
+    for prefix in _ENV_WEBROOT_PREFIXES + _ENV_DEEP_PREFIXES:
+        for suffix in _ENV_NO_DOT_SUFFIXES:
+            paths.append(f"/{prefix}/env{suffix}")
+
+    # Group 5 — bare-webroot `env<suffix>` for the same no-dot suffix
+    # set (`/env.production`, `/env.php`). Bare `/env` is skipped —
+    # owned by the `actuator-env` trap upstream (Spring Boot Actuator
+    # `/env` JSON shape), which shares the URL but not the response.
+    for suffix in _ENV_NO_DOT_SUFFIXES:
+        if suffix == "":
+            continue
+        paths.append(f"/env{suffix}")
+
+    # Group 6 — `<name>.env` credential-tier filenames. Bare webroot
+    # and every webroot / deep prefix. Same render shape; harvester
+    # dictionaries key on the `.env` suffix and grep KEY=VALUE bytes.
+    for name in _ENV_LEAF_NAMES:
+        paths.append(f"/{name}.env")
+        for prefix in _ENV_WEBROOT_PREFIXES + _ENV_DEEP_PREFIXES:
+            paths.append(f"/{prefix}/{name}.env")
+
+    # Group 7 — `<prefix>/<subdir>/env` deep-bare-env variants
+    # (`/storage/config/env`, `/app/api/env`, `/storage/backup/env`).
+    # Bare-webroot `/<subdir>/env` also covered so `/config/env`,
+    # `/api/env`, `/backup/env` don't fall through.
+    for subdir in _ENV_INNER_SUBDIRS:
+        paths.append(f"/{subdir}/env")
+        for prefix in _ENV_WEBROOT_PREFIXES + _ENV_DEEP_PREFIXES:
+            paths.append(f"/{prefix}/{subdir}/env")
 
     # Dedupe while preserving order — defensive against future overlap
     # between the bare-dotfile and prefix loops.
@@ -13990,6 +14118,30 @@ def _gitlab_cookie_header(r: dict[str, object]) -> tuple[tuple[str, str], ...]:
     )
 
 
+# App-layout webroot prefixes — harvester dictionaries walking `/storage/`
+# and `/app/` under Laravel-style app-in-webroot layouts (or `/backend/`,
+# `/public_html/`, etc. under other framework conventions) enumerate the
+# same `.aws/credentials`, `.aws/config`, `.s3cfg`, `.netrc`, `_netrc`,
+# `.git-credentials` files that appear at bare webroot. Without prefixed
+# coverage those probes fall through to a 404 and the canary never issues.
+# One-line data source drives every dotdir/cred trap below so the
+# prefixed variants stay consistent as new prefixes get added.
+_APP_LAYOUT_CRED_PREFIXES: tuple[str, ...] = (
+    "app", "storage", "backend", "backup", "public", "public_html",
+    "www", "htdocs",
+)
+
+
+def _app_layout_variants(canonical: str) -> tuple[str, ...]:
+    """Return `<prefix>/<canonical>` variants across
+    `_APP_LAYOUT_CRED_PREFIXES` for a canonical webroot path like
+    `.aws/credentials`. `canonical` is written without a leading `/`."""
+    return tuple(
+        f"/{prefix}/{canonical}"
+        for prefix in _APP_LAYOUT_CRED_PREFIXES
+    )
+
+
 CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     CanaryTrap(
         "aws-credentials-file",
@@ -14015,6 +14167,12 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/home/node/.aws/credentials",
             "/home/deploy/.aws/credentials",
             "/home/www-data/.aws/credentials",
+            # App-layout webroot-prefix variants — harvester
+            # dictionaries walk `<prefix>/.aws/credentials` under
+            # Laravel `/storage/` and `/app/` layouts alongside
+            # `/backend/`, `/public/`, `/www/`, `/htdocs/`,
+            # `/public_html/`, `/backup/`. Same INI renderer.
+            *_app_layout_variants(".aws/credentials"),
             # Bare `/credentials` — scanner dictionaries enumerate the
             # filename without the `.aws/` directory prefix because
             # operators occasionally drop the AWS INI directly in the
@@ -14029,7 +14187,17 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "aws-config-file",
-        ("/.aws/config",),
+        (
+            "/.aws/config",
+            # `~/.aws/config` webroot-prefix variants — same rationale
+            # as the credentials-file trap. Home-dir and app-layout
+            # prefixes.
+            "/root/.aws/config",
+            "/home/.aws/config",
+            "/home/ubuntu/.aws/config",
+            "/home/ec2-user/.aws/config",
+            *_app_layout_variants(".aws/config"),
+        ),
         ("aws",),
         render_aws_config_ini,
         "text/plain; charset=utf-8",
@@ -14263,6 +14431,17 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/google-credentials.json",
             "/service_account.json",
             "/gcp-key.json",
+            # `.gcp/credentials` — no-extension bare-dotdir credential
+            # variant walked alongside `.aws/credentials` and
+            # `.azure/credentials` in scanner dictionaries. Not a
+            # canonical gcloud path, but harvesters probe it as the
+            # "GCP equivalent of ~/.aws/credentials". Same
+            # service-account JSON shape; harvesters key on
+            # `"type": "service_account"` regardless of filename.
+            "/.gcp/credentials",
+            "/root/.gcp/credentials",
+            *_app_layout_variants(".gcp/credentials"),
+            *_app_layout_variants(".gcp/credentials.json"),
         ),
         ("aws",),
         render_gcp_service_account_json,
@@ -15278,7 +15457,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "netrc",
-        ("/.netrc", "/_netrc"),
+        (
+            "/.netrc", "/_netrc",
+            # App-layout webroot-prefix variants — harvester dictionaries
+            # walking `<prefix>/.netrc` and `<prefix>/_netrc` under
+            # `/storage/`, `/app/`, etc.
+            *_app_layout_variants(".netrc"),
+            *_app_layout_variants("_netrc"),
+        ),
         ("gitlab-username-password",),
         render_netrc,
         "text/plain; charset=utf-8",
@@ -15288,11 +15474,12 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         # `/root/.git-credentials` + `/home/.git-credentials` mirror the
         # ssh-private-key webroot-prefix variants — observed in scanner
         # dictionaries probing for home-dir leakage below misconfigured
-        # webroots.
+        # webroots. App-layout prefixes cover Laravel `/storage/` etc.
         (
             "/.git-credentials",
             "/root/.git-credentials",
             "/home/.git-credentials",
+            *_app_layout_variants(".git-credentials"),
         ),
         ("gitlab-username-password",),
         render_git_credentials,
@@ -16077,6 +16264,8 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         (
             "/.s3cfg",
             "/root/.s3cfg",
+            # App-layout webroot-prefix variants.
+            *_app_layout_variants(".s3cfg"),
         ),
         ("aws",),
         render_s3cfg,
@@ -16087,6 +16276,7 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         (
             "/.passwd-s3fs",
             "/root/.passwd-s3fs",
+            *_app_layout_variants(".passwd-s3fs"),
         ),
         ("aws",),
         render_passwd_s3fs,
@@ -16154,6 +16344,21 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("/.azure/clouds.config",),
         ("aws",),
         render_azure_clouds_config,
+        "text/plain; charset=utf-8",
+    ),
+    # `.azure/credentials` — non-canonical file scanner dictionaries
+    # walk under bare + app-layout webroot prefixes alongside
+    # `.aws/credentials`, `.gcp/credentials`, `.s3cfg`, `.netrc`.
+    # Flat-INI service-principal shape; canary in `client_secret`.
+    CanaryTrap(
+        "azure-credentials-file",
+        (
+            "/.azure/credentials",
+            "/root/.azure/credentials",
+            *_app_layout_variants(".azure/credentials"),
+        ),
+        ("aws",),
+        render_azure_credentials_ini,
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(
