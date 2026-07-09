@@ -12810,3 +12810,91 @@ async def test_dispatch_phpmyadmin_no_api_key_still_serves(flux_client, monkeypa
     assert resp.status == 200
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "phpmyadmin-login"
+
+
+# --- Bounded log rotation (unbounded env-canary.jsonl fix) --------------
+
+
+def test_append_log_writes_line_when_no_rotation_configured(tmp_path, monkeypatch):
+    """LOG_MAX_BYTES=0 disables rotation and preserves legacy behavior:
+    the sink grows unbounded. Guards against the rotation code path
+    ever silently dropping writes when it's turned off."""
+    log_path = tmp_path / "env-canary.jsonl"
+    monkeypatch.setattr(tbenv, "LOG_PATH", log_path)
+    monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 0)
+    monkeypatch.setattr(tbenv, "LOG_ROTATIONS", 4)
+    for i in range(3):
+        tbenv.append_log({"seq": i, "result": "not-handled"})
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 3
+    assert not (tmp_path / "env-canary.jsonl.1").exists()
+
+
+def test_append_log_rotates_at_cap_and_starts_fresh(tmp_path, monkeypatch):
+    """Cap trips a rotation: the oversize file moves to `.1` and the
+    next write lands in a fresh, small active file. Prior lines are
+    preserved in `.1` — nothing is truncated."""
+    log_path = tmp_path / "env-canary.jsonl"
+    monkeypatch.setattr(tbenv, "LOG_PATH", log_path)
+    monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 128)
+    monkeypatch.setattr(tbenv, "LOG_ROTATIONS", 4)
+    # Drive the active file past the cap. Each payload line is well
+    # under 128 bytes on its own; the sum crosses the threshold.
+    for i in range(10):
+        tbenv.append_log({"seq": i, "result": "not-handled"})
+    # Collect every surviving line across the rotation chain.
+    all_lines: list[str] = []
+    for name in ("env-canary.jsonl", "env-canary.jsonl.1", "env-canary.jsonl.2",
+                 "env-canary.jsonl.3", "env-canary.jsonl.4"):
+        p = tmp_path / name
+        if p.exists():
+            all_lines.extend(p.read_text().splitlines())
+    # No data loss across the rotation boundary.
+    assert len(all_lines) == 10
+    # Order across the chain reflects the shift order: oldest lines
+    # end up in the highest-numbered rotation, newest in active.
+    active = log_path.read_text().splitlines()
+    assert active[-1].startswith('{"result": "not-handled", "seq": 9')
+    # Fresh active file is well under the cap after rotation — otherwise
+    # rotation would fire on every single subsequent line.
+    assert log_path.stat().st_size < tbenv.LOG_MAX_BYTES
+
+
+def test_append_log_keeps_bounded_number_of_rotations(tmp_path, monkeypatch):
+    """LOG_ROTATIONS=2 means at most `.1` and `.2` archived tails — the
+    on-disk footprint is bounded at (2 + 1) × cap regardless of how
+    many rotation cycles the caller drives. This is the property that
+    stops a runaway sink from filling the volume."""
+    log_path = tmp_path / "env-canary.jsonl"
+    monkeypatch.setattr(tbenv, "LOG_PATH", log_path)
+    monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 64)
+    monkeypatch.setattr(tbenv, "LOG_ROTATIONS", 2)
+    for i in range(60):
+        tbenv.append_log({"seq": i, "result": "not-handled"})
+    # Only `.1` and `.2` should exist; `.3` (and higher) never appear.
+    assert (tmp_path / "env-canary.jsonl.1").exists()
+    assert (tmp_path / "env-canary.jsonl.2").exists()
+    assert not (tmp_path / "env-canary.jsonl.3").exists()
+    assert not (tmp_path / "env-canary.jsonl.4").exists()
+
+
+def test_append_log_rotation_survives_missing_intermediate_files(tmp_path, monkeypatch):
+    """Rotation walks `.N` → `.N+1` down the chain; a missing middle
+    slot (e.g. an operator deleted `.2` between cycles) must not stop
+    the shift or lose the currently-active file."""
+    log_path = tmp_path / "env-canary.jsonl"
+    monkeypatch.setattr(tbenv, "LOG_PATH", log_path)
+    monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 128)
+    monkeypatch.setattr(tbenv, "LOG_ROTATIONS", 4)
+    # Prime `.1` and `.3`; leave `.2` and `.4` missing.
+    (tmp_path / "env-canary.jsonl.1").write_text('{"seq": -1}\n')
+    (tmp_path / "env-canary.jsonl.3").write_text('{"seq": -3}\n')
+    # Drive active past the cap.
+    for i in range(10):
+        tbenv.append_log({"seq": i, "result": "not-handled"})
+    # The previously-active oversize file must have moved to `.1`;
+    # anything that would have shifted around the missing `.2` slot
+    # is best-effort — the important invariant is no crash and no
+    # dropped active-file writes.
+    assert log_path.exists()
+    assert (tmp_path / "env-canary.jsonl.1").exists()

@@ -42,6 +42,20 @@ CANARY_TYPES = [
 TRACEBIT_SOURCE = (os.environ.get("TRACEBIT_ENV_CANARY_SOURCE") or "flux").strip()
 TRACEBIT_SOURCE_TYPE = (os.environ.get("TRACEBIT_ENV_CANARY_SOURCE_TYPE") or "endpoint").strip()
 LOG_PATH = Path(os.environ.get("TRACEBIT_ENV_LOG_PATH") or "/var/log/honeypot/tracebit/env-canary.jsonl")
+# Size cap for the JSONL sink. Without this, the file grows without bound
+# and — on high-volume boxes — pins the volume at 100% inside a few
+# weeks, wedging every other process that needs to write (finch,
+# sync-to-remote, cowrie, pcap). A recent operator report described
+# exactly that: a 6.1 GB env-canary.jsonl on the busiest sensor filled
+# a 24 GB disk and stalled the upstream shipper for days. Cap defaults
+# to 256 MiB per active file with up to 4 rotated tails
+# (`.1`..`.4`) — so the sink is bounded at ~1.25 GB total on disk while
+# leaving a shipper enough lag time (several hours at real volumes) to
+# drain the rotated tails before they roll off. Both are configurable
+# via env var; set the cap to 0 to disable rotation entirely (matches
+# the legacy behavior).
+LOG_MAX_BYTES = max(int((os.environ.get("TRACEBIT_ENV_LOG_MAX_BYTES") or str(256 * 1024 * 1024)).strip() or "0"), 0)
+LOG_ROTATIONS = max(int((os.environ.get("TRACEBIT_ENV_LOG_ROTATIONS") or "4").strip() or "0"), 0)
 TARPIT_ENABLED = (os.environ.get("TRACEBIT_ENV_TARPIT_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
 TARPIT_SECONDS = max(int((os.environ.get("TRACEBIT_ENV_TARPIT_SECONDS") or "0").strip() or "0"), 0)
 TARPIT_CHUNK_BYTES = max(int((os.environ.get("TRACEBIT_ENV_TARPIT_CHUNK_BYTES") or "32").strip() or "32"), 1)
@@ -2279,8 +2293,52 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _rotate_log_if_needed() -> None:
+    """Shift the active sink to `.1` (and each `.N` down one slot) when
+    it exceeds LOG_MAX_BYTES. Best-effort — any OS-level failure
+    (concurrent rotator, disk-full, permissions) is swallowed so the
+    caller can still attempt the append. Race between two concurrent
+    appenders: the second rename either succeeds against a fresh empty
+    file (harmless) or fails with FileNotFoundError (also harmless).
+    Missing `.N` files in the rotation chain are skipped silently.
+    """
+    if LOG_MAX_BYTES <= 0:
+        return
+    try:
+        size = LOG_PATH.stat().st_size
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    if size < LOG_MAX_BYTES:
+        return
+    # Walk oldest → newest so `.N` gets clobbered by `.N-1`, freeing the
+    # slot each step. `.LOG_ROTATIONS` is dropped; `.LOG_ROTATIONS-1` →
+    # `.LOG_ROTATIONS`; ...; `.1` → `.2`; active → `.1`.
+    for n in range(LOG_ROTATIONS, 0, -1):
+        src = LOG_PATH.with_name(LOG_PATH.name + (f".{n - 1}" if n > 1 else ""))
+        dst = LOG_PATH.with_name(LOG_PATH.name + f".{n}")
+        # For n == 1, src is the active LOG_PATH itself; the final
+        # rename shifts the currently-oversize file down to `.1`.
+        try:
+            if n == LOG_ROTATIONS:
+                # Drop the oldest tail — bounded on-disk cost.
+                try:
+                    dst.unlink()
+                except FileNotFoundError:
+                    pass
+            if src.exists():
+                src.replace(dst)
+        except OSError:
+            # Best-effort; a mid-rotation failure just means the active
+            # file may still be oversize on the next call. Better than
+            # raising and blocking the append.
+            continue
+
+
 def append_log(payload: dict[str, object]) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_log_if_needed()
     with LOG_PATH.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 

@@ -26,6 +26,8 @@ canaries at hit time.
 | Var | Default | Notes |
 | --- | --- | --- |
 | `TRACEBIT_ENV_LOG_PATH` | `/var/log/honeypot/tracebit/env-canary.jsonl` | One JSON line per event. Parent dir is created on first write. |
+| `TRACEBIT_ENV_LOG_MAX_BYTES` | `268435456` (256 MiB) | Active sink is rotated when it exceeds this many bytes. `0` disables rotation (unbounded, legacy behavior). |
+| `TRACEBIT_ENV_LOG_ROTATIONS` | `4` | Number of `.1`..`.N` tails to keep. On-disk footprint is bounded at roughly `(ROTATIONS + 1) × MAX_BYTES`. |
 
 ## Tarpit
 
