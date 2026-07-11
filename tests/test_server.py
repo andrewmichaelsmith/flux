@@ -586,6 +586,7 @@ def test_all_trap_families_default_on():
     assert tbenv.TELESCOPE_ENABLED
     assert tbenv.OIDC_DISCOVERY_ENABLED
     assert tbenv.PHPMYADMIN_ENABLED
+    assert tbenv.ADMINER_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -13274,6 +13275,272 @@ async def test_dispatch_phpmyadmin_no_api_key_still_serves(flux_client, monkeypa
     assert resp.status == 200
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "phpmyadmin-login"
+
+
+# --- Fake Adminer login trap --------------------------------------------
+
+def test_adminer_enabled_by_default():
+    assert tbenv.ADMINER_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/adminer.php",
+    "/adminer/adminer.php",
+    "/adminer/index.php",
+    "/adminer/",
+    "/adminer",
+    "/admin/adminer.php",
+    "/admin/adminer/adminer.php",
+    "/db/adminer.php",
+    "/database/adminer.php",
+    "/mysql/adminer.php",
+    "/tools/adminer.php",
+    "/tools/adminer/adminer.php",
+    "/backup/adminer.php",
+    "/_adminer/adminer.php",
+    "/wp-content/plugins/adminer/adminer.php",
+    "/adminer-4.8.1.php",
+    "/adminer-4.7.9.php",
+    # Case-insensitive.
+    "/Adminer.php",
+    "/ADMINER/adminer.php",
+    # Query strings must be stripped before match.
+    "/adminer.php?server=localhost",
+    "/adminer/adminer.php?db=prod",
+])
+def test_adminer_path_matches_observed_probes(path):
+    assert tbenv.is_adminer_path(path), f"expected match: {path}"
+
+
+@pytest.mark.parametrize("path", [
+    "/",
+    "/index.php",
+    "/wp-login.php",
+    "/adminer.php.bak",
+    "/notadminer.php",
+    "/adminerX/",
+    "/adminer-notaversion.php",
+])
+def test_adminer_path_non_match(path):
+    assert not tbenv.is_adminer_path(path), f"unexpected match: {path}"
+
+
+def test_adminer_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "ADMINER_ENABLED", False)
+    assert not tbenv.is_adminer_path("/adminer.php")
+
+
+def test_adminer_login_html_no_fixed_credential_literals():
+    """The bare GET login page never carries fixed credential-shaped
+    literals. Every value that shows up (token, submitted-field echo)
+    is per-hit synthetic. The canary is only embedded on the POST
+    error re-serve, so a bare-GET banner-grab never harvests it."""
+    body_1 = tbenv.render_adminer_login_html(version="4.8.1", token="a" * 32)
+    body_2 = tbenv.render_adminer_login_html(version="4.8.1", token="b" * 32)
+    # Token bytes vary; nothing else on the bare-GET does.
+    assert b"a" * 32 in body_1
+    assert b"b" * 32 in body_2
+    # No AWS canary marker on the bare-GET page — must ship only on POST.
+    assert b"AKIA" not in body_1
+    assert b"AKIA" not in body_2
+    # Form field names match real Adminer.
+    assert b'name="auth[username]"' in body_1
+    assert b'name="auth[password]"' in body_1
+    assert b'name="auth[server]"' in body_1
+    assert b'name="auth[db]"' in body_1
+    assert b'name="auth[driver]"' in body_1
+    assert b'name="auth[permanent]"' in body_1
+
+
+def test_adminer_login_html_embeds_canary_on_error_reserve():
+    """On the POST re-serve after credential capture, the AWS canary
+    lands in the `<datalist>` server-history preset — grep-by-AKIA
+    scrapers harvest it. Bare GET does not carry the canary; only
+    POST does."""
+    body = tbenv.render_adminer_login_html(
+        version="4.8.1", token="x" * 32,
+        aws=FAKE_TRACEBIT["aws"],
+        error="Invalid credentials.",
+        submitted_user="admin",
+    )
+    # Error notice renders on POST re-serve.
+    assert b"Invalid credentials." in body
+    # Canary lands inside the server-history datalist.
+    assert b'data-aws-key="AKIAFAKEEXAMPLE01"' in body
+    assert b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    # And the submitted username is echoed back into the value attribute.
+    assert b'value="admin"' in body
+
+
+def test_adminer_login_html_html_escapes_submitted_fields():
+    """A malicious submitted username / server / db must not break out
+    of the value attribute. All three carry the same escape treatment."""
+    body = tbenv.render_adminer_login_html(
+        version="4.8.1", token="1" * 32,
+        submitted_user='"><script>alert(1)</script>',
+        submitted_server='<img src=x onerror=1>',
+        submitted_db='"><b>',
+    ).decode("utf-8", errors="replace")
+    assert "<script>" not in body
+    assert "&quot;&gt;&lt;script&gt;" in body
+    assert "&lt;img src=x onerror=1&gt;" in body
+
+
+def test_adminer_extract_creds_records_no_plaintext_password():
+    """We log the username + password length, never the password itself."""
+    body = (
+        b"auth%5Bdriver%5D=server"
+        b"&auth%5Bserver%5D=localhost"
+        b"&auth%5Busername%5D=root"
+        b"&auth%5Bpassword%5D=hunter2"
+        b"&auth%5Bdb%5D=production"
+        b"&auth%5Bpermanent%5D=1"
+        b"&token=abc123"
+    )
+    fields = tbenv.extract_adminer_creds(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert fields["auth_username"] == "root"
+    assert fields["auth_server"] == "localhost"
+    assert fields["auth_db"] == "production"
+    assert fields["auth_driver"] == "server"
+    assert fields["auth_permanent"] == "1"
+    assert fields["hasPwd"] == "true"
+    assert fields["pwdLen"] == "7"
+    assert fields["token"] == "abc123"
+    # Password value itself is not stored.
+    assert "auth_password" not in fields
+    assert b"hunter2" not in str(fields).encode()
+
+
+def test_adminer_extract_creds_bracket_notation():
+    """Some clients send raw `auth[foo]` (not URL-encoded brackets).
+    Both shapes must extract to the same normalized field names."""
+    body = b"auth[username]=root&auth[password]=hunter2&auth[server]=localhost"
+    fields = tbenv.extract_adminer_creds(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert fields["auth_username"] == "root"
+    assert fields["auth_server"] == "localhost"
+    assert fields["hasPwd"] == "true"
+
+
+async def test_dispatch_adminer_get_renders_login(flux_client, monkeypatch):
+    resp = await flux_client.get(
+        "/adminer.php",
+        headers={"X-Forwarded-For": "203.0.113.210"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b'name="auth[username]"' in body
+    assert b'name="auth[password]"' in body
+    assert b'name="auth[server]"' in body
+    # Per-hit token + session cookie.
+    cookie = resp.headers.get("Set-Cookie", "")
+    assert cookie.startswith("adminer_sid_")
+    assert "HttpOnly" in cookie
+    # Bare-GET must never carry the canary.
+    assert b"AKIA" not in body
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "adminer-login"
+    assert entry["adminerMethod"] == "GET"
+    assert entry["adminerPath"] == "/adminer.php"
+    assert entry["clientIp"] == "203.0.113.210"
+
+
+async def test_dispatch_adminer_post_captures_credentials_and_ships_canary(
+    flux_client, monkeypatch,
+):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    body = (
+        b"auth%5Bdriver%5D=server"
+        b"&auth%5Bserver%5D=localhost"
+        b"&auth%5Busername%5D=admin"
+        b"&auth%5Bpassword%5D=correcthorsebatterystaple"
+        b"&auth%5Bdb%5D=prod"
+        b"&auth%5Bpermanent%5D=1"
+        b"&token=xyz"
+    )
+    resp = await flux_client.post(
+        "/adminer/adminer.php",
+        data=body,
+        headers={
+            "X-Forwarded-For": "203.0.113.211",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": "adminer_sid_abcd=oldsession",
+        },
+    )
+    assert resp.status == 200
+    page = await resp.read()
+    # Error notice on the re-served form.
+    assert b"Invalid credentials." in page
+    # Submitted username echoed back.
+    assert b'value="admin"' in page
+    # And the AWS canary lands in the datalist history preset.
+    assert b"AKIAFAKEEXAMPLE01" in page
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "adminer-credential-post"
+    assert entry["adminerUsername"] == "admin"
+    assert entry["adminerServer"] == "localhost"
+    assert entry["adminerDb"] == "prod"
+    assert entry["adminerDriver"] == "server"
+    assert entry["adminerHasPwd"] is True
+    assert entry["adminerPwdLen"] == "25"
+    assert entry["adminerPermanent"] is True
+    assert entry["adminerSessionCookiePresent"] is True
+    assert "aws" in entry["canaryTypes"]
+
+
+async def test_dispatch_adminer_post_without_api_key_still_captures(flux_client, monkeypatch):
+    """Keyless deployments still get the credential-capture signal; the
+    canary slot just goes empty. The POST error re-serve renders without
+    a canary marker in that case."""
+    monkeypatch.setattr(tbenv, "API_KEY", "")
+    body = b"auth%5Busername%5D=root&auth%5Bpassword%5D=toor"
+    resp = await flux_client.post(
+        "/adminer.php",
+        data=body,
+        headers={
+            "X-Forwarded-For": "203.0.113.212",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    page = await resp.read()
+    assert b"Invalid credentials." in page
+    # No canary — API key wasn't set.
+    assert b"AKIA" not in page
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "adminer-credential-post"
+    assert entry["adminerUsername"] == "root"
+    assert entry["adminerHasPwd"] is True
+
+
+async def test_dispatch_adminer_disabled_falls_through(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "ADMINER_ENABLED", False)
+    resp = await flux_client.get(
+        "/adminer.php",
+        headers={"X-Forwarded-For": "203.0.113.213"},
+    )
+    assert resp.status == 404
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "not-handled"
+
+
+async def test_dispatch_adminer_head_returns_empty_body(flux_client):
+    resp = await flux_client.head(
+        "/adminer.php",
+        headers={"X-Forwarded-For": "203.0.113.214"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert body == b""
+    # Content-Length still reflects the GET body size — same as real Adminer.
+    assert int(resp.headers.get("Content-Length", "0")) > 0
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "adminer-login"
+    assert entry["adminerMethod"] == "HEAD"
 
 
 # --- Bounded log rotation (unbounded env-canary.jsonl fix) --------------

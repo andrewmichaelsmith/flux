@@ -2323,6 +2323,60 @@ _PHPMYADMIN_VERSIONED_RE = re.compile(
 )
 
 
+# --- Fake Adminer login page -------------------------------------------
+# Recurring `python-requests/2.32.5` DB-admin-hunter dictionaries walk
+# the classic Adminer install-paths (`/adminer.php`, `/adminer/`,
+# `/adminer/adminer.php`, `/admin/adminer.php`) alongside
+# `/.DS_Store` + `/whm` as a scripted kit. Every hit currently 404s.
+# Adminer is a single-file PHP DB admin tool — if a real deployment
+# left it on the webroot, discovered credentials give instant DB
+# takeover. Returning the canonical Adminer 4.8.1 login HTML (with
+# the real `auth[driver]` / `auth[server]` / `auth[username]` /
+# `auth[password]` / `auth[db]` form field names) lets the brute
+# fleets actually POST credentials; a POST captures them and re-serves
+# the login page with the standard "Invalid credentials" notice.
+# A per-request Tracebit AWS canary is embedded in a Recent-servers
+# preset entry (only in the POST response) so scrapers that grep the
+# post-login page for AKIA harvest a replay-fireable key. Real
+# Adminer returns 200 on both GET and failed-POST, so the trap
+# matches the on-the-wire shape banner-grab + brute clients expect.
+ADMINER_ENABLED = _env_bool("HONEYPOT_ADMINER_ENABLED")
+ADMINER_VERSION = (os.environ.get("HONEYPOT_ADMINER_VERSION") or "4.8.1").strip()
+ADMINER_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_ADMINER_BODY_DECODE_LIMIT") or "4096").strip() or "4096"),
+    256,
+)
+# Exact match set. Adminer is a single .php file; scanners hit specific
+# well-known placements rather than deep sub-paths. Override via CSV.
+_ADMINER_DEFAULT_PATHS = ",".join([
+    "/adminer.php",
+    "/adminer/adminer.php",
+    "/adminer/index.php",
+    "/adminer/",
+    "/adminer",
+    "/admin/adminer.php",
+    "/admin/adminer/adminer.php",
+    "/db/adminer.php",
+    "/database/adminer.php",
+    "/mysql/adminer.php",
+    "/tools/adminer.php",
+    "/tools/adminer/adminer.php",
+    "/backup/adminer.php",
+    "/_adminer/adminer.php",
+    "/wp-content/plugins/adminer/adminer.php",
+    "/adminer-4.8.1.php",
+    "/adminer-4.8.0.php",
+    "/adminer-4.7.9.php",
+    "/adminer-4.7.8.php",
+    "/adminer-4.7.7.php",
+])
+ADMINER_PATHS = frozenset(
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_ADMINER_PATHS_CSV") or _ADMINER_DEFAULT_PATHS).split(",")
+    if value.strip()
+)
+
+
 # --- Backup-archive canary trap ----------------------------------------
 # Scanner dictionaries enumerate the cross product `<base>.<ext>` of a
 # 60+-name base list and ~15 compressed-archive extensions hunting for
@@ -3142,6 +3196,19 @@ def is_phpmyadmin_path(path: str) -> bool:
         if lp == prefix or lp == prefix + "/" or lp.startswith(prefix + "/"):
             return True
     return bool(_PHPMYADMIN_VERSIONED_RE.match(lp))
+
+
+def is_adminer_path(path: str) -> bool:
+    """Match Adminer install-path aliases. Adminer is a single-file
+    PHP DB admin tool, so scanners hit specific well-known placements
+    (`/adminer.php`, `/adminer/adminer.php`, `/admin/adminer.php`,
+    …) rather than a deep sub-tree. Query string is stripped before
+    comparison so `/adminer.php?server=…` still dispatches. Override
+    the set via `HONEYPOT_ADMINER_PATHS_CSV`."""
+    if not ADMINER_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    return lp in ADMINER_PATHS
 
 
 def is_cmd_injection_path(path: str) -> bool:
@@ -5844,6 +5911,166 @@ def extract_phpmyadmin_creds(body: bytes, content_type: str) -> dict[str, str]:
                 result["pwdLen"] = str(len(values[0]))[:6]
             else:
                 result[key] = values[0][:200]
+    return result
+
+
+def render_adminer_login_html(
+    *,
+    version: str,
+    token: str,
+    aws: dict | None = None,
+    error: str = "",
+    submitted_user: str = "",
+    submitted_server: str = "",
+    submitted_db: str = "",
+) -> bytes:
+    """Adminer 4.x login page. Real Adminer packs the whole app into a
+    single .php file, so the login form field names match the actual
+    `auth[driver]` / `auth[server]` / `auth[username]` / `auth[password]`
+    / `auth[db]` / `auth[permanent]` structure brute clients expect to
+    POST into. Optional `aws` dict embeds a Tracebit AWS canary in a
+    hidden "Recent servers" preset entry — real Adminer surfaces a
+    `<datalist>`-style history in the login page, so a preset entry
+    naming `s3-backup.internal` with `AKIA…` in the datalist attribute
+    slots reads as a leaky shared-host build to grep-by-field scrapers.
+    We only ship this on the error re-serve (after a credential POST),
+    not on the bare GET, so the canary only mints when a scanner
+    actually attempted a login."""
+    safe_token = (
+        token.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )
+    safe_user = (
+        submitted_user.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )[:120]
+    safe_server = (
+        submitted_server.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )[:120]
+    safe_db = (
+        submitted_db.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )[:120]
+    safe_version = (
+        version.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )[:16]
+    error_html = ""
+    if error:
+        safe_error = (
+            error.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )[:200]
+        error_html = f'<p class="error">{safe_error}</p>\n'
+
+    # AWS canary embed — only present on the POST re-serve so bare-GET
+    # banner-grab scanners can't harvest without going through the
+    # credential-capture code path first. Renders as a "Recent servers"
+    # history preset the way a leaky shared-host Adminer install would
+    # (Adminer's real login page has a `<datalist>`-populated server
+    # input; we shape the same slot to embed the canary).
+    aws = aws or {}
+    aws_key = aws.get("awsAccessKeyId", "") if isinstance(aws, dict) else ""
+    aws_secret = aws.get("awsSecretAccessKey", "") if isinstance(aws, dict) else ""
+    canary_html = ""
+    if aws_key or aws_secret:
+        safe_key = (
+            aws_key.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;")
+        )
+        safe_sec = (
+            aws_secret.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;")
+        )
+        canary_html = (
+            '<datalist id="server-history">\n'
+            '  <option value="localhost" label="MySQL local"></option>\n'
+            f'  <option value="s3-backup.internal.example.com:3306" '
+            f'data-user="s3sync" data-aws-key="{safe_key}" '
+            f'data-aws-secret="{safe_sec}" label="RDS backup restore"></option>\n'
+            '  <option value="rds-prod.internal:3306" label="Prod RDS"></option>\n'
+            '</datalist>\n'
+        )
+
+    body = f"""<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<link rel="shortcut icon" type="image/x-icon" href="?file=favicon.ico&amp;version={safe_version}">
+<link rel="apple-touch-icon" href="?file=favicon.ico&amp;version={safe_version}">
+<link rel="stylesheet" type="text/css" href="?file=default.css&amp;version={safe_version}">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Login - Adminer</title>
+</head>
+<body class="ltr nojs">
+<script nonce="{safe_token[:16]}">document.body.className = document.body.className.replace(/ nojs/, ' js');</script>
+<div id="help" class="jush-sql jsonly hidden"></div>
+<div id="content">
+<div id="menu" class="loginform"><h1>
+<a href="https://www.adminer.org/" target="_blank" rel="noreferrer noopener" id="h1">Adminer</a>
+<span class="version">{safe_version}</span>
+<a href="https://www.adminer.org/#download" target="_blank" rel="noreferrer noopener" id="version"></a>
+</h1>
+</div>
+{error_html}<form action="" method="post">
+<div><input type="hidden" name="token" value="{safe_token}"></div>
+<table cellspacing="0" class="layout">
+<tr><th>System</th><td><select name="auth[driver]" aria-label="database system">
+<option value="server" selected>MySQL</option>
+<option value="sqlite">SQLite 3</option>
+<option value="pgsql">PostgreSQL</option>
+<option value="oracle">Oracle (beta)</option>
+<option value="mssql">MS SQL</option>
+<option value="mongo">MongoDB (alpha)</option>
+</select></td></tr>
+<tr><th>Server</th><td><input name="auth[server]" value="{safe_server}" title="hostname[:port]" placeholder="localhost" autocapitalize="off" list="server-history"></td></tr>
+<tr><th>Username</th><td><input name="auth[username]" id="username" value="{safe_user}" autocomplete="username" autocapitalize="off"></td></tr>
+<tr><th>Password</th><td><input type="password" name="auth[password]" autocomplete="current-password"></td></tr>
+<tr><th>Database</th><td><input name="auth[db]" value="{safe_db}" autocapitalize="off"></td></tr>
+</table>
+<p>
+<input type="submit" value="Login">
+<label><input type="checkbox" name="auth[permanent]" value="1"> Permanent login</label>
+</p>
+</form>
+{canary_html}</div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def extract_adminer_creds(body: bytes, content_type: str) -> dict[str, str]:
+    """Pull the six Adminer login fields off a
+    `application/x-www-form-urlencoded` or `multipart/form-data` POST
+    body. Real Adminer uses `auth[<field>]` PHP-array field names, so
+    we match those exactly. Records username, server, DB name, driver,
+    submitted token, and whether a password was present — the
+    password bytes themselves are never stored."""
+    parsed = parse_form_body(body, content_type)
+    result: dict[str, str] = {}
+    for suffix, out_key in (
+        ("username", "auth_username"),
+        ("server", "auth_server"),
+        ("db", "auth_db"),
+        ("driver", "auth_driver"),
+        ("permanent", "auth_permanent"),
+    ):
+        for form_key in (f"auth[{suffix}]", f"auth%5B{suffix}%5D"):
+            values = parsed.get(form_key)
+            if values and values[0]:
+                result[out_key] = values[0][:200]
+                break
+    for form_key in ("auth[password]", "auth%5Bpassword%5D"):
+        values = parsed.get(form_key)
+        if values and values[0]:
+            result["hasPwd"] = "true"
+            result["pwdLen"] = str(len(values[0]))[:6]
+            break
+    tok = parsed.get("token")
+    if tok and tok[0]:
+        result["token"] = tok[0][:200]
     return result
 
 
@@ -20564,6 +20791,152 @@ async def _handle_telescope(
     )
 
 
+async def _handle_adminer(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Adminer login page. GET (or HEAD) on any `/<adminer-alias>`
+    path renders the canonical Adminer 4.x login HTML with a per-hit
+    hidden form token + per-hit `adminer_sid_<random>` cookie. POSTs
+    that supply `auth[username]` / `auth[password]` are captured as
+    an `adminer-credential-post` event and re-serve the login page
+    with the standard "Invalid credentials" error notice — plus an
+    embedded Tracebit AWS canary in the `<datalist>` server-history
+    preset (only on the POST re-serve, so bare-GET banner-grab
+    scanners can't harvest without going through credential capture
+    first). Real Adminer returns 200 on both the bare GET and the
+    failed POST, so the trap matches the on-the-wire shape brute
+    clients expect.
+
+    No fixed credential literals are ever emitted — the token, the
+    session cookie, and every field value on the fresh-GET response
+    are per-hit synthetics (uuid hex), per the flux
+    every-credential-per-hit-unique design principle. The AWS canary
+    is Tracebit-minted on POST via `_get_or_issue_canary(('aws',),
+    ...)` with the per-IP cache bounding quota burn."""
+    method = request.method
+    lp = path.lower().split("?", 1)[0]
+    content_type_req = request.headers.get("Content-Type", "")
+    cookie_header = request.headers.get("Cookie", "")
+    cookies = parse_cookies(cookie_header)
+    submitted_session = ""
+    for cname in list(cookies):
+        if cname.startswith("adminer_sid_") or cname.startswith("adminer_key"):
+            submitted_session = cookies[cname]
+            break
+
+    token = uuid.uuid4().hex[:32]
+    session_id = uuid.uuid4().hex
+    session_slot = uuid.uuid4().hex[:8]
+
+    host = str(log_context.get("host", ""))
+    request_id = str(log_context.get("requestId", ""))
+    client_ip = str(log_context.get("clientIp", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+
+    common_headers = {
+        "Server": "Apache/2.4.41 (Ubuntu)",
+        "X-Powered-By": f"PHP/8.1.27 Adminer/{ADMINER_VERSION}",
+        "X-Frame-Options": "DENY",
+        "Cache-Control": "no-store, no-cache, must-revalidate, pre-check=0, post-check=0, max-age=0",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "origin-when-cross-origin",
+    }
+    set_cookie = (
+        f"adminer_sid_{session_slot}={session_id}; Path=/; HttpOnly; SameSite=Strict"
+    )
+
+    if method == "POST":
+        creds = extract_adminer_creds(request_body, content_type_req)
+        body_preview = ""
+        if request_body:
+            body_preview = request_body[:ADMINER_BODY_DECODE_LIMIT].decode(
+                "utf-8", errors="replace",
+            )
+
+        # Mint the AWS canary — only on POST, so bare-GET scanners
+        # can't harvest without submitting credentials first. Cached
+        # per-IP by `_get_or_issue_canary` so a brute burst reuses
+        # one canary rather than N.
+        tracebit_response = None
+        if API_KEY:
+            tracebit_response = await _get_or_issue_canary(
+                ("aws",), client_ip, request_id, host, user_agent, path, proto,
+            )
+        if tracebit_response is None:
+            tracebit_response = {}
+        aws = _aws(tracebit_response)
+        canary_types = [k for k, v in tracebit_response.items() if v]
+
+        log_entry = {
+            **log_context,
+            "result": "adminer-credential-post",
+            "status": 200,
+            "adminerPath": path,
+            "adminerUsername": creds.get("auth_username", ""),
+            "adminerServer": creds.get("auth_server", ""),
+            "adminerDb": creds.get("auth_db", ""),
+            "adminerDriver": creds.get("auth_driver", ""),
+            "adminerHasPwd": creds.get("hasPwd", "") == "true",
+            "adminerPwdLen": creds.get("pwdLen", ""),
+            "adminerPermanent": creds.get("auth_permanent", "") == "1",
+            "adminerTokenSubmitted": creds.get("token", "")[:48],
+            "adminerSessionCookiePresent": bool(submitted_session),
+            "canaryTypes": canary_types,
+            "contentType": content_type_req[:120],
+        }
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview
+        html = render_adminer_login_html(
+            version=ADMINER_VERSION,
+            token=token,
+            aws=aws,
+            error="Invalid credentials.",
+            submitted_user=creds.get("auth_username", ""),
+            submitted_server=creds.get("auth_server", ""),
+            submitted_db=creds.get("auth_db", ""),
+        )
+        log_entry["bytes"] = len(html)
+        append_log(log_entry)
+        return web.Response(
+            status=200, body=html,
+            headers={
+                **common_headers,
+                "Content-Type": "text/html; charset=utf-8",
+                "Set-Cookie": set_cookie,
+                "Content-Length": str(len(html)),
+            },
+        )
+
+    # GET / HEAD — render the bare login page. No canary on this
+    # branch: it only mints on POST after a credential capture.
+    html = render_adminer_login_html(version=ADMINER_VERSION, token=token)
+    response_body = b"" if method == "HEAD" else html
+    log_entry = {
+        **log_context,
+        "result": "adminer-login",
+        "status": 200,
+        "adminerPath": path,
+        "adminerMethod": method,
+        "adminerSessionCookiePresent": bool(submitted_session),
+        "bytes": len(html),
+    }
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=response_body,
+        headers={
+            **common_headers,
+            "Content-Type": "text/html; charset=utf-8",
+            "Set-Cookie": set_cookie,
+            "Content-Length": str(len(html)),
+        },
+    )
+
+
 async def _handle_phpmyadmin(
     request: web.Request,
     log_context: dict[str, object],
@@ -22678,6 +23051,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_phpmyadmin_path(path):
         return await _handle_phpmyadmin(request, log_context, path, request_body)
+
+    if is_adminer_path(path):
+        return await _handle_adminer(request, log_context, path, request_body)
 
     if is_coldfusion_path(path):
         return await _handle_coldfusion(request, log_context, path, request_body)
