@@ -1165,6 +1165,17 @@ FAKE_TRACEBIT = {
     ("/wordpress/wp-content/debug.log", b"AKIAFAKEEXAMPLE01"),
     ("/blog/wp-content/debug.log", b"AKIAFAKEEXAMPLE01"),
     ("/var/www/html/wp-content/debug.log", b"AKIAFAKEEXAMPLE01"),
+    # ASP.NET Trace.axd detail view — AWS canary lands in three
+    # natural slots at once so the response carries a credential
+    # whichever fields the scraper grabs.
+    ("/trace.axd", b"AKIAFAKEEXAMPLE01"),
+    ("/trace.axd", b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+    ("/trace.axd", b"AWS_ACCESS_KEY_ID"),
+    ("/trace.axd", b"AWS4-HMAC-SHA256 Credential=AKIAFAKEEXAMPLE01"),
+    ("/trace.axd", b"AwsProfile"),
+    ("/trace.axd", b"Server Variables"),
+    ("/trace.axd", b".ASPXAUTH"),
+    ("/trace.axd/", b"AKIAFAKEEXAMPLE01"),
 ])
 def test_canary_trap_renderers_embed_canary(path, needle):
     trap = tbenv._TRAP_BY_PATH[path]
@@ -1237,6 +1248,10 @@ def test_canary_trap_renderers_embed_canary(path, needle):
     "/app/etc/env.php",
     "/magento/app/etc/env.php",
     "/var/www/html/app/etc/env.php",
+    # Trace.axd detail view carries a per-hit DbConnectionString +
+    # per-hit .ASPXAUTH cookie / __VIEWSTATE / signature so identical
+    # sensors don't ship an identical body across the fleet.
+    "/trace.axd",
 ])
 def test_canary_trap_renderers_do_not_embed_fixed_password_literal(path):
     # Regression: the ``h6T!9pq2Wz@LmRnV`` / ``prod_rw`` DB-password literal
@@ -1511,6 +1526,32 @@ async def test_vite_env_404s_without_api_key(flux_client, monkeypatch):
         headers={"X-Forwarded-For": "203.0.113.45"},
     )
     assert resp.status == 404
+
+
+@pytest.mark.parametrize("path", ["/trace.axd", "/trace.axd?id=1", "/Trace.axd", "/trace.axd/"])
+async def test_dispatch_routes_trace_axd_to_trap(flux_client, monkeypatch, path):
+    """A ``/trace.axd`` hit — with or without the ``?id=<n>`` query,
+    trailing slash, or case variation — must dispatch to the ASP.NET
+    trace canary, not to tarpit or 404. The IIS Server + X-AspNet-Version
+    headers accompany the body so a scanner that fingerprints the
+    platform first still takes the follow-up hop."""
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        path,
+        headers={"X-Forwarded-For": "203.0.113.46"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/html")
+    assert resp.headers["Server"].startswith("Microsoft-IIS/")
+    assert resp.headers.get("X-AspNet-Version")
+    body = await resp.read()
+    assert b"AKIAFAKEEXAMPLE01" in body
+    assert b"Server Variables" in body
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "trace-axd"
 
 
 def test_htpasswd_falls_back_to_default_username_when_tracebit_missing():
@@ -2483,6 +2524,17 @@ def test_gitlab_cookie_emits_set_cookie_header():
     assert "Set-Cookie" in names
     cookie_value = next(v for k, v in headers if k == "Set-Cookie")
     assert "cookieCanaryValue" in cookie_value
+
+
+def test_trace_axd_emits_iis_and_aspnet_headers():
+    """Scanners fingerprint the platform on Server / X-AspNet-Version
+    before grepping the trace body — a bare aiohttp Server: header
+    would signal "not real ASP.NET" and drop the follow-up hit."""
+    trap = tbenv._TRAP_BY_PATH["/trace.axd"]
+    headers = dict(trap.extra_headers(FAKE_TRACEBIT))
+    assert headers.get("Server", "").startswith("Microsoft-IIS/")
+    assert headers.get("X-AspNet-Version")
+    assert headers.get("X-Powered-By") == "ASP.NET"
 
 
 async def _fake_canary(*args, **kwargs):

@@ -11186,6 +11186,150 @@ def render_generic_ci_yml(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+_TRACE_AXD_STYLE = (
+    "<style type='text/css'>"
+    "body{background:#fff;color:#000;font:small verdana,sans-serif}"
+    ".tpBody{margin:5px}"
+    "table{border-collapse:collapse;width:96%}"
+    ".tpHead{background:#ffc;font-weight:bold;padding:2px}"
+    "td{padding:2px 4px;border-bottom:1px solid #ccc;vertical-align:top}"
+    "h1{font-size:16pt;margin:0 0 4px 0}"
+    "h2{font-size:12pt;font-weight:bold;background:#cccc99;padding:2px;margin:8px 0 4px 0}"
+    ".alt{background:#eee}"
+    "</style>"
+)
+
+
+def render_trace_axd_detail(r: dict[str, object]) -> bytes:
+    """ASP.NET Trace.axd?id=<n> per-request detail view.
+
+    Real detail dumps include Request Details, Trace Information,
+    Control Tree, Session State, Application State, Request Cookies,
+    Response Cookies, Headers Collection, Response Headers Collection,
+    Form Collection, Querystring Collection, and Server Variables.
+    Credential-scraping scanners pull this page specifically because
+    the Headers / Server Variables tables leak Authorization tokens
+    and env vars.
+
+    The AWS canary lands in three natural slots:
+      1. Server Variables ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY``
+         — the classic env-leak shape.
+      2. Headers Collection ``Authorization`` — an ``AWS4-HMAC-SHA256``
+         Credential=... value, which is what a S3 SDK client would
+         actually send.
+      3. Session State ``AwsProfile`` — as a serialized ini fragment.
+
+    Everything else (session id, form values, DB connection string) is
+    per-hit random so the response doesn't fingerprint the fleet.
+    """
+    aws = _aws(r)
+    aws_key = aws.get("awsAccessKeyId", "")
+    aws_secret = aws.get("awsSecretAccessKey", "")
+    aws_session = aws.get("awsSessionToken", "")
+    session_id = uuid.uuid4().hex[:24]
+    asp_session = base64.b64encode(uuid.uuid4().bytes).decode("ascii").rstrip("=")
+    aspxauth = uuid.uuid4().hex.upper() + secrets.token_hex(12).upper()
+    db_password = _fake_db_password()
+    now_str = time.strftime("%m/%d/%Y %I:%M:%S %p", time.gmtime())
+    return (
+        "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\">"
+        "<html xmlns='http://www.w3.org/1999/xhtml'>"
+        "<head><title>Application Trace</title>"
+        f"{_TRACE_AXD_STYLE}"
+        "</head>"
+        "<body><span class='tpBody'>"
+        "<h1>Request Details</h1>"
+        "<table>"
+        f"<tr><td><b>Session Id:</b></td><td>{session_id}</td>"
+        f"<td><b>Request Type:</b></td><td>POST</td></tr>"
+        f"<tr><td><b>Time of Request:</b></td><td>{now_str}</td>"
+        f"<td><b>Status Code:</b></td><td>200</td></tr>"
+        "<tr><td><b>Request Encoding:</b></td><td>Unicode (UTF-8)</td>"
+        "<td><b>Response Encoding:</b></td><td>Unicode (UTF-8)</td></tr>"
+        "</table>"
+        "<h2 class='alt'>Trace Information</h2>"
+        "<table>"
+        "<tr><td class='tpHead'>Category</td><td class='tpHead'>Message</td>"
+        "<td class='tpHead'>From First(s)</td><td class='tpHead'>From Last(s)</td></tr>"
+        "<tr><td>aspx.page</td><td>Begin PreInit</td><td></td><td></td></tr>"
+        "<tr><td>aspx.page</td><td>End PreInit</td><td>0.000123</td><td>0.000123</td></tr>"
+        "<tr><td>aspx.page</td><td>Begin Init</td><td>0.000178</td><td>0.000055</td></tr>"
+        "<tr><td>aspx.page</td><td>End Load</td><td>0.014591</td><td>0.014412</td></tr>"
+        "<tr><td>aspx.page</td><td>Begin ProcessPostData</td><td>0.014622</td><td>0.000031</td></tr>"
+        "<tr><td>aspx.page</td><td>End SaveState</td><td>0.048221</td><td>0.033598</td></tr>"
+        "</table>"
+        "<h2 class='alt'>Session State</h2>"
+        "<table>"
+        "<tr><td class='tpHead'>Session Key</td><td class='tpHead'>Type</td>"
+        "<td class='tpHead'>Value</td></tr>"
+        "<tr><td>UserID</td><td>System.String</td><td>svc_deploy</td></tr>"
+        "<tr><td>TenantID</td><td>System.Int32</td><td>7</td></tr>"
+        "<tr><td>DbConnectionString</td><td>System.String</td>"
+        "<td>Server=db.internal;Database=Portal;User Id=portal_rw;"
+        f"Password={db_password};</td></tr>"
+        "<tr><td>AwsProfile</td><td>System.String</td>"
+        f"<td>[default]&#10;aws_access_key_id = {aws_key}&#10;"
+        f"aws_secret_access_key = {aws_secret}&#10;region = us-east-1</td></tr>"
+        "</table>"
+        "<h2 class='alt'>Request Cookies Collection</h2>"
+        "<table>"
+        "<tr><td class='tpHead'>Name</td><td class='tpHead'>Value</td>"
+        "<td class='tpHead'>Size</td></tr>"
+        f"<tr><td>ASP.NET_SessionId</td><td>{asp_session}</td>"
+        f"<td>{40 + len(asp_session)}</td></tr>"
+        f"<tr><td>.ASPXAUTH</td><td>{aspxauth}</td><td>{len(aspxauth) + 12}</td></tr>"
+        "</table>"
+        "<h2 class='alt'>Headers Collection</h2>"
+        "<table>"
+        "<tr><td class='tpHead'>Name</td><td class='tpHead'>Value</td></tr>"
+        "<tr><td>Host</td><td>portal.internal</td></tr>"
+        "<tr><td>Content-Type</td><td>application/x-www-form-urlencoded</td></tr>"
+        "<tr><td>User-Agent</td><td>aws-sdk-dotnet-coreclr/3.7.400</td></tr>"
+        f"<tr><td>Authorization</td>"
+        f"<td>AWS4-HMAC-SHA256 Credential={aws_key}/20260714/us-east-1/s3/aws4_request,"
+        f" SignedHeaders=host;x-amz-content-sha256;x-amz-date,"
+        f" Signature={secrets.token_hex(32)}</td></tr>"
+        f"<tr><td>X-Amz-Security-Token</td><td>{aws_session}</td></tr>"
+        "</table>"
+        "<h2 class='alt'>Form Collection</h2>"
+        "<table>"
+        "<tr><td class='tpHead'>Name</td><td class='tpHead'>Value</td></tr>"
+        "<tr><td>__VIEWSTATE</td>"
+        f"<td>/wEPDwULLTE1MTk4MjE1MTdkZA{secrets.token_urlsafe(32)}</td></tr>"
+        "<tr><td>ctl00$MainContent$Username</td><td>svc_deploy</td></tr>"
+        "<tr><td>ctl00$MainContent$Password</td><td>[not shown]</td></tr>"
+        "</table>"
+        "<h2 class='alt'>Server Variables</h2>"
+        "<table>"
+        "<tr><td class='tpHead'>Name</td><td class='tpHead'>Value</td></tr>"
+        "<tr><td>APPL_PHYSICAL_PATH</td><td>C:\\inetpub\\wwwroot\\Portal\\</td></tr>"
+        "<tr><td>AUTH_TYPE</td><td>Forms</td></tr>"
+        "<tr><td>AUTH_USER</td><td>svc_deploy</td></tr>"
+        f"<tr><td>AWS_ACCESS_KEY_ID</td><td>{aws_key}</td></tr>"
+        f"<tr><td>AWS_SECRET_ACCESS_KEY</td><td>{aws_secret}</td></tr>"
+        f"<tr><td>AWS_SESSION_TOKEN</td><td>{aws_session}</td></tr>"
+        "<tr><td>AWS_DEFAULT_REGION</td><td>us-east-1</td></tr>"
+        "<tr><td>SERVER_SOFTWARE</td><td>Microsoft-IIS/10.0</td></tr>"
+        "</table>"
+        "</span></body></html>"
+    ).encode("utf-8")
+
+
+def _trace_axd_extra_headers(r: dict[str, object]) -> tuple[tuple[str, str], ...]:
+    """ASP.NET-ish response headers.
+
+    Real IIS + ASP.NET returns Server/X-AspNet-Version headers on
+    Trace.axd; scanners fingerprint the platform from those before
+    grepping the body, so serving them raises the odds the trap looks
+    real enough for a follow-up ``?id=1`` hit.
+    """
+    return (
+        ("Server", "Microsoft-IIS/10.0"),
+        ("X-AspNet-Version", "4.0.30319"),
+        ("X-Powered-By", "ASP.NET"),
+    )
+
+
 def render_application_properties(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     db_password = _fake_db_password()
@@ -15327,6 +15471,27 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_generic_ci_yml,
         "application/yaml; charset=utf-8",
+    ),
+    # ASP.NET Application Trace (``Trace.axd``). Left-on tracing in
+    # production Web.config leaks Request.Headers / Server.Variables /
+    # Form.Collection / Session.State across the entire recent
+    # request history — a recurring credential-disclosure finding
+    # scanners hit specifically to grep for ``Authorization`` values
+    # and env-var-shape server variables. Rendered body is the
+    # per-request detail view (Trace.axd?id=<n>) — the shape that
+    # carries the actual secrets — served unconditionally so the
+    # canary lands whether the scanner probes only the index path or
+    # follows through to a detail id. The AWS canary lands in three
+    # natural places at once: Server Variables ``AWS_ACCESS_KEY_ID``,
+    # Headers Collection ``Authorization`` AWS4-HMAC-SHA256 line, and
+    # Session State ``AwsProfile``.
+    CanaryTrap(
+        "trace-axd",
+        ("/trace.axd", "/trace.axd/"),
+        ("aws",),
+        render_trace_axd_detail,
+        "text/html; charset=utf-8",
+        _trace_axd_extra_headers,
     ),
     CanaryTrap(
         "application-properties",
