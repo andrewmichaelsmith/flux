@@ -588,6 +588,7 @@ def test_all_trap_families_default_on():
     assert tbenv.PHPMYADMIN_ENABLED
     assert tbenv.ADMINER_ENABLED
     assert tbenv.DS_STORE_ENABLED
+    assert tbenv.WEBLOGIC_CONSOLE_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -13759,6 +13760,156 @@ async def test_dispatch_ds_store_etag_per_request(flux_client):
     assert etags[0] != etags[1], (
         "ETag must be per-request unique so If-None-Match on later hits "
         "doesn't act as a fleet fingerprint."
+    )
+
+
+# --- Oracle WebLogic Admin Console trap ---------------------------------
+
+
+def test_weblogic_console_enabled_by_default():
+    assert tbenv.WEBLOGIC_CONSOLE_ENABLED
+
+
+def test_weblogic_console_default_paths_match_observed_probes():
+    for path in (
+        "/console",
+        "/console/",
+        "/console/login/LoginForm.jsp",
+        "/console/j_security_check",
+        "/CONSOLE/",  # case-insensitive
+    ):
+        assert tbenv.is_weblogic_console_path(path), f"expected match: {path}"
+
+
+def test_weblogic_console_path_non_match():
+    for path in (
+        "/",
+        "/console/.env",              # config-leak variant caught elsewhere
+        "/console/payments/config.js",  # deep sub-path not owned by this trap
+        "/console.php",               # PHP-shape console, different app
+        "/consoles/",                 # bare prefix without matching path
+    ):
+        assert not tbenv.is_weblogic_console_path(path), f"unexpected match: {path}"
+
+
+def test_weblogic_console_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "WEBLOGIC_CONSOLE_ENABLED", False)
+    assert not tbenv.is_weblogic_console_path("/console/")
+
+
+def test_render_weblogic_console_login_html_shape():
+    body = tbenv.render_weblogic_console_login_html(
+        "console.example", "14.1.1.0.0",
+    ).decode("utf-8")
+    assert "WebLogic Server Administration Console" in body
+    assert "j_username" in body
+    assert "j_password" in body
+    assert "/console/j_security_check" in body
+    assert "14.1.1.0.0" in body
+
+
+def test_render_weblogic_console_login_html_error_notice_on_failure():
+    body = tbenv.render_weblogic_console_login_html(
+        "console.example", "14.1.1.0.0",
+        error="Authentication Denied", submitted_user="weblogic",
+    ).decode("utf-8")
+    assert "Authentication Denied" in body
+    # Failed login should repopulate the username field so form-scraping
+    # bots see the standard WebLogic failure UX.
+    assert 'value="weblogic"' in body
+
+
+def test_extract_weblogic_console_creds_j2ee_field_names():
+    body = b"j_username=weblogic&j_password=Password1"
+    creds = tbenv.extract_weblogic_console_creds(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert creds.get("username") == "weblogic"
+    assert creds.get("hasPwd") == "true"
+    assert creds.get("pwdLen") == "9"
+
+
+def test_extract_weblogic_console_creds_lowercase_fallback():
+    body = b"username=admin&password=x"
+    creds = tbenv.extract_weblogic_console_creds(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert creds.get("username") == "admin"
+    assert creds.get("hasPwd") == "true"
+
+
+async def test_dispatch_weblogic_console_get_returns_login_html_with_cookie(flux_client):
+    resp = await flux_client.get(
+        "/console/",
+        headers={"X-Forwarded-For": "203.0.113.230", "Host": "console.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "WebLogic Server Administration Console" in text
+    assert "j_username" in text
+    set_cookie = resp.headers.get("Set-Cookie", "")
+    assert "ADMINCONSOLESESSION=" in set_cookie
+    server_hdr = resp.headers.get("Server", "")
+    assert server_hdr.startswith("WebLogic Server ")
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "weblogic-console-login"
+    assert entry["weblogicConsolePath"] == "/console/"
+    assert entry["weblogicConsoleMethod"] == "GET"
+
+
+async def test_dispatch_weblogic_console_head_returns_empty_body(flux_client):
+    resp = await flux_client.head(
+        "/console",
+        headers={"X-Forwarded-For": "203.0.113.231"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert body == b""
+    # Content-Length still reflects the would-be body size so scanners
+    # that decide follow-up on Content-Length see the real number.
+    assert int(resp.headers.get("Content-Length", "0")) > 0
+
+
+async def test_dispatch_weblogic_console_post_captures_credentials(flux_client):
+    resp = await flux_client.post(
+        "/console/j_security_check",
+        data="j_username=weblogic&j_password=hunter2",
+        headers={
+            "X-Forwarded-For": "203.0.113.232",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Authentication Denied" in text
+    assert "ADMINCONSOLESESSION=" in resp.headers.get("Set-Cookie", "")
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "weblogic-console-credential-post"
+    assert entry["weblogicConsoleUsername"] == "weblogic"
+    assert entry["weblogicConsoleHasPwd"] is True
+    assert entry["weblogicConsolePwdLen"] == "7"
+    assert "hunter2" not in text            # password never echoed in response
+    # bodyPreview intentionally captures the raw POST body for triage
+    # (same shape as the Adminer trap logs), but the trap must not
+    # break out a dedicated password field.
+    assert "weblogicConsolePassword" not in entry
+    assert "j_password" not in {k for k in entry}
+
+
+async def test_dispatch_weblogic_console_session_cookie_per_request_unique(flux_client):
+    cookies = []
+    for i in range(2):
+        resp = await flux_client.get(
+            "/console/",
+            headers={"X-Forwarded-For": f"203.0.113.{240 + i}"},
+        )
+        assert resp.status == 200
+        cookies.append(resp.headers.get("Set-Cookie", ""))
+    assert cookies[0] and cookies[1]
+    assert cookies[0] != cookies[1], (
+        "ADMINCONSOLESESSION must be per-request unique — never a fixed literal."
     )
 
 

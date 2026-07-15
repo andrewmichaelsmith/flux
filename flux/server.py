@@ -2450,6 +2450,55 @@ DS_STORE_ENTRY_NAMES = tuple(
 )
 
 
+# --- Fake Oracle WebLogic Admin Console ---------------------------------
+# `/console/` is the Oracle WebLogic Server admin console — a Java EE
+# app that runs on the AdminServer port and, when exposed to the
+# internet, provides a credential POST sink plus the RCE chains
+# CVE-2020-14882 / CVE-2020-14750 (auth bypass), CVE-2019-2725 /
+# CVE-2019-2729 (WLS9-async / wls-wsat deserialisation), and
+# CVE-2023-21839 (JNDI injection). Coordinated multi-IP scanner
+# fleets walk `/console/` alongside a small `payments/config.js` /
+# `base/config.js` / URL-encoded-dotenv (`%2eenv`, `%2ejson`)
+# dictionary, all rooted at `/console/`. Every hit currently 404s;
+# a plausible WebLogic 14c login page absorbs the credential POST
+# (real login target is `/console/j_security_check` with
+# `j_username` / `j_password` J2EE FORM auth field names) and mints
+# a per-request `ADMINCONSOLESESSION` cookie so the JSESSIONID-
+# replay chain stays alive past the first POST.
+WEBLOGIC_CONSOLE_ENABLED = _env_bool("HONEYPOT_WEBLOGIC_CONSOLE_ENABLED")
+# Advertised in the login HTML `<meta>` version tag and in the
+# `Server:` header. 14.1.1.0.0 is a common current-LTS build that
+# scanners deciding whether to ship an exploit body don't bail on
+# a "patched" banner.
+WEBLOGIC_CONSOLE_VERSION = (
+    os.environ.get("HONEYPOT_WEBLOGIC_CONSOLE_VERSION") or "14.1.1.0.0"
+).strip()
+_WEBLOGIC_CONSOLE_DEFAULT_PATHS = ",".join([
+    "/console",
+    "/console/",
+    "/console/login/loginform.jsp",
+    # Real J2EE FORM-auth submit target; scanners POST creds here
+    # after fetching the login form. Also observed as a direct
+    # first-request target from credential-stuffing dictionaries.
+    "/console/j_security_check",
+])
+WEBLOGIC_CONSOLE_PATHS = frozenset(
+    value.strip().lower()
+    for value in (
+        os.environ.get("HONEYPOT_WEBLOGIC_CONSOLE_PATHS_CSV")
+        or _WEBLOGIC_CONSOLE_DEFAULT_PATHS
+    ).split(",")
+    if value.strip()
+)
+WEBLOGIC_CONSOLE_BODY_DECODE_LIMIT = max(
+    int(
+        (os.environ.get("HONEYPOT_WEBLOGIC_CONSOLE_BODY_DECODE_LIMIT") or "4096").strip()
+        or "4096"
+    ),
+    256,
+)
+
+
 # --- Backup-archive canary trap ----------------------------------------
 # Scanner dictionaries enumerate the cross product `<base>.<ext>` of a
 # 60+-name base list and ~15 compressed-archive extensions hunting for
@@ -3296,6 +3345,23 @@ def is_ds_store_path(path: str) -> bool:
         return False
     lp = path.lower().split("?", 1)[0]
     return lp in DS_STORE_PATHS
+
+
+def is_weblogic_console_path(path: str) -> bool:
+    """Match Oracle WebLogic Admin Console landing + credential-POST
+    targets. Exact-match on the canonical set (`/console`, `/console/`,
+    `/console/login/LoginForm.jsp`, `/console/j_security_check`);
+    query string stripped before comparison. Deep sub-paths under
+    `/console/` (asset fetches, `/console/console.portal?_pageLabel=...`
+    navigation, RCE payload targets like
+    `/console/css/%252e%252e/consolejndi.portal`) are intentionally
+    NOT matched here — they overlap with other traps (e.g. URL-
+    encoded traversal caught elsewhere) or produce plausible-response
+    ambiguity in the login flow."""
+    if not WEBLOGIC_CONSOLE_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    return lp in WEBLOGIC_CONSOLE_PATHS
 
 
 def is_cmd_injection_path(path: str) -> bool:
@@ -6218,6 +6284,102 @@ def render_ds_store_body(entry_names: tuple[str, ...]) -> bytes:
 
     body = header + b"".join(records)
     return body
+
+
+def render_weblogic_console_login_html(
+    host: str,
+    version: str,
+    error: str = "",
+    submitted_user: str = "",
+) -> bytes:
+    """Oracle WebLogic Server admin console login page. Modelled on
+    the real console/login/LoginForm.jsp response from a stock
+    WebLogic 14.1.1 AdminServer — Oracle-branded HTML, `j_username`
+    / `j_password` J2EE FORM-auth field names, form submits to
+    `/console/j_security_check`. On a POST re-serve we surface the
+    submitted username so form-scraping bots think the failed-login
+    branch was reached (real WebLogic re-populates the username
+    field on failure)."""
+    safe_host = (host or "console.example").replace("<", "&lt;").replace(">", "&gt;")
+    safe_user = (submitted_user or "").replace("<", "&lt;").replace(">", "&gt;")[:200]
+    safe_error = error.replace("<", "&lt;").replace(">", "&gt;")[:200]
+    error_html = ""
+    if safe_error:
+        error_html = (
+            f'<p class=\"errortext\" id=\"errortext\">'
+            f'<img src=\"/console/framework/skins/wlsconsole/images/error.gif\" '
+            f'alt=\"error\" /> {safe_error}</p>'
+        )
+    body = f"""<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\"
+  \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">
+<html xmlns=\"http://www.w3.org/1999/xhtml\">
+<head>
+<meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\" />
+<meta name=\"WebLogic-Version\" content=\"{version}\" />
+<title>Oracle WebLogic Server Administration Console</title>
+<link rel=\"stylesheet\" href=\"/console/framework/skins/wlsconsole/css/master.css\" type=\"text/css\" />
+</head>
+<body class=\"login\">
+<div id=\"header\">
+<img src=\"/console/framework/skins/wlsconsole/images/login_WebLogic_branding.png\"
+  alt=\"Oracle WebLogic Server Administration Console\" />
+</div>
+<div id=\"content\">
+<h1>Oracle WebLogic Server Administration Console <span>{version}</span></h1>
+<p>Welcome to the WebLogic Server Administration Console for
+<code>{safe_host}</code>. Log in using the WebLogic Server
+administrator credentials for this domain.</p>
+{error_html}
+<form method=\"post\" action=\"/console/j_security_check\" name=\"loginData\"
+  autocomplete=\"off\">
+<table class=\"login\">
+<tbody>
+<tr><td><label for=\"username\">Username:</label></td>
+    <td><input type=\"text\" name=\"j_username\" id=\"username\"
+      value=\"{safe_user}\" autocomplete=\"username\"
+      autocapitalize=\"off\" /></td></tr>
+<tr><td><label for=\"password\">Password:</label></td>
+    <td><input type=\"password\" name=\"j_password\" id=\"password\"
+      autocomplete=\"current-password\" /></td></tr>
+</tbody>
+</table>
+<p><input type=\"submit\" name=\"loginButton\" value=\"Log In\" /></p>
+</form>
+</div>
+<div id=\"footer\">
+<p>WebLogic Server Version: {version}<br />
+Copyright &#169; 1996, Oracle and/or its affiliates. All rights reserved.
+Oracle is a registered trademark of Oracle Corporation and/or its
+affiliates. Other names may be trademarks of their respective owners.</p>
+</div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def extract_weblogic_console_creds(body: bytes, content_type: str) -> dict[str, str]:
+    """Pull the J2EE FORM-auth username / password-presence pair off a
+    `/console/j_security_check` (or landing-path) POST body. Records
+    the submitted `j_username` and whether `j_password` was present
+    + its length — the password bytes themselves are never stored."""
+    parsed = parse_form_body(body, content_type)
+    result: dict[str, str] = {}
+    # Real WebLogic uses `j_username` / `j_password` (J2EE FORM-auth
+    # standard); some scanner kits also submit lowercased or
+    # capitalised variants — accept both.
+    for key in ("j_username", "j_Username", "j_UserName", "username", "j_user"):
+        values = parsed.get(key)
+        if values and values[0]:
+            result["username"] = values[0][:200]
+            break
+    for key in ("j_password", "j_Password", "password"):
+        values = parsed.get(key)
+        if values and values[0]:
+            result["hasPwd"] = "true"
+            result["pwdLen"] = str(len(values[0]))[:6]
+            break
+    return result
 
 
 def render_liferay_jsonws_landing(host: str, aws: dict, version: str, build: str) -> bytes:
@@ -21272,6 +21434,109 @@ async def _handle_adminer(
     )
 
 
+async def _handle_weblogic_console(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Oracle WebLogic AdminServer console. GET/HEAD returns the login
+    HTML with a per-request `ADMINCONSOLESESSION` cookie. POST is
+    treated as a credential submission: captures `j_username` +
+    `j_password`-presence, re-serves the login page with the
+    "Authentication Denied" error notice, and mints a fresh session
+    cookie so the JSESSIONID / ADMINCONSOLESESSION replay chain
+    stays alive past the first POST. No fixed credential literals are
+    emitted; the session cookie is per-hit `uuid4().hex`."""
+    method = request.method
+    content_type_req = request.headers.get("Content-Type", "")
+    cookie_header = request.headers.get("Cookie", "")
+    cookies = parse_cookies(cookie_header)
+    submitted_session = cookies.get("ADMINCONSOLESESSION") or cookies.get("JSESSIONID") or ""
+
+    host = str(log_context.get("host", ""))
+    # Real WebLogic mints `ADMINCONSOLESESSION=<uppercased-alnum>` with
+    # a `Path=/console; HttpOnly` scope. Per-request value keeps replay
+    # attempts attributable to the issuance event in the trap log.
+    session_id = uuid.uuid4().hex.upper()
+    set_cookie = (
+        f"ADMINCONSOLESESSION={session_id}; Path=/console; HttpOnly"
+    )
+
+    common_headers = {
+        # Real WebLogic 14c AdminServer advertises this exact banner.
+        "Server": f"WebLogic Server {WEBLOGIC_CONSOLE_VERSION}",
+        # Framework identifier real WebLogic ships in the login flow;
+        # `X-ORACLE-DMS-ECID` is the Diagnostic-Message-Service context
+        # ID scanners cross-reference to confirm a WebLogic origin.
+        "X-ORACLE-DMS-ECID": uuid.uuid4().hex,
+        "X-ORACLE-DMS-RID": "0",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "X-Frame-Options": "SAMEORIGIN",
+    }
+
+    if method == "POST":
+        creds = extract_weblogic_console_creds(request_body, content_type_req)
+        body_preview = ""
+        if request_body:
+            body_preview = request_body[:WEBLOGIC_CONSOLE_BODY_DECODE_LIMIT].decode(
+                "utf-8", errors="replace",
+            )
+        html = render_weblogic_console_login_html(
+            host,
+            WEBLOGIC_CONSOLE_VERSION,
+            error="Authentication Denied",
+            submitted_user=creds.get("username", ""),
+        )
+        log_entry: dict[str, object] = {
+            **log_context,
+            "result": "weblogic-console-credential-post",
+            "status": 200,
+            "weblogicConsolePath": path,
+            "weblogicConsoleUsername": creds.get("username", ""),
+            "weblogicConsoleHasPwd": creds.get("hasPwd", "") == "true",
+            "weblogicConsolePwdLen": creds.get("pwdLen", ""),
+            "weblogicConsoleSessionCookiePresent": bool(submitted_session),
+            "contentType": content_type_req[:120],
+            "bytes": len(html),
+        }
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview
+        append_log(log_entry)
+        return web.Response(
+            status=200, body=html,
+            headers={
+                **common_headers,
+                "Content-Type": "text/html; charset=utf-8",
+                "Set-Cookie": set_cookie,
+                "Content-Length": str(len(html)),
+            },
+        )
+
+    html = render_weblogic_console_login_html(host, WEBLOGIC_CONSOLE_VERSION)
+    response_body = b"" if method == "HEAD" else html
+    log_entry = {
+        **log_context,
+        "result": "weblogic-console-login",
+        "status": 200,
+        "weblogicConsolePath": path,
+        "weblogicConsoleMethod": method,
+        "weblogicConsoleSessionCookiePresent": bool(submitted_session),
+        "bytes": len(html),
+    }
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=response_body,
+        headers={
+            **common_headers,
+            "Content-Type": "text/html; charset=utf-8",
+            "Set-Cookie": set_cookie,
+            "Content-Length": str(len(html)),
+        },
+    )
+
+
 async def _handle_ds_store(
     request: web.Request,
     log_context: dict[str, object],
@@ -23436,6 +23701,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_ds_store_path(path):
         return await _handle_ds_store(request, log_context, path)
+
+    if is_weblogic_console_path(path):
+        return await _handle_weblogic_console(request, log_context, path, request_body)
 
     if is_coldfusion_path(path):
         return await _handle_coldfusion(request, log_context, path, request_body)
