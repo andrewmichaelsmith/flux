@@ -2393,6 +2393,63 @@ ADMINER_PATHS = frozenset(
 )
 
 
+# --- .DS_Store filesystem-metadata leak trap ---------------------------
+# macOS Finder writes a `.DS_Store` alongside every browsed directory;
+# devs who develop on macOS and rsync the webroot up leak the whole
+# tree structure with it (folder + file names, sort order, view state).
+# Every hit currently 404s — the same directory-hunter dictionaries
+# that walk `/adminer.php` / `/whm` also cross-reference `.DS_Store`
+# because it's the fastest one-request enumeration of a webroot:
+# strings-out the body and you have a directory listing without
+# needing an Autoindex-on Apache. Recurring, coordinated multi-IP
+# scanner kits also cross-reference the file to seed follow-up
+# probes with the leaked filenames. The trap returns a plausibly
+# valid Finder `.DS_Store` binary whose embedded UTF-16BE record
+# names point at existing flux trap paths (`.env`, `.git`, `wp-admin`,
+# `phpmyadmin`, `backup.zip`, …); a scraper that strings-out the
+# body harvests a list of "found" webroot paths and follows them
+# straight back into other flux handlers — so the trap's success
+# metric is the follow-on probe volume from the same source IP.
+DS_STORE_ENABLED = _env_bool("HONEYPOT_DS_STORE_ENABLED")
+_DS_STORE_DEFAULT_PATHS = ",".join([
+    "/.ds_store",
+    "/.ds_store/",
+])
+DS_STORE_PATHS = frozenset(
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_DS_STORE_PATHS_CSV") or _DS_STORE_DEFAULT_PATHS).split(",")
+    if value.strip()
+)
+# Filenames embedded in the returned `.DS_Store` binary. These are the
+# strings a scraper harvests via `strings /path/to/.DS_Store` and hands
+# to their follow-up crawler — every entry points at a path that flux
+# already handles, so any follow-through routes back to a trap. Override
+# via CSV to seed a bait list specific to a target profile.
+_DS_STORE_DEFAULT_ENTRY_NAMES = ",".join([
+    ".env",
+    ".env.production",
+    ".git",
+    ".aws",
+    "backup.zip",
+    "backup.sql",
+    "admin",
+    "phpmyadmin",
+    "wp-admin",
+    "wp-config.php.bak",
+    "config",
+    "adminer.php",
+    "deploy",
+])
+DS_STORE_ENTRY_NAMES = tuple(
+    value.strip()
+    for value in (
+        os.environ.get("HONEYPOT_DS_STORE_ENTRY_NAMES_CSV")
+        or _DS_STORE_DEFAULT_ENTRY_NAMES
+    ).split(",")
+    if value.strip()
+)
+
+
 # --- Backup-archive canary trap ----------------------------------------
 # Scanner dictionaries enumerate the cross product `<base>.<ext>` of a
 # 60+-name base list and ~15 compressed-archive extensions hunting for
@@ -3228,6 +3285,17 @@ def is_adminer_path(path: str) -> bool:
         return False
     lp = path.lower().split("?", 1)[0]
     return lp in ADMINER_PATHS
+
+
+def is_ds_store_path(path: str) -> bool:
+    """Match `/.DS_Store` (case-insensitive, both `/` and no-`/` variants).
+    macOS Finder writes this file into every browsed directory; leaked
+    copies enumerate the webroot for scanners running `strings` over
+    the binary."""
+    if not DS_STORE_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    return lp in DS_STORE_PATHS
 
 
 def is_cmd_injection_path(path: str) -> bool:
@@ -6091,6 +6159,65 @@ def extract_adminer_creds(body: bytes, content_type: str) -> dict[str, str]:
     if tok and tok[0]:
         result["token"] = tok[0][:200]
     return result
+
+
+def render_ds_store_body(entry_names: tuple[str, ...]) -> bytes:
+    """Return a plausibly-shaped Finder `.DS_Store` binary whose
+    records embed `entry_names` as UTF-16BE strings — the exact shape
+    a scraper running `strings .DS_Store` or a mac_apt-style parser
+    walks to enumerate a leaked webroot.
+
+    The buddy-allocator layout in the real format is not fully
+    reconstructed (parsers that strictly validate the free-list
+    bail before the record table); the goal is a body that:
+
+      * Starts with the canonical 4-byte alignment prefix + `Bud1`
+        magic + a large `offset` / `size` / `offset-copy` triple so
+        `file(1)` and `magic`-based scanners classify it as `Apple
+        Desktop Services Store`.
+      * Contains one Master DSDB record header (`DSDB`).
+      * Contains one `Iloc` (icon location) record per entry name,
+        each with the name emitted as UTF-16BE with a `\\x00\\x00`
+        terminator — the shape `strings -e b` extracts cleanly.
+
+    All entry names are chosen (via `DS_STORE_ENTRY_NAMES` /
+    `HONEYPOT_DS_STORE_ENTRY_NAMES_CSV`) to route back into existing
+    flux handlers when a scraper follows them up, so the trap's
+    downstream metric is the follow-on probe volume — not the
+    single `.DS_Store` fetch."""
+    header = (
+        b"\x00\x00\x00\x01"           # alignment prefix
+        b"Bud1"                        # magic
+        + (0x00001000).to_bytes(4, "big")   # root block offset
+        + (0x00000800).to_bytes(4, "big")   # root block size
+        + (0x00001000).to_bytes(4, "big")   # root block offset (copy)
+        + b"\x00" * 16                  # padding
+    )
+    records: list[bytes] = []
+    # One `DSDB` master record so a lightweight parser sees the
+    # expected structure marker before the per-file records.
+    records.append(b"DSDB" + b"\x00" * 4 + b"\x00" * 4)
+
+    for name in entry_names:
+        name_bytes = name.encode("utf-16-be", errors="replace")
+        # Record shape: name-length (u32 BE, count of UTF-16 code units),
+        # name (UTF-16BE), 4-byte structure type `Iloc` (icon location),
+        # 4-byte data type `blob`, 4-byte blob length, blob payload.
+        name_units = max(1, len(name_bytes) // 2)
+        blob = b"\x00\x00\x00\x50\x00\x00\x00\x28"  # dummy x,y coords
+        rec = (
+            name_units.to_bytes(4, "big")
+            + name_bytes
+            + b"\x00\x00"               # UTF-16 NUL terminator
+            + b"Iloc"                   # structure ID
+            + b"blob"                   # data type
+            + len(blob).to_bytes(4, "big")
+            + blob
+        )
+        records.append(rec)
+
+    body = header + b"".join(records)
+    return body
 
 
 def render_liferay_jsonws_landing(host: str, aws: dict, version: str, build: str) -> bytes:
@@ -21145,6 +21272,50 @@ async def _handle_adminer(
     )
 
 
+async def _handle_ds_store(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    """Serve a plausible Finder `.DS_Store` binary. GET returns the
+    binary body; HEAD returns 200 with the same headers and empty
+    body. No credential capture — this trap's success signal is
+    the follow-on probe volume for the embedded entry names, not
+    the `.DS_Store` fetch itself."""
+    body = render_ds_store_body(DS_STORE_ENTRY_NAMES)
+    method = request.method
+    response_body = b"" if method == "HEAD" else body
+    log_entry = {
+        **log_context,
+        "result": "ds-store",
+        "status": 200,
+        "dsStorePath": path,
+        "dsStoreMethod": method,
+        "dsStoreEntryCount": len(DS_STORE_ENTRY_NAMES),
+        "bytes": len(body),
+    }
+    append_log(log_entry)
+    return web.Response(
+        status=200,
+        body=response_body,
+        headers={
+            # `.DS_Store` has no registered IANA MIME type — real
+            # webservers serve it as application/octet-stream (nginx
+            # default) or fall back to text/plain (apache). Match the
+            # nginx shape; a scraper's file-command classifier looks
+            # at the magic bytes, not the header.
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(body)),
+            "Cache-Control": "no-store",
+            # Real deployments that leak `.DS_Store` almost always sit
+            # behind a stock nginx that ships the file with an ETag +
+            # Last-Modified pair. Emit a per-hit ETag so the trap isn't
+            # a fleet-wide fingerprint via `If-None-Match` on later hits.
+            "ETag": f'"{uuid.uuid4().hex[:16]}"',
+        },
+    )
+
+
 async def _handle_phpmyadmin(
     request: web.Request,
     log_context: dict[str, object],
@@ -23262,6 +23433,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_adminer_path(path):
         return await _handle_adminer(request, log_context, path, request_body)
+
+    if is_ds_store_path(path):
+        return await _handle_ds_store(request, log_context, path)
 
     if is_coldfusion_path(path):
         return await _handle_coldfusion(request, log_context, path, request_body)

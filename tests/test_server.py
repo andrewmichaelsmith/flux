@@ -587,6 +587,7 @@ def test_all_trap_families_default_on():
     assert tbenv.OIDC_DISCOVERY_ENABLED
     assert tbenv.PHPMYADMIN_ENABLED
     assert tbenv.ADMINER_ENABLED
+    assert tbenv.DS_STORE_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -13667,6 +13668,98 @@ async def test_dispatch_adminer_head_returns_empty_body(flux_client):
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "adminer-login"
     assert entry["adminerMethod"] == "HEAD"
+
+
+# --- /.DS_Store filesystem-metadata leak trap ---------------------------
+
+
+def test_ds_store_enabled_by_default():
+    assert tbenv.DS_STORE_ENABLED
+
+
+def test_ds_store_default_paths_match_observed_probes():
+    for path in ("/.DS_Store", "/.ds_store", "/.DS_Store/"):
+        assert tbenv.is_ds_store_path(path), f"expected match: {path}"
+
+
+def test_ds_store_path_non_match():
+    for path in (
+        "/",
+        "/.env",
+        "/.DS_Store.bak",           # a suffix-appended name is not the exact leak
+        "/wp-content/.DS_Store",    # deep-tree copies are out of scope for v1
+        "/DS_Store",                # no leading dot — a scanner asking for this
+                                    # is not actually looking at the leaked file
+    ):
+        assert not tbenv.is_ds_store_path(path), f"unexpected match: {path}"
+
+
+def test_ds_store_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "DS_STORE_ENABLED", False)
+    assert not tbenv.is_ds_store_path("/.DS_Store")
+
+
+def test_render_ds_store_body_has_magic_and_entries():
+    body = tbenv.render_ds_store_body((".env", "backup.zip", "wp-admin"))
+    # File(1) / magic classifiers look at the first 8 bytes to tag this
+    # as an Apple Desktop Services Store file.
+    assert body[:8] == b"\x00\x00\x00\x01Bud1"
+    assert b"DSDB" in body
+    assert b"Iloc" in body
+    # UTF-16BE encoding of the embedded names — the shape `strings -e b`
+    # extracts cleanly.
+    for name in (".env", "backup.zip", "wp-admin"):
+        assert name.encode("utf-16-be") in body
+
+
+async def test_dispatch_ds_store_get_returns_binary(flux_client):
+    resp = await flux_client.get(
+        "/.DS_Store",
+        headers={"X-Forwarded-For": "203.0.113.220"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Content-Type") == "application/octet-stream"
+    body = await resp.read()
+    assert body[:8] == b"\x00\x00\x00\x01Bud1"
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "ds-store"
+    assert entry["dsStorePath"] == "/.DS_Store"
+    assert entry["dsStoreMethod"] == "GET"
+    assert entry["dsStoreEntryCount"] == len(tbenv.DS_STORE_ENTRY_NAMES)
+    assert entry["bytes"] == len(body)
+
+
+async def test_dispatch_ds_store_head_returns_empty_body_but_length_header(flux_client):
+    resp = await flux_client.head(
+        "/.DS_Store",
+        headers={"X-Forwarded-For": "203.0.113.221"},
+    )
+    assert resp.status == 200
+    assert resp.headers.get("Content-Type") == "application/octet-stream"
+    assert int(resp.headers.get("Content-Length", "0")) > 0
+    body = await resp.read()
+    assert body == b""
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "ds-store"
+    assert entry["dsStoreMethod"] == "HEAD"
+
+
+async def test_dispatch_ds_store_etag_per_request(flux_client):
+    etags = []
+    for i in range(2):
+        resp = await flux_client.get(
+            "/.DS_Store",
+            headers={"X-Forwarded-For": f"203.0.113.{222 + i}"},
+        )
+        assert resp.status == 200
+        etags.append(resp.headers.get("ETag", ""))
+    assert etags[0] and etags[1]
+    assert etags[0] != etags[1], (
+        "ETag must be per-request unique so If-None-Match on later hits "
+        "doesn't act as a fleet fingerprint."
+    )
 
 
 # --- Bounded log rotation (unbounded env-canary.jsonl fix) --------------
