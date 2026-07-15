@@ -888,15 +888,31 @@ RDWEB_ENABLED = _env_bool("HONEYPOT_RDWEB_ENABLED")
 _RDWEB_DEFAULT_PATHS = ",".join([
     "/rdweb",
     "/rdweb/",
+    "/rdweb/pages",
     "/rdweb/pages/",
     "/rdweb/pages/en-us/login.aspx",
     "/rdweb/pages/en-us/default.aspx",
+    # HTML5 Remote Desktop Web Client landing paths (Windows Server
+    # 2019 / 2022 RDWeb ships the webclient alongside the classic
+    # ASP.NET login flow).
+    "/rdweb/webclient",
+    "/rdweb/webclient/",
+    "/rdweb/webclient/index.html",
 ])
 RDWEB_PATHS = {
     value.strip().lower()
     for value in (os.environ.get("HONEYPOT_RDWEB_PATHS_CSV") or _RDWEB_DEFAULT_PATHS).split(",")
     if value.strip()
 }
+# Real Server 2019 / 2022 RDWeb ships pre-built locale directories
+# under `/rdweb/pages/<xx-yy>/` — scanners probe the non-en-US variants
+# (`tr-tr`, `es-es`, `zh-cn`, `fr-fr`, …) to look for locale-specific
+# forms and to avoid detection rules keyed only on `/en-us/`. Match
+# any two-letter language + two-letter region tag rather than enumerating
+# all 20+ locales, and dispatch based on the trailing filename.
+_RDWEB_LOCALE_PATH_RE = re.compile(
+    r"^/rdweb/pages/[a-z]{2}-[a-z]{2}/(login|default)\.aspx$",
+)
 # Windows Server build advertised in the RDWeb logon HTML. 17763 is the
 # Server 2019 LTSC build that scanners commonly fingerprint when picking
 # password-spraying targets; matches the broad install base.
@@ -2857,7 +2873,10 @@ def is_citrix_gateway_path(path: str) -> bool:
 def is_rdweb_path(path: str) -> bool:
     if not RDWEB_ENABLED:
         return False
-    return path.lower() in RDWEB_PATHS
+    lp = path.lower()
+    if lp in RDWEB_PATHS:
+        return True
+    return bool(_RDWEB_LOCALE_PATH_RE.match(lp))
 
 
 # Exchange surface is wide enough that an exact-match table would rot
@@ -19475,12 +19494,36 @@ async def _handle_rdweb(
     # after harvesting a session cookie from the login POST).
     serve_canary = False
 
-    if lpath in {"/rdweb", "/rdweb/", "/rdweb/pages/", "/rdweb/pages/en-us/login.aspx"}:
-        # Treat all the landing variants as the login form. Scanners
-        # commonly POST creds against the short `/RDWeb` path rather than
-        # the full `/RDWeb/Pages/en-US/login.aspx` ASP.NET handler URL —
-        # we still serve the same HTML, but log it as a credential POST
-        # and mint a session cookie on any of the four landing variants.
+    # Classify the request into three buckets: login form (GET) / credential
+    # POST (POST) / post-auth default page (GET). Locale-specific
+    # `/rdweb/pages/<xx-yy>/{login,default}.aspx` variants route by
+    # trailing filename so the tr-tr / es-es / zh-cn / … dictionaries
+    # scanners walk all land on the same handler.
+    locale_match = _RDWEB_LOCALE_PATH_RE.match(lpath)
+    is_default_page = lpath == "/rdweb/pages/en-us/default.aspx" or (
+        locale_match is not None and locale_match.group(1) == "default"
+    )
+    # Landing variants that scanners POST credentials against — the short
+    # `/RDWeb` path plus every localized login form. Also treat the two
+    # HTML5 webclient landing paths as login-form GETs so scanners walking
+    # `/rdweb/webclient/index.html` after finding the classic login flow
+    # keep chaining probes.
+    is_landing = lpath in {
+        "/rdweb",
+        "/rdweb/",
+        "/rdweb/pages",
+        "/rdweb/pages/",
+        "/rdweb/pages/en-us/login.aspx",
+        "/rdweb/webclient",
+        "/rdweb/webclient/",
+        "/rdweb/webclient/index.html",
+    } or (locale_match is not None and locale_match.group(1) == "login")
+
+    if is_landing:
+        # Scanners commonly POST creds against the short `/RDWeb` path
+        # rather than the full ASP.NET handler URL — we still serve the
+        # same HTML, but log it as a credential POST and mint a session
+        # cookie on any of the landing variants.
         if method == "POST":
             result_tag = "rdweb-login-post"
             content_type = "text/html; charset=utf-8"
@@ -19494,7 +19537,7 @@ async def _handle_rdweb(
             result_tag = "rdweb-login"
             body = render_rdweb_login_html(host, RDWEB_SERVER_BUILD)
             content_type = "text/html; charset=utf-8"
-    elif lpath == "/rdweb/pages/en-us/default.aspx":
+    elif is_default_page:
         result_tag = "rdweb-default"
         content_type = "text/html; charset=utf-8"
         serve_canary = True

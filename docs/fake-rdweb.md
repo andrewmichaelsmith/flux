@@ -12,11 +12,16 @@ to the trap log.
 | `/RDWeb` | `POST` | Treated as credential POST: post-auth resource list HTML + `Set-Cookie: TSWAAuthHttpOnlyCookie=<per-request hex>; Path=/RDWeb; Secure; HttpOnly` |
 | `/RDWeb/` | `GET`, `HEAD` | Same logon HTML |
 | `/RDWeb/` | `POST` | Treated as credential POST (same response + cookie as above) |
+| `/RDWeb/Pages` | `GET`, `HEAD` | Same logon HTML |
+| `/RDWeb/Pages` | `POST` | Treated as credential POST (same response + cookie as above) |
 | `/RDWeb/Pages/` | `GET`, `HEAD` | Same logon HTML |
 | `/RDWeb/Pages/` | `POST` | Treated as credential POST (same response + cookie as above) |
 | `/RDWeb/Pages/en-US/login.aspx` | `GET`, `HEAD` | Logon HTML with a per-request `__VIEWSTATE` placeholder; form posts back to the same path |
 | `/RDWeb/Pages/en-US/login.aspx` | `POST` | Post-auth resource list HTML; `Set-Cookie: TSWAAuthHttpOnlyCookie=<per-request hex>; Path=/RDWeb; Secure; HttpOnly` |
+| `/RDWeb/Pages/<xx-yy>/login.aspx` | `GET`, `HEAD`, `POST` | Same behaviour as the en-US login form — any two-letter language + two-letter region tag matches (`tr-TR`, `es-ES`, `zh-CN`, `fr-FR`, …), covering the pre-built locale directories Server 2019 / 2022 RDWeb ships |
 | `/RDWeb/Pages/en-US/Default.aspx` | `GET`, `HEAD`, `POST` | `RemoteApp and Desktop Connection` panel; with `TRACEBIT_API_KEY` set, advertises one `Cloud Console` tile whose `RDPFileContents` HTML comment embeds a per-hit Tracebit AWS canary (`aws_access_key_id` / `aws_secret_access_key` / `aws_session_token`). Without an API key, falls back to `No resources are currently available.` |
+| `/RDWeb/Pages/<xx-yy>/Default.aspx` | `GET`, `HEAD`, `POST` | Same behaviour + canary as the en-US default page for every locale variant |
+| `/RDWeb/WebClient`, `/RDWeb/WebClient/`, `/RDWeb/WebClient/index.html` | `GET`, `HEAD`, `POST` | HTML5 Remote Desktop Web Client landing paths (Windows Server 2019 / 2022 ship the webclient alongside the classic ASP.NET login flow) — GET returns the same login HTML; POST is treated as a credential POST with cookie mint |
 
 All matched paths return `200` with `Cache-Control: no-store`,
 `Server: Microsoft-IIS/10.0`, and `X-Powered-By: ASP.NET`. Disabled
@@ -32,11 +37,14 @@ The handler logs:
 - `rdwebPath` (exact request path)
 - `rdwebMethod` (HTTP verb)
 - `rdwebUsername` and `rdwebHasPassword` for any landing-path POST
-  (`/RDWeb`, `/RDWeb/`, `/RDWeb/Pages/`, or `/RDWeb/Pages/en-US/login.aspx`).
-  Password value is never stored — only presence. Field-name handling
-  accepts both the canonical `DomainUserName` + `UserPass` form-field
-  names and the lowercased / generic `username` / `password` variants
-  some scanners emit.
+  (short landings `/RDWeb`, `/RDWeb/`, `/RDWeb/Pages`, `/RDWeb/Pages/`,
+  the classic `/RDWeb/Pages/en-US/login.aspx` handler, every locale
+  variant `/RDWeb/Pages/<xx-yy>/login.aspx`, and the HTML5 web-client
+  landings `/RDWeb/WebClient[/index.html]`). Password value is never
+  stored — only presence. Field-name handling accepts both the
+  canonical `DomainUserName` + `UserPass` form-field names and the
+  lowercased / generic `username` / `password` variants some scanners
+  emit.
 - `canaryTypes` — list of Tracebit canary types embedded in the
   response (e.g. `["aws"]` on landing-path POSTs and on
   `Default.aspx` GETs/HEADs/POSTs when an API key is configured).

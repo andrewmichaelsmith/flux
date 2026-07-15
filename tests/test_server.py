@@ -5409,9 +5409,30 @@ def test_rdweb_default_paths_match_observed_probes():
     for path in (
         "/RDWeb",
         "/RDWeb/",
+        "/RDWeb/Pages",
         "/RDWeb/Pages/",
         "/RDWeb/Pages/en-US/login.aspx",
         "/RDWeb/Pages/en-US/Default.aspx",
+        "/RDWeb/WebClient",
+        "/RDWeb/WebClient/",
+        "/RDWeb/WebClient/index.html",
+    ):
+        assert tbenv.is_rdweb_path(path), f"expected match: {path}"
+
+
+def test_rdweb_locale_paths_match_all_locales():
+    # Real Server 2019 / 2022 RDWeb ships `<xx-yy>/` locale directories
+    # under `/RDWeb/Pages/`; scanners rotate the trailing dictionary
+    # (tr-tr, es-es, zh-cn, fr-fr, …) to catch installs that dropped
+    # en-us. Any two-letter language + two-letter region tag matches.
+    for path in (
+        "/RDWeb/Pages/es-ES/login.aspx",
+        "/RDWeb/Pages/es-ES/Default.aspx",
+        "/RDWeb/Pages/tr-TR/login.aspx",
+        "/RDWeb/Pages/tr-TR/Default.aspx",
+        "/RDWeb/Pages/zh-CN/login.aspx",
+        "/RDWeb/Pages/fr-FR/login.aspx",
+        "/rdweb/pages/de-de/default.aspx",
     ):
         assert tbenv.is_rdweb_path(path), f"expected match: {path}"
 
@@ -5420,7 +5441,10 @@ def test_rdweb_path_non_match():
     for path in (
         "/",
         "/rdweb-foo",
-        "/RDWeb/Pages/foo.aspx",  # not in our default set
+        "/RDWeb/Pages/foo.aspx",  # bare filename, no locale directory
+        "/RDWeb/Pages/en-US/foo.aspx",  # unknown filename inside a locale dir
+        "/RDWeb/Pages/notalocale/login.aspx",  # non-locale-shaped segment
+        "/RDWeb/Pages/x-y/login.aspx",  # single-letter language tag
         "/.env",
         "/remote/login",
     ):
@@ -5505,14 +5529,19 @@ async def test_dispatch_rdweb_login_post_logs_username_and_sets_session_cookie(f
     [
         "/RDWeb",
         "/RDWeb/",
+        "/RDWeb/Pages",
         "/RDWeb/Pages/",
+        "/RDWeb/Pages/es-ES/login.aspx",
+        "/RDWeb/Pages/tr-TR/login.aspx",
     ],
 )
 async def test_dispatch_rdweb_login_post_on_short_landing_paths(flux_client, post_path):
     # Scanners observed in the wild POST credentials to the short landing
-    # paths (`/RDWeb`, `/RDWeb/`, `/RDWeb/Pages/`), not just the full
-    # `/RDWeb/Pages/en-US/login.aspx` URL. All four should be treated as
-    # credential POSTs: parse the form, mint a session cookie, log result.
+    # paths (`/RDWeb`, `/RDWeb/`, `/RDWeb/Pages`, `/RDWeb/Pages/`) and to
+    # localized login pages (`/RDWeb/Pages/<xx-yy>/login.aspx`), not just
+    # the full `/RDWeb/Pages/en-US/login.aspx` URL. All should be treated
+    # as credential POSTs: parse the form, mint a session cookie, log
+    # result.
     resp = await flux_client.post(
         post_path,
         data="DomainUserName=DOMAIN%5Cadmin&UserPass=hunter2",
@@ -5530,6 +5559,51 @@ async def test_dispatch_rdweb_login_post_on_short_landing_paths(flux_client, pos
     assert entry["rdwebPath"] == post_path
     assert entry["rdwebUsername"] == "DOMAIN\\admin"
     assert entry["rdwebHasPassword"] is True
+
+
+@pytest.mark.parametrize(
+    "get_path",
+    [
+        "/RDWeb/Pages",
+        "/RDWeb/Pages/es-ES/login.aspx",
+        "/RDWeb/Pages/tr-TR/login.aspx",
+        "/RDWeb/WebClient",
+        "/RDWeb/WebClient/index.html",
+    ],
+)
+async def test_dispatch_rdweb_login_gets_localized_and_webclient(flux_client, get_path):
+    # GET on newly-covered landing paths (no-trailing-slash `/RDWeb/Pages`,
+    # localized login forms, HTML5 webclient) returns the login HTML with
+    # the same result tag as `/RDWeb/Pages/en-US/login.aspx`.
+    resp = await flux_client.get(
+        get_path,
+        headers={"X-Forwarded-For": "203.0.113.173", "Host": "rdweb.example"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "RD Web Access" in text
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "rdweb-login"
+    assert entry["rdwebPath"] == get_path
+
+
+async def test_dispatch_rdweb_localized_default_page_serves_canary(
+    flux_client, monkeypatch,
+):
+    # Non-en-US Default.aspx pages should behave identically to the
+    # en-US default page — post-auth resource list with a canary when
+    # API_KEY is configured.
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+    resp = await flux_client.get(
+        "/RDWeb/Pages/es-ES/Default.aspx",
+        headers={"X-Forwarded-For": "203.0.113.191"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "rdweb-default"
+    assert "aws" in entry.get("canaryTypes", [])
 
 
 async def test_dispatch_rdweb_login_post_cookie_per_request_unique(flux_client):
