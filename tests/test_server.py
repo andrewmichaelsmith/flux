@@ -7946,6 +7946,43 @@ def test_fake_git_repo_covers_common_branch_refs():
             assert sha in files[key].decode("utf-8"), key
 
 
+def test_fake_git_repo_covers_common_tag_refs():
+    """Scanner enumeration dictionaries walk `refs/tags/<name>` for common
+    release-cadence tag names (`v1.0`, `v1.1`, `v0.1`, `latest`, …) after
+    the branch heads — any real repo with a published release ships these.
+    A 404 on every one of them while `refs/heads/main` returns 200 is a
+    consistency tell that the tree was hand-synthesized without the
+    tagging plumbing a real release cycle produces."""
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    sha = meta["commitSha"]
+    assert set(tbenv._FAKE_GIT_TAG_REFS) >= {"v1.0", "v1.1", "latest"}
+    for tag in tbenv._FAKE_GIT_TAG_REFS:
+        key = f"/.git/refs/tags/{tag}"
+        assert key in files, f"missing fake-git tag ref: {key}"
+        # Lightweight tag: bare commit-sha ref, newline-terminated.
+        assert files[key].decode("utf-8") == sha + "\n", key
+
+
+def test_fake_git_repo_ships_info_plumbing_files():
+    """`.git/info/attributes`, `.git/info/sparse-checkout`, and
+    `.git/info/packs` are enumerated after `.git/info/exclude`. Empty
+    (or comment-only) bodies are valid resting states on a real repo —
+    the fingerprint check is that the file exists at all, not that it
+    has non-trivial content."""
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, _meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    # `attributes`: comment header + a couple of plausible patterns.
+    attrs = files["/.git/info/attributes"].decode("utf-8")
+    assert attrs.startswith("# ")
+    assert "text=auto" in attrs
+    # `sparse-checkout`: empty is a valid resting state.
+    assert files["/.git/info/sparse-checkout"] == b""
+    # `packs`: empty for a repo with only loose objects (matches
+    # `/.git/objects/info/packs` already shipped).
+    assert files["/.git/info/packs"] == b""
+
+
 def test_fake_git_repo_covers_stash_and_wip_refs():
     """`refs/stash` + `logs/refs/stash` are present in any repo with a
     saved stash; the git-wip extension adds `refs/wip/index/...` and

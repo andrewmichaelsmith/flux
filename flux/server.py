@@ -9227,6 +9227,20 @@ _FAKE_GIT_EXTRA_BRANCHES: tuple[str, ...] = (
     "qa",
 )
 
+# Tag refs a released repo would ship. Lightweight tags (bare commit-sha refs
+# under `refs/tags/`) — no separate tag-object plumbing needed. The same
+# `commit_sha` used for the branch heads is fine: every tag is projected
+# onto the one synthesized commit. Common release-cadence names cover the
+# scanner dictionaries that walk `/.git/refs/tags/<name>` after the branches.
+_FAKE_GIT_TAG_REFS: tuple[str, ...] = (
+    "v0.1",
+    "v1.0",
+    "v1.1",
+    "v2.0",
+    "latest",
+    "release",
+)
+
 
 def _fake_git_hook_body(name: str) -> bytes:
     """Plausible-shaped `.sample` hook body.
@@ -9435,6 +9449,24 @@ def _build_fake_repo(
             "# git ls-files --others --exclude-from=.git/info/exclude\n"
             "*.log\n.DS_Store\n"
         ).encode("utf-8"),
+        # Additional /.git/info/* files a real repo commonly has. Scanners
+        # enumerate these as fingerprint checks after the main refs — a 404
+        # on `/.git/info/attributes` against an otherwise-plausible
+        # `/.git/info/exclude` is a "this isn't real" tell. `attributes` is
+        # populated when a repo pins its own line-ending / merge rules;
+        # `sparse-checkout` is populated when sparse checkout is enabled
+        # (empty is a valid resting state on a freshly-init'd repo);
+        # `packs` is written when `git repack` runs (empty is also valid on
+        # a repo with only loose objects).
+        "/.git/info/attributes": (
+            "# .git/info/attributes — repo-local git attributes\n"
+            "* text=auto eol=lf\n"
+            "*.png binary\n"
+            "*.jpg binary\n"
+            "*.pdf binary\n"
+        ).encode("utf-8"),
+        "/.git/info/sparse-checkout": b"",
+        "/.git/info/packs": b"",
         "/.git/logs/head": reflog_line.encode("utf-8"),
         "/.git/logs/refs/heads/main": reflog_line.encode("utf-8"),
         "/.git/logs/refs/heads/master": reflog_line.encode("utf-8"),
@@ -9465,6 +9497,15 @@ def _build_fake_repo(
         files[f"/.git/refs/remotes/origin/{branch}"] = f"{commit_sha}\n".encode("utf-8")
         files[f"/.git/logs/refs/heads/{branch}"] = reflog_line.encode("utf-8")
         files[f"/.git/logs/refs/remotes/origin/{branch}"] = reflog_line.encode("utf-8")
+
+    # Lightweight tag refs (`refs/tags/<name>` -> commit sha). Scanners
+    # enumerate these alongside branch names after `/.git/HEAD`; a repo
+    # with any published release ships them. Same commit_sha across all
+    # tags keeps the synthesized tree consistent — every tag points at
+    # the one commit. Lightweight (bare-sha) form avoids the tag-object
+    # plumbing that annotated tags need.
+    for tag in _FAKE_GIT_TAG_REFS:
+        files[f"/.git/refs/tags/{tag}"] = f"{commit_sha}\n".encode("utf-8")
 
     # git-stash refs: a real repo with any saved stash has these; their
     # absence is a banner-grab tell for scanners that enumerate
