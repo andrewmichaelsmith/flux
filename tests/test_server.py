@@ -2189,6 +2189,37 @@ def test_bare_credentials_json_routes_to_config_json(path):
     "/.env1", "/.env_copy",
     # Sloppy-commit `env.*` (no leading dot) variants
     "/env.old", "/env.save", "/env.backup",
+    # Editor-scratch / rename-workflow variants that dictionaries walk
+    # alongside the classic `.bak` / `.old` set.
+    "/.env.toml", "/.env.tmp", "/.env.temp",
+    "/.env.prev", "/.env.new", "/.env.copy", "/.env.template",
+    "/.env.saved", "/.env.default",
+    "/.env.old~", "/.env.save~", "/.env.bak~", "/.env.backup~",
+    # Multi-tier `.local` overrides on each env-tier.
+    "/.env.prod.local", "/.env.production.local",
+    "/.env.live.local", "/.env.staging.local", "/.env.stage.local",
+    "/.env.uat.local", "/.env.qa.local", "/.env.preprod.local",
+    # Underscore-tier variants beyond the existing `_bak` / `_old` set.
+    "/.env_prod", "/.env_dev", "/.env_backup",
+    "/.env_prev", "/.env_default",
+    # Same set under a webroot prefix (cross-product coverage).
+    "/backend/.env.tmp", "/backend/.env.template",
+    "/backend/.env.production.local", "/backend/.env_prod",
+    "/api/.env.new", "/api/.env.copy", "/api/.env.staging.local",
+    # New webroot prefixes hit by real scanners (grafana/kibana/strapi/
+    # ghost/discourse/prometheus + compose/deployment/testing/bak/
+    # archive/conf/php + docker-compose).
+    "/grafana/.env", "/kibana/.env", "/strapi/.env", "/ghost/.env",
+    "/discourse/.env", "/prometheus/.env",
+    "/compose/.env", "/deployment/.env", "/testing/.env",
+    "/bak/.env", "/archive/.env", "/conf/.env", "/php/.env",
+    "/docker-compose/.env",
+    # `/docker/compose/.env` — new deep-prefix (multi-segment) shape.
+    "/docker/compose/.env", "/docker/compose/.env.production",
+    "/docker/compose/.env.local",
+    # Leading-dot dotdir prefixes (Group 8 — `/.docker/.env` etc.).
+    "/.docker/.env", "/.docker/.env.production", "/.docker/.env.local",
+    "/.config/.env", "/.local/.env",
 ])
 def test_env_prefix_paths_dispatch_to_env_production(path):
     trap = tbenv._TRAP_BY_PATH.get(path.lower())

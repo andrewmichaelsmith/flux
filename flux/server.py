@@ -12034,9 +12034,30 @@ _ENV_FILE_SUFFIXES: tuple[str, ...] = (
     ".save", ".bak", ".backup", ".backup1", ".backup2",
     ".old", ".orig", ".swp", "~",
     ".dist", ".override", ".private", ".remote",
-    ".json", ".yaml", ".yml", ".txt",
+    ".json", ".yaml", ".yml", ".txt", ".toml",
     "1", "2",
     "_bak", "_old", "_orig", "_copy", "_priv", "_example",
+    # Editor scratch / operator rename-workflow variants harvesters walk
+    # alongside `.bak` / `.old`. Distinct paths, same render — the missing
+    # coverage kept `.env.tmp` / `.env.new` / `.env.template` / `.env.copy`
+    # falling into the generic tarpit while the sibling `.bak` served a
+    # canary.
+    ".tmp", ".temp",
+    ".prev", ".new", ".copy", ".template",
+    ".saved", ".default",
+    # Compound editor-backup suffix — vim/emacs leave `.env.old~` when
+    # editing an already-rotated `.env.old`. Harvesters walk the full
+    # cross-product of "editor-backup on a backup".
+    ".old~", ".save~", ".bak~", ".backup~",
+    # Multi-tier `.local` overrides on each env-tier (Next.js /
+    # create-react-app convention). `.development.local` and
+    # `.test.local` were already covered; add the sibling tiers.
+    ".prod.local", ".production.local",
+    ".live.local", ".staging.local", ".stage.local",
+    ".uat.local", ".qa.local", ".preprod.local",
+    # Underscore-separated tier variants beyond the existing
+    # `_bak` / `_old` / `_orig` / `_copy` / `_priv` / `_example` set.
+    "_prod", "_dev", "_backup", "_prev", "_default",
 )
 
 # Webroot-prefix variants. Off-the-shelf env-harvester dictionaries walk a
@@ -12051,34 +12072,36 @@ _ENV_FILE_SUFFIXES: tuple[str, ...] = (
 # by the `mail-service-env` trap below and are not duplicated here.
 _ENV_WEBROOT_PREFIXES: tuple[str, ...] = (
     "actions", "admin", "admin-panel", "administrator", "angular", "ansible",
-    "api", "app", "application", "apps", "assets", "aws", "azure",
-    "backend", "backup", "backups", "beta", "bin", "bootstrap", "build",
+    "api", "app", "application", "apps", "archive", "assets", "aws", "azure",
+    "backend", "backup", "backups", "bak", "beta", "bin", "bootstrap", "build",
     "buildkite", "bulk",
     "cache", "cakephp", "campaign", "cd", "ci", "circleci", "client",
-    "cloud", "cms", "codeigniter", "config", "control-panel", "core", "crm",
+    "cloud", "cms", "codeigniter", "compose", "conf", "config",
+    "control-panel", "core", "crm",
     "cron", "cronlab", "current",
-    "dashboard", "database", "deploy", "dev", "development", "dist",
-    "docker", "drupal",
+    "dashboard", "database", "deploy", "deployment", "dev", "development",
+    "discourse", "dist", "docker", "docker-compose", "drupal",
     "elasticsearch", "email", "en", "erp", "exapi", "express",
     "frontend",
-    "gateway", "gcp", "github", "gitlab", "graphql",
+    "gateway", "gcp", "ghost", "github", "gitlab", "grafana", "graphql",
     "htdocs", "html",
     "infrastructure", "internal",
     "jenkins", "job", "joomla",
-    "k8s", "kafka", "kubernetes",
+    "k8s", "kafka", "kibana", "kubernetes",
     "lab", "laravel", "laravel5", "lib", "live", "local", "logs",
     "magento", "mailer", "microservice", "mongodb", "mysql",
     "nest", "newsletter", "next", "node", "notifications", "notify", "nuxt",
     "old", "opt",
-    "panel", "portal", "postgres", "prestashop", "preview", "private",
-    "prod", "production", "project", "psnlink", "public", "public_html",
+    "panel", "php", "portal", "postgres", "prestashop", "preview", "private",
+    "prod", "production", "project", "prometheus", "psnlink", "public",
+    "public_html",
     "qa", "queue",
     "rabbitmq", "react", "redis", "release", "releases", "resources",
     "rest",
     "saas", "sbin", "scripts", "server", "service", "shared", "shop",
     "shopify", "site", "sitemaps", "smtp", "src", "stage", "staging",
-    "storage", "store", "svelte", "symfony",
-    "temp", "terraform", "test", "tmp", "tools", "transactional",
+    "storage", "store", "strapi", "svelte", "symfony",
+    "temp", "terraform", "test", "testing", "tmp", "tools", "transactional",
     "travis",
     "uat", "uploads", "user-panel",
     "v1", "v2", "v3", "vendor", "vite", "vue",
@@ -12091,6 +12114,22 @@ _ENV_DEEP_PREFIXES: tuple[str, ...] = (
     "var/www",
     "var/www/html",
     "srv",
+    # Docker-compose sample-layout scanners walk `/docker/compose/.env`
+    # (the classic multi-service layout) as well as the flat
+    # `/docker-compose/.env` and bare `/compose/.env` variants — cover
+    # the two-segment deep form here; the flat variants are picked up by
+    # the top-level webroot-prefix list.
+    "docker/compose",
+)
+
+# Group 8 — leading-dot dotdir prefixes. Some harvesters walk
+# `/<dotdir>/.env` (e.g. `/.docker/.env`, `/.config/.env`, `/.local/.env`)
+# as a matched pair with the bare-dotfile variants. Kept small — these
+# are conventional home-dotdir names that carry app/user config.
+_ENV_DOTDIR_PREFIXES: tuple[str, ...] = (
+    ".docker",
+    ".config",
+    ".local",
 )
 
 
@@ -12129,7 +12168,7 @@ _ENV_INNER_SUBDIRS: tuple[str, ...] = (
 def _env_production_paths() -> tuple[str, ...]:
     """Generate the path tuple for the env-production canary trap.
 
-    Builds seven groups:
+    Builds eight groups:
       1. Bare-dotfile variants — `/.env.production`, `/.env.bak`, etc.
          Cover every entry in `_ENV_FILE_SUFFIXES` plus the legacy
          `_<suffix>` aliases (`/.env_bak`, `/.env2`, `/.environ`).
@@ -12151,6 +12190,9 @@ def _env_production_paths() -> tuple[str, ...]:
       7. `<prefix>/<subdir>/env` deep-bare-env variants observed under
          `/storage/config/env`, `/app/api/env`, `/storage/backup/env`,
          etc.
+      8. `<dotdir>/.env<suffix>` cross-product for the leading-dot
+         directory-prefix shape (`/.docker/.env`, `/.config/.env`) —
+         harvesters walk these alongside the bare-dotfile variants.
 
     Mail-service prefixes (sendgrid, postmark, …) are excluded — the
     dedicated `mail-service-env` trap below handles them with its own
@@ -12213,6 +12255,14 @@ def _env_production_paths() -> tuple[str, ...]:
         paths.append(f"/{subdir}/env")
         for prefix in _ENV_WEBROOT_PREFIXES + _ENV_DEEP_PREFIXES:
             paths.append(f"/{prefix}/{subdir}/env")
+
+    # Group 8 — leading-dot dotdir prefixes. Every suffix (including the
+    # empty one for bare `/<dotdir>/.env`) is generated so a harvester
+    # walking `/.docker/.env` / `.env.local` / `.env.bak` under a leading-
+    # dot dir lands on a canary.
+    for dotdir in _ENV_DOTDIR_PREFIXES:
+        for suffix in _ENV_FILE_SUFFIXES:
+            paths.append(f"/{dotdir}/.env{suffix}")
 
     # Dedupe while preserving order — defensive against future overlap
     # between the bare-dotfile and prefix loops.
