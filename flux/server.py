@@ -8597,7 +8597,14 @@ def parse_form_body(body_bytes: bytes, content_type: str) -> dict[str, list[str]
     if not body_bytes:
         return {}
     ct = (content_type or "").split(";", 1)[0].strip().lower()
-    if ct not in {"application/x-www-form-urlencoded", ""}:
+    # FortiOS SSL VPN posts `Content-Type: text/plain;charset=UTF-8` on
+    # `/remote/logincheck` with a body that is otherwise form-urlencoded
+    # (`ajax=1&username=…&credential=…`). Wild credential-stuffer fleets
+    # copy that content type verbatim, so accepting `text/plain` here is
+    # what recovers `username` / `credential` capture on those hits.
+    # `parse_qs` on genuinely-free-text bodies just yields keys nothing
+    # downstream looks for, so this doesn't leak into other traps.
+    if ct not in {"application/x-www-form-urlencoded", "text/plain", ""}:
         return {}
     try:
         text = body_bytes.decode("utf-8", errors="replace")

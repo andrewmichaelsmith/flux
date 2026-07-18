@@ -318,6 +318,33 @@ def test_parse_form_body_treats_missing_content_type_as_form():
     assert tbenv.parse_form_body(b"cmd=id", "") == {"cmd": ["id"]}
 
 
+def test_parse_form_body_accepts_text_plain():
+    """Real FortiOS SSL VPN posts `/remote/logincheck` with
+    `Content-Type: text/plain;charset=UTF-8` even though the body is
+    form-urlencoded. Credential-stuffer fleets that pretend to be Forti
+    scanners copy that shape verbatim, and losing them was silently
+    wiping out ~87% of fortigate credential capture."""
+    body = b"ajax=1&username=jane.doe&credential=june2026!1"
+    assert tbenv.parse_form_body(body, "text/plain;charset=UTF-8") == {
+        "ajax": ["1"],
+        "username": ["jane.doe"],
+        "credential": ["june2026!1"],
+    }
+    # Case-insensitive on the media-type token too.
+    assert tbenv.parse_form_body(b"a=b", "TEXT/PLAIN") == {"a": ["b"]}
+
+
+def test_extract_fortigate_logincheck_form_text_plain():
+    """End-to-end: the fortigate logincheck extractor now returns a
+    non-empty username and has_password=True for real FortiOS-shaped
+    submissions, not the previous ('', False)."""
+    body = b"ajax=1&username=imran.ali&credential=june2026!1"
+    ct = "text/plain;charset=UTF-8"
+    assert tbenv.extract_fortigate_logincheck_form(body, ct) == (
+        "imran.ali", True,
+    )
+
+
 class _FakeHeaders(dict):
     def get(self, key, default=""):  # case-insensitive like HTTPMessage
         for k, v in self.items():
