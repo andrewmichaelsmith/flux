@@ -3902,8 +3902,22 @@ def test_cisco_webvpn_default_paths_match_observed_sequence():
         "/+CSCOE+/logon_forms.js",
         "/+CSCOL+/Java.jar",
         "/+CSCOL+/a1.jar",
+        "/+webvpn+/index.html",
     ):
         assert tbenv.is_cisco_webvpn_path(path), f"expected match: {path}"
+
+
+def test_cisco_webvpn_logon_form_action_is_a_routed_path():
+    """The logon HTML form action MUST be handled by the same dispatcher —
+    otherwise the form points at a `not-handled` 404 and credential
+    capture on that endpoint is lost."""
+    html = tbenv.render_cisco_webvpn_logon_html("vpn.example").decode("utf-8")
+    match = re.search(r'action="([^"]+)"', html)
+    assert match, "form action attribute not found"
+    action = match.group(1)
+    assert tbenv.is_cisco_webvpn_path(action), (
+        f"webvpn logon form points at {action!r} but no handler covers it"
+    )
 
 
 def test_cisco_webvpn_path_non_match():
@@ -3950,6 +3964,28 @@ async def test_dispatch_cisco_webvpn_logon_post_logs_username_not_password(flux_
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "cisco-webvpn-logon"
     assert entry["ciscoWebvpnUsername"] == "admin"
+    assert entry["ciscoWebvpnHasPassword"] is True
+    assert "password" not in entry
+
+
+async def test_dispatch_cisco_webvpn_index_html_post_captures_credentials(flux_client):
+    """POST to the form's own action target must land in the WebVPN
+    dispatcher and capture username / hasPassword — the pre-fix behavior
+    fell through to `not-handled` 404."""
+    resp = await flux_client.post(
+        "/+webvpn+/index.html",
+        data="Login=Login&buttonClicked=4&password=hunter2&username=svc-vpn",
+        headers={
+            "X-Forwarded-For": "203.0.113.61",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "Secure Access SSL VPN" in text
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "cisco-webvpn-login-post"
+    assert entry["ciscoWebvpnUsername"] == "svc-vpn"
     assert entry["ciscoWebvpnHasPassword"] is True
     assert "password" not in entry
 
@@ -7786,6 +7822,15 @@ def test_build_fake_repo_produces_expected_layout_and_sha_linkage():
     # refs/heads/main + packed-refs both reference the commit SHA.
     assert meta["commitSha"] in files["/.git/refs/heads/main"].decode()
     assert meta["commitSha"] in files["/.git/packed-refs"].decode()
+
+    # `/.git/` root serves an autoindex listing (top fake-git-miss key
+    # historically); it must reference the canonical top-level entries
+    # so scanners walking the listing find the same paths we serve.
+    index_body = files["/.git/"].decode()
+    assert "Index of /.git" in index_body
+    for entry in ("HEAD", "config", "packed-refs", "objects/", "refs/",
+                  "hooks/", "info/", "logs/"):
+        assert f'href="{entry}"' in index_body, entry
 
     # The secrets blob object exists at its hashed path and decompresses
     # to a body that still carries the canary.

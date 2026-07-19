@@ -735,6 +735,11 @@ _CISCO_WEBVPN_DEFAULT_PATHS = ",".join([
     "/+cscol+/java.jar",
     "/+cscol+/a1.jar",
     "/+cscoe+/portal.html",
+    # `/+webvpn+/index.html` is the form's own POST target
+    # (see render_cisco_webvpn_logon_html — action="/+webvpn+/index.html").
+    # A scanner following the form lands here; without a handler it fell
+    # through to `not-handled` 404, wasting credential-capture signal.
+    "/+webvpn+/index.html",
 ])
 CISCO_WEBVPN_PATHS = {
     value.strip().lower()
@@ -9417,7 +9422,42 @@ def _build_fake_repo(
         else f"git@{FAKE_GIT_REMOTE_HOST}:{FAKE_GIT_REMOTE_PATH}"
     )
     fetch_head_line = f"{commit_sha}\t\tbranch 'main' of {fetch_head_remote}\n"
+    # Apache-style autoindex body for `/.git/`. Scanners that probe the
+    # bare directory (top fake-git-miss key in fleet logs) treat a 404
+    # here as a "not real / restricted" tell, or move on before they
+    # ever ask for `/.git/HEAD`. Serving a plausible listing keeps them
+    # walking the tree — and every linked entry below is one we do
+    # answer with real content, so this is pure trap deepening.
+    git_root_index = (
+        "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n"
+        "<html>\n"
+        " <head>\n"
+        "  <title>Index of /.git</title>\n"
+        " </head>\n"
+        " <body>\n"
+        "<h1>Index of /.git</h1>\n"
+        "<pre>      <a href=\"?C=N;O=D\">Name</a>\n"
+        "      <hr>\n"
+        "      <a href=\"../\">Parent Directory</a>\n"
+        "      <a href=\"HEAD\">HEAD</a>\n"
+        "      <a href=\"config\">config</a>\n"
+        "      <a href=\"description\">description</a>\n"
+        "      <a href=\"FETCH_HEAD\">FETCH_HEAD</a>\n"
+        "      <a href=\"ORIG_HEAD\">ORIG_HEAD</a>\n"
+        "      <a href=\"COMMIT_EDITMSG\">COMMIT_EDITMSG</a>\n"
+        "      <a href=\"index\">index</a>\n"
+        "      <a href=\"packed-refs\">packed-refs</a>\n"
+        "      <a href=\"hooks/\">hooks/</a>\n"
+        "      <a href=\"info/\">info/</a>\n"
+        "      <a href=\"logs/\">logs/</a>\n"
+        "      <a href=\"objects/\">objects/</a>\n"
+        "      <a href=\"refs/\">refs/</a>\n"
+        "      <hr>\n"
+        "</pre>\n"
+        "</body></html>\n"
+    ).encode("utf-8")
     files: dict[str, bytes] = {
+        "/.git/": git_root_index,
         "/.git/head": b"ref: refs/heads/main\n",
         "/.git/config": config_text.encode("utf-8"),
         # Some scanners ask for a credential-store file inside the exposed
@@ -19004,6 +19044,13 @@ async def _handle_cisco_webvpn(
         result_tag = "cisco-webvpn-logon"
         body = render_cisco_webvpn_logon_html(host)
         content_type = "text/html; charset=utf-8"
+    elif lpath == "/+webvpn+/index.html":
+        # POST target of the logon form. Real WebVPN returns the SSL VPN
+        # portal after auth; we can't tell if credentials "worked", so
+        # re-serve the login page and log any username/password submitted.
+        result_tag = "cisco-webvpn-login-post"
+        body = render_cisco_webvpn_logon_html(host)
+        content_type = "text/html; charset=utf-8"
     elif lpath == "/+cscoe+/logon_forms.js":
         result_tag = "cisco-webvpn-logon-forms-js"
         body = render_cisco_webvpn_logon_forms_js()
@@ -23365,6 +23412,11 @@ async def _send_fake_git(
 
     if git_key.startswith("/.git/objects/") and "/info/" not in git_key:
         content_type = "application/x-git-loose-object"
+    elif git_key == "/.git/":
+        # Directory autoindex is HTML — matches Apache's mod_autoindex /
+        # nginx `autoindex on` fingerprint that scanners look for at the
+        # bare-directory level.
+        content_type = "text/html; charset=utf-8"
     else:
         content_type = "text/plain; charset=utf-8"
 
