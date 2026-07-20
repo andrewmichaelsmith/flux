@@ -36,6 +36,23 @@ def test_default_webshell_paths_include_azure_wp_checker_anchor():
         assert tbenv.is_webshell_path(path), f"expected webshell match: {path}"
 
 
+def test_default_webshell_paths_include_hitlist_cohort():
+    """A systematic 'shell-hitlist' scanner cohort probes ~23 short PHP paths at
+    root as a single bundle per source IP. All GET, empty body, empty UA — a
+    pure reachability check for someone else's planted shell. Every path in
+    this bundle must match the webshell handler so the cohort's follow-up
+    `?cmd=` lands on the trap instead of a 404."""
+    must_match = [
+        "/155.php", "/201.php", "/admin.php", "/alls.php", "/biufile.php",
+        "/blurbs.php", "/error_log.php", "/footer.php", "/h02ugyh.php",
+        "/images.php", "/ingfo.php", "/k.php", "/k2.php", "/mac.php",
+        "/ops.php", "/qterm.php", "/red.php", "/ups.php", "/v543.php",
+        "/wefile.php", "/x.php", "/xyn.php", "/zoro.php",
+    ]
+    for path in must_match:
+        assert tbenv.is_webshell_path(path), f"expected webshell match: {path}"
+
+
 def test_default_webshell_paths_include_style_php_family():
     """style.php is a recurring webshell-rename: legitimate WordPress serves
     style.css, never style.php, so any /style.php — at the root or under any of

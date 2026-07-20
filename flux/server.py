@@ -235,6 +235,18 @@ _WEBSHELL_DEFAULT_PATHS = ",".join([
     "/wp-block.php", "/wp-good.php", "/wp-kikikoko.php",
     #   - non-.php backdoors ("dr0v" is a specific observed marker name)
     "/dr0v",
+    #   - "webshell hitlist" cohort: a systematic scan family from
+    #     compromised-cloud IP ranges hits ~23 short PHP paths at root as
+    #     a single bundle from each source IP (top scanners hit every path
+    #     in the list, 60-100+ distinct IPs per path). Empty body, GET
+    #     only — pure reachability check for someone else's planted shell.
+    #     Adding the full bundle converts a plate of 404s into trap hits
+    #     that then follow up with `?cmd=` for real intel.
+    "/155.php", "/201.php", "/admin.php", "/alls.php", "/biufile.php",
+    "/blurbs.php", "/error_log.php", "/footer.php", "/h02ugyh.php",
+    "/images.php", "/ingfo.php", "/k.php", "/k2.php", "/mac.php",
+    "/ops.php", "/qterm.php", "/red.php", "/ups.php", "/v543.php",
+    "/wefile.php", "/x.php", "/xyn.php", "/zoro.php",
     #   - "style.php" webshell-jacking family (active since Jan 2026):
     #     dedicated single-path checker fleet renames its eval(...) shell
     #     `style.php` and probes both the bare root and the four standard

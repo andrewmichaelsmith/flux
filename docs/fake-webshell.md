@@ -4,7 +4,10 @@ Matches known PHP webshell probe paths. Two matchers, both default-on:
 
 - **Exact paths** (full list in `HONEYPOT_WEBSHELL_PATHS_CSV`, e.g.
   `/wp-content/plugins/hellopress/wp_filemanager.php`, `/shell.php`,
-  short-named `*.php` shells).
+  short-named `*.php` shells). Includes a ~23-path "shell-hitlist" bundle
+  (`/qterm.php`, `/wefile.php`, `/x.php`, `/mac.php`, `/ops.php`,
+  `/error_log.php`, `/blurbs.php`, `/155.php`, `/201.php`, …) that a
+  systematic scan family probes together from each source IP.
 - **Regex families** (not env-configurable; set in source):
   - `/.well-known/<name>.php` — attackers use the `/.well-known/`
     directory as a shell-drop location because it's often writable
