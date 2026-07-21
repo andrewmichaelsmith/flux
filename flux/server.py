@@ -783,6 +783,12 @@ _IVANTI_VPN_DEFAULT_PATHS = ",".join([
     "/dana-cached/hc/hostcheckerinstaller.exe",
     "/dana-cached/hc/hostcheckerinstaller.dmg",
     "/dana-ws/namedusers",
+    # Network Connect Windows-installer version marker. Scanners fetch
+    # this before deciding which client to fingerprint or which CVE
+    # branch (CVE-2023-46805 vs CVE-2024-21887) to try; returning a
+    # plausible dotted version keeps the probe alive so the follow-on
+    # /dana-na/ probe lands on our handler instead of a 404.
+    "/dana-na/nc/nc_gina_ver.txt",
 ])
 IVANTI_VPN_PATHS = {
     value.strip().lower()
@@ -12148,10 +12154,10 @@ _ENV_WEBROOT_PREFIXES: tuple[str, ...] = (
     "jenkins", "job", "joomla",
     "k8s", "kafka", "kibana", "kubernetes",
     "lab", "laravel", "laravel5", "lib", "live", "local", "logs",
-    "magento", "mailer", "microservice", "mongodb", "mysql",
+    "magento", "mailer", "microservice", "modules", "mongodb", "mysql",
     "nest", "newsletter", "next", "node", "notifications", "notify", "nuxt",
     "old", "opt",
-    "panel", "php", "portal", "postgres", "prestashop", "preview", "private",
+    "panel", "php", "plugins", "portal", "postgres", "prestashop", "preview", "private",
     "prod", "production", "project", "prometheus", "psnlink", "public",
     "public_html",
     "qa", "queue",
@@ -12160,7 +12166,7 @@ _ENV_WEBROOT_PREFIXES: tuple[str, ...] = (
     "saas", "sbin", "scripts", "server", "service", "shared", "shop",
     "shopify", "site", "sitemaps", "smtp", "src", "stage", "staging",
     "storage", "store", "strapi", "svelte", "symfony",
-    "temp", "terraform", "test", "testing", "tmp", "tools", "transactional",
+    "temp", "terraform", "test", "testing", "themes", "tmp", "tools", "transactional",
     "travis",
     "uat", "uploads", "user-panel",
     "v1", "v2", "v3", "vendor", "vite", "vue",
@@ -12179,6 +12185,14 @@ _ENV_DEEP_PREFIXES: tuple[str, ...] = (
     # the two-segment deep form here; the flat variants are picked up by
     # the top-level webroot-prefix list.
     "docker/compose",
+    # WordPress plugin-tree secrets-hunt — broad crawler dictionaries walk
+    # `/wp-content/plugins/.env*` alongside the flat `/plugins/.env` and
+    # `/wp-content/.env`. Both flat prefixes are already in the top-level
+    # list; adding the compound deep prefix catches the WP-specific
+    # tree-walk shape without duplicating the flat variants.
+    "wp-content/plugins",
+    "wp-content/themes",
+    "wp-content/mu-plugins",
 )
 
 # Group 8 — leading-dot dotdir prefixes. Some harvesters walk
@@ -12349,16 +12363,47 @@ def _fake_mail_api_key(service: str) -> str:
     return secrets.token_urlsafe(32)
 
 
-_MAIL_SERVICE_PATH_MAP: dict[str, tuple[str, str, str, str]] = {
-    "/sendgrid/.env":  ("sendgrid",  "SENDGRID_API_KEY",        "smtp.sendgrid.net",  "apikey"),
-    "/postmark/.env":  ("postmark",  "POSTMARK_SERVER_TOKEN",   "smtp.postmarkapp.com", ""),
-    "/mailjet/.env":   ("mailjet",   "MJ_APIKEY_PUBLIC",        "in-v3.mailjet.com",  ""),
-    "/brevo/.env":     ("brevo",     "BREVO_API_KEY",           "smtp-relay.brevo.com", ""),
-    "/mailgun/.env":   ("mailgun",   "MAILGUN_API_KEY",         "smtp.mailgun.org",   ""),
-    "/mailing/.env":   ("sendgrid",  "SENDGRID_API_KEY",        "smtp.sendgrid.net",  "apikey"),
-    "/mail/.env":      ("sendgrid",  "SENDGRID_API_KEY",        "smtp.sendgrid.net",  "apikey"),
-    "/mailserver/.env": ("postmark", "POSTMARK_SERVER_TOKEN",   "smtp.postmarkapp.com", ""),
+_MAIL_SERVICE_CONFIGS: dict[str, tuple[str, str, str, str]] = {
+    "sendgrid":  ("sendgrid",  "SENDGRID_API_KEY",        "smtp.sendgrid.net",   "apikey"),
+    "postmark":  ("postmark",  "POSTMARK_SERVER_TOKEN",   "smtp.postmarkapp.com", ""),
+    "mailjet":   ("mailjet",   "MJ_APIKEY_PUBLIC",        "in-v3.mailjet.com",   ""),
+    "brevo":     ("brevo",     "BREVO_API_KEY",           "smtp-relay.brevo.com", ""),
+    "mailgun":   ("mailgun",   "MAILGUN_API_KEY",         "smtp.mailgun.org",    ""),
 }
+
+# Broad-dictionary secret hunters walk `<name>.env` — both bare
+# (`/sendgrid.env`) and under app-layout prefixes (`/config/env/mailjet.env`,
+# `/api/smtp/mailgun.env`, `/config/mailer/postmark.env`, …) — as siblings
+# of the existing `/<service>/.env` shape. Same service-specific renderer
+# in every case; the path is only used to pick which credential template
+# to render.
+_MAIL_SERVICE_LEAF_PREFIXES: tuple[str, ...] = (
+    "",  # bare `/sendgrid.env`
+    "/app", "/api", "/backend", "/config", "/config/env",
+    "/config/mailer", "/api/smtp", "/srv", "/var/www",
+    "/private", "/secrets", "/env",
+)
+
+_MAIL_SERVICE_PATH_MAP: dict[str, tuple[str, str, str, str]] = {
+    # `/<service>/.env` — canonical dedicated-directory layout.
+    "/sendgrid/.env":  _MAIL_SERVICE_CONFIGS["sendgrid"],
+    "/postmark/.env":  _MAIL_SERVICE_CONFIGS["postmark"],
+    "/mailjet/.env":   _MAIL_SERVICE_CONFIGS["mailjet"],
+    "/brevo/.env":     _MAIL_SERVICE_CONFIGS["brevo"],
+    "/mailgun/.env":   _MAIL_SERVICE_CONFIGS["mailgun"],
+    "/mailing/.env":   _MAIL_SERVICE_CONFIGS["sendgrid"],
+    "/mail/.env":      _MAIL_SERVICE_CONFIGS["sendgrid"],
+    "/mailserver/.env": _MAIL_SERVICE_CONFIGS["postmark"],
+}
+# `<prefix>/<service>.env` — broad-dictionary secret hunters walk this
+# compound-filename layout for every prefix in `_MAIL_SERVICE_LEAF_PREFIXES`.
+# Route each to the service-specific renderer so the response carries the
+# expected credential shape (SENDGRID_API_KEY / MJ_APIKEY_PUBLIC / …), not
+# a generic dotenv body.
+for _svc_name, _svc_cfg in _MAIL_SERVICE_CONFIGS.items():
+    for _pfx in _MAIL_SERVICE_LEAF_PREFIXES:
+        _MAIL_SERVICE_PATH_MAP.setdefault(f"{_pfx}/{_svc_name}.env", _svc_cfg)
+del _svc_name, _svc_cfg, _pfx
 
 
 def _render_mail_service_env_for(path: str) -> "Callable[[dict[str, object]], bytes]":
@@ -15809,6 +15854,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # file at the project root regardless of editor.
             "/sftp.json",
             "/.ftpconfig",
+            # Atom `Remote-Sync` package — same JSON shape (host / port /
+            # username / password / remotePath fields), stored at the
+            # project root; broad secrets-hunter dictionaries walk it
+            # alongside `/.vscode/sftp.json`.
+            "/.remote-sync.json",
+            # VS Code `ftp-sync` extension (distinct filename from the
+            # `sftp.json` Liximomo variant). Same shape.
+            "/.vscode/ftp-sync.json",
         ),
         ("gitlab-username-password",),
         render_sftp_config_json,
@@ -16623,6 +16676,38 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/home/node/.ssh/id_rsa",
             "/home/deploy/.ssh/id_rsa",
             "/home/www-data/.ssh/id_rsa",
+            # `.pem`-suffixed key/cert variants. Secrets hunters walk the
+            # PEM-filename convention alongside the OpenSSH `id_*`
+            # filenames — cloud consoles export downloaded keys as
+            # `<name>.pem`, and mixed ssh/tls deployments drop key or
+            # signed-cert files (`cert.pem`, `client.pem`, `identity.pem`)
+            # into `~/.ssh/`. Same private-key body served for all: a
+            # scanner that grepped the response for `BEGIN OPENSSH PRIVATE
+            # KEY` gets what it was looking for regardless of the
+            # requested filename.
+            "/.ssh/cert.pem",
+            "/.ssh/client.pem",
+            "/.ssh/server.pem",
+            "/.ssh/identity.pem",
+            "/.ssh/id_rsa.pem",
+            "/.ssh/id_ed25519.pem",
+            "/.ssh/id_ecdsa.pem",
+            "/.ssh/deploy.pem",
+            "/.ssh/deploy_key.pem",
+            "/.ssh/private.pem",
+            "/.ssh/key.pem",
+            # User-home-prefix variants for the `.pem` set, mirroring the
+            # `.ssh/id_rsa` matrix above.
+            "/root/.ssh/cert.pem",
+            "/home/.ssh/cert.pem",
+            "/home/ubuntu/.ssh/cert.pem",
+            "/home/ec2-user/.ssh/cert.pem",
+            "/home/admin/.ssh/cert.pem",
+            "/home/deploy/.ssh/cert.pem",
+            "/home/ubuntu/.ssh/id_rsa.pem",
+            "/home/ec2-user/.ssh/id_rsa.pem",
+            "/home/admin/.ssh/id_rsa.pem",
+            "/home/deploy/.ssh/id_rsa.pem",
         ),
         ("ssh",),
         render_ssh_private_key,
@@ -19155,6 +19240,14 @@ async def _handle_ivanti_vpn(
         result_tag = "ivanti-namedusers"
         body = render_ivanti_namedusers_json()
         content_type = "application/json; charset=utf-8"
+    elif lpath == "/dana-na/nc/nc_gina_ver.txt":
+        # NC (Network Connect) GINA installer version marker. Real Pulse
+        # Secure serves a bare dotted version literal (no trailing
+        # newline in the wild samples). Advertising an old-enough build
+        # keeps scanners on the CVE-2023-46805 / CVE-2024-21887 branch.
+        result_tag = "ivanti-nc-gina-ver"
+        body = b"7.0.6"
+        content_type = "text/plain; charset=utf-8"
     else:
         # Path matched the set but no renderer — defensive 404, matches the
         # cisco-webvpn / sonicwall miss pattern.

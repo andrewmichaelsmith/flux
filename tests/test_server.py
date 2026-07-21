@@ -995,6 +995,21 @@ FAKE_TRACEBIT = {
     ("/.ssh/id_ed25519_sk", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/.ssh/id_ecdsa_key", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/.ssh/id_ecdsa_sk", b"BEGIN OPENSSH PRIVATE KEY"),
+    # `.pem`-suffixed key/cert variants — cloud-console-downloaded key
+    # convention + mixed ssh/tls filename convention. Same private-key
+    # body served for all so a scanner grepping `BEGIN OPENSSH PRIVATE
+    # KEY` gets what it was looking for regardless of the requested name.
+    ("/.ssh/cert.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/client.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/identity.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_rsa.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/id_ed25519.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/.ssh/key.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/home/ubuntu/.ssh/cert.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/home/ec2-user/.ssh/cert.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/home/deploy/.ssh/cert.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/root/.ssh/cert.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/home/ubuntu/.ssh/id_rsa.pem", b"BEGIN OPENSSH PRIVATE KEY"),
     # Common scanner-dict typo for known_hosts — same render as the canonical.
     ("/.ssh/know_hosts", b"203.0.113.99 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
     ("/authorized_keys", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
@@ -1345,6 +1360,53 @@ def test_mail_service_env_paths_produce_different_content():
     assert b"POSTMARK_SERVER_TOKEN" in pm_body
     assert b"SENDGRID_API_KEY" not in pm_body
     assert b"POSTMARK_SERVER_TOKEN" not in sg_body
+
+
+@pytest.mark.parametrize("path,svc_marker", [
+    # Compound `<name>.env` — bare + app-layout webroot prefix.
+    # Broad-dictionary secret hunters walk these alongside the canonical
+    # `/<service>/.env` shape, and each must route to the same
+    # service-specific renderer so the payload contains the API-key line
+    # the scanner is grepping for.
+    ("/sendgrid.env",              b"SENDGRID_API_KEY=SG."),
+    ("/mailjet.env",               b"MJ_APIKEY_PUBLIC="),
+    ("/mailgun.env",               b"MAILGUN_API_KEY=key-"),
+    ("/postmark.env",              b"POSTMARK_SERVER_TOKEN="),
+    ("/brevo.env",                 b"BREVO_API_KEY=xkeysib-"),
+    ("/app/mailjet.env",           b"MJ_APIKEY_PUBLIC="),
+    ("/api/sendgrid.env",          b"SENDGRID_API_KEY=SG."),
+    ("/backend/mailgun.env",       b"MAILGUN_API_KEY=key-"),
+    ("/config/env/mailjet.env",    b"MJ_APIKEY_PUBLIC="),
+    ("/config/mailer/postmark.env", b"POSTMARK_SERVER_TOKEN="),
+    ("/api/smtp/sendgrid.env",     b"SENDGRID_API_KEY=SG."),
+    ("/srv/mailgun.env",           b"MAILGUN_API_KEY=key-"),
+    ("/private/brevo.env",         b"BREVO_API_KEY=xkeysib-"),
+])
+def test_mail_service_compound_env_paths_render_service_specific(path, svc_marker):
+    trap = tbenv._TRAP_BY_PATH.get(path)
+    assert trap is not None and trap.name == "mail-service-env", (
+        f"{path!r} should dispatch to mail-service-env, got {trap and trap.name!r}"
+    )
+    body = trap.render(FAKE_TRACEBIT)
+    assert svc_marker in body, f"{path} should contain {svc_marker!r}"
+    assert b"AWS_ACCESS_KEY_ID=" in body
+
+
+def test_mail_service_compound_paths_do_not_clobber_env_production():
+    # The `_ENV_LEAF_NAMES` cross-product used to skip mail-service names,
+    # but env-production and mail-service-env can still overlap on
+    # generated compound paths if a future edit expands leaf names to
+    # cover `sendgrid` / `mailjet` / `...`. Guard against silent
+    # clobbering: `/<prefix>/<mail-service>.env` must stay routed to
+    # mail-service-env so the response carries the service-specific
+    # credential shape.
+    for prefix in ("/app/", "/api/", "/backend/", "/config/env/"):
+        for service in ("sendgrid", "mailjet", "mailgun", "postmark", "brevo"):
+            path = f"{prefix}{service}.env"
+            trap = tbenv._TRAP_BY_PATH.get(path)
+            assert trap is not None and trap.name == "mail-service-env", (
+                f"{path!r} should stay mail-service-env, got {trap and trap.name!r}"
+            )
 
 
 @pytest.mark.parametrize("path", [
@@ -2264,6 +2326,17 @@ def test_bare_credentials_json_routes_to_config_json(path):
     # Leading-dot dotdir prefixes (Group 8 — `/.docker/.env` etc.).
     "/.docker/.env", "/.docker/.env.production", "/.docker/.env.local",
     "/.config/.env", "/.local/.env",
+    # CMS plugin/theme/module trees — flat + WordPress deep layout.
+    # Broad crawler dictionaries walk `/plugins/.env`, `/themes/.env`,
+    # `/wp-content/plugins/.env`, and the plugin-tree suffix expansion.
+    "/plugins/.env", "/plugins/.env.production", "/plugins/.env.local",
+    "/plugins/.env.bak", "/plugins/.env.backup",
+    "/themes/.env", "/themes/.env.production", "/themes/.env.local",
+    "/modules/.env", "/modules/.env.production",
+    "/wp-content/plugins/.env", "/wp-content/plugins/.env.production",
+    "/wp-content/plugins/.env.bak", "/wp-content/plugins/.env.local",
+    "/wp-content/themes/.env", "/wp-content/themes/.env.production",
+    "/wp-content/mu-plugins/.env", "/wp-content/mu-plugins/.env.local",
 ])
 def test_env_prefix_paths_dispatch_to_env_production(path):
     trap = tbenv._TRAP_BY_PATH.get(path.lower())
@@ -4067,6 +4140,8 @@ def test_ivanti_vpn_default_paths_match_observed_sequence():
         "/dana-cached/hc/HostCheckerInstaller.exe",
         "/dana-cached/hc/HostCheckerInstaller.dmg",
         "/dana-ws/namedusers",
+        # NC (Network Connect) GINA installer version marker.
+        "/dana-na/nc/nc_gina_ver.txt",
     ):
         assert tbenv.is_ivanti_vpn_path(path), f"expected match: {path}"
 
@@ -4200,6 +4275,22 @@ async def test_dispatch_ivanti_disabled_returns_404(flux_client, monkeypatch):
     assert resp.status == 404
     entries = _log_entries(flux_client.log_path)
     assert entries[-1]["result"] == "not-handled"
+
+
+async def test_dispatch_ivanti_nc_gina_version_marker(flux_client):
+    resp = await flux_client.get(
+        "/dana-na/nc/nc_gina_ver.txt",
+        headers={"X-Forwarded-For": "203.0.113.76"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    # Bare dotted version literal (no HTML, no trailing newline in the
+    # wild samples). Scanners parse the first line as a version tuple to
+    # decide which client-side CVE branch to probe next.
+    assert body == b"7.0.6"
+    assert resp.headers["Content-Type"].startswith("text/plain")
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "ivanti-nc-gina-ver"
 
 
 # --- Fake IBM Aspera Faspex trap ---
@@ -10310,6 +10401,11 @@ def test_sftp_config_paths_registered():
         "/sftp-config.json",
         "/sftp.json",
         "/.ftpconfig",
+        # Atom Remote-Sync + VS Code ftp-sync — same JSON shape (host/
+        # port/username/password/remotePath), broad secrets-hunter
+        # dictionaries walk them alongside the Liximomo `sftp.json`.
+        "/.remote-sync.json",
+        "/.vscode/ftp-sync.json",
     ):
         trap = tbenv.find_canary_trap(path)
         assert trap is not None, f"missing trap: {path}"
