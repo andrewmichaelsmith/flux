@@ -5,6 +5,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import pathlib
 import re
 
 import aiohttp
@@ -14252,6 +14253,48 @@ def test_append_log_rotation_survives_missing_intermediate_files(tmp_path, monke
     # dropped active-file writes.
     assert log_path.exists()
     assert (tmp_path / "env-canary.jsonl.1").exists()
+
+
+def test_append_log_swallows_oserror_on_write(tmp_path, monkeypatch):
+    """A full/read-only volume must not propagate OSError out of
+    append_log — otherwise every request handler that logs a hit
+    returns 500 to the caller, fingerprinting the sensor as broken
+    and driving scanners away. Losing the telemetry line is the
+    correct tradeoff when the sink cannot be written."""
+    log_path = tmp_path / "env-canary.jsonl"
+    monkeypatch.setattr(tbenv, "LOG_PATH", log_path)
+    monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 0)
+    monkeypatch.setattr(tbenv, "LOG_ROTATIONS", 4)
+    # Simulate a wedged sink: any open() for write raises ENOSPC.
+    real_open = pathlib.Path.open
+    def _fail_open(self, mode="r", *args, **kwargs):
+        if self == log_path and ("a" in mode or "w" in mode):
+            raise OSError(28, "No space left on device")
+        return real_open(self, mode, *args, **kwargs)
+    monkeypatch.setattr(pathlib.Path, "open", _fail_open)
+    # Must return normally, not raise. Handler above stays 200.
+    tbenv.append_log({"result": "not-handled", "seq": 0})
+    # Sink was never created (open failed) — telemetry line is lost,
+    # but that is the acceptable degradation.
+    assert not log_path.exists()
+
+
+def test_append_log_swallows_oserror_on_mkdir(tmp_path, monkeypatch):
+    """Same contract when the parent directory can't be created
+    (e.g. read-only mount): swallow the error and lose the line
+    rather than 500 the request."""
+    log_path = tmp_path / "nested" / "env-canary.jsonl"
+    monkeypatch.setattr(tbenv, "LOG_PATH", log_path)
+    monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 0)
+    monkeypatch.setattr(tbenv, "LOG_ROTATIONS", 4)
+    real_mkdir = pathlib.Path.mkdir
+    def _fail_mkdir(self, *args, **kwargs):
+        if self == log_path.parent:
+            raise OSError(30, "Read-only file system")
+        return real_mkdir(self, *args, **kwargs)
+    monkeypatch.setattr(pathlib.Path, "mkdir", _fail_mkdir)
+    tbenv.append_log({"result": "not-handled", "seq": 0})
+    assert not log_path.exists()
 
 
 # --- /robots.txt stable-response tests --------------------------------------

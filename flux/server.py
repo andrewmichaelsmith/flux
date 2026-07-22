@@ -2646,10 +2646,23 @@ def _rotate_log_if_needed() -> None:
 
 
 def append_log(payload: dict[str, object]) -> None:
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    """Append one JSONL telemetry line to the sink. Best-effort — any
+    OS-level failure at the mkdir / open / write step (volume full,
+    read-only remount, permission drop) is swallowed so a wedged log
+    volume never propagates a 500 out of the request handler that
+    called us. A 500 fingerprints the sensor as broken and drives
+    scanners away; losing a single telemetry line is preferable.
+    Rotation is already best-effort inside `_rotate_log_if_needed`."""
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
     _rotate_log_if_needed()
-    with LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    except OSError:
+        return
 
 
 def _is_internal_ip(value: str) -> bool:
