@@ -8223,6 +8223,93 @@ def test_fake_git_hook_body_is_not_verbatim_git_template():
     assert "An example hook script to verify what is about to be committed" not in body
 
 
+def test_fake_git_repo_serves_subdirectory_autoindexes():
+    """Scanners walk `/.git/<subdir>/` as part of tree enumeration; a 404
+    on a subdirectory index is a "not real / restricted" tell just like a
+    404 on `/.git/` itself. Every subdirectory that has enumerable leaves
+    must render as an autoindex."""
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, _meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    required_indexes = (
+        "/.git/hooks/",
+        "/.git/info/",
+        "/.git/refs/",
+        "/.git/refs/heads/",
+        "/.git/refs/tags/",
+        "/.git/refs/remotes/",
+        "/.git/refs/remotes/origin/",
+        "/.git/refs/wip/",
+        "/.git/refs/wip/index/",
+        "/.git/refs/wip/wtree/",
+        "/.git/refs/wip/index/refs/",
+        "/.git/refs/wip/wtree/refs/",
+        "/.git/refs/wip/index/refs/heads/",
+        "/.git/refs/wip/wtree/refs/heads/",
+        "/.git/objects/",
+        "/.git/objects/info/",
+        "/.git/objects/pack/",
+        "/.git/logs/",
+        "/.git/logs/refs/",
+        "/.git/logs/refs/heads/",
+        "/.git/logs/refs/remotes/",
+        "/.git/logs/refs/remotes/origin/",
+        "/.git/branches/",
+    )
+    for key in required_indexes:
+        assert key in files, key
+        body = files[key].decode("utf-8")
+        # Trimmed leading `/` so H1 always reads "Index of /.git..." for
+        # every listing regardless of nesting depth.
+        expected_h1 = key.rstrip("/") if key != "/.git/" else "/.git"
+        assert f"Index of {expected_h1}" in body, key
+        assert "Parent Directory" in body, key
+
+
+def test_fake_git_autoindex_child_links_match_served_leaves():
+    """The rendered subdirectory autoindex must link to every leaf we
+    actually answer — otherwise a scanner following the listing would
+    fetch a link and get 404, which itself is a "not real" tell.
+
+    Guards against silent drift between the autoindex link table and
+    the `files` map (e.g. adding a new branch to _FAKE_GIT_EXTRA_BRANCHES
+    without extending the /refs/heads/ index)."""
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, _meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+
+    # /.git/refs/heads/ must link every branch we actually serve as a ref.
+    heads_index = files["/.git/refs/heads/"].decode("utf-8")
+    for branch in ("main", "master", *tbenv._FAKE_GIT_EXTRA_BRANCHES):
+        assert f'href="{branch}"' in heads_index, branch
+        assert f"/.git/refs/heads/{branch}" in files, branch
+
+    # /.git/hooks/ must link every hook sample file we ship.
+    hooks_index = files["/.git/hooks/"].decode("utf-8")
+    for hook_name in tbenv._FAKE_GIT_HOOK_NAMES:
+        entry = f"{hook_name}.sample"
+        assert f'href="{entry}"' in hooks_index, entry
+        assert f"/.git/hooks/{entry}" in files, entry
+
+    # /.git/refs/tags/ must link every tag we ship.
+    tags_index = files["/.git/refs/tags/"].decode("utf-8")
+    for tag in tbenv._FAKE_GIT_TAG_REFS:
+        assert f'href="{tag}"' in tags_index, tag
+        assert f"/.git/refs/tags/{tag}" in files, tag
+
+
+def test_fake_git_autoindex_bodies_use_html_shape():
+    """Autoindex bodies must be the Apache/nginx `autoindex on` shape a
+    scanner's fingerprint check expects — HTML with a `?C=N;O=D` sort
+    link and an <hr> above and below the <a> table. Fixed the wire
+    shape so scanners hashing the response against known Apache/nginx
+    autoindex signatures stay engaged."""
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, _meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    body = files["/.git/hooks/"].decode("utf-8")
+    assert body.startswith("<!DOCTYPE HTML PUBLIC")
+    assert "?C=N;O=D" in body
+    assert body.count("<hr>") == 2
+
+
 # --- _close_http_session lifecycle ---
 
 

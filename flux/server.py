@@ -9453,40 +9453,55 @@ def _build_fake_repo(
         else f"git@{FAKE_GIT_REMOTE_HOST}:{FAKE_GIT_REMOTE_PATH}"
     )
     fetch_head_line = f"{commit_sha}\t\tbranch 'main' of {fetch_head_remote}\n"
-    # Apache-style autoindex body for `/.git/`. Scanners that probe the
-    # bare directory (top fake-git-miss key in fleet logs) treat a 404
-    # here as a "not real / restricted" tell, or move on before they
-    # ever ask for `/.git/HEAD`. Serving a plausible listing keeps them
-    # walking the tree — and every linked entry below is one we do
-    # answer with real content, so this is pure trap deepening.
-    git_root_index = (
-        "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n"
-        "<html>\n"
-        " <head>\n"
-        "  <title>Index of /.git</title>\n"
-        " </head>\n"
-        " <body>\n"
-        "<h1>Index of /.git</h1>\n"
-        "<pre>      <a href=\"?C=N;O=D\">Name</a>\n"
-        "      <hr>\n"
-        "      <a href=\"../\">Parent Directory</a>\n"
-        "      <a href=\"HEAD\">HEAD</a>\n"
-        "      <a href=\"config\">config</a>\n"
-        "      <a href=\"description\">description</a>\n"
-        "      <a href=\"FETCH_HEAD\">FETCH_HEAD</a>\n"
-        "      <a href=\"ORIG_HEAD\">ORIG_HEAD</a>\n"
-        "      <a href=\"COMMIT_EDITMSG\">COMMIT_EDITMSG</a>\n"
-        "      <a href=\"index\">index</a>\n"
-        "      <a href=\"packed-refs\">packed-refs</a>\n"
-        "      <a href=\"hooks/\">hooks/</a>\n"
-        "      <a href=\"info/\">info/</a>\n"
-        "      <a href=\"logs/\">logs/</a>\n"
-        "      <a href=\"objects/\">objects/</a>\n"
-        "      <a href=\"refs/\">refs/</a>\n"
-        "      <hr>\n"
-        "</pre>\n"
-        "</body></html>\n"
-    ).encode("utf-8")
+    # Apache-style autoindex body for `/.git/` and its subdirectories.
+    # Scanners that probe a bare directory (top fake-git-miss key in fleet
+    # logs) treat a 404 here as a "not real / restricted" tell, or move on
+    # before they ever ask for `/.git/HEAD`. Serving a plausible listing
+    # keeps them walking the tree — and every linked entry below is one we
+    # do answer with real content, so this is pure trap deepening.
+    def _autoindex(display_path: str, entries: tuple[str, ...]) -> bytes:
+        # `display_path` is the /.git-relative path shown in the H1
+        # ("/.git", "/.git/refs", …). `entries` are the child names to
+        # link. Directories carry a trailing "/" in the entry string;
+        # everything else renders as a file link. Matches nginx
+        # `autoindex on` output shape closely enough that scanners hashing
+        # against Apache/nginx autoindex fingerprints stay engaged.
+        body = [
+            "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n",
+            "<html>\n",
+            " <head>\n",
+            f"  <title>Index of {display_path}</title>\n",
+            " </head>\n",
+            " <body>\n",
+            f"<h1>Index of {display_path}</h1>\n",
+            "<pre>      <a href=\"?C=N;O=D\">Name</a>\n",
+            "      <hr>\n",
+            "      <a href=\"../\">Parent Directory</a>\n",
+        ]
+        for entry in entries:
+            body.append(f"      <a href=\"{entry}\">{entry}</a>\n")
+        body.append("      <hr>\n</pre>\n</body></html>\n")
+        return "".join(body).encode("utf-8")
+
+    git_root_index = _autoindex(
+        "/.git",
+        (
+            "HEAD",
+            "config",
+            "description",
+            "FETCH_HEAD",
+            "ORIG_HEAD",
+            "COMMIT_EDITMSG",
+            "index",
+            "packed-refs",
+            "branches/",
+            "hooks/",
+            "info/",
+            "logs/",
+            "objects/",
+            "refs/",
+        ),
+    )
     files: dict[str, bytes] = {
         "/.git/": git_root_index,
         "/.git/head": b"ref: refs/heads/main\n",
@@ -9602,6 +9617,70 @@ def _build_fake_repo(
     for branch in ("main", "master", *_FAKE_GIT_EXTRA_BRANCHES):
         files[f"/.git/refs/wip/index/refs/heads/{branch}"] = f"{commit_sha}\n".encode("utf-8")
         files[f"/.git/refs/wip/wtree/refs/heads/{branch}"] = f"{commit_sha}\n".encode("utf-8")
+
+    # Subdirectory autoindexes. Scanners walk `/.git/<subdir>/` after the
+    # bare directory — recent recon fleets (multi-IP, mixed ASN, plain
+    # `git/N.NN` clients + browser-mimic HTTP/2) enumerate every listed
+    # subdir; without an autoindex here they hit 404 fake-git-miss on the
+    # subdirectory even though the leaf files under it (e.g.
+    # `/.git/refs/heads/main`, `/.git/hooks/pre-commit.sample`) render fine.
+    # Same "keep them walking the tree" rationale as the /.git/ root index.
+    _hook_entries = tuple(sorted(f"{name}.sample" for name in _FAKE_GIT_HOOK_NAMES))
+    _branch_entries = tuple(sorted({"main", "master", *_FAKE_GIT_EXTRA_BRANCHES}))
+    _tag_entries = tuple(sorted(_FAKE_GIT_TAG_REFS))
+    files["/.git/hooks/"] = _autoindex("/.git/hooks", _hook_entries)
+    files["/.git/info/"] = _autoindex(
+        "/.git/info",
+        ("attributes", "exclude", "packs", "refs", "sparse-checkout"),
+    )
+    files["/.git/refs/"] = _autoindex(
+        "/.git/refs",
+        ("heads/", "remotes/", "stash", "tags/", "wip/"),
+    )
+    files["/.git/refs/heads/"] = _autoindex("/.git/refs/heads", _branch_entries)
+    files["/.git/refs/tags/"] = _autoindex("/.git/refs/tags", _tag_entries)
+    files["/.git/refs/remotes/"] = _autoindex("/.git/refs/remotes", ("origin/",))
+    files["/.git/refs/remotes/origin/"] = _autoindex(
+        "/.git/refs/remotes/origin",
+        ("HEAD", *_branch_entries),
+    )
+    files["/.git/refs/wip/"] = _autoindex("/.git/refs/wip", ("index/", "wtree/"))
+    files["/.git/refs/wip/index/"] = _autoindex("/.git/refs/wip/index", ("refs/",))
+    files["/.git/refs/wip/wtree/"] = _autoindex("/.git/refs/wip/wtree", ("refs/",))
+    files["/.git/refs/wip/index/refs/"] = _autoindex(
+        "/.git/refs/wip/index/refs", ("heads/",),
+    )
+    files["/.git/refs/wip/wtree/refs/"] = _autoindex(
+        "/.git/refs/wip/wtree/refs", ("heads/",),
+    )
+    files["/.git/refs/wip/index/refs/heads/"] = _autoindex(
+        "/.git/refs/wip/index/refs/heads", _branch_entries,
+    )
+    files["/.git/refs/wip/wtree/refs/heads/"] = _autoindex(
+        "/.git/refs/wip/wtree/refs/heads", _branch_entries,
+    )
+    files["/.git/objects/"] = _autoindex("/.git/objects", ("info/", "pack/"))
+    files["/.git/objects/info/"] = _autoindex("/.git/objects/info", ("packs",))
+    # Empty `pack/` — no pack files in the synthesized loose-only repo, but
+    # scanners walk the directory anyway. An autoindex with just the
+    # Parent Directory link matches the shape a fresh `git init` yields.
+    files["/.git/objects/pack/"] = _autoindex("/.git/objects/pack", ())
+    files["/.git/logs/"] = _autoindex("/.git/logs", ("HEAD", "refs/"))
+    files["/.git/logs/refs/"] = _autoindex(
+        "/.git/logs/refs", ("heads/", "remotes/", "stash"),
+    )
+    files["/.git/logs/refs/heads/"] = _autoindex(
+        "/.git/logs/refs/heads", _branch_entries,
+    )
+    files["/.git/logs/refs/remotes/"] = _autoindex(
+        "/.git/logs/refs/remotes", ("origin/",),
+    )
+    files["/.git/logs/refs/remotes/origin/"] = _autoindex(
+        "/.git/logs/refs/remotes/origin", ("HEAD", *_branch_entries),
+    )
+    # `/.git/branches/` is a legacy directory `git init` still creates,
+    # empty on any modern repo. Scanners that walk the full tree hit it.
+    files["/.git/branches/"] = _autoindex("/.git/branches", ())
 
     # Editor-swap / backup-rotation aliases for `/.git/config` and
     # `/.git/credentials`. Scanner dictionaries walk `.bak` / `.old` /
@@ -23528,13 +23607,14 @@ async def _send_fake_git(
             headers={"Content-Type": "text/plain; charset=utf-8"},
         )
 
-    if git_key.startswith("/.git/objects/") and "/info/" not in git_key:
-        content_type = "application/x-git-loose-object"
-    elif git_key == "/.git/":
-        # Directory autoindex is HTML — matches Apache's mod_autoindex /
-        # nginx `autoindex on` fingerprint that scanners look for at the
-        # bare-directory level.
+    if git_key.endswith("/"):
+        # Any trailing-slash /.git/... key is a directory autoindex — HTML,
+        # matching Apache's mod_autoindex / nginx `autoindex on` fingerprint.
+        # Covers `/.git/`, `/.git/refs/`, `/.git/hooks/`, `/.git/objects/`,
+        # `/.git/logs/`, and their subdirectories.
         content_type = "text/html; charset=utf-8"
+    elif git_key.startswith("/.git/objects/") and "/info/" not in git_key:
+        content_type = "application/x-git-loose-object"
     else:
         content_type = "text/plain; charset=utf-8"
 
