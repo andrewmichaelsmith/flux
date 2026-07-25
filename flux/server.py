@@ -14714,6 +14714,88 @@ def render_codex_auth_json(r: dict[str, object]) -> bytes:
     }, indent=2).encode("utf-8")
 
 
+def render_codex_config_toml(r: dict[str, object]) -> bytes:
+    # OpenAI Codex CLI `~/.codex/config.toml`. Distinct from `auth.json`
+    # (OAuth token triple, already trapped): `config.toml` is the
+    # persistent model/provider/mcp-server settings file. The interesting
+    # slot for a scanner is the `env` block on each `[mcp_servers.*]`
+    # entry — a Codex user routinely pastes API keys there so the spawned
+    # MCP server sees them as environment variables. `env_key` also lists
+    # the env-var name Codex looks up for the model provider's key, which
+    # a scanner cross-references with any `.env` it also fetches. Same
+    # AWS-canary-in-LLM-shape caveat as the other AI-cred traps.
+    aws = _aws(r)
+    return (
+        'model = "gpt-5-codex"\n'
+        'model_provider = "openai"\n'
+        'approval_policy = "on-failure"\n'
+        'sandbox_mode = "workspace-write"\n'
+        "\n"
+        "[model_providers.openai]\n"
+        'name = "openai"\n'
+        'base_url = "https://api.openai.com/v1"\n'
+        'env_key = "OPENAI_API_KEY"\n'
+        "\n"
+        "[model_providers.anthropic]\n"
+        'name = "anthropic"\n'
+        'base_url = "https://api.anthropic.com"\n'
+        'env_key = "ANTHROPIC_API_KEY"\n'
+        "\n"
+        "[mcp_servers.github]\n"
+        'command = "npx"\n'
+        'args = ["-y", "@modelcontextprotocol/server-github"]\n'
+        "[mcp_servers.github.env]\n"
+        f'GITHUB_PERSONAL_ACCESS_TOKEN = "{aws.get("awsAccessKeyId", "")}"\n'
+        "\n"
+        "[mcp_servers.internal-tools]\n"
+        'command = "uvx"\n'
+        'args = ["--from", "internal-tools-mcp", "serve"]\n'
+        "[mcp_servers.internal-tools.env]\n"
+        f'API_KEY = "{aws.get("awsSecretAccessKey", "")}"\n'
+        f'SESSION_TOKEN = "{aws.get("awsSessionToken", "")}"\n'
+        'BASE_URL = "https://tools.internal.lan"\n'
+        "\n"
+        "[history]\n"
+        "persistence = true\n"
+        "max_entries = 1000\n"
+    ).encode("utf-8")
+
+
+def render_rclone_conf(r: dict[str, object]) -> bytes:
+    # rclone stores per-remote cloud-storage credentials in
+    # `~/.config/rclone/rclone.conf` (also historically `~/.rclone.conf`).
+    # INI shape: one `[remote_name]` section per configured remote, with
+    # `type = s3` / `gcs` / `dropbox` / … driving the field set. The
+    # `[remote-s3]` slot maps 1:1 to an AWS Tracebit canary
+    # (access_key_id + secret_access_key + optional session_token +
+    # region), which is exactly the shape rclone writes for
+    # `rclone config` against an S3-compatible backend.
+    aws = _aws(r)
+    session = aws.get("awsSessionToken", "")
+    section_body = (
+        "[remote-s3]\n"
+        "type = s3\n"
+        "provider = AWS\n"
+        "env_auth = false\n"
+        f"access_key_id = {aws.get('awsAccessKeyId', '')}\n"
+        f"secret_access_key = {aws.get('awsSecretAccessKey', '')}\n"
+    )
+    if session:
+        section_body += f"session_token = {session}\n"
+    section_body += (
+        "region = us-east-1\n"
+        "location_constraint = us-east-1\n"
+        "acl = private\n"
+        "\n"
+        "[remote-b2]\n"
+        "type = b2\n"
+        f"account = {aws.get('awsAccessKeyId', '')}\n"
+        f"key = {aws.get('awsSecretAccessKey', '')}\n"
+        "hard_delete = true\n"
+    )
+    return section_body.encode("utf-8")
+
+
 def render_gemini_oauth_creds_json(r: dict[str, object]) -> bytes:
     # Google Gemini CLI `~/.gemini/oauth_creds.json`. Stores Google OAuth
     # refresh + access tokens after `gemini auth`. Standard
@@ -17082,6 +17164,12 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # /.credentials.json webroot variant from the same fleet.
             "/.config/claude/.credentials.json",
             "/.credentials.json",
+            # XDG variant filed under `~/.config/anthropic/credentials/`,
+            # with a per-profile `default.json`. Mid-July 2026 scanner
+            # cohorts walk it alongside `/.claude/.credentials.json` and
+            # the AI-editor bundle below, so a keyless fetcher that only
+            # tries the Anthropic-branded path lands here.
+            "/.config/anthropic/credentials/default.json",
         ),
         ("aws",),
         render_claude_credentials_json,
@@ -17121,6 +17209,11 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/.mcp/config.json",
             "/.mcp/settings.json",
             "/.cursor/mcp_config.json",
+            # Root-dotfile variant — some MCP client walkthroughs put a
+            # bare `~/.mcp.json` at $HOME instead of under `~/.mcp/`.
+            # Scanner dictionaries add both the directory and the flat-
+            # dotfile shape in the same sweep.
+            "/.mcp.json",
         ),
         ("aws",),
         render_cursor_mcp_json,
@@ -17232,6 +17325,25 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_codex_auth_json,
         "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "codex-config-toml",
+        ("/.codex/config.toml", "/root/.codex/config.toml"),
+        ("aws",),
+        render_codex_config_toml,
+        "application/toml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "rclone-conf",
+        (
+            "/rclone.conf",
+            "/.rclone.conf",
+            "/.config/rclone/rclone.conf",
+            "/root/.config/rclone/rclone.conf",
+        ),
+        ("aws",),
+        render_rclone_conf,
+        "text/plain; charset=utf-8",
     ),
     CanaryTrap(
         "gemini-oauth-creds",

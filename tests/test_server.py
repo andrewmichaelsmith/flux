@@ -10583,6 +10583,10 @@ def test_ai_toolchain_config_paths_registered():
         "/.mcp/config.json": "mcp-config",
         "/.mcp/settings.json": "mcp-config",
         "/.cursor/mcp_config.json": "mcp-config",
+        # Root-dotfile variant added mid-July 2026 after a scanner cohort
+        # was observed walking the bare `~/.mcp.json` shape alongside the
+        # `~/.mcp/` directory shape.
+        "/.mcp.json": "mcp-config",
         "/.continue/config.json": "continue-config",
         "/.sourcegraph/cody.json": "cody-config",
         "/.aider.conf.yml": "aider-conf",
@@ -10874,6 +10878,18 @@ def test_ai_ide_credential_paths_registered():
         "/.config/claude/.credentials.json": "claude-credentials",
         "/.credentials.json": "claude-credentials",
         "/root/.config/claude/.credentials.json": "claude-credentials-root",
+        # XDG variant filed under `~/.config/anthropic/credentials/`,
+        # walked by mid-July 2026 scanner cohorts alongside
+        # `/.claude/.credentials.json` and the AI-editor bundle.
+        "/.config/anthropic/credentials/default.json": "claude-credentials",
+        # OpenAI Codex CLI persistent config (distinct from `auth.json`).
+        "/.codex/config.toml": "codex-config-toml",
+        "/root/.codex/config.toml": "codex-config-toml",
+        # rclone remote credential store (S3/GCS/B2/… per-remote INI).
+        "/rclone.conf": "rclone-conf",
+        "/.rclone.conf": "rclone-conf",
+        "/.config/rclone/rclone.conf": "rclone-conf",
+        "/root/.config/rclone/rclone.conf": "rclone-conf",
         "/AGENTS.md": "agents-md",
         "/.claude/CLAUDE.md": "agents-md",
         "/root/.claude/CLAUDE.md": "agents-md",
@@ -10889,6 +10905,43 @@ def test_render_codex_auth_embeds_aws_canary():
     payload = json.loads(body)
     assert payload["OPENAI_API_KEY"] == "AKIAFAKEEXAMPLE01"
     assert payload["tokens"]["refresh_token"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+def test_render_codex_config_toml_embeds_aws_canary():
+    body = tbenv.render_codex_config_toml(FAKE_TRACEBIT).decode("utf-8")
+    # Both AWS canary halves must appear (mcp_servers env slots).
+    assert "AKIAFAKEEXAMPLE01" in body
+    assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    # Shape check — must parse as TOML and expose the mcp_servers env
+    # slot the scanner is grepping for.
+    import tomllib
+    parsed = tomllib.loads(body)
+    assert parsed["mcp_servers"]["github"]["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"] == "AKIAFAKEEXAMPLE01"
+    assert parsed["mcp_servers"]["internal-tools"]["env"]["API_KEY"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert parsed["model_providers"]["openai"]["env_key"] == "OPENAI_API_KEY"
+
+
+def test_render_rclone_conf_embeds_aws_canary_and_parses_as_ini():
+    body = tbenv.render_rclone_conf(FAKE_TRACEBIT).decode("utf-8")
+    assert "AKIAFAKEEXAMPLE01" in body
+    assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    # Shape check — real rclone.conf parses as INI.
+    import configparser
+    cp = configparser.ConfigParser()
+    cp.read_string(body)
+    assert cp["remote-s3"]["type"] == "s3"
+    assert cp["remote-s3"]["access_key_id"] == "AKIAFAKEEXAMPLE01"
+    assert cp["remote-s3"]["secret_access_key"] == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert cp["remote-b2"]["type"] == "b2"
+
+
+def test_render_rclone_conf_omits_session_token_when_empty():
+    """FAKE_TRACEBIT ships a non-empty awsSessionToken; a canary that
+    happens to omit one must not emit an empty `session_token = ` line —
+    scanners that filter on presence-of-key would treat that as a bug."""
+    stripped = {**FAKE_TRACEBIT, "aws": {**FAKE_TRACEBIT["aws"], "awsSessionToken": ""}}
+    body = tbenv.render_rclone_conf(stripped).decode("utf-8")
+    assert "session_token" not in body
 
 
 def test_render_gemini_oauth_creds_embeds_aws_canary():
@@ -11051,6 +11104,14 @@ def test_render_agents_md_embeds_aws_canary():
     ("/root/.config/claude/.credentials.json", "claude-credentials-root", "AKIAFAKEEXAMPLE01"),
     ("/AGENTS.md", "agents-md", "AKIAFAKEEXAMPLE01"),
     ("/.claude/CLAUDE.md", "agents-md", "AKIAFAKEEXAMPLE01"),
+    # Mid-July 2026 dictionary additions.
+    ("/.config/anthropic/credentials/default.json", "claude-credentials", "AKIAFAKEEXAMPLE01"),
+    ("/.codex/config.toml", "codex-config-toml", "AKIAFAKEEXAMPLE01"),
+    ("/root/.codex/config.toml", "codex-config-toml", "AKIAFAKEEXAMPLE01"),
+    ("/rclone.conf", "rclone-conf", "AKIAFAKEEXAMPLE01"),
+    ("/.rclone.conf", "rclone-conf", "AKIAFAKEEXAMPLE01"),
+    ("/.config/rclone/rclone.conf", "rclone-conf", "AKIAFAKEEXAMPLE01"),
+    ("/root/.config/rclone/rclone.conf", "rclone-conf", "AKIAFAKEEXAMPLE01"),
 ])
 async def test_dispatch_routes_ai_ide_paths_to_traps(
     flux_client, monkeypatch, path, expected_result, canary_substring,
@@ -11070,6 +11131,7 @@ async def test_dispatch_routes_ai_ide_paths_to_traps(
     ("/.claude/settings.json", "claude-settings", "AKIAFAKEEXAMPLE01"),
     ("/.cline/settings.json", "cline-settings", "AKIAFAKEEXAMPLE01"),
     ("/.cline/mcp_settings.json", "mcp-config", "AKIAFAKEEXAMPLE01"),
+    ("/.mcp.json", "mcp-config", "AKIAFAKEEXAMPLE01"),
     ("/.continue/config.json", "continue-config", "AKIAFAKEEXAMPLE01"),
     ("/.sourcegraph/cody.json", "cody-config", "wJalrXUtnFEMI"),
     ("/.aider.conf.yml", "aider-conf", "AKIAFAKEEXAMPLE01"),
