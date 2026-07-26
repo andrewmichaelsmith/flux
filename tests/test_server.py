@@ -54,6 +54,36 @@ def test_default_webshell_paths_include_hitlist_cohort():
         assert tbenv.is_webshell_path(path), f"expected webshell match: {path}"
 
 
+def test_default_webshell_paths_include_azure_cohort_misses():
+    """A coordinated Azure/Microsoft-hosted scanner cohort probes ~100
+    shell-shaped `*.php` filenames as one bundle from each source IP. Most
+    of that dictionary already resolves via the hitlist cohort, but a
+    handful of paths were consistent 404-not-handled misses that also
+    reproduce across independent scanner cohorts (5+ distinct source IPs
+    each in a recent 7-day window). `/this_is_a_new_hello_world.php` in
+    particular is the single top not-handled path and gets probed far
+    beyond this one cohort. All of these must reach the webshell handler
+    so the follow-up `?cmd=` lands on the trap instead of a 404."""
+    must_match = [
+        "/this_is_a_new_hello_world.php",
+        "/wp-content/admin.php",
+        "/wp-content/index.php",
+        "/wp-content/themes/index.php",
+        "/wp.php",
+        "/wp-load.php",
+        "/w.php",
+        "/file.php",
+        "/2.php",
+        "/82.php",
+        "/goods.php",
+        "/bless.php",
+        "/simple.php",
+        "/atomlib.php",
+    ]
+    for path in must_match:
+        assert tbenv.is_webshell_path(path), f"expected webshell match: {path}"
+
+
 def test_default_webshell_paths_include_style_php_family():
     """style.php is a recurring webshell-rename: legitimate WordPress serves
     style.css, never style.php, so any /style.php — at the root or under any of

@@ -261,6 +261,30 @@ _WEBSHELL_DEFAULT_PATHS = ",".join([
     "/wp-content/themes/style.php",
     "/wp-includes/style.php",
     "/js/style.php",
+    #   - Coordinated Azure/Microsoft-hosted webshell-scanner cohort: a
+    #     multi-region fleet sharing one TLS+JA4H fingerprint probes ~100
+    #     shell-shaped `*.php` filenames as a single bundle from each source
+    #     IP. Most of its dictionary already resolves via the hitlist bundle
+    #     above; this block covers the observed misses that repeated across
+    #     independent scanner cohorts (5+ distinct source IPs each in a
+    #     recent 7-day window). `/this_is_a_new_hello_world.php` in
+    #     particular is the top single 404-not-handled path and gets probed
+    #     by many actors beyond this one cohort. Empty body, GET only —
+    #     same shell-jacking reachability check as the /style.php family.
+    "/this_is_a_new_hello_world.php",
+    "/wp-content/admin.php",
+    "/wp-content/index.php",
+    "/wp-content/themes/index.php",
+    "/wp.php",
+    "/wp-load.php",
+    "/w.php",
+    "/file.php",
+    "/2.php",
+    "/82.php",
+    "/goods.php",
+    "/bless.php",
+    "/simple.php",
+    "/atomlib.php",
 ])
 WEBSHELL_PATHS = {
     value.strip().lower()

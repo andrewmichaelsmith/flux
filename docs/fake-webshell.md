@@ -7,7 +7,14 @@ Matches known PHP webshell probe paths. Two matchers, both default-on:
   short-named `*.php` shells). Includes a ~23-path "shell-hitlist" bundle
   (`/qterm.php`, `/wefile.php`, `/x.php`, `/mac.php`, `/ops.php`,
   `/error_log.php`, `/blurbs.php`, `/155.php`, `/201.php`, …) that a
-  systematic scan family probes together from each source IP.
+  systematic scan family probes together from each source IP, and a
+  smaller "coordinated cohort" bundle
+  (`/this_is_a_new_hello_world.php`, `/wp-content/{admin,index,themes/index}.php`,
+  `/wp{,-load}.php`, `/w.php`, `/file.php`, `/2.php`, `/82.php`,
+  `/goods.php`, `/bless.php`, `/simple.php`, `/atomlib.php`) that a
+  multi-region webshell-scanner fleet fans out from Azure/Microsoft
+  address space, with the same paths recurring across independent
+  scanner cohorts (so the trap catches more than just that one fleet).
 - **Regex families** (not env-configurable; set in source):
   - `/.well-known/<name>.php` — attackers use the `/.well-known/`
     directory as a shell-drop location because it's often writable
