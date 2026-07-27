@@ -9299,13 +9299,21 @@ _FAKE_GIT_EXTRA_BRANCHES: tuple[str, ...] = (
 # `commit_sha` used for the branch heads is fine: every tag is projected
 # onto the one synthesized commit. Common release-cadence names cover the
 # scanner dictionaries that walk `/.git/refs/tags/<name>` after the branches.
+# All entries stay within one convention: semver-v-prefixed release tags
+# plus movable named pointers (`latest`/`release`/`stable`). Mixing bare
+# `1.0.0` semver or channel-name tags like `alpha`/`beta` alongside the
+# v-prefixed tags would make the release-naming pattern inconsistent —
+# a fingerprint tell for scanners that check convention adherence.
 _FAKE_GIT_TAG_REFS: tuple[str, ...] = (
     "v0.1",
     "v1.0",
+    "v1.0.0",
     "v1.1",
     "v2.0",
+    "v2.0.0",
     "latest",
     "release",
+    "stable",
 )
 
 
@@ -9621,8 +9629,16 @@ def _build_fake_repo(
     # tags keeps the synthesized tree consistent — every tag points at
     # the one commit. Lightweight (bare-sha) form avoids the tag-object
     # plumbing that annotated tags need.
+    #
+    # Also write the matching `logs/refs/tags/<name>` reflog line for
+    # every tag — `git tag <name>` creates it, so scanners walking
+    # `/.git/logs/refs/tags/<name>` after `/.git/refs/tags/<name>` expect
+    # a 200 there too. Historically only branches got their reflog written
+    # (see _FAKE_GIT_EXTRA_BRANCHES loop above); the tag-side reflog was
+    # asymmetric-missing and every tag walked from the miss log.
     for tag in _FAKE_GIT_TAG_REFS:
         files[f"/.git/refs/tags/{tag}"] = f"{commit_sha}\n".encode("utf-8")
+        files[f"/.git/logs/refs/tags/{tag}"] = reflog_line.encode("utf-8")
 
     # git-stash refs: a real repo with any saved stash has these; their
     # absence is a banner-grab tell for scanners that enumerate
@@ -9691,10 +9707,13 @@ def _build_fake_repo(
     files["/.git/objects/pack/"] = _autoindex("/.git/objects/pack", ())
     files["/.git/logs/"] = _autoindex("/.git/logs", ("HEAD", "refs/"))
     files["/.git/logs/refs/"] = _autoindex(
-        "/.git/logs/refs", ("heads/", "remotes/", "stash"),
+        "/.git/logs/refs", ("heads/", "remotes/", "stash", "tags/"),
     )
     files["/.git/logs/refs/heads/"] = _autoindex(
         "/.git/logs/refs/heads", _branch_entries,
+    )
+    files["/.git/logs/refs/tags/"] = _autoindex(
+        "/.git/logs/refs/tags", _tag_entries,
     )
     files["/.git/logs/refs/remotes/"] = _autoindex(
         "/.git/logs/refs/remotes", ("origin/",),

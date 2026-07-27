@@ -8206,6 +8206,49 @@ def test_fake_git_repo_covers_common_tag_refs():
         assert files[key].decode("utf-8") == sha + "\n", key
 
 
+def test_fake_git_repo_writes_tag_reflog_for_every_tag_ref():
+    """`git tag <name>` writes an entry into `.git/logs/refs/tags/<name>`.
+    Scanners walk that path after `refs/tags/<name>`; a repo that returns
+    a tag ref but 404s on its reflog is asymmetric — a "someone hand-
+    dropped a ref file without going through `git tag`" tell. Every tag
+    ref must have a matching reflog leaf, mirroring how branches get
+    both `refs/heads/<b>` and `logs/refs/heads/<b>`."""
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    sha = meta["commitSha"]
+    for tag in tbenv._FAKE_GIT_TAG_REFS:
+        key = f"/.git/logs/refs/tags/{tag}"
+        assert key in files, f"missing fake-git tag reflog: {key}"
+        # Reflog line shape is `<zero-sha> <commit-sha> <author> <ts> <tz>\t<msg>\n`;
+        # the important assertions are non-empty body containing the commit sha
+        # (so `git log <tag>` from a client that walks the reflog resolves) and
+        # matching what the branch-side reflog writes.
+        line = files[key].decode("utf-8")
+        assert sha in line, key
+        assert line == files["/.git/logs/refs/heads/main"].decode("utf-8"), (
+            f"tag reflog for {tag} diverges from branch reflog shape"
+        )
+
+
+def test_fake_git_logs_refs_tags_autoindex_lists_every_tag():
+    """Scanners walking `/.git/logs/refs/tags/` follow the autoindex links
+    to `/.git/logs/refs/tags/<tag>`; every listed link must resolve to a
+    served reflog leaf, otherwise the click-through 404 is itself a
+    "not a real repo" tell. Parallels the existing branches autoindex
+    test."""
+    secrets_body = tbenv._format_secrets_yaml(FAKE_TRACEBIT)
+    files, _meta = tbenv._build_fake_repo(secrets_body, FAKE_TRACEBIT)
+    index = files["/.git/logs/refs/tags/"].decode("utf-8")
+    for tag in tbenv._FAKE_GIT_TAG_REFS:
+        assert f'href="{tag}"' in index, tag
+        assert f"/.git/logs/refs/tags/{tag}" in files, tag
+    # Parent `logs/refs/` autoindex must also advertise the `tags/`
+    # subdirectory now that its leaves exist — otherwise scanners walking
+    # the parent listing miss it entirely.
+    logs_refs_index = files["/.git/logs/refs/"].decode("utf-8")
+    assert 'href="tags/"' in logs_refs_index
+
+
 def test_fake_git_repo_ships_info_plumbing_files():
     """`.git/info/attributes`, `.git/info/sparse-checkout`, and
     `.git/info/packs` are enumerated after `.git/info/exclude`. Empty
@@ -8281,6 +8324,7 @@ def test_fake_git_repo_serves_subdirectory_autoindexes():
         "/.git/logs/",
         "/.git/logs/refs/",
         "/.git/logs/refs/heads/",
+        "/.git/logs/refs/tags/",
         "/.git/logs/refs/remotes/",
         "/.git/logs/refs/remotes/origin/",
         "/.git/branches/",
