@@ -15219,6 +15219,145 @@ def render_symfony_parameters_yml(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_rails_database_yml(r: dict[str, object]) -> bytes:
+    """Rails `config/database.yml` — the canonical DB config shipped
+    with every `rails new` app. Real content: per-environment blocks
+    (`development`, `test`, `production`) with adapter / database /
+    host / port / username / password / pool. Credential harvesters
+    grep raw bytes for `password:` and cross-reference with
+    `production:` context; every credential slot is per-hit unique so
+    the fleet can't be fingerprinted by a fixed literal. The AWS
+    canary lands in a `production:` sub-slot as `s3_bucket_key_id` /
+    `s3_bucket_secret` — a common `config/database.yml` convention
+    for apps that stash S3 credentials next to the DB config (a
+    Rails-community anti-pattern that shows up in real-world leaks
+    exactly because `database.yml` is the first file operators
+    accidentally commit or leave in the webroot)."""
+    aws = _aws(r)
+    dev_password = _fake_db_password()
+    test_password = _fake_db_password()
+    prod_password = _fake_db_password()
+    return (
+        "# Rails database configuration.\n"
+        "# See https://guides.rubyonrails.org/configuring.html#configuring-a-database\n"
+        "default: &default\n"
+        "  adapter: postgresql\n"
+        "  encoding: unicode\n"
+        "  pool: <%= ENV.fetch(\"RAILS_MAX_THREADS\") { 5 } %>\n"
+        "  host: db.internal\n"
+        "  port: 5432\n"
+        "\n"
+        "development:\n"
+        "  <<: *default\n"
+        "  database: app_development\n"
+        "  username: app\n"
+        f"  password: {dev_password}\n"
+        "\n"
+        "test:\n"
+        "  <<: *default\n"
+        "  database: app_test\n"
+        "  username: app\n"
+        f"  password: {test_password}\n"
+        "\n"
+        "production:\n"
+        "  <<: *default\n"
+        "  database: app_production\n"
+        "  username: app_prod\n"
+        f"  password: {prod_password}\n"
+        "  # S3-backed pg_dump credentials (nightly backup cron).\n"
+        f"  s3_bucket_key_id: {aws.get('awsAccessKeyId', '')}\n"
+        f"  s3_bucket_secret: {aws.get('awsSecretAccessKey', '')}\n"
+        f"  s3_bucket_session_token: {aws.get('awsSessionToken', '')}\n"
+        "  s3_bucket_region: us-east-1\n"
+        "  s3_bucket: app-pg-dumps-prod\n"
+    ).encode("utf-8")
+
+
+def render_rails_secrets_yml(r: dict[str, object]) -> bytes:
+    """Rails legacy `config/secrets.yml` (pre-5.2, before
+    `credentials.yml.enc`) — plaintext YAML with `secret_key_base`
+    and any per-environment secret slots the app defined. This is
+    the file the community-standard 2015-2020 Rails app leaked
+    when the webroot got misconfigured; `secret_key_base` alone
+    lets an attacker forge session cookies (Rails session cookie
+    is HMAC'd with this key). Per-hit unique `secret_key_base`;
+    AWS canary in the `aws:` block."""
+    aws = _aws(r)
+    dev_secret = secrets.token_hex(64)
+    test_secret = secrets.token_hex(64)
+    prod_secret = secrets.token_hex(64)
+    smtp_password = _fake_db_password()
+    return (
+        "# Be sure to restart your server when you modify this file.\n"
+        "\n"
+        "# Your secret key is used for verifying the integrity of signed cookies.\n"
+        "# If you change this key, all old signed cookies will become invalid!\n"
+        "\n"
+        "# Make sure the secret is at least 30 characters and all random,\n"
+        "# no regular words or you'll be exposed to dictionary attacks.\n"
+        "# You can use `rails secret` to generate a secure secret key.\n"
+        "\n"
+        "development:\n"
+        f"  secret_key_base: {dev_secret}\n"
+        "\n"
+        "test:\n"
+        f"  secret_key_base: {test_secret}\n"
+        "\n"
+        "# Do not keep production secrets in the unencrypted secrets file.\n"
+        "# Instead, either read values from the environment.\n"
+        "# Or, use `bin/rails credentials:edit` to set the encrypted secrets.\n"
+        "\n"
+        "production:\n"
+        f"  secret_key_base: {prod_secret}\n"
+        "  aws:\n"
+        f"    access_key_id: {aws.get('awsAccessKeyId', '')}\n"
+        f"    secret_access_key: {aws.get('awsSecretAccessKey', '')}\n"
+        f"    session_token: {aws.get('awsSessionToken', '')}\n"
+        "    region: us-east-1\n"
+        "    bucket: app-uploads-prod\n"
+        "  smtp:\n"
+        "    address: email-smtp.us-east-1.amazonaws.com\n"
+        "    port: 587\n"
+        "    user_name: apikey\n"
+        f"    password: {smtp_password}\n"
+    ).encode("utf-8")
+
+
+def render_rails_master_key(r: dict[str, object]) -> bytes:
+    """Rails 5.2+ `config/master.key` — 32-hex-char AES key that
+    decrypts `config/credentials.yml.enc`. Real production leaks
+    are exactly this shape: 32 lowercase hex characters, no
+    trailing newline stripped by Rails on read (a real Rails app
+    file has a trailing newline). Not a Tracebit canary — the
+    file itself is just a random hex string with no embeddable
+    credential-shaped slot. Per-hit unique so the file is not a
+    fleet-wide fingerprint (and any harvester correlating master
+    keys across sensors sees all-different values, matching what
+    a real fleet of Rails apps would present)."""
+    del r
+    return (secrets.token_hex(16) + "\n").encode("utf-8")
+
+
+def render_rails_credentials_enc(r: dict[str, object]) -> bytes:
+    """Rails 5.2+ `config/credentials.yml.enc` — YAML-encrypted-with-
+    ActiveSupport::MessageEncryptor blob. Real file shape is
+    `<base64_ciphertext>--<base64_iv>--<base64_auth_tag>` on one
+    line, aes-128-gcm mode. Scanners hunting for Rails secret
+    leaks probe this filename specifically to fingerprint 5.2+
+    apps and follow up with `config/master.key`. Since a
+    harvester needs the matching master.key to decrypt (which is
+    a separate probe), the body itself is per-hit random bytes in
+    the correct shape — its value is confirming the app is Rails
+    5.2+ and inviting the master.key follow-up probe. No AWS
+    canary embedded (would be unreachable inside GCM ciphertext);
+    the canary lives in `secrets.yml` for the Rails 4-5 shape."""
+    del r
+    ciphertext = base64.b64encode(secrets.token_bytes(384)).decode("ascii")
+    iv = base64.b64encode(secrets.token_bytes(12)).decode("ascii")
+    auth_tag = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+    return f"{ciphertext}--{iv}--{auth_tag}\n".encode("utf-8")
+
+
 def render_yii2_debug_view(r: dict[str, object]) -> bytes:
     """Yii2 debugger ConfigPanel view — HTML page mimicking the
     `?panel=config` rendering that the dev-mode `yii\\debug\\Module`
@@ -17576,6 +17715,132 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_symfony_profiler_phpinfo,
         "text/html; charset=utf-8",
+    ),
+    # --- Rails secrets bundle -------------------------------------------
+    # `config/database.yml`, `config/secrets.yml` (pre-5.2 legacy),
+    # `config/master.key` (5.2+ decryption key), and
+    # `config/credentials.yml.enc` (5.2+ encrypted YAML blob) are the four
+    # secret-shaped files every Rails app ships. Scanner dictionaries walk
+    # them together — a source hitting `/config/database.yml` almost
+    # always follows up with `/config/secrets.yml` and `/config/master.key`.
+    # Real-world Rails webroot misconfigs (nginx `root` pointed one dir
+    # too high) leak all four in one shot. Each variant is a separate
+    # CanaryTrap entry so the renderer matches the file shape;
+    # database.yml + secrets.yml both carry an AWS canary in the
+    # Rails-idiomatic slot (`production.s3_bucket_*` and
+    # `production.aws.*` respectively); master.key + credentials.yml.enc
+    # have no readable credential slot to embed the canary in and serve
+    # per-hit random shape-plausible bytes.
+    CanaryTrap(
+        "rails-database-yml",
+        (
+            # Direct file leak — canonical `config/database.yml`.
+            "/config/database.yml",
+            # Backup / editor / dialect variants — scanner dictionaries
+            # walk the same base name with these suffixes because a real
+            # dev often leaves the pre-edit copy behind.
+            "/config/database.yml.example",
+            "/config/database.yml.sample",
+            "/config/database.yml.dist",
+            "/config/database.yml.default",
+            "/config/database.yml.bak",
+            "/config/database.yml.old",
+            "/config/database.yml.save",
+            "/config/database.yml.orig",
+            "/config/database.yml.swp",
+            "/config/database.yml~",
+            # Dialect-specific alternates that some Rails deploys keep
+            # side-by-side (dev + prod on different DB backends).
+            "/config/database.yml.pgsql",
+            "/config/database.yml.postgres",
+            "/config/database.yml.postgresql",
+            "/config/database.yml.mysql",
+            "/config/database.yml.sqlite",
+            "/config/database.yml.sqlite3",
+            # Leading-dot vim swap — the naming convention real vim uses.
+            "/.config/database.yml.swp",
+            # `/app/config/database.yml` is a common Rails-in-`app/`
+            # deployment layout (also matches monorepo `apps/<name>/config/`
+            # webroot leaks). The full `_app_layout_variants` set covers
+            # `/storage/`, `/backend/`, `/backup/`, `/public/`,
+            # `/public_html/`, `/www/`, `/htdocs/`.
+            *_app_layout_variants("config/database.yml"),
+            *_app_layout_variants("config/database.yml.example"),
+            *_app_layout_variants("config/database.yml.bak"),
+            *_app_layout_variants("config/database.yml~"),
+        ),
+        ("aws",),
+        render_rails_database_yml,
+        "text/yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "rails-secrets-yml",
+        (
+            "/config/secrets.yml",
+            "/config/secrets.yml.example",
+            "/config/secrets.yml.sample",
+            "/config/secrets.yml.dist",
+            "/config/secrets.yml.bak",
+            "/config/secrets.yml.old",
+            "/config/secrets.yml.save",
+            "/config/secrets.yml.orig",
+            "/config/secrets.yml.swp",
+            "/config/secrets.yml~",
+            "/config/secrets.yml.backup",
+            "/.config/secrets.yml.swp",
+            *_app_layout_variants("config/secrets.yml"),
+            *_app_layout_variants("config/secrets.yml.example"),
+            *_app_layout_variants("config/secrets.yml.bak"),
+            *_app_layout_variants("config/secrets.yml~"),
+        ),
+        ("aws",),
+        render_rails_secrets_yml,
+        "text/yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "rails-master-key",
+        (
+            # Rails 5.2+ decryption key for credentials.yml.enc. Real
+            # file is 32 hex chars + trailing newline; no canary
+            # embedded (nothing credential-shaped to hide in a bare
+            # AES key). Per-hit unique so the fleet isn't
+            # fingerprintable by a fixed literal.
+            "/config/master.key",
+            "/config/master.key.bak",
+            "/config/master.key.old",
+            "/config/master.key.orig",
+            "/config/master.key~",
+            # Rails 6+ multi-environment credentials — each has its
+            # own key file alongside the encrypted YAML.
+            "/config/credentials/production.key",
+            "/config/credentials/staging.key",
+            "/config/credentials/development.key",
+            "/config/credentials/test.key",
+            *_app_layout_variants("config/master.key"),
+            *_app_layout_variants("config/credentials/production.key"),
+        ),
+        ("aws",),
+        render_rails_master_key,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "rails-credentials-enc",
+        (
+            "/config/credentials.yml.enc",
+            "/config/credentials.yml.enc.bak",
+            "/config/credentials.yml.enc.old",
+            "/config/credentials.yml.enc~",
+            # Rails 6+ multi-environment encrypted credentials.
+            "/config/credentials/production.yml.enc",
+            "/config/credentials/staging.yml.enc",
+            "/config/credentials/development.yml.enc",
+            "/config/credentials/test.yml.enc",
+            *_app_layout_variants("config/credentials.yml.enc"),
+            *_app_layout_variants("config/credentials/production.yml.enc"),
+        ),
+        ("aws",),
+        render_rails_credentials_enc,
+        "application/octet-stream",
     ),
     CanaryTrap(
         "symfony-parameters-yml",

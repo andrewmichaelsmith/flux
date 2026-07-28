@@ -2251,6 +2251,239 @@ def test_magento_env_paths_do_not_match_tarpit():
         )
 
 
+@pytest.mark.parametrize("path,expected_trap", [
+    # Canonical direct-file leaks — the four secret-shaped files every
+    # Rails app ships.
+    ("/config/database.yml", "rails-database-yml"),
+    ("/config/secrets.yml", "rails-secrets-yml"),
+    ("/config/master.key", "rails-master-key"),
+    ("/config/credentials.yml.enc", "rails-credentials-enc"),
+    # Rails 6+ multi-environment credentials.
+    ("/config/credentials/production.yml.enc", "rails-credentials-enc"),
+    ("/config/credentials/staging.yml.enc", "rails-credentials-enc"),
+    ("/config/credentials/development.yml.enc", "rails-credentials-enc"),
+    ("/config/credentials/test.yml.enc", "rails-credentials-enc"),
+    ("/config/credentials/production.key", "rails-master-key"),
+    ("/config/credentials/staging.key", "rails-master-key"),
+    # database.yml editor / backup / dialect variants.
+    ("/config/database.yml.example", "rails-database-yml"),
+    ("/config/database.yml.sample", "rails-database-yml"),
+    ("/config/database.yml.dist", "rails-database-yml"),
+    ("/config/database.yml.default", "rails-database-yml"),
+    ("/config/database.yml.bak", "rails-database-yml"),
+    ("/config/database.yml.old", "rails-database-yml"),
+    ("/config/database.yml.save", "rails-database-yml"),
+    ("/config/database.yml.orig", "rails-database-yml"),
+    ("/config/database.yml.swp", "rails-database-yml"),
+    ("/config/database.yml~", "rails-database-yml"),
+    ("/config/database.yml.pgsql", "rails-database-yml"),
+    ("/config/database.yml.postgres", "rails-database-yml"),
+    ("/config/database.yml.postgresql", "rails-database-yml"),
+    ("/config/database.yml.mysql", "rails-database-yml"),
+    ("/config/database.yml.sqlite", "rails-database-yml"),
+    ("/config/database.yml.sqlite3", "rails-database-yml"),
+    ("/.config/database.yml.swp", "rails-database-yml"),
+    # secrets.yml editor / backup variants.
+    ("/config/secrets.yml.example", "rails-secrets-yml"),
+    ("/config/secrets.yml.bak", "rails-secrets-yml"),
+    ("/config/secrets.yml.backup", "rails-secrets-yml"),
+    ("/config/secrets.yml~", "rails-secrets-yml"),
+    ("/.config/secrets.yml.swp", "rails-secrets-yml"),
+    # master.key backup variants.
+    ("/config/master.key.bak", "rails-master-key"),
+    ("/config/master.key.old", "rails-master-key"),
+    ("/config/master.key.orig", "rails-master-key"),
+    ("/config/master.key~", "rails-master-key"),
+    # credentials.yml.enc backup variants.
+    ("/config/credentials.yml.enc.bak", "rails-credentials-enc"),
+    ("/config/credentials.yml.enc.old", "rails-credentials-enc"),
+    ("/config/credentials.yml.enc~", "rails-credentials-enc"),
+    # App-layout webroot-prefix variants (docker /app, /storage, etc.).
+    ("/app/config/database.yml", "rails-database-yml"),
+    ("/backend/config/database.yml", "rails-database-yml"),
+    ("/backup/config/database.yml", "rails-database-yml"),
+    ("/public/config/database.yml", "rails-database-yml"),
+    ("/public_html/config/database.yml", "rails-database-yml"),
+    ("/storage/config/database.yml", "rails-database-yml"),
+    ("/www/config/database.yml", "rails-database-yml"),
+    ("/htdocs/config/database.yml", "rails-database-yml"),
+    ("/app/config/secrets.yml", "rails-secrets-yml"),
+    ("/app/config/master.key", "rails-master-key"),
+    ("/app/config/credentials.yml.enc", "rails-credentials-enc"),
+    ("/backend/config/database.yml.bak", "rails-database-yml"),
+    ("/app/config/database.yml~", "rails-database-yml"),
+])
+def test_rails_secrets_trap_dispatch(path, expected_trap):
+    """Every Rails secret-file variant scanners walk must route to the
+    correct dedicated renderer (not fold into the generic env-vault or
+    tarpit). Group ownership: database.yml + siblings → rails-database-yml
+    (with AWS canary in the `production.s3_bucket_*` slot); secrets.yml
+    + siblings → rails-secrets-yml (with AWS canary in the `production.aws`
+    block); master.key + per-env .key → rails-master-key (per-hit random
+    32-hex, no canary slot); credentials.yml.enc + per-env .yml.enc →
+    rails-credentials-enc (per-hit random GCM-shaped blob)."""
+    trap = tbenv._TRAP_BY_PATH[path.lower()]
+    assert trap.name == expected_trap, (
+        f"{path!r} routes to {trap.name!r}; expected {expected_trap!r}"
+    )
+
+
+@pytest.mark.parametrize("path", [
+    "/config/database.yml",
+    "/config/database.yml.bak",
+    "/config/database.yml~",
+    "/config/secrets.yml",
+    "/config/secrets.yml.backup",
+    "/config/master.key",
+    "/config/master.key.bak",
+    "/config/credentials.yml.enc",
+    "/config/credentials/production.yml.enc",
+    "/config/credentials/production.key",
+    "/app/config/database.yml",
+    "/backend/config/database.yml.bak",
+])
+def test_rails_secrets_paths_do_not_match_tarpit(path):
+    """Tarpit dispatch runs before CanaryTrap lookup. Any Rails secret
+    variant that matched `is_tarpit_path` would drip junk bytes forever
+    without embedding the AWS canary."""
+    assert not tbenv.is_tarpit_path(path), (
+        f"{path!r} matches is_tarpit_path — tarpit would shadow the "
+        f"rails-* canary trap"
+    )
+
+
+def test_render_rails_database_yml_shape_and_per_hit_uniqueness():
+    """Body must look like a real Rails `config/database.yml` — YAML
+    with `default: &default` anchor and `development` / `test` /
+    `production` blocks. AWS canary lands in the
+    `production.s3_bucket_*` slot; DB passwords are per-hit random
+    across the three environment blocks and across two consecutive
+    renders."""
+    body_1 = tbenv.render_rails_database_yml(FAKE_TRACEBIT).decode("utf-8")
+    body_2 = tbenv.render_rails_database_yml(FAKE_TRACEBIT).decode("utf-8")
+    for marker in (
+        "default: &default",
+        "adapter: postgresql",
+        "development:\n",
+        "test:\n",
+        "production:\n",
+        "  <<: *default",
+        "  password: ",
+        "s3_bucket_key_id: AKIAFAKEEXAMPLE01",
+        "s3_bucket_secret: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    ):
+        assert marker in body_1, f"missing {marker!r} in database.yml render"
+    # Every env's password differs (per-hit random).
+    passwords = [line.strip() for line in body_1.splitlines() if line.strip().startswith("password:")]
+    assert len(passwords) == 3
+    assert len(set(passwords)) == 3, f"env passwords collide: {passwords}"
+    # AWS canary present in both renders.
+    assert "AKIAFAKEEXAMPLE01" in body_1
+    assert "AKIAFAKEEXAMPLE01" in body_2
+    # But two consecutive bodies differ — per-hit random fields prevent
+    # a fixed cross-sensor fingerprint.
+    assert body_1 != body_2
+
+
+def test_render_rails_secrets_yml_shape_and_per_hit_uniqueness():
+    """Body must look like a real Rails `config/secrets.yml` — YAML
+    with `development` / `test` / `production` top-level keys and a
+    `secret_key_base` under each. AWS canary lands in the
+    `production.aws` block; secret_key_base values are per-hit random
+    across environments and renders."""
+    body_1 = tbenv.render_rails_secrets_yml(FAKE_TRACEBIT).decode("utf-8")
+    body_2 = tbenv.render_rails_secrets_yml(FAKE_TRACEBIT).decode("utf-8")
+    for marker in (
+        "development:\n",
+        "test:\n",
+        "production:\n",
+        "  secret_key_base: ",
+        "  aws:\n",
+        "    access_key_id: AKIAFAKEEXAMPLE01",
+        "    secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "    region: us-east-1",
+        "  smtp:\n",
+    ):
+        assert marker in body_1, f"missing {marker!r} in secrets.yml render"
+    # Every env's secret_key_base differs (per-hit random).
+    keys = [
+        line.strip().split(": ", 1)[1]
+        for line in body_1.splitlines()
+        if line.strip().startswith("secret_key_base:")
+    ]
+    assert len(keys) == 3
+    assert len(set(keys)) == 3, f"env secret_key_base collide: {keys}"
+    # Each is 128 hex characters (secrets.token_hex(64)).
+    for key in keys:
+        assert len(key) == 128 and all(c in "0123456789abcdef" for c in key), (
+            f"secret_key_base not 128-hex: {key!r}"
+        )
+    assert body_1 != body_2
+
+
+def test_render_rails_master_key_shape_and_per_hit_uniqueness():
+    """master.key is 32 lowercase hex chars + trailing newline. No
+    canary slot to embed — the file is just an AES key. Two
+    consecutive renders differ so the fleet isn't fingerprintable by
+    a fixed literal."""
+    body_1 = tbenv.render_rails_master_key(FAKE_TRACEBIT).decode("utf-8")
+    body_2 = tbenv.render_rails_master_key(FAKE_TRACEBIT).decode("utf-8")
+    assert body_1.endswith("\n")
+    key_1 = body_1.rstrip("\n")
+    key_2 = body_2.rstrip("\n")
+    assert len(key_1) == 32, f"master.key should be 32 hex chars, got {len(key_1)}"
+    assert all(c in "0123456789abcdef" for c in key_1), f"non-hex master.key: {key_1!r}"
+    assert body_1 != body_2
+
+
+def test_render_rails_credentials_enc_shape_and_per_hit_uniqueness():
+    """credentials.yml.enc is
+    `<base64_ciphertext>--<base64_iv>--<base64_auth_tag>` on one
+    line (Rails 5.2+ ActiveSupport::MessageEncryptor GCM shape).
+    Body itself is per-hit random bytes — no embedded canary since a
+    harvester needs the matching master.key to decrypt (a separate
+    probe). Two consecutive renders differ."""
+    body_1 = tbenv.render_rails_credentials_enc(FAKE_TRACEBIT).decode("utf-8")
+    body_2 = tbenv.render_rails_credentials_enc(FAKE_TRACEBIT).decode("utf-8")
+    line = body_1.rstrip("\n")
+    parts = line.split("--")
+    assert len(parts) == 3, f"expected 3 `--`-separated base64 parts, got {len(parts)}: {line!r}"
+    # Each part is valid base64.
+    for part in parts:
+        base64.b64decode(part, validate=True)
+    # GCM IV is 12 bytes → 16 base64 chars; auth tag is 16 bytes → 24 base64 chars.
+    assert len(base64.b64decode(parts[1])) == 12, "IV should be 12 bytes"
+    assert len(base64.b64decode(parts[2])) == 16, "auth tag should be 16 bytes"
+    assert body_1 != body_2
+
+
+@pytest.mark.parametrize("path,needle", [
+    # Rails database.yml renders — AWS canary in the production.s3_bucket_*
+    # slot, DB creds per-hit random.
+    ("/config/database.yml", b"default: &default"),
+    ("/config/database.yml", b"s3_bucket_key_id: AKIAFAKEEXAMPLE01"),
+    ("/config/database.yml.example", b"s3_bucket_key_id: AKIAFAKEEXAMPLE01"),
+    ("/config/database.yml~", b"default: &default"),
+    ("/app/config/database.yml", b"s3_bucket_key_id: AKIAFAKEEXAMPLE01"),
+    ("/backend/config/database.yml.bak", b"s3_bucket_key_id: AKIAFAKEEXAMPLE01"),
+    # Rails secrets.yml renders — AWS canary in the production.aws block.
+    ("/config/secrets.yml", b"secret_key_base: "),
+    ("/config/secrets.yml", b"    access_key_id: AKIAFAKEEXAMPLE01"),
+    ("/config/secrets.yml.example", b"    access_key_id: AKIAFAKEEXAMPLE01"),
+    ("/app/config/secrets.yml", b"    access_key_id: AKIAFAKEEXAMPLE01"),
+])
+def test_rails_secrets_render_via_dispatch(path, needle):
+    """Verify the full path → CanaryTrap → renderer wiring for the
+    Rails secrets family produces content that credential harvesters
+    grep for. AWS canary + shape markers must be present on every
+    variant."""
+    trap = tbenv._TRAP_BY_PATH[path.lower()]
+    body = trap.render(FAKE_TRACEBIT)
+    assert needle in body, (
+        f"{path!r} → {trap.name!r} render missing {needle!r}"
+    )
+
+
 @pytest.mark.parametrize("path", [
     # Regression: scanner-walkable variants on the gcp-credentials-json
     # family must NOT collide with the existing config-json trap that
