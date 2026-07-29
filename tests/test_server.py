@@ -662,6 +662,7 @@ def test_all_trap_families_default_on():
     assert tbenv.OIDC_DISCOVERY_ENABLED
     assert tbenv.PHPMYADMIN_ENABLED
     assert tbenv.ADMINER_ENABLED
+    assert tbenv.WHM_ENABLED
     assert tbenv.DS_STORE_ENABLED
     assert tbenv.WEBLOGIC_CONSOLE_ENABLED
 
@@ -14379,6 +14380,237 @@ async def test_dispatch_adminer_head_returns_empty_body(flux_client):
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "adminer-login"
     assert entry["adminerMethod"] == "HEAD"
+
+
+# --- Fake cPanel / WHM login trap ---------------------------------------
+
+def test_whm_enabled_by_default():
+    assert tbenv.WHM_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/whm",
+    "/whm/",
+    "/whm/index",
+    "/2086/",
+    "/2086/login",
+    "/2086/login/",
+    "/2087/",
+    "/2087/login/",
+    "/cpanel",
+    "/cpanel/",
+    "/2082/",
+    "/2083/",
+    "/session/login",
+    "/session/login/",
+    # Case-insensitive.
+    "/WHM",
+    "/CPanel/",
+    # Query strings must be stripped before match.
+    "/whm?login_theme=cpanel",
+    "/session/login/?goto_uri=%2Fwhm%2F",
+    # cpsess-tokenised post-redirect landings — the shape real cpsrvd
+    # sends after `/whm` → 302 → `/cpsess<hex>/session/login/`.
+    "/cpsess1234567890abcdef1234567890abcdef/whm/",
+    "/cpsess1234567890abcdef1234567890abcdef/session/login/",
+    "/cpsessabcdef1234567890abcdef1234567890/cpanel/",
+    # cpsess with a deep sub-path (real cpsrvd routes many WHM subtrees).
+    "/cpsess1234567890abcdef1234567890abcdef/whm/scripts2/logout",
+])
+def test_whm_path_matches_observed_probes(path):
+    assert tbenv.is_whm_path(path), f"expected match: {path}"
+
+
+@pytest.mark.parametrize("path", [
+    "/",
+    "/wp-login.php",
+    "/adminer.php",
+    "/login",  # bare /login is too generic; only WHM-specific aliases match
+    "/login/",
+    "/whmcs",   # WHMCS is a different product; must not collide
+    "/whmcs/",
+    "/whm-config",
+    "/whmscripts",
+    # cpsess with too-short hex (< 16 chars) or non-hex must not match
+    "/cpsessABC/whm/",
+    "/cpsessXYZ1234567890/whm/",
+    "/cpsess/whm/",
+])
+def test_whm_path_non_match(path):
+    assert not tbenv.is_whm_path(path), f"unexpected match: {path}"
+
+
+def test_whm_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "WHM_ENABLED", False)
+    assert not tbenv.is_whm_path("/whm")
+    assert not tbenv.is_whm_path("/cpsess1234567890abcdef1234567890abcdef/whm/")
+
+
+def test_whm_login_html_no_fixed_credential_literals():
+    """No fixed credential-shaped literals anywhere in the rendered
+    page. Every value that varies (cpsess token, per-hit username
+    echo) is a synthetic passed in by the handler; the page body
+    itself carries no hard-coded secret."""
+    body_1 = tbenv.render_whm_login_html(
+        version="11.126.0.5", cpsess="a" * 32, hostname="server-01",
+    )
+    body_2 = tbenv.render_whm_login_html(
+        version="11.126.0.5", cpsess="b" * 32, hostname="server-02",
+    )
+    # cpsess token bytes vary per hit.
+    assert b"cpsess" + b"a" * 32 in body_1
+    assert b"cpsess" + b"b" * 32 in body_2
+    # WHM has no natural credential slot on the login page, so no
+    # canary marker should ever appear here (unlike Adminer, which
+    # embeds one in the datalist history).
+    assert b"AKIA" not in body_1
+    assert b"AKIA" not in body_2
+    # Real WHM login-form field names.
+    assert b'name="user"' in body_1
+    assert b'name="pass"' in body_1
+    assert b'name="goto_uri"' in body_1
+    assert b'name="goto_app"' in body_1
+    # Real WHM branding + version echoed in the footer.
+    assert b"WebHost Manager" in body_1
+    assert b"11.126.0.5" in body_1
+
+
+def test_whm_login_html_error_reserve_echoes_username():
+    """On the POST re-serve after credential capture, the error notice
+    renders and the submitted username is echoed back into the value
+    attribute the way real cpsrvd does."""
+    body = tbenv.render_whm_login_html(
+        version="11.126.0.5", cpsess="x" * 32, hostname="server-03",
+        error="The login is invalid.",
+        submitted_user="root",
+    )
+    assert b"The login is invalid." in body
+    assert b'value="root"' in body
+
+
+def test_whm_login_html_html_escapes_submitted_fields():
+    """A malicious submitted username / hostname / goto_uri must not
+    break out of the value attribute."""
+    body = tbenv.render_whm_login_html(
+        version="11.126.0.5", cpsess="1" * 32, hostname='"><script>',
+        goto_uri='"><b>',
+        submitted_user='"><script>alert(1)</script>',
+    ).decode("utf-8", errors="replace")
+    assert "<script>" not in body
+    assert "&quot;&gt;&lt;script&gt;" in body
+
+
+def test_whm_extract_creds_records_no_plaintext_password():
+    """We log the username + password length, never the password itself."""
+    body = (
+        b"user=root"
+        b"&pass=hunter2"
+        b"&goto_uri=%2Fwhm%2F"
+        b"&goto_app=whostmgrd"
+    )
+    fields = tbenv.extract_whm_creds(
+        body, "application/x-www-form-urlencoded",
+    )
+    assert fields["user"] == "root"
+    assert fields["hasPwd"] == "true"
+    assert fields["pwdLen"] == "7"
+    assert fields["goto_uri"] == "/whm/"
+    assert fields["goto_app"] == "whostmgrd"
+    # Password value itself is not stored.
+    assert "pass" not in fields
+    assert b"hunter2" not in str(fields).encode()
+
+
+async def test_dispatch_whm_get_renders_login(flux_client):
+    resp = await flux_client.get(
+        "/whm",
+        headers={"X-Forwarded-For": "203.0.113.220"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert b'name="user"' in body
+    assert b'name="pass"' in body
+    assert b"WebHost Manager" in body
+    # Per-hit cprelogin cookie.
+    cookie = resp.headers.get("Set-Cookie", "")
+    assert cookie.startswith("cprelogin=")
+    assert "HttpOnly" in cookie
+    # Real cpsrvd banner.
+    assert resp.headers.get("Server", "").startswith("cpsrvd/")
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "whm-login"
+    assert entry["whmMethod"] == "GET"
+    assert entry["whmPath"] == "/whm"
+    assert entry["clientIp"] == "203.0.113.220"
+
+
+async def test_dispatch_whm_post_captures_credentials(flux_client):
+    body = (
+        b"user=admin&pass=correcthorsebatterystaple"
+        b"&goto_uri=%2Fwhm%2F&goto_app=whostmgrd"
+    )
+    resp = await flux_client.post(
+        "/whm/",
+        data=body,
+        headers={
+            "X-Forwarded-For": "203.0.113.221",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert resp.status == 200
+    page = await resp.read()
+    assert b"The login is invalid." in page
+    assert b'value="admin"' in page
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "whm-credential-post"
+    assert entry["whmUsername"] == "admin"
+    assert entry["whmHasPwd"] is True
+    assert entry["whmPwdLen"] == "25"
+    assert entry["whmGotoApp"] == "whostmgrd"
+
+
+async def test_dispatch_whm_cpsess_preserves_token(flux_client):
+    """When the scanner hits a `/cpsess<hex>/...` alias directly, the
+    same cpsess token flows through the login form action so a
+    follow-on POST keeps the same session context — matches real
+    cpsrvd's session-preserving behaviour."""
+    cpsess = "abcdef1234567890" * 2  # 32-hex
+    resp = await flux_client.get(
+        f"/cpsess{cpsess}/session/login/",
+        headers={"X-Forwarded-For": "203.0.113.222"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    # cpsess token from the URL is preserved in the form action.
+    assert f"/cpsess{cpsess}/login/".encode() in body
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "whm-login"
+    assert entry["whmCpsessFromPath"] is True
+
+
+async def test_dispatch_whm_disabled_falls_through(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "WHM_ENABLED", False)
+    resp = await flux_client.get(
+        "/whm",
+        headers={"X-Forwarded-For": "203.0.113.223"},
+    )
+    assert resp.status == 404
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "not-handled"
+
+
+async def test_dispatch_whm_head_returns_empty_body(flux_client):
+    resp = await flux_client.head(
+        "/whm",
+        headers={"X-Forwarded-For": "203.0.113.224"},
+    )
+    assert resp.status == 200
+    body = await resp.read()
+    assert body == b""
+    assert int(resp.headers.get("Content-Length", "0")) > 0
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "whm-login"
+    assert entry["whmMethod"] == "HEAD"
 
 
 # --- /.DS_Store filesystem-metadata leak trap ---------------------------

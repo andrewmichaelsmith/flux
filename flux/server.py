@@ -2440,6 +2440,93 @@ ADMINER_PATHS = frozenset(
 )
 
 
+# --- Fake cPanel / WebHost Manager (WHM) login page -----------------------
+# `python-requests/2.32.5` hosting-admin-hunter dictionaries walk `/whm`,
+# `/adminer.php`, and `/.DS_Store` as a scripted kit — Adminer and
+# `.DS_Store` are already trapped; `/whm` currently 404s (called out
+# as a known miss in the Adminer and DS_Store comment blocks). WHM
+# (WebHost Manager) is cPanel's tenant-root admin: a successful WHM
+# credential capture is root-tier hosting-account access, one tier
+# above what cPanel-user brute nets, so any credential POST that
+# lands here separates a hosting-provider-targeting actor from the
+# generic MySQL / Adminer brute cohort.
+#
+# Real WHM sits behind `cpsrvd/11.126.x` on ports 2086/2087 and is
+# proxied to /whm on 80/443 at many shared-host frontends. The
+# canonical login flow is `GET /whm` → 302 `/cpsess<32-hex>/session/
+# login/?goto_uri=%2Fwhm%2F` → 200 login form. We collapse the
+# redirect chain into a single 200 login page on any of the
+# canonical entry aliases (`/whm`, `/whm/`, `/2086/`, `/2087/`,
+# `/cpanel`, `/session/login`, …) plus the post-redirect
+# `/cpsess<hex>/…` shape so scanners that hit the redirect target
+# directly (some do) still land on the form. The login form field
+# names (`user`, `pass`, hidden `goto_uri` + `goto_app=whostmgrd`)
+# match real WHM so credential-brute clients POST the same field
+# shape. POST captures `user` + password-length (never the password
+# itself), re-serves the login page with the standard
+# `The login is invalid.` error notice, and mints a fresh per-hit
+# `cprelogin` cookie so scripted retry loops see a new session
+# each attempt.
+#
+# No fixed credential literals: the cpsess token, the cprelogin
+# cookie value, the goto_uri echo, and the per-hit hostname/build
+# label are all synthesized per request. `Server: cpsrvd/11.126.0.5`
+# banner is a static build label (not a credential) that scanners
+# fingerprinting cPanel expect to see.
+WHM_ENABLED = _env_bool("HONEYPOT_WHM_ENABLED")
+WHM_VERSION = (os.environ.get("HONEYPOT_WHM_VERSION") or "11.126.0.5").strip()
+WHM_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_WHM_BODY_DECODE_LIMIT") or "4096").strip() or "4096"),
+    256,
+)
+# Exact-match set. cpsess-tokenised URLs (`/cpsess<32-hex>/whm/`,
+# `/cpsess<32-hex>/session/login/`) can't be enumerated as literals
+# and are matched via `_WHM_CPSESS_RE` below.
+_WHM_DEFAULT_PATHS = ",".join([
+    "/whm",
+    "/whm/",
+    "/whm/index",
+    "/whm/index.html",
+    "/2086",
+    "/2086/",
+    "/2086/login",
+    "/2086/login/",
+    # 2087 is the SSL-only WHM port; scanners still probe the path on
+    # the SSL-terminated frontend.
+    "/2087",
+    "/2087/",
+    "/2087/login",
+    "/2087/login/",
+    # cPanel user-tier login lives under /cpanel (2082/2083); WHM
+    # scanners often bundle it as a fingerprint probe. Serving the
+    # same WHM-shape login form is fine — the extracted creds go into
+    # the same capture regardless of which alias the scanner hit.
+    "/cpanel",
+    "/cpanel/",
+    "/2082",
+    "/2082/",
+    "/2083",
+    "/2083/",
+    # `/session/login` and `/session/login/` are the post-redirect
+    # canonical form entry points; some scanners skip the initial
+    # `/whm` GET and hit the target directly.
+    "/session/login",
+    "/session/login/",
+])
+WHM_PATHS = frozenset(
+    value.strip().lower()
+    for value in (os.environ.get("HONEYPOT_WHM_PATHS_CSV") or _WHM_DEFAULT_PATHS).split(",")
+    if value.strip()
+)
+# Matches WHM's cpsess-tokenised URLs. The `cpsess` prefix + 16-64
+# lowercase hex chars is what real cpsrvd mints — narrow enough that
+# generic path traversal fuzz doesn't collide.
+_WHM_CPSESS_RE = re.compile(
+    r"^/cpsess[0-9a-f]{16,64}/(?:whm/?|cpanel/?|session/login/?|"
+    r"whm/[a-z0-9._/\-]*|cpanel/[a-z0-9._/\-]*)$"
+)
+
+
 # --- .DS_Store filesystem-metadata leak trap ---------------------------
 # macOS Finder writes a `.DS_Store` alongside every browsed directory;
 # devs who develop on macOS and rsync the webroot up leak the whole
@@ -3394,6 +3481,27 @@ def is_adminer_path(path: str) -> bool:
         return False
     lp = path.lower().split("?", 1)[0]
     return lp in ADMINER_PATHS
+
+
+def is_whm_path(path: str) -> bool:
+    """Match cPanel WHM login-page aliases. Two shapes:
+
+      * Static entry-point aliases (`/whm`, `/whm/`, `/2086/`,
+        `/2087/`, `/cpanel`, `/session/login`, …) — enumerated
+        exact-match set, overridable via `HONEYPOT_WHM_PATHS_CSV`.
+      * cpsess-tokenised post-redirect URLs (`/cpsess<16-64 hex>/
+        whm/`, `/cpsess<hex>/session/login/`) — matched via regex
+        so scanners hitting a real redirect target still land on
+        the login page.
+
+    Query string is stripped before comparison; `/whm?…` still
+    dispatches."""
+    if not WHM_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    if lp in WHM_PATHS:
+        return True
+    return bool(_WHM_CPSESS_RE.match(lp))
 
 
 def is_ds_store_path(path: str) -> bool:
@@ -6284,6 +6392,141 @@ def extract_adminer_creds(body: bytes, content_type: str) -> dict[str, str]:
     tok = parsed.get("token")
     if tok and tok[0]:
         result["token"] = tok[0][:200]
+    return result
+
+
+def render_whm_login_html(
+    *,
+    version: str,
+    cpsess: str,
+    hostname: str,
+    goto_uri: str = "/whm/",
+    error: str = "",
+    submitted_user: str = "",
+) -> bytes:
+    """cPanel WHM 11.x login page. Real WHM (cpsrvd) serves this
+    landing after `/whm` → `/cpsess<hex>/session/login/?goto_uri=
+    %2Fwhm%2F` — we collapse the redirect into a single 200 that
+    still carries the cpsess token in every internal asset URL and
+    the form's action attribute, so a scanner following those hrefs
+    walks back into the same handler.
+
+    The login form field names are the real WHM shape: `user` +
+    `pass` + hidden `goto_uri` and `goto_app=whostmgrd`, so brute
+    clients built for real WHM POST the same bytes here. The
+    `<title>` and Server banner (`cpsrvd/11.126.x`) match what
+    fingerprinters expect. Optional `error` renders the standard
+    "The login is invalid." notice as WHM does on a bad credential
+    POST; `submitted_user` echoes the last-attempted username back
+    the way real cpsrvd does — no fixed literals anywhere."""
+    safe_cpsess = re.sub(r"[^0-9a-f]", "", cpsess.lower())[:64]
+    safe_host = (
+        (hostname or "server").replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )[:80]
+    safe_goto = (
+        (goto_uri or "/whm/").replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )[:200]
+    safe_user = (
+        submitted_user.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )[:120]
+    safe_version = (
+        version.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )[:32]
+    error_html = ""
+    if error:
+        safe_error = (
+            error.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )[:200]
+        error_html = (
+            f'<div id="status_msg" class="status_msg errormsg">'
+            f'<div class="errormsg-inner">{safe_error}</div></div>\n'
+        )
+
+    body = f"""<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="robots" content="noindex,nofollow">
+<title>{safe_host} - WHM Login</title>
+<link rel="shortcut icon" href="/cPanel_magic_revision_0/unprotected/cpanel/dist/global-cpanel-favicon.ico">
+<link rel="stylesheet" href="/cPanel_magic_revision_0/unprotected/cpanel/dist/global-cpanel-styles-optimized.css">
+<link rel="stylesheet" href="/cpsess{safe_cpsess}/unprotected/cpanel/dist/login-cpanel-styles-optimized.css">
+</head>
+<body class="cjt-body-container login-container">
+<div id="page">
+  <header id="branding">
+    <div class="brand-logo cpanel-branding" role="banner"></div>
+    <h1 class="brand-title">WebHost Manager</h1>
+  </header>
+  <main id="main-container" class="login-main">
+    <div class="login-inner">
+      <div class="server-info">
+        <span class="server-label">Server:</span>
+        <span class="server-name">{safe_host}</span>
+      </div>
+      {error_html}<form id="login_form" name="login_form"
+            action="/cpsess{safe_cpsess}/login/?login_only=1"
+            method="post" autocomplete="off">
+        <input type="hidden" name="goto_uri" value="{safe_goto}">
+        <input type="hidden" name="goto_app" value="whostmgrd">
+        <div class="input-row">
+          <label for="user">Username</label>
+          <input type="text" id="user" name="user" value="{safe_user}"
+                 autocapitalize="off" autocorrect="off" spellcheck="false"
+                 required>
+        </div>
+        <div class="input-row">
+          <label for="pass">Password</label>
+          <input type="password" id="pass" name="pass" required>
+        </div>
+        <div class="button-row">
+          <button type="submit" id="login_submit"
+                  class="btn btn-primary login-btn">Log in</button>
+        </div>
+      </form>
+      <div class="reset-link">
+        <a href="/resetpass">Reset Password</a>
+      </div>
+    </div>
+  </main>
+  <footer id="footer">
+    <span class="copyright">Copyright&copy; 2026 cPanel, L.L.C.</span>
+    <span class="build">cPanel &amp; WHM {safe_version}</span>
+  </footer>
+</div>
+</body>
+</html>
+"""
+    return body.encode("utf-8", errors="replace")
+
+
+def extract_whm_creds(body: bytes, content_type: str) -> dict[str, str]:
+    """Pull the WHM/cPanel login fields off a form-urlencoded (or
+    multipart) POST body. Real WHM (cpsrvd) uses bare `user` + `pass`
+    field names (not the `auth[username]` PHP-array shape Adminer
+    uses) plus optional `goto_uri` and `goto_app` hidden fields.
+    Records the username, submitted goto redirect target, submitted
+    goto_app, and whether a password was present — the password
+    bytes themselves are never stored."""
+    parsed = parse_form_body(body, content_type)
+    result: dict[str, str] = {}
+    user_values = parsed.get("user") or []
+    if user_values and user_values[0]:
+        result["user"] = user_values[0][:200]
+    pass_values = parsed.get("pass") or []
+    if pass_values and pass_values[0]:
+        result["hasPwd"] = "true"
+        result["pwdLen"] = str(len(pass_values[0]))[:6]
+    for key in ("goto_uri", "goto_app"):
+        vals = parsed.get(key) or []
+        if vals and vals[0]:
+            result[key] = vals[0][:200]
     return result
 
 
@@ -22196,6 +22439,152 @@ async def _handle_adminer(
     )
 
 
+async def _handle_whm(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """cPanel WHM login page. GET / HEAD renders the WHM 11.x login
+    HTML with a per-request `cpsess<hex>` token embedded in the form
+    action + asset URLs plus a per-request `cprelogin` cookie. POST
+    that supplies `user` + `pass` is captured as a `whm-credential-post`
+    event and re-serves the login page with the standard "The login
+    is invalid." error notice.
+
+    No fixed credential literals: the cpsess token, the cprelogin
+    cookie value, the goto_uri echo, and every field value on the
+    fresh-GET response are per-hit synthetics (uuid hex), per the
+    every-credential-per-hit-unique design principle."""
+    method = request.method
+    lp = path.lower().split("?", 1)[0]
+    content_type_req = request.headers.get("Content-Type", "")
+    query_string = request.query_string or ""
+    cookie_header = request.headers.get("Cookie", "")
+    cookies = parse_cookies(cookie_header)
+    submitted_session = ""
+    for cname in list(cookies):
+        if cname.startswith("cprelogin") or cname.startswith("cpsession"):
+            submitted_session = cookies[cname]
+            break
+
+    # cpsess tokens are lowercase hex; extract from URL when the
+    # scanner hit a `/cpsess<hex>/…` alias so the same token flows
+    # through form action + asset URLs (real cpsrvd preserves the
+    # session token across the login page → POST cycle).
+    cpsess_in_path = ""
+    m = re.match(r"^/cpsess([0-9a-f]{16,64})/", lp)
+    if m:
+        cpsess_in_path = m.group(1)
+    cpsess = cpsess_in_path or uuid.uuid4().hex + uuid.uuid4().hex[:16]
+
+    cprelogin_id = uuid.uuid4().hex
+    hostname = str(log_context.get("host", "")) or "server"
+
+    # Preserve the `goto_uri` from a form-submit or query string so
+    # the login page's hidden goto field echoes what the scanner
+    # sent (real WHM does this).
+    goto_uri = "/whm/"
+    if query_string:
+        try:
+            qparsed = parse_qs(query_string, keep_blank_values=True)
+            gvals = qparsed.get("goto_uri") or qparsed.get("goto")
+            if gvals and gvals[0]:
+                goto_uri = gvals[0][:200]
+        except Exception:
+            pass
+
+    request_id = str(log_context.get("requestId", ""))
+
+    common_headers = {
+        "Server": f"cpsrvd/{WHM_VERSION}",
+        "X-Frame-Options": "SAMEORIGIN",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+        "Referrer-Policy": "same-origin",
+        "Strict-Transport-Security": "max-age=31536000",
+    }
+    set_cookie = (
+        f"cprelogin={cprelogin_id}; Path=/; HttpOnly; SameSite=Strict"
+    )
+
+    if method == "POST":
+        creds = extract_whm_creds(request_body, content_type_req)
+        body_preview = ""
+        if request_body:
+            body_preview = request_body[:WHM_BODY_DECODE_LIMIT].decode(
+                "utf-8", errors="replace",
+            )
+        if creds.get("goto_uri"):
+            goto_uri = creds["goto_uri"]
+
+        log_entry = {
+            **log_context,
+            "result": "whm-credential-post",
+            "status": 200,
+            "whmPath": path,
+            "whmUsername": creds.get("user", ""),
+            "whmHasPwd": creds.get("hasPwd", "") == "true",
+            "whmPwdLen": creds.get("pwdLen", ""),
+            "whmGotoUri": creds.get("goto_uri", ""),
+            "whmGotoApp": creds.get("goto_app", ""),
+            "whmSessionCookiePresent": bool(submitted_session),
+            "whmCpsessFromPath": bool(cpsess_in_path),
+            "contentType": content_type_req[:120],
+        }
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview
+        html = render_whm_login_html(
+            version=WHM_VERSION,
+            cpsess=cpsess,
+            hostname=hostname,
+            goto_uri=goto_uri,
+            error="The login is invalid.",
+            submitted_user=creds.get("user", ""),
+        )
+        log_entry["bytes"] = len(html)
+        append_log(log_entry)
+        return web.Response(
+            status=200, body=html,
+            headers={
+                **common_headers,
+                "Content-Type": "text/html; charset=utf-8",
+                "Set-Cookie": set_cookie,
+                "Content-Length": str(len(html)),
+            },
+        )
+
+    # GET / HEAD — render the bare login page.
+    html = render_whm_login_html(
+        version=WHM_VERSION,
+        cpsess=cpsess,
+        hostname=hostname,
+        goto_uri=goto_uri,
+    )
+    response_body = b"" if method == "HEAD" else html
+    log_entry = {
+        **log_context,
+        "result": "whm-login",
+        "status": 200,
+        "whmPath": path,
+        "whmMethod": method,
+        "whmSessionCookiePresent": bool(submitted_session),
+        "whmCpsessFromPath": bool(cpsess_in_path),
+        "bytes": len(html),
+    }
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=response_body,
+        headers={
+            **common_headers,
+            "Content-Type": "text/html; charset=utf-8",
+            "Set-Cookie": set_cookie,
+            "Content-Length": str(len(html)),
+        },
+    )
+
+
 async def _handle_weblogic_console(
     request: web.Request,
     log_context: dict[str, object],
@@ -24466,6 +24855,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_adminer_path(path):
         return await _handle_adminer(request, log_context, path, request_body)
+
+    if is_whm_path(path):
+        return await _handle_whm(request, log_context, path, request_body)
 
     if is_ds_store_path(path):
         return await _handle_ds_store(request, log_context, path)
