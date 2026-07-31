@@ -2602,6 +2602,13 @@ def test_bare_credentials_json_routes_to_config_json(path):
     "/wp-content/plugins/.env.bak", "/wp-content/plugins/.env.local",
     "/wp-content/themes/.env", "/wp-content/themes/.env.production",
     "/wp-content/mu-plugins/.env", "/wp-content/mu-plugins/.env.local",
+    # Node.js dependency-tree — dictionaries walk `/node_modules/.env*`
+    # alongside the flat and framework-prefixed variants (real projects
+    # sometimes commit an `.env` there by accident, so the shape has
+    # legitimate scanner demand).
+    "/node_modules/.env", "/node_modules/.env.prod",
+    "/node_modules/.env.production", "/node_modules/.env.local",
+    "/node_modules/.env.bak",
 ])
 def test_env_prefix_paths_dispatch_to_env_production(path):
     trap = tbenv._TRAP_BY_PATH.get(path.lower())
