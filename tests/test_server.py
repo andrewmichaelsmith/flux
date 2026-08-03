@@ -5865,6 +5865,181 @@ async def test_dispatch_docker_daemon_auth_header_logged(flux_client):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_docker_daemon_container_logs_completes_takeover_chain(flux_client):
+    # create -> start -> logs. The read-back is what a loader uses to
+    # confirm execution; a 404 there ends the engagement at the payoff.
+    cid = "a" * 64
+    resp = await flux_client.get(
+        f"/v1.41/containers/{cid}/logs?stdout=1&stderr=1",
+        headers={"X-Forwarded-For": "203.0.113.221"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"] == "application/vnd.docker.multiplexed-stream"
+    raw = await resp.read()
+    # Must decode as Docker's 8-byte-header multiplexed stream, exactly.
+    off = 0
+    frames = []
+    while off < len(raw):
+        stream_type = raw[off]
+        size = int.from_bytes(raw[off + 4:off + 8], "big")
+        assert stream_type in (1, 2)
+        assert raw[off + 1:off + 4] == b"\x00\x00\x00"
+        frames.append((stream_type, raw[off + 8:off + 8 + size]))
+        off += 8 + size
+    assert off == len(raw), "frame lengths must tile the body exactly"
+    assert frames
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-container-logs"]
+    assert entries[-1]["dockerDaemonTargetContainerId"] == cid
+    assert entries[-1]["dockerDaemonStage"] == "logs"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_container_logs_without_stream_returns_400(flux_client):
+    # Stock daemon rejects a logs read that selects neither stream.
+    cid = "b" * 64
+    resp = await flux_client.get(
+        f"/containers/{cid}/logs",
+        headers={"X-Forwarded-For": "203.0.113.222"},
+    )
+    assert resp.status == 400
+    assert b"at least one stream" in await resp.read()
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-container-logs-nostream"]
+    assert entries[-1]["dockerDaemonTargetContainerId"] == cid
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_container_logs_records_follow(flux_client):
+    cid = "c" * 64
+    resp = await flux_client.get(
+        f"/containers/{cid}/logs?stdout=1&follow=1",
+        headers={"X-Forwarded-For": "203.0.113.223"},
+    )
+    assert resp.status == 200
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-container-logs"]
+    assert entries[-1]["dockerDaemonLogsFollow"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/networks", "/volumes", "/system/df"])
+async def test_dispatch_docker_daemon_local_list_endpoints_return_200(flux_client, endpoint):
+    # These were declared in the endpoint set but had no handler branch,
+    # so the daemon 404'd on its own advertised API.
+    resp = await flux_client.get(
+        f"/v1.43{endpoint}",
+        headers={"X-Forwarded-For": "203.0.113.224"},
+    )
+    assert resp.status == 200
+    assert await resp.json() is not None
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] != "docker-daemon-miss"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint", ["/swarm", "/services", "/secrets", "/configs", "/nodes", "/tasks"]
+)
+async def test_dispatch_docker_daemon_swarm_endpoints_match_non_manager_node(flux_client, endpoint):
+    # /info advertises Swarm.LocalNodeState=inactive, so these must return
+    # the stock non-manager 503, not a manager-shaped list.
+    resp = await flux_client.get(
+        f"/v1.43{endpoint}",
+        headers={"X-Forwarded-For": "203.0.113.225"},
+    )
+    assert resp.status == 503
+    body = await resp.json()
+    assert "not a swarm manager" in body["message"]
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-swarm-unavailable"]
+    assert entries[-1]["dockerDaemonEndpoint"] == endpoint
+
+
+def test_docker_daemon_info_swarm_state_matches_swarm_endpoint_behaviour():
+    # Guards the coherence the 503 depends on: if /info is ever changed to
+    # advertise an active swarm, the 503 becomes a self-contradiction.
+    info = json.loads(tbenv.render_docker_daemon_info())
+    assert info["Swarm"]["LocalNodeState"] == "inactive"
+    assert info["Swarm"]["ControlAvailable"] is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_auth_captures_registry_credentials(flux_client):
+    body = json.dumps({
+        "username": "deploybot",
+        "password": "s3cr3t-value",
+        "serveraddress": "registry.example.net",
+    }).encode("utf-8")
+    resp = await flux_client.post(
+        "/v1.43/auth",
+        headers={"X-Forwarded-For": "203.0.113.226", "Content-Type": "application/json"},
+        data=body,
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["Status"] == "Login Succeeded"
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-auth"]
+    last = entries[-1]
+    assert last["dockerDaemonAuthUsername"] == "deploybot"
+    assert last["dockerDaemonAuthServer"] == "registry.example.net"
+    assert last["dockerDaemonAuthPasswordSha256"] == hashlib.sha256(b"s3cr3t-value").hexdigest()
+    assert last["dockerDaemonAuthSource"] == "body"
+    # The captured credential must never be reflected back to the caller —
+    # the hash is for correlating replays, the response stays stock.
+    assert "s3cr3t-value" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_auth_captures_base64_registry_header(flux_client):
+    blob = base64.urlsafe_b64encode(json.dumps({
+        "username": "ciuser", "password": "pw", "serveraddress": "index.docker.io",
+    }).encode("utf-8")).decode("ascii")
+    resp = await flux_client.post(
+        "/auth",
+        headers={"X-Forwarded-For": "203.0.113.227", "X-Registry-Auth": blob},
+        data=b"",
+    )
+    assert resp.status == 200
+    entries = [e for e in _log_entries(flux_client.log_path) if e.get("result") == "docker-daemon-auth"]
+    last = entries[-1]
+    assert last["dockerDaemonAuthUsername"] == "ciuser"
+    assert last["dockerDaemonAuthSource"] == "header"
+
+
+def test_docker_daemon_auth_response_carries_no_fixed_credential():
+    # IdentityToken stays empty: a stock daemon returns it empty after a
+    # username/password login, and a canned token would be a fixed literal
+    # shipped identically by every sensor.
+    payload = json.loads(tbenv.render_docker_daemon_auth())
+    assert payload["IdentityToken"] == ""
+
+
+@pytest.mark.asyncio
+async def test_dispatch_docker_daemon_build_and_commit(flux_client):
+    resp = await flux_client.post(
+        "/v1.43/build",
+        headers={"X-Forwarded-For": "203.0.113.228"},
+        data=b"tarball",
+    )
+    assert resp.status == 200
+    resp2 = await flux_client.post(
+        "/v1.43/commit",
+        headers={"X-Forwarded-For": "203.0.113.229"},
+        data=b"{}",
+    )
+    assert resp2.status == 201
+    assert (await resp2.json())["Id"].startswith("sha256:")
+
+
+def test_docker_daemon_commit_ids_are_per_hit_unique():
+    a = json.loads(tbenv.render_docker_daemon_commit(tbenv.secrets.token_hex(32)))["Id"]
+    b = json.loads(tbenv.render_docker_daemon_commit(tbenv.secrets.token_hex(32)))["Id"]
+    assert a != b
+
+
+def test_docker_daemon_container_stage_re_covers_logs():
+    assert tbenv._DOCKER_DAEMON_CONTAINER_STAGE_RE.match("/containers/" + "a" * 64 + "/logs")
+    assert not tbenv._DOCKER_DAEMON_CONTAINER_STAGE_RE.match("/containers/" + "a" * 64 + "/bogus")
+
+
+@pytest.mark.asyncio
 async def test_dispatch_docker_daemon_disabled_returns_404(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "DOCKER_DAEMON_ENABLED", False)
     resp = await flux_client.get(
@@ -14423,6 +14598,18 @@ def test_whm_enabled_by_default():
     "/cpsessabcdef1234567890abcdef1234567890/cpanel/",
     # cpsess with a deep sub-path (real cpsrvd routes many WHM subtrees).
     "/cpsess1234567890abcdef1234567890abcdef/whm/scripts2/logout",
+    # cpsrvd proxy-subdomain entry points (service-subdomain access rather
+    # than port-based). These reached the 404 fallback before.
+    "/___proxy_subdomain_whm",
+    "/___proxy_subdomain_whm/login",
+    "/___proxy_subdomain_whm/login/",
+    "/___proxy_subdomain_cpanel",
+    "/___proxy_subdomain_cpanel/login",
+    "/___proxy_subdomain_webmail/",
+    "/openid_connect/cpanelid",
+    # Case/query handling applies to the proxy prefixes too.
+    "/___PROXY_SUBDOMAIN_WHM/login",
+    "/___proxy_subdomain_whm/login/?goto_uri=%2Fwhm%2F",
 ])
 def test_whm_path_matches_observed_probes(path):
     assert tbenv.is_whm_path(path), f"expected match: {path}"
@@ -14442,6 +14629,12 @@ def test_whm_path_matches_observed_probes(path):
     "/cpsessABC/whm/",
     "/cpsessXYZ1234567890/whm/",
     "/cpsess/whm/",
+    # Proxy-subdomain prefix must stay exact — no generic prefix match.
+    "/___proxy_subdomain_",
+    "/___proxy_subdomain_whmcs",
+    "/___proxy_subdomain_whm/scripts2/logout",
+    "/openid_connect",
+    "/openid_connect/other",
 ])
 def test_whm_path_non_match(path):
     assert not tbenv.is_whm_path(path), f"unexpected match: {path}"

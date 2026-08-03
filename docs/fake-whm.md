@@ -11,6 +11,7 @@ Adminer brute cohort.
 | Path | Methods | Response |
 | --- | --- | --- |
 | `/whm`, `/whm/`, `/whm/index`, `/whm/index.html`, `/2086`, `/2086/`, `/2086/login`, `/2086/login/`, `/2087`, `/2087/`, `/2087/login`, `/2087/login/`, `/cpanel`, `/cpanel/`, `/2082`, `/2082/`, `/2083`, `/2083/`, `/session/login`, `/session/login/` | `GET`, `HEAD` | WHM 11.x login HTML with per-request `cpsess<hex>` token embedded in form action + asset URLs and a per-request `cprelogin=<hex>` cookie |
+| `/___proxy_subdomain_whm`, `/___proxy_subdomain_whm/login`, `/___proxy_subdomain_whm/login/`, `/___proxy_subdomain_cpanel`, `/___proxy_subdomain_cpanel/login`, `/___proxy_subdomain_webmail` (and trailing-slash forms), `/openid_connect/cpanelid` | `GET`, `HEAD` | Same login HTML. These are cpsrvd's internal proxy-subdomain entry points — the rewrite target when a host is reached via its `whm.` / `cpanel.` / `webmail.` service subdomain rather than by port |
 | `/cpsess<16-64 hex>/whm/`, `/cpsess<hex>/whm/<subpath>`, `/cpsess<hex>/cpanel/`, `/cpsess<hex>/cpanel/<subpath>`, `/cpsess<hex>/session/login/` | `GET`, `HEAD` | Same login HTML — cpsess token from the URL is preserved through the form action so a follow-on POST keeps the same session context |
 | Any of the above | `POST` | Captures `user`, `pass` length (never the password itself), `goto_uri`, `goto_app`; re-serves the login HTML with the standard `The login is invalid.` error notice and the submitted username echoed back into the value attribute |
 
@@ -63,6 +64,18 @@ this cohort's kit. That combination — high-value target,
 distinctive scripted-kit signature, known miss called out in the
 Adminer and DS_Store comment blocks — motivates the dedicated trap
 rather than folding into a generic form handler.
+
+The `___proxy_subdomain_*` prefixes were a follow-on miss. cpsrvd
+exposes the same panels two ways: by port (`:2086` / `:2087` for WHM,
+`:2082` / `:2083` for cPanel) and via service subdomains
+(`whm.<domain>`, `cpanel.<domain>`, `webmail.<domain>`), which cpsrvd
+rewrites onto these internal prefixes. The port-based aliases were
+already covered; credential-stuffing tooling that targets the subdomain
+form emits the rewritten prefix verbatim and so kept landing on the 404
+fallback instead of the login capture. Recurring probe volume against
+the proxy-subdomain form runs ahead of the port-based aliases, which
+makes it the broader of the two entry surfaces rather than a long-tail
+variant.
 
 ## Canary placement
 

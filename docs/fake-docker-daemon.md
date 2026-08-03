@@ -22,6 +22,44 @@ ack a fake container ID and 204 the `/start`.
 | `/containers/<id>/exec` | POST | `{"Id":"<64-hex>"}` — fake exec ID minted per request |
 | `/exec/<id>/start` | POST | Empty `200 OK` (hijacked-stream shape) |
 | `/exec/<id>/{json,resize}` | GET / POST | Plausible exec inspect / resize responses |
+| `/containers/<id>/logs` | GET | Docker multiplexed log stream (see below); `400 Bad parameters` when neither `stdout` nor `stderr` is selected |
+| `/networks` | GET | The three stock local networks (`bridge`, `host`, `none`) |
+| `/volumes` | GET | One plausible named local volume |
+| `/system/df` | GET | Stock disk-usage summary |
+| `/auth` | POST | `{"Status":"Login Succeeded","IdentityToken":""}` + registry-credential capture |
+| `/build` | POST | Chunked build-output stream shape |
+| `/commit` | POST | `{"Id":"sha256:<64-hex>"}` — per-request image ID |
+| `/swarm`, `/services`, `/secrets`, `/configs`, `/nodes`, `/tasks` | GET | `503` stock "this node is not a swarm manager" error |
+
+### Container log read-back
+
+`GET /containers/<id>/logs` closes the takeover chain: `create` →
+`start` → `exec` → **read the output back**. That is the step where a
+loader confirms its payload executed, so a 404 there ends the
+engagement at the point of maximum engagement.
+
+The body is Docker's multiplexed stream framing — an 8-byte header per
+frame (stream type, three zero bytes, big-endian `uint32` length)
+followed by the payload, served as
+`Content-Type: application/vnd.docker.multiplexed-stream`. Clients that
+call the endpoint without a TTY parse this framing and choke on a raw
+byte blob, so emitting it correctly is what keeps a real Docker client
+— and the loaders that embed one — in the chain.
+
+The content is deliberately generic runtime chatter. The trap does not
+know which command the caller asked for, so inventing its output would
+contradict whatever they sent; what it can assert is the framing and
+that a container process started.
+
+### Swarm routes
+
+`/info` advertises `Swarm.LocalNodeState: inactive` and
+`ControlAvailable: false`, so the swarm-manager routes return the
+verbatim non-manager `503` a stock daemon returns rather than a
+manager-shaped list. A list here would contradict `/info` and
+fingerprint the surface; the `503` is also a stronger tell than a `404`
+that a genuine daemon is listening. A regression test pins `/info` and
+these routes together so the two cannot drift apart.
 
 All responses set `Server: Docker/<version> (linux)` and
 `Api-Version: 1.43` headers — cryptominer scanners gate Cmd-shipping
@@ -72,6 +110,21 @@ Mutation requests also log `dockerDaemonBodySha256` and a
 
 `X-Registry-Auth` (Docker-specific) and `Authorization` headers are
 captured in `dockerDaemonAuthHeader`.
+
+`POST /auth` additionally decodes the registry credentials the caller
+submits — either a base64url JSON blob in `X-Registry-Auth` or a plain
+JSON body — into `dockerDaemonAuthUsername`, `dockerDaemonAuthServer`,
+`dockerDaemonAuthPasswordSha256`, `dockerDaemonAuthPasswordLen` and
+`dockerDaemonAuthSource` (`header` / `body`). Which registry an
+operator authenticates against, and under what account, is the point of
+answering `/auth` at all. The password is recorded as a hash so
+credential reuse can be correlated across hits, and is never reflected
+back to the caller; `IdentityToken` in the response stays empty, which
+is both what a stock daemon returns after a username/password login and
+what keeps a fixed credential-shaped literal out of the response.
+
+`GET /containers/<id>/logs` logs `dockerDaemonTargetContainerId`,
+`dockerDaemonStage: logs`, and `dockerDaemonLogsFollow`.
 
 Container / exec IDs issued by the trap are echoed back in the
 response **and** logged as `dockerDaemonIssuedContainerId` /

@@ -1132,10 +1132,22 @@ _DOCKER_DAEMON_EXACT_ENDPOINTS = frozenset({
     "/volumes",
     "/services",
     "/swarm",
+    "/secrets",
+    "/configs",
+    "/nodes",
+    "/tasks",
     "/system/df",
     "/auth",
     "/build",
     "/commit",
+})
+# Endpoints only a swarm *manager* answers. `/info` advertises
+# `Swarm.LocalNodeState: inactive`, so these must return the real
+# non-manager 503 rather than a list — a manager-shaped reply would
+# contradict `/info` and fingerprint the surface. The 503 is also a
+# stronger tell than a 404 that a genuine daemon is listening.
+_DOCKER_DAEMON_SWARM_ONLY_ENDPOINTS = frozenset({
+    "/services", "/swarm", "/secrets", "/configs", "/nodes", "/tasks",
 })
 # Strip a leading `/vMAJOR.MINOR` API version prefix.
 _DOCKER_DAEMON_VERSION_PREFIX_RE = re.compile(r"^/v\d+(?:\.\d+){0,2}(?=/)")
@@ -1149,7 +1161,7 @@ _DOCKER_DAEMON_SSRF_PREFIX_RE = re.compile(
 # container ID we minted on /containers/create; scanners that follow
 # the protocol will POST /start / /exec against it.
 _DOCKER_DAEMON_CONTAINER_STAGE_RE = re.compile(
-    r"^/containers/([0-9a-f]{8,64})/(start|stop|kill|wait|exec|json|attach|restart)$",
+    r"^/containers/([0-9a-f]{8,64})/(start|stop|kill|wait|exec|json|attach|restart|logs)$",
     re.IGNORECASE,
 )
 _DOCKER_DAEMON_EXEC_STAGE_RE = re.compile(
@@ -2512,6 +2524,27 @@ _WHM_DEFAULT_PATHS = ",".join([
     # `/whm` GET and hit the target directly.
     "/session/login",
     "/session/login/",
+    # cpsrvd's proxy-subdomain entry points. When a host is reached via
+    # the `whm.<domain>` / `cpanel.<domain>` service subdomains rather
+    # than by port, cpsrvd rewrites the request onto these internal
+    # `___proxy_subdomain_*` prefixes. Credential-stuffing tooling that
+    # targets the subdomain form emits them verbatim, so they are a
+    # distinct entry surface from the port-based aliases above and were
+    # reaching the 404 fallback rather than the login capture.
+    "/___proxy_subdomain_whm",
+    "/___proxy_subdomain_whm/",
+    "/___proxy_subdomain_whm/login",
+    "/___proxy_subdomain_whm/login/",
+    "/___proxy_subdomain_cpanel",
+    "/___proxy_subdomain_cpanel/",
+    "/___proxy_subdomain_cpanel/login",
+    "/___proxy_subdomain_cpanel/login/",
+    "/___proxy_subdomain_webmail",
+    "/___proxy_subdomain_webmail/",
+    # cPanel's OpenID Connect handoff — probed alongside the proxy
+    # prefixes by the same tooling.
+    "/openid_connect/cpanelid",
+    "/openid_connect/cpanelid/",
 ])
 WHM_PATHS = frozenset(
     value.strip().lower()
@@ -5300,6 +5333,182 @@ def render_docker_daemon_container_create(container_id: str, warnings: list[str]
 
 def render_docker_daemon_exec_create(exec_id: str) -> bytes:
     return json.dumps({"Id": exec_id}, separators=(",", ":")).encode("utf-8")
+
+
+def _docker_daemon_log_frame(stream: int, text: str) -> bytes:
+    """One frame of Docker's multiplexed log stream.
+
+    Header is 8 bytes: stream type (1=stdout, 2=stderr), three zero
+    padding bytes, then a big-endian uint32 payload length. Clients
+    that call `/containers/<id>/logs` without a TTY parse this framing
+    and choke on a raw byte blob, so emitting it properly is what keeps
+    a real Docker client (and the loaders that embed one) in the chain.
+    """
+    payload = text.encode("utf-8")
+    return bytes([stream, 0, 0, 0]) + len(payload).to_bytes(4, "big") + payload
+
+
+def render_docker_daemon_container_logs() -> bytes:
+    """Log stream for a container the caller just created and started.
+
+    Deliberately generic: we do not know what command the caller asked
+    for, so inventing its output would contradict whatever they sent.
+    What we can assert truthfully-in-fiction is the runtime chatter a
+    freshly-started container emits before its entrypoint produces
+    anything — enough for the client to parse a well-formed stream and
+    continue, without claiming knowledge of the payload.
+    """
+    return (
+        _docker_daemon_log_frame(2, "level=info msg=\"starting container process\"\n")
+        + _docker_daemon_log_frame(1, "\n")
+    )
+
+
+def render_docker_daemon_networks() -> bytes:
+    """The three networks every stock daemon has. A miner scanner reads
+    this to decide whether to attach its container to `host`."""
+    payload = [
+        {
+            "Name": "bridge", "Id": hashlib.sha256(b"net-bridge").hexdigest(),
+            "Created": "2026-01-14T08:12:44.118273401Z", "Scope": "local",
+            "Driver": "bridge", "EnableIPv6": False, "Internal": False,
+            "Attachable": False, "Ingress": False,
+            "IPAM": {"Driver": "default", "Options": None,
+                     "Config": [{"Subnet": "172.17.0.0/16", "Gateway": "172.17.0.1"}]},
+            "Options": {"com.docker.network.bridge.default_bridge": "true"},
+            "Labels": {},
+        },
+        {
+            "Name": "host", "Id": hashlib.sha256(b"net-host").hexdigest(),
+            "Created": "2026-01-14T08:12:43.995114272Z", "Scope": "local",
+            "Driver": "host", "EnableIPv6": False, "Internal": False,
+            "Attachable": False, "Ingress": False,
+            "IPAM": {"Driver": "default", "Options": None, "Config": []},
+            "Options": {}, "Labels": {},
+        },
+        {
+            "Name": "none", "Id": hashlib.sha256(b"net-none").hexdigest(),
+            "Created": "2026-01-14T08:12:43.981002913Z", "Scope": "local",
+            "Driver": "null", "EnableIPv6": False, "Internal": False,
+            "Attachable": False, "Ingress": False,
+            "IPAM": {"Driver": "default", "Options": None, "Config": []},
+            "Options": {}, "Labels": {},
+        },
+    ]
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_docker_daemon_volumes() -> bytes:
+    payload = {
+        "Volumes": [
+            {
+                "CreatedAt": "2026-01-14T08:19:02Z",
+                "Driver": "local",
+                "Labels": None,
+                "Mountpoint": "/var/lib/docker/volumes/app_data/_data",
+                "Name": "app_data",
+                "Options": None,
+                "Scope": "local",
+            },
+        ],
+        "Warnings": None,
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_docker_daemon_system_df() -> bytes:
+    payload = {
+        "LayersSize": 84934656,
+        "Images": [],
+        "Containers": [],
+        "Volumes": [],
+        "BuildCache": [],
+        "BuilderSize": 0,
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_docker_daemon_swarm_unavailable() -> bytes:
+    """Verbatim non-manager error a stock daemon returns on swarm routes."""
+    return json.dumps(
+        {"message": "This node is not a swarm manager. Use \"docker swarm "
+                    "init\" or \"docker swarm join\" to connect this node to "
+                    "swarm and try again."},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def render_docker_daemon_auth() -> bytes:
+    """Registry-login ack. `IdentityToken` is empty on a real daemon that
+    authenticated with a plain username/password, so it stays empty here —
+    emitting a token-shaped string would be both unrealistic and a fixed
+    credential-like literal."""
+    return json.dumps(
+        {"Status": "Login Succeeded", "IdentityToken": ""},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def render_docker_daemon_commit(image_id: str) -> bytes:
+    return json.dumps({"Id": f"sha256:{image_id}"}, separators=(",", ":")).encode("utf-8")
+
+
+def render_docker_daemon_build() -> bytes:
+    """Chunked build-output stream shape. Enough for a client to parse a
+    successful build without us echoing an attacker-supplied Dockerfile."""
+    return (
+        b'{"stream":"Step 1/1 : FROM alpine:latest"}\n'
+        b'{"stream":"\\n"}\n'
+        b'{"stream":" ---\\u003e Using cache\\n"}\n'
+        b'{"aux":{"ID":"sha256:' + hashlib.sha256(b"build-aux").hexdigest().encode("ascii") + b'"}}\n'
+    )
+
+
+def _docker_daemon_parse_registry_auth(auth_header: str, body_preview: str) -> dict[str, object]:
+    """Pull the registry credentials a caller submits to `/auth`.
+
+    Docker sends them either as a base64url JSON blob in `X-Registry-Auth`
+    or as a plain JSON POST body. Both carry `username` / `password` /
+    `serveraddress`. Capturing which registry an operator authenticates
+    against — and under what account — is the point of answering `/auth`
+    at all; the password is recorded as a hash, never echoed back.
+    """
+    out: dict[str, object] = {}
+    blob = ""
+    if auth_header:
+        raw = auth_header.strip()
+        pad = "=" * (-len(raw) % 4)
+        for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+            try:
+                blob = decoder(raw + pad).decode("utf-8", errors="replace")
+                break
+            except Exception:
+                continue
+        if blob:
+            out["dockerDaemonAuthSource"] = "header"
+    if not blob and body_preview:
+        blob = body_preview
+        out["dockerDaemonAuthSource"] = "body"
+    if not blob:
+        return out
+    try:
+        parsed = json.loads(blob)
+    except Exception:
+        return out
+    if not isinstance(parsed, dict):
+        return out
+    username = parsed.get("username") or parsed.get("Username")
+    server = parsed.get("serveraddress") or parsed.get("ServerAddress")
+    password = parsed.get("password") or parsed.get("Password")
+    if isinstance(username, str) and username:
+        out["dockerDaemonAuthUsername"] = username[:256]
+    if isinstance(server, str) and server:
+        out["dockerDaemonAuthServer"] = server[:256]
+    if isinstance(password, str) and password:
+        out["dockerDaemonAuthPasswordSha256"] = hashlib.sha256(
+            password.encode("utf-8")).hexdigest()
+        out["dockerDaemonAuthPasswordLen"] = len(password)
+    return out
 
 
 # Indicators we pull out of POST bodies for fast triage. Cryptominer /
@@ -20487,6 +20696,31 @@ async def _handle_docker_daemon(
         extra["dockerDaemonIssuedContainerId"] = cid
         body = render_docker_daemon_container_create(cid)
         status_code = 201
+    elif norm in _DOCKER_DAEMON_SWARM_ONLY_ENDPOINTS:
+        # Coherent with `/info`, which reports Swarm.LocalNodeState=inactive.
+        result_tag = "docker-daemon-swarm-unavailable"
+        body = render_docker_daemon_swarm_unavailable()
+        status_code = 503
+    elif norm == "/networks":
+        result_tag = "docker-daemon-networks-list"
+        body = render_docker_daemon_networks()
+    elif norm == "/volumes":
+        result_tag = "docker-daemon-volumes-list"
+        body = render_docker_daemon_volumes()
+    elif norm == "/system/df":
+        result_tag = "docker-daemon-system-df"
+        body = render_docker_daemon_system_df()
+    elif norm == "/auth":
+        result_tag = "docker-daemon-auth"
+        extra.update(_docker_daemon_parse_registry_auth(auth_header, body_preview))
+        body = render_docker_daemon_auth()
+    elif norm == "/build" and method == "POST":
+        result_tag = "docker-daemon-build"
+        body = render_docker_daemon_build()
+    elif norm == "/commit" and method == "POST":
+        result_tag = "docker-daemon-commit"
+        body = render_docker_daemon_commit(secrets.token_hex(32))
+        status_code = 201
     elif norm == "/images/create" and method == "POST":
         result_tag = "docker-daemon-image-pull"
         # /images/create takes the image name in the query string
@@ -20528,6 +20762,25 @@ async def _handle_docker_daemon(
             result_tag = "docker-daemon-container-attach"
             body = b""
             status_code = 200
+        elif stage == "logs":
+            # The payoff step of the takeover chain: create -> start ->
+            # exec -> *read the output back*. A 404 here dead-ends the
+            # engagement at the exact moment the caller believes it has
+            # execution, and loaders that check the read abort on it.
+            query = request.rel_url.query
+            wants_stdout = query.get("stdout") in ("1", "true", "True")
+            wants_stderr = query.get("stderr") in ("1", "true", "True")
+            if not wants_stdout and not wants_stderr:
+                # Verbatim stock-daemon behaviour for a stream-less request.
+                result_tag = "docker-daemon-container-logs-nostream"
+                body = (b'{"message":"Bad parameters: you must choose at '
+                        b'least one stream"}\n')
+                status_code = 400
+            else:
+                result_tag = "docker-daemon-container-logs"
+                extra["dockerDaemonLogsFollow"] = query.get("follow") in ("1", "true", "True")
+                body = render_docker_daemon_container_logs()
+                content_type = "application/vnd.docker.multiplexed-stream"
     elif exec_match:
         exid = exec_match.group(1)
         stage = exec_match.group(2).lower()
