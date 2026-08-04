@@ -484,6 +484,50 @@ WP_LOGIN_ADMIN_PATHS: set[str] = {
     "/wp-admin/install.php",
 }
 
+# --- WordPress setup-config.php install-hijack trap -----------------------
+# `/wp-admin/setup-config.php` is the pre-install wizard WordPress serves
+# while `wp-config.php` is still absent. It is not a credential-brute
+# surface — it is the opposite direction. A host that answers here is one
+# where the attacker can *complete the installation themselves*: step 2
+# accepts a database name, user, password and host, writes them into
+# `wp-config.php`, and step 3 creates the first administrator account.
+# That is unauthenticated takeover of an unfinished install, and scanner
+# kits walk it as a standalone dictionary entry alongside the
+# `/wp-admin/install.php` liveness check that this file already traps.
+#
+# The interesting capture is inverted from every other login trap here.
+# Those record what an attacker guesses about *our* credentials; this one
+# records the database endpoint the attacker wants *our* install to
+# connect to — an attacker-controlled host, username and password, i.e.
+# a piece of their own infrastructure rather than a guess about ours.
+# Serving the wizard through to the "connected successfully" page is what
+# elicits it, so the handler implements the real multi-step flow rather
+# than a single static page.
+WP_SETUP_CONFIG_ENABLED = _env_bool("HONEYPOT_WP_SETUP_CONFIG_ENABLED")
+WP_SETUP_CONFIG_VERSION = (
+    os.environ.get("HONEYPOT_WP_SETUP_CONFIG_VERSION") or "6.8.2"
+).strip()
+WP_SETUP_CONFIG_BODY_DECODE_LIMIT = max(
+    int(
+        (os.environ.get("HONEYPOT_WP_SETUP_CONFIG_BODY_DECODE_LIMIT") or "4096").strip()
+        or "4096"
+    ),
+    512,
+)
+# Same multi-install subdirectory fan-out the wlwmanifest trap uses —
+# scanner dictionaries walk `/wordpress/wp-admin/setup-config.php` at
+# comparable volume to the webroot form, because a half-finished install
+# parked in a subdirectory is exactly the case that stays unfinished.
+_WP_SETUP_CONFIG_PREFIXES: tuple[str, ...] = (
+    "", "blog", "wp", "wp1", "wp2", "wordpress", "site", "shop", "news",
+    "test", "cms", "web", "media", "sito", "website", "new", "old",
+    "main", "home", "public", "portal",
+)
+_WP_SETUP_CONFIG_PATHS: set[str] = {
+    f"/{(prefix + '/') if prefix else ''}wp-admin/setup-config.php"
+    for prefix in _WP_SETUP_CONFIG_PREFIXES
+}
+
 # --- WordPress XML-RPC trap (xmlrpc.php) ---------------------------------
 # `/xmlrpc.php` is the historical WordPress brute-force / pingback
 # amplification vector. Scanner dictionaries POST `wp.getUsersBlogs` and
@@ -2559,6 +2603,86 @@ _WHM_CPSESS_RE = re.compile(
     r"whm/[a-z0-9._/\-]*|cpanel/[a-z0-9._/\-]*)$"
 )
 
+# --- Fake 3CX web client API trap ----------------------------------------
+# 3CX is a widely deployed software PBX whose browser client authenticates
+# against a small JSON API under `/webclient/api/`. The token-mint call
+# (`/webclient/api/Login/GetAccessToken`) is the single interesting verb:
+# it takes a JSON body of `{"Username": ..., "Password": ...}` and returns
+# an OAuth-shaped token envelope on success.
+#
+# It is a high-value credential target for two reasons that make it worth
+# a dedicated handler rather than folding into the generic form trap.
+# First, a PBX credential is not just an account — it is outbound dial
+# capability, which is directly monetisable via toll fraud, so the
+# population that walks this endpoint is distinguishable from generic
+# CMS-brute traffic. Second, the endpoint speaks JSON rather than form
+# encoding, so the credential fields never appear in a form-encoded body
+# and the generic webapp-form capture cannot read them.
+#
+# Because these clients POST their credential payload whether or not the
+# endpoint exists, a 404 here loses the credential material at the exact
+# moment it is on the wire. Answering with a plausible token envelope both
+# captures the submitted pair and lets the client proceed to the
+# post-authentication calls its kit makes next, which is behaviour no
+# 404 can ever reveal.
+THREECX_ENABLED = _env_bool("HONEYPOT_3CX_ENABLED")
+THREECX_VERSION = (os.environ.get("HONEYPOT_3CX_VERSION") or "20.0.5.2118").strip()
+THREECX_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_3CX_BODY_DECODE_LIMIT") or "4096").strip() or "4096"),
+    256,
+)
+# Credential-bearing endpoints: these mint a token envelope and capture
+# the submitted pair.
+_THREECX_LOGIN_DEFAULT_PATHS = ",".join([
+    "/webclient/api/login/getaccesstoken",
+    "/webclient/api/login",
+    "/webclient/api/login/loginuser",
+    "/webclient/api/login/gettokenauth",
+    "/webclient/api/login/refreshtoken",
+    # Deliberately scoped to `/webclient/` only. The bare `/api/login`
+    # sibling is already owned by the generic web-app form trap, and
+    # claiming it here would relabel that established population as
+    # PBX-targeting when most of it is not.
+])
+THREECX_LOGIN_PATHS = frozenset(
+    value.strip().lower()
+    for value in (
+        os.environ.get("HONEYPOT_3CX_LOGIN_PATHS_CSV") or _THREECX_LOGIN_DEFAULT_PATHS
+    ).split(",")
+    if value.strip()
+)
+# Post-authentication surface. Present so a client that accepts the token
+# envelope has somewhere to go — the follow-on calls it chooses are the
+# behavioural signal this trap exists to collect.
+_THREECX_API_DEFAULT_PATHS = ",".join([
+    "/webclient/api/login/getsystemstatus",
+    "/webclient/api/login/ping",
+    "/webclient/api/login/logout",
+    "/webclient/api/systemstatus",
+    "/webclient/api/users",
+    "/webclient/api/users/current",
+    "/webclient/api/settings",
+    "/webclient/api/mydevices",
+    "/webclient/api/contacts",
+    "/webclient/api/recordings",
+    "/webclient/api/voicemails",
+])
+THREECX_API_PATHS = frozenset(
+    value.strip().lower()
+    for value in (
+        os.environ.get("HONEYPOT_3CX_API_PATHS_CSV") or _THREECX_API_DEFAULT_PATHS
+    ).split(",")
+    if value.strip()
+)
+# Browser entry points that serve the client shell rather than JSON.
+THREECX_UI_PATHS = frozenset({
+    "/webclient",
+    "/webclient/",
+    "/webclient/index.html",
+    "/webclient/login",
+    "/webclient/login/",
+})
+
 
 # --- .DS_Store filesystem-metadata leak trap ---------------------------
 # macOS Finder writes a `.DS_Store` alongside every browsed directory;
@@ -3050,6 +3174,47 @@ def _webapp_form_match(path: str) -> str | None:
         return WEBAPP_FORM_PATH_SUFFIX[p]
     stripped = p.rstrip("/") or "/"
     return WEBAPP_FORM_PATH_SUFFIX.get(stripped)
+
+
+def is_wp_setup_config_path(path: str) -> bool:
+    """Match the WordPress pre-install wizard at
+    `/wp-admin/setup-config.php`, including the multi-install
+    subdirectory forms (`/wordpress/wp-admin/setup-config.php`,
+    `/blog/wp-admin/setup-config.php`, …).
+
+    The query string carries the wizard step (`?step=1`) and is
+    stripped before matching so every step lands on the handler.
+    """
+    if not WP_SETUP_CONFIG_ENABLED:
+        return False
+    return path.lower().split("?", 1)[0] in _WP_SETUP_CONFIG_PATHS
+
+
+def is_threecx_login_path(path: str) -> bool:
+    """Match the 3CX credential-bearing API endpoints (the token mint).
+
+    Trailing slash is tolerated and the query string stripped, since
+    clients vary on both while POSTing an identical JSON body.
+    """
+    if not THREECX_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    return lp in THREECX_LOGIN_PATHS or lp.rstrip("/") in THREECX_LOGIN_PATHS
+
+
+def is_threecx_api_path(path: str) -> bool:
+    """Match the 3CX post-authentication API surface."""
+    if not THREECX_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    return lp in THREECX_API_PATHS or lp.rstrip("/") in THREECX_API_PATHS
+
+
+def is_threecx_ui_path(path: str) -> bool:
+    """Match the 3CX browser client shell entry points."""
+    if not THREECX_ENABLED:
+        return False
+    return path.lower().split("?", 1)[0] in THREECX_UI_PATHS
 
 
 def is_wp_login_path(path: str) -> bool:
@@ -6739,6 +6904,103 @@ def extract_whm_creds(body: bytes, content_type: str) -> dict[str, str]:
     return result
 
 
+def extract_wp_setup_config_fields(body: bytes, content_type: str) -> dict[str, str]:
+    """Pull the WordPress install-wizard database fields off the step-2
+    POST body.
+
+    Unlike every other credential extractor in this file, the captured
+    values describe attacker-controlled infrastructure rather than a
+    guess at ours: `dbhost` is the database endpoint they want the
+    install to dial, and `uname`/`pwd` are credentials that are valid
+    *somewhere they control*. Both are recorded in full — including the
+    password, which is the one place in this file that is correct to
+    keep, because it is not our secret and its reuse across probes is
+    the linkage signal.
+
+    `prefix` and `dbname` are kept as low-cost kit fingerprints: the
+    defaults (`wp_`, `wordpress`) versus bespoke values separate an
+    untouched off-the-shelf script from a hand-driven one.
+    """
+    parsed = parse_form_body(body, content_type)
+    result: dict[str, str] = {}
+    for field, cap in (
+        ("dbname", 200),
+        ("uname", 200),
+        ("dbhost", 250),
+        ("prefix", 120),
+        ("language", 32),
+    ):
+        vals = parsed.get(field) or []
+        if vals and vals[0]:
+            result[field] = vals[0][:cap]
+    pwd_values = parsed.get("pwd") or []
+    if pwd_values and pwd_values[0]:
+        result["hasPwd"] = "true"
+        result["pwdLen"] = str(len(pwd_values[0]))[:6]
+        result["pwd"] = pwd_values[0][:200]
+    submit_values = parsed.get("submit") or []
+    if submit_values and submit_values[0]:
+        result["submit"] = submit_values[0][:80]
+    return result
+
+
+def extract_threecx_creds(body: bytes, content_type: str) -> dict[str, str]:
+    """Pull the 3CX login fields off a POST body.
+
+    The browser client sends JSON (`{"Username": …, "Password": …,
+    "SecurityCode": …}`), but scripted clients frequently send the same
+    field names form-encoded, so both are accepted. JSON is tried first
+    and the form parser is the fallback; field lookup is
+    case-insensitive because kits vary between `Username`, `username`
+    and `UserName` against an API that accepts all three.
+
+    Records the username and whether a password was present plus its
+    length — the password bytes themselves are never stored, matching
+    the other credential-capture traps in this file.
+    """
+    result: dict[str, str] = {}
+    if not body:
+        return result
+
+    fields: dict[str, str] = {}
+    ctype = (content_type or "").lower()
+    text = body[:THREECX_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+    if "json" in ctype or text.lstrip()[:1] == "{":
+        try:
+            parsed_json = json.loads(text)
+            if isinstance(parsed_json, dict):
+                for key, value in parsed_json.items():
+                    if isinstance(value, (str, int, float, bool)):
+                        fields[str(key).lower()] = str(value)
+        except Exception:
+            pass
+    if not fields:
+        parsed = parse_form_body(body, content_type)
+        for key, values in parsed.items():
+            if values and values[0]:
+                fields[key.lower()] = values[0]
+
+    for candidate in ("username", "user", "email", "extension"):
+        if fields.get(candidate):
+            result["username"] = fields[candidate][:200]
+            break
+    for candidate in ("password", "pass", "pwd"):
+        if fields.get(candidate):
+            result["hasPwd"] = "true"
+            result["pwdLen"] = str(len(fields[candidate]))[:6]
+            break
+    # 3CX prompts for a second factor when the extension has one
+    # configured; a client that populates it is working from harvested
+    # detail rather than a plain credential-stuffing list.
+    for candidate in ("securitycode", "code", "otp"):
+        if fields.get(candidate):
+            result["securityCode"] = fields[candidate][:32]
+            break
+    if fields.get("reallyremember") or fields.get("rememberme"):
+        result["rememberMe"] = "true"
+    return result
+
+
 def render_ds_store_body(entry_names: tuple[str, ...]) -> bytes:
     """Return a plausibly-shaped Finder `.DS_Store` binary whose
     records embed `entry_names` as UTF-16BE strings — the exact shape
@@ -8653,6 +8915,197 @@ def render_wp_login_html(*, nonce: str, redirect_to: str) -> bytes:
 </form>
 <p id="nav"><a href="/wp-login.php?action=lostpassword">Lost your password?</a></p>
 </div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def _html_escape_attr(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _wp_setup_config_chrome(title: str, version: str, inner: str) -> bytes:
+    """Shared WP install-wizard page chrome. Real `setup-config.php`
+    renders through `wp-admin/install.php`'s header with the
+    `wp-core-ui` body classes and the install stylesheet, which is what
+    a scanner checking "is this really the WordPress wizard" matches."""
+    body = f"""<!DOCTYPE html>
+<html lang="en-US">
+<head>
+<meta name="viewport" content="width=device-width" />
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+<meta name="robots" content="noindex,nofollow" />
+<title>{title} &rsaquo; Setup Configuration File</title>
+<link rel="stylesheet" href="/wp-admin/css/install.min.css?ver={version}" type="text/css" />
+</head>
+<body class="wp-core-ui language-chooser">
+<p id="logo">WordPress</p>
+{inner}
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_wp_setup_config_welcome(*, version: str, action: str) -> bytes:
+    """Step 0 — the "Before we begin" page real WordPress shows when
+    `wp-config.php` is absent. The `Let's go!` link carries `?step=1`,
+    which is the hop that leads to the database form."""
+    safe_action = _html_escape_attr(action)
+    inner = f"""<h1 class="screen-reader-text">Before getting started</h1>
+<p>Welcome to WordPress. Before getting started, you will need to know the following items.</p>
+<ol>
+\t<li>Database name</li>
+\t<li>Database username</li>
+\t<li>Database password</li>
+\t<li>Database host</li>
+\t<li>Table prefix (if you want to run more than one WordPress in a single database)</li>
+</ol>
+<p>We are going to use this information to create a <code>wp-config.php</code> file.</p>
+<p>In all likelihood, these items were supplied to you by your Web Host. If you do not have this information, then you will need to contact them before you can continue.</p>
+<p class="step"><a href="{safe_action}?step=1" class="button button-large">Let&#8217;s go!</a></p>
+"""
+    return _wp_setup_config_chrome("WordPress", version, inner)
+
+
+def render_wp_setup_config_dbform(
+    *, version: str, action: str, error: str = "", submitted: dict[str, str] | None = None,
+) -> bytes:
+    """Step 1 — the database connection form. This is the page whose
+    POST carries the attacker-controlled database endpoint.
+
+    Field defaults mirror stock WordPress (`localhost`, `wp_`) so a
+    client that overwrites them is visibly supplying its own
+    infrastructure rather than submitting the form untouched.
+    """
+    submitted = submitted or {}
+    safe_action = _html_escape_attr(action)
+    dbname = _html_escape_attr(submitted.get("dbname", "wordpress"))
+    uname = _html_escape_attr(submitted.get("uname", "username"))
+    dbhost = _html_escape_attr(submitted.get("dbhost", "localhost"))
+    prefix = _html_escape_attr(submitted.get("prefix", "wp_"))
+    error_html = (
+        f'<div class="notice notice-error inline"><p>{_html_escape_attr(error)}</p></div>\n'
+        if error
+        else ""
+    )
+    inner = f"""<h1 class="screen-reader-text">Set up your database connection</h1>
+{error_html}<p>Below you should enter your database connection details. If you are not sure about these, contact your host.</p>
+<form method="post" action="{safe_action}?step=2">
+\t<table class="form-table" role="presentation">
+\t\t<tr>
+\t\t\t<th scope="row"><label for="dbname">Database Name</label></th>
+\t\t\t<td><input name="dbname" id="dbname" type="text" size="25" value="{dbname}" /></td>
+\t\t\t<td>The name of the database you want to use with WordPress.</td>
+\t\t</tr>
+\t\t<tr>
+\t\t\t<th scope="row"><label for="uname">Username</label></th>
+\t\t\t<td><input name="uname" id="uname" type="text" size="25" value="{uname}" /></td>
+\t\t\t<td>Your database username.</td>
+\t\t</tr>
+\t\t<tr>
+\t\t\t<th scope="row"><label for="pwd">Password</label></th>
+\t\t\t<td><input name="pwd" id="pwd" type="text" size="25" value="" autocomplete="off" /></td>
+\t\t\t<td>Your database password.</td>
+\t\t</tr>
+\t\t<tr>
+\t\t\t<th scope="row"><label for="dbhost">Database Host</label></th>
+\t\t\t<td><input name="dbhost" id="dbhost" type="text" size="25" value="{dbhost}" /></td>
+\t\t\t<td>You should be able to get this info from your web host, if <code>localhost</code> does not work.</td>
+\t\t</tr>
+\t\t<tr>
+\t\t\t<th scope="row"><label for="prefix">Table Prefix</label></th>
+\t\t\t<td><input name="prefix" id="prefix" type="text" value="{prefix}" size="25" /></td>
+\t\t\t<td>If you want to run multiple WordPress installations in a single database, change this.</td>
+\t\t</tr>
+\t</table>
+\t<p class="step"><input name="submit" type="submit" value="Submit" class="button button-large" /></p>
+</form>
+"""
+    return _wp_setup_config_chrome("WordPress", version, inner)
+
+
+def render_wp_setup_config_success(*, version: str, action: str) -> bytes:
+    """Step 2 — the "All right, sparky!" page real WordPress serves once
+    it has connected to the supplied database. Serving it is what closes
+    the loop: the client believes its database details were accepted, so
+    the next request is the install-step handoff rather than a bail-out.
+
+    The handoff link points at `/wp-admin/install.php`, which this
+    server already answers, so the wizard has a coherent next hop.
+    """
+    safe_action = _html_escape_attr(action)
+    base = safe_action.rsplit("/", 1)[0]
+    inner = f"""<h1 class="screen-reader-text">Successful database connection</h1>
+<p>All right, sparky! You&#8217;ve made it through this part of the installation. WordPress can now communicate with your database. If you are ready, time now to&hellip;</p>
+<p class="step"><a href="{base}/install.php" class="button button-large">Run the installation</a></p>
+"""
+    return _wp_setup_config_chrome("WordPress", version, inner)
+
+
+def render_threecx_token_envelope(*, version: str) -> bytes:
+    """3CX `GetAccessToken` success envelope.
+
+    Every token-shaped field is minted per hit (`secrets.token_urlsafe`
+    payload inside a JWT-shaped three-segment string), never a fixed
+    literal — a constant token here would be worthless on replay and
+    would fingerprint every host serving this trap with one shared
+    string.
+    """
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    payload = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "sub": secrets.token_hex(8),
+                "aud": "3cxwebclient",
+                "scope": "openid profile offline_access",
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    access_token = f"{header}.{payload}.{secrets.token_urlsafe(32)}"
+    envelope = {
+        "Status": "AuthSuccess",
+        "TwoFactorAuth": False,
+        "RefreshToken": secrets.token_urlsafe(32),
+        "Token": {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": secrets.token_urlsafe(32),
+        },
+        "Version": version,
+    }
+    return json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+
+
+def render_threecx_login_html(*, version: str) -> bytes:
+    """3CX web client shell. The real client is a single-page app whose
+    index carries the build label scanners fingerprint on."""
+    safe_version = _html_escape_attr(version)
+    body = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>3CX Web Client</title>
+<base href="/webclient/" />
+<meta name="version" content="{safe_version}" />
+<link rel="icon" type="image/x-icon" href="/webclient/favicon.ico" />
+</head>
+<body>
+<app-root></app-root>
+<script src="/webclient/runtime.js" defer></script>
+<script src="/webclient/polyfills.js" defer></script>
+<script src="/webclient/main.js" defer></script>
 </body>
 </html>
 """
@@ -19630,6 +20083,282 @@ async def _handle_webapp_form(
     )
 
 
+async def _handle_wp_setup_config(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """WordPress pre-install wizard. Walks the real three-step flow:
+
+      * no step / `?step=0` → the "Before we begin" welcome page
+      * `?step=1`           → the database connection form
+      * `POST ?step=2`      → capture the submitted database endpoint,
+                              then serve the "successful connection"
+                              page so the client proceeds to
+                              `install.php` instead of bailing out
+
+    The step-2 capture is the point of the trap. `dbhost`, `uname` and
+    `pwd` describe a database the *client* controls and expects this
+    install to dial — attacker infrastructure, not a guess at ours —
+    so unlike the credential-brute traps in this file the password is
+    recorded in full. It is not our secret, and its reuse across
+    probes is what links otherwise-unrelated sources.
+
+    No fixed credential literals: the only values this handler emits
+    are stock WordPress form defaults (`localhost`, `wp_`), which are
+    not secrets.
+    """
+    method = request.method
+    lp = path.split("?", 1)[0]
+    step = ""
+    if query_string:
+        try:
+            qparsed = parse_qs(query_string, keep_blank_values=True)
+            svals = qparsed.get("step") or []
+            if svals and svals[0]:
+                step = svals[0][:8]
+        except Exception:
+            pass
+
+    common_headers = {
+        "X-Frame-Options": "SAMEORIGIN",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-cache, must-revalidate, max-age=0",
+        "Expires": "Wed, 11 Jan 1984 05:00:00 GMT",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+    }
+
+    if method == "POST":
+        fields = extract_wp_setup_config_fields(
+            request_body, request.headers.get("Content-Type", ""),
+        )
+        body_preview = ""
+        if request_body:
+            body_preview = request_body[:WP_SETUP_CONFIG_BODY_DECODE_LIMIT].decode(
+                "utf-8", errors="replace",
+            )
+        dbhost = fields.get("dbhost", "")
+        html = render_wp_setup_config_success(
+            version=WP_SETUP_CONFIG_VERSION, action=lp,
+        )
+        log_entry: dict[str, object] = {
+            **log_context,
+            "result": "wp-setup-config-db-post",
+            "status": 200,
+            "wpSetupConfigPath": path,
+            "wpSetupConfigStep": step or "2",
+            "wpSetupConfigDbName": fields.get("dbname", ""),
+            "wpSetupConfigDbUser": fields.get("uname", ""),
+            "wpSetupConfigDbHost": dbhost,
+            # A client that leaves `localhost` in place is submitting the
+            # form untouched; anything else is an endpoint it controls
+            # and is the reason this trap exists.
+            "wpSetupConfigDbHostIsRemote": bool(
+                dbhost and dbhost.split(":", 1)[0].lower()
+                not in ("localhost", "127.0.0.1", "::1", "")
+            ),
+            "wpSetupConfigDbPassword": fields.get("pwd", ""),
+            "wpSetupConfigHasPwd": fields.get("hasPwd", "") == "true",
+            "wpSetupConfigPwdLen": fields.get("pwdLen", ""),
+            "wpSetupConfigPrefix": fields.get("prefix", ""),
+            "wpSetupConfigPrefixIsDefault": fields.get("prefix", "wp_") == "wp_",
+            "contentType": request.headers.get("Content-Type", "")[:120],
+            "bytes": len(html),
+        }
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview
+        append_log(log_entry)
+        return web.Response(
+            status=200, body=html,
+            headers={
+                **common_headers,
+                "Content-Type": "text/html; charset=utf-8",
+                "Content-Length": str(len(html)),
+            },
+        )
+
+    if step == "1":
+        html = render_wp_setup_config_dbform(
+            version=WP_SETUP_CONFIG_VERSION, action=lp,
+        )
+        result = "wp-setup-config-dbform"
+    elif step == "2":
+        # A GET on step 2 means the client jumped straight to the
+        # submit target without POSTing anything. Real WordPress falls
+        # back to the form; mirroring that keeps the flow coherent.
+        html = render_wp_setup_config_dbform(
+            version=WP_SETUP_CONFIG_VERSION, action=lp,
+        )
+        result = "wp-setup-config-dbform"
+    else:
+        html = render_wp_setup_config_welcome(
+            version=WP_SETUP_CONFIG_VERSION, action=lp,
+        )
+        result = "wp-setup-config-welcome"
+
+    response_body = b"" if method == "HEAD" else html
+    append_log({
+        **log_context,
+        "result": result,
+        "status": 200,
+        "wpSetupConfigPath": path,
+        "wpSetupConfigStep": step,
+        "wpSetupConfigMethod": method,
+        "bytes": len(html),
+    })
+    return web.Response(
+        status=200, body=response_body,
+        headers={
+            **common_headers,
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Length": str(len(html)),
+        },
+    )
+
+
+async def _handle_threecx(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake 3CX web client API.
+
+    Three surfaces:
+
+      * UI paths       → the single-page client shell
+      * login paths    → credential capture; POST returns a plausible
+                         token envelope, GET returns the "POST only"
+                         error the real API emits
+      * post-auth API  → an empty-but-valid JSON envelope, so a client
+                         that accepted the token has somewhere to go
+                         and the calls it chooses become observable
+
+    The token envelope carries no fixed literals — access token,
+    refresh token and subject are minted per hit.
+    """
+    method = request.method
+    lp = path.lower().split("?", 1)[0]
+    content_type_req = request.headers.get("Content-Type", "")
+    auth_header = request.headers.get("Authorization", "")
+
+    common_headers = {
+        # Real 3CX fronts the web client with nginx and advertises the
+        # PBX build in a custom header scanners fingerprint on.
+        "Server": "nginx",
+        "X-3CX-Version": THREECX_VERSION,
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "SAMEORIGIN",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+    }
+
+    if is_threecx_ui_path(path):
+        html = render_threecx_login_html(version=THREECX_VERSION)
+        response_body = b"" if method == "HEAD" else html
+        append_log({
+            **log_context,
+            "result": "3cx-webclient-shell",
+            "status": 200,
+            "threecxPath": path,
+            "threecxMethod": method,
+            "bytes": len(html),
+        })
+        return web.Response(
+            status=200, body=response_body,
+            headers={
+                **common_headers,
+                "Content-Type": "text/html; charset=utf-8",
+                "Content-Length": str(len(html)),
+            },
+        )
+
+    if is_threecx_login_path(path):
+        if method == "POST":
+            creds = extract_threecx_creds(request_body, content_type_req)
+            body_preview = ""
+            if request_body:
+                body_preview = request_body[:THREECX_BODY_DECODE_LIMIT].decode(
+                    "utf-8", errors="replace",
+                )
+            payload = render_threecx_token_envelope(version=THREECX_VERSION)
+            log_entry: dict[str, object] = {
+                **log_context,
+                "result": "3cx-credential-post",
+                "status": 200,
+                "threecxPath": path,
+                "threecxUsername": creds.get("username", ""),
+                "threecxHasPwd": creds.get("hasPwd", "") == "true",
+                "threecxPwdLen": creds.get("pwdLen", ""),
+                "threecxSecurityCode": creds.get("securityCode", ""),
+                "threecxRememberMe": creds.get("rememberMe", "") == "true",
+                # JSON vs form encoding separates a client written
+                # against the real API from one replaying a generic
+                # form-post template at it.
+                "threecxBodyEncoding": (
+                    "json" if "json" in content_type_req.lower()
+                    or request_body[:1] == b"{" else "form"
+                ),
+                "contentType": content_type_req[:120],
+                "bytes": len(payload),
+            }
+            if body_preview:
+                log_entry["bodyPreview"] = body_preview
+            append_log(log_entry)
+            return web.Response(
+                status=200, body=payload,
+                headers={
+                    **common_headers,
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Content-Length": str(len(payload)),
+                },
+            )
+
+        # Real 3CX answers a bare GET on the token endpoint with a 405
+        # and an empty body; mirroring that keeps the fingerprint honest
+        # while still recording the probe.
+        append_log({
+            **log_context,
+            "result": "3cx-login-probe",
+            "status": 405,
+            "threecxPath": path,
+            "threecxMethod": method,
+            "bytes": 0,
+        })
+        return web.Response(
+            status=405, body=b"",
+            headers={**common_headers, "Allow": "POST", "Content-Length": "0"},
+        )
+
+    # Post-authentication API surface.
+    payload = json.dumps(
+        {"Status": "OK", "Version": THREECX_VERSION}, separators=(",", ":"),
+    ).encode("utf-8")
+    response_body = b"" if method == "HEAD" else payload
+    append_log({
+        **log_context,
+        "result": "3cx-api-probe",
+        "status": 200,
+        "threecxPath": path,
+        "threecxMethod": method,
+        # Whether the client carried the token it was just issued is the
+        # signal that separates a kit that parses the envelope and
+        # continues from one that fires a fixed request list regardless.
+        "threecxBearerPresent": auth_header.lower().startswith("bearer "),
+        "bytes": len(payload),
+    })
+    return web.Response(
+        status=200, body=response_body,
+        headers={
+            **common_headers,
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Length": str(len(payload)),
+        },
+    )
+
+
 async def _handle_wp_login(
     request: web.Request,
     log_context: dict[str, object],
@@ -25074,6 +25803,13 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_rdweb_path(path):
         return await _handle_rdweb(request, log_context, path, request_body)
 
+    if (
+        is_threecx_ui_path(path)
+        or is_threecx_login_path(path)
+        or is_threecx_api_path(path)
+    ):
+        return await _handle_threecx(request, log_context, path, request_body)
+
     if is_exchange_path(path):
         return await _handle_exchange(request, log_context, path, query_string, request_body)
 
@@ -25163,6 +25899,13 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # Windows + Apache + PHP-CGI fingerprint they're checking for.
     if is_php_cgi_liveness_path(path):
         return await _handle_php_cgi_liveness(request, log_context, path)
+
+    # Ahead of the `/wp-admin/*` redirect so the install wizard serves
+    # its own multi-step flow instead of being bounced to the login page.
+    if is_wp_setup_config_path(path):
+        return await _handle_wp_setup_config(
+            request, log_context, path, query_string, request_body,
+        )
 
     if is_wp_login_path(path):
         return await _handle_wp_login(request, log_context, path, request_body)

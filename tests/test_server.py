@@ -665,6 +665,8 @@ def test_all_trap_families_default_on():
     assert tbenv.WHM_ENABLED
     assert tbenv.DS_STORE_ENABLED
     assert tbenv.WEBLOGIC_CONSOLE_ENABLED
+    assert tbenv.WP_SETUP_CONFIG_ENABLED
+    assert tbenv.THREECX_ENABLED
 
 
 def test_tarpit_enabled_by_default():
@@ -15310,3 +15312,307 @@ async def test_robots_txt_only_matches_exact_path(flux_client):
         # tagged as a crawler robots response.
         entry = _log_entries(flux_client.log_path)[-1]
         assert entry["result"] != "robots-crawler", f"unexpected match on {probe_path}"
+
+
+# --- WordPress setup-config.php install-hijack trap ----------------------
+
+def test_wp_setup_config_enabled_by_default():
+    assert tbenv.WP_SETUP_CONFIG_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/wp-admin/setup-config.php",
+    "/wordpress/wp-admin/setup-config.php",
+    "/blog/wp-admin/setup-config.php",
+    "/wp/wp-admin/setup-config.php",
+    "/cms/wp-admin/setup-config.php",
+    "/site/wp-admin/setup-config.php",
+    "/new/wp-admin/setup-config.php",
+    # Case-insensitive.
+    "/WP-Admin/Setup-Config.php",
+    # Query string carries the wizard step and must be stripped.
+    "/wp-admin/setup-config.php?step=1",
+    "/wordpress/wp-admin/setup-config.php?step=1&language=en_GB",
+])
+def test_wp_setup_config_path_matches(path):
+    assert tbenv.is_wp_setup_config_path(path), f"expected match: {path}"
+
+
+@pytest.mark.parametrize("path", [
+    "/",
+    "/wp-admin/",
+    "/wp-admin/install.php",
+    "/wp-login.php",
+    "/setup-config.php",
+    "/wp-admin/setup-config.phps",
+    "/wp-admin/setup-config.php.bak",
+    "/unknown/deeper/wp-admin/setup-config.php",
+])
+def test_wp_setup_config_path_does_not_match(path):
+    assert not tbenv.is_wp_setup_config_path(path), f"unexpected match: {path}"
+
+
+def test_wp_setup_config_disabled_switch(monkeypatch):
+    monkeypatch.setattr(tbenv, "WP_SETUP_CONFIG_ENABLED", False)
+    assert not tbenv.is_wp_setup_config_path("/wp-admin/setup-config.php")
+
+
+async def test_wp_setup_config_welcome_page(flux_client):
+    resp = await flux_client.get(
+        "/wp-admin/setup-config.php", headers={"X-Forwarded-For": "203.0.113.90"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    # The welcome page's only job is to advertise the step=1 hop.
+    assert "step=1" in text
+    assert "wp-config.php" in text
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "wp-setup-config-welcome"
+
+
+async def test_wp_setup_config_step1_serves_db_form(flux_client):
+    resp = await flux_client.get(
+        "/wp-admin/setup-config.php?step=1",
+        headers={"X-Forwarded-For": "203.0.113.91"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    for field in ("dbname", "uname", "pwd", "dbhost", "prefix"):
+        assert f'name="{field}"' in text, f"missing field {field}"
+    assert 'action="/wp-admin/setup-config.php?step=2"' in text
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "wp-setup-config-dbform"
+
+
+async def test_wp_setup_config_post_captures_attacker_database(flux_client):
+    """The whole point of the trap: step 2 records the database endpoint
+    the client wants this install to dial, which is infrastructure the
+    client controls rather than a guess at ours."""
+    resp = await flux_client.post(
+        "/wp-admin/setup-config.php?step=2",
+        data={
+            "dbname": "wp_hijack",
+            "uname": "attacker_db_user",
+            "pwd": "s3cret-db-pass",
+            "dbhost": "db.exfil.example:3306",
+            "prefix": "hx_",
+            "submit": "Submit",
+        },
+        headers={"X-Forwarded-For": "203.0.113.92"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    # Success page keeps the wizard coherent so the client goes on to
+    # install.php instead of bailing.
+    assert "install.php" in text
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "wp-setup-config-db-post"
+    assert entry["wpSetupConfigDbName"] == "wp_hijack"
+    assert entry["wpSetupConfigDbUser"] == "attacker_db_user"
+    assert entry["wpSetupConfigDbHost"] == "db.exfil.example:3306"
+    # Password IS retained here — it is the client's own secret, not ours.
+    assert entry["wpSetupConfigDbPassword"] == "s3cret-db-pass"
+    assert entry["wpSetupConfigHasPwd"] is True
+    assert entry["wpSetupConfigPwdLen"] == "14"
+    assert entry["wpSetupConfigDbHostIsRemote"] is True
+    assert entry["wpSetupConfigPrefix"] == "hx_"
+    assert entry["wpSetupConfigPrefixIsDefault"] is False
+
+
+@pytest.mark.parametrize("dbhost,expected_remote", [
+    ("localhost", False),
+    ("127.0.0.1", False),
+    ("127.0.0.1:3306", False),
+    ("::1", False),
+    ("db.exfil.example", True),
+    ("198.51.100.7:3306", True),
+])
+async def test_wp_setup_config_flags_remote_database_host(
+    flux_client, dbhost, expected_remote,
+):
+    await flux_client.post(
+        "/wp-admin/setup-config.php?step=2",
+        data={"dbname": "wordpress", "uname": "u", "pwd": "p", "dbhost": dbhost},
+        headers={"X-Forwarded-For": "203.0.113.93"},
+    )
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["wpSetupConfigDbHostIsRemote"] is expected_remote
+
+
+async def test_wp_setup_config_takes_priority_over_wp_admin_redirect(flux_client):
+    """`/wp-admin/*` normally redirects to the login page; the wizard must
+    win so the multi-step flow is reachable."""
+    resp = await flux_client.get(
+        "/wp-admin/setup-config.php", headers={"X-Forwarded-For": "203.0.113.94"},
+        allow_redirects=False,
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"].startswith("wp-setup-config")
+
+
+async def test_wp_setup_config_subdirectory_form_reaches_handler(flux_client):
+    resp = await flux_client.get(
+        "/wordpress/wp-admin/setup-config.php?step=1",
+        headers={"X-Forwarded-For": "203.0.113.95"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    # Form action must stay inside the subdirectory install.
+    assert 'action="/wordpress/wp-admin/setup-config.php?step=2"' in text
+
+
+# --- Fake 3CX web client API trap ----------------------------------------
+
+def test_threecx_enabled_by_default():
+    assert tbenv.THREECX_ENABLED
+
+
+@pytest.mark.parametrize("path", [
+    "/webclient/api/Login/GetAccessToken",
+    "/webclient/api/login/getaccesstoken",
+    "/webclient/api/Login",
+    "/webclient/api/Login/",
+    "/webclient/api/Login/LoginUser",
+    "/webclient/api/Login/GetTokenAuth",
+    "/webclient/api/Login/RefreshToken",
+    "/webclient/api/Login/GetAccessToken?x=1",
+])
+def test_threecx_login_path_matches(path):
+    assert tbenv.is_threecx_login_path(path), f"expected match: {path}"
+
+
+@pytest.mark.parametrize("path", [
+    "/",
+    "/api/login",          # owned by the generic web-app form trap
+    "/api/auth",
+    "/login",
+    "/webclient/api/Unknown",
+    "/wp-login.php",
+])
+def test_threecx_login_path_does_not_match(path):
+    assert not tbenv.is_threecx_login_path(path), f"unexpected match: {path}"
+
+
+def test_threecx_does_not_shadow_generic_webapp_form_login():
+    """`/api/login` must keep routing to the established form trap —
+    relabelling it as PBX traffic would corrupt that population."""
+    assert not tbenv.is_threecx_login_path("/api/login")
+    assert tbenv.is_webapp_form_path("/api/login")
+
+
+def test_threecx_disabled_switch(monkeypatch):
+    monkeypatch.setattr(tbenv, "THREECX_ENABLED", False)
+    assert not tbenv.is_threecx_login_path("/webclient/api/Login/GetAccessToken")
+    assert not tbenv.is_threecx_api_path("/webclient/api/Login/Ping")
+    assert not tbenv.is_threecx_ui_path("/webclient/")
+
+
+async def test_threecx_credential_post_json_is_captured(flux_client):
+    resp = await flux_client.post(
+        "/webclient/api/Login/GetAccessToken",
+        data=json.dumps({
+            "Username": "1001",
+            "Password": "pbx-admin-pass",
+            "SecurityCode": "482913",
+        }),
+        headers={
+            "Content-Type": "application/json",
+            "X-Forwarded-For": "203.0.113.96",
+        },
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["Status"] == "AuthSuccess"
+    assert payload["Token"]["token_type"] == "Bearer"
+    assert payload["Token"]["access_token"].count(".") == 2
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "3cx-credential-post"
+    assert entry["threecxUsername"] == "1001"
+    assert entry["threecxHasPwd"] is True
+    assert entry["threecxPwdLen"] == "14"
+    assert entry["threecxSecurityCode"] == "482913"
+    assert entry["threecxBodyEncoding"] == "json"
+    # Password bytes are never stored for a credential guessed at us.
+    assert "pbx-admin-pass" not in json.dumps(
+        {k: v for k, v in entry.items() if k != "bodyPreview"}
+    )
+
+
+async def test_threecx_credential_post_form_encoded_is_captured(flux_client):
+    resp = await flux_client.post(
+        "/webclient/api/Login",
+        data={"Username": "operator", "Password": "hunter2"},
+        headers={"X-Forwarded-For": "203.0.113.97"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "3cx-credential-post"
+    assert entry["threecxUsername"] == "operator"
+    assert entry["threecxPwdLen"] == "7"
+    assert entry["threecxBodyEncoding"] == "form"
+
+
+async def test_threecx_access_tokens_are_unique_per_hit(flux_client):
+    """A fixed token would be worthless on replay and would fingerprint
+    every host serving this trap with one shared string."""
+    tokens = set()
+    for i in range(3):
+        resp = await flux_client.post(
+            "/webclient/api/Login/GetAccessToken",
+            data=json.dumps({"Username": "u", "Password": "p"}),
+            headers={
+                "Content-Type": "application/json",
+                "X-Forwarded-For": f"203.0.113.{100 + i}",
+            },
+        )
+        payload = await resp.json()
+        tokens.add(payload["Token"]["access_token"])
+        tokens.add(payload["RefreshToken"])
+    assert len(tokens) == 6, "token-shaped fields must be minted per hit"
+
+
+async def test_threecx_get_on_token_endpoint_is_405(flux_client):
+    resp = await flux_client.get(
+        "/webclient/api/Login/GetAccessToken",
+        headers={"X-Forwarded-For": "203.0.113.98"},
+    )
+    assert resp.status == 405
+    assert resp.headers["Allow"] == "POST"
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "3cx-login-probe"
+
+
+async def test_threecx_ui_path_serves_client_shell(flux_client):
+    resp = await flux_client.get(
+        "/webclient/", headers={"X-Forwarded-For": "203.0.113.99"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "<app-root>" in text
+    assert resp.headers["X-3CX-Version"] == tbenv.THREECX_VERSION
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "3cx-webclient-shell"
+
+
+async def test_threecx_post_auth_probe_records_bearer_presence(flux_client):
+    """Whether the client carried the token it was just issued separates a
+    kit that parses the envelope from one firing a fixed request list."""
+    resp = await flux_client.get(
+        "/webclient/api/Users/current",
+        headers={
+            "X-Forwarded-For": "203.0.113.101",
+            "Authorization": "Bearer abc.def.ghi",
+        },
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "3cx-api-probe"
+    assert entry["threecxBearerPresent"] is True
+
+    await flux_client.get(
+        "/webclient/api/Users/current",
+        headers={"X-Forwarded-For": "203.0.113.102"},
+    )
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["threecxBearerPresent"] is False
