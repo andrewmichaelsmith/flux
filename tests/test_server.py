@@ -663,6 +663,7 @@ def test_all_trap_families_default_on():
     assert tbenv.PHPMYADMIN_ENABLED
     assert tbenv.ADMINER_ENABLED
     assert tbenv.WHM_ENABLED
+    assert tbenv.VITE_FS_ENABLED
     assert tbenv.DS_STORE_ENABLED
     assert tbenv.WEBLOGIC_CONSOLE_ENABLED
     assert tbenv.WP_SETUP_CONFIG_ENABLED
@@ -1569,7 +1570,11 @@ async def test_dispatch_routes_bash_history_variants_to_trap(flux_client, monkey
     body = await resp.read()
     assert b"export AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
     entries = _log_entries(flux_client.log_path)
-    assert entries[-1]["result"] == "bash-history"
+    # Same body either way, but an `/@fs/` request is tagged for the
+    # filesystem-walk population rather than the webroot one — those are
+    # different scanner behaviours and shouldn't share a bucket.
+    expected = "vite-fs-bash-history" if path.startswith("/@fs/") else "bash-history"
+    assert entries[-1]["result"] == expected
 
 
 @pytest.mark.parametrize("path", [
@@ -1588,7 +1593,8 @@ async def test_dispatch_routes_zsh_history_variants_to_trap(flux_client, monkeyp
     body = await resp.read()
     assert b"export AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
     entries = _log_entries(flux_client.log_path)
-    assert entries[-1]["result"] == "zsh-history"
+    expected = "vite-fs-zsh-history" if path.startswith("/@fs/") else "zsh-history"
+    assert entries[-1]["result"] == expected
 
 
 def test_render_vite_env_embeds_canary_in_flat_define_block():

@@ -698,6 +698,45 @@ MCP_SERVER_BODY_DECODE_LIMIT = max(
     int((os.environ.get("HONEYPOT_MCP_SERVER_BODY_DECODE_LIMIT") or "2048").strip() or "2048"),
     256,
 )
+
+# --- Vite dev-server `/@fs/` arbitrary file read -----------------------
+# Vite serves files outside the project root through the `/@fs/<absolute
+# path>` prefix. A series of disclosed `server.fs.deny` bypasses let an
+# unauthenticated client read any file the dev-server user can open, and
+# scanners now walk that primitive with a list of absolute paths rather
+# than a list of URLs — `/@fs/root/.aws/credentials`,
+# `/@fs/usr/src/app/.env`, `/@fs/proc/self/environ`, and so on.
+#
+# That inverts what a path list can cover. Every other trap here matches
+# webroot-relative URLs a scanner picked out of a dictionary; `/@fs/`
+# takes an arbitrary absolute path, so enumerating literals is
+# unwinnable — the thirteen `/@fs/...history` entries that predate this
+# block only ever matched a fraction of what arrives. Instead we resolve
+# the requested absolute path against the existing trap table by walking
+# its leading directory segments off one at a time, so
+# `/@fs/usr/src/app/.env` finds the same `.env` renderer as a bare
+# `/.env` probe and any future prefix the scanner invents resolves for
+# free.
+#
+# The requested absolute path is itself the intel: it is the scanner's
+# belief about the target's runtime layout (`/home/node` says a Docker
+# Node image, `/var/www/html` says a classic LAMP box, `/workspace` says
+# a devcontainer). Nothing else we serve reveals that, because no other
+# surface lets the client name a filesystem path.
+#
+# Unresolvable paths get a 404, matching a real Vite dev server asked
+# for a file that does not exist. Logging the miss still captures the
+# path, so the dictionary is recorded whether or not we answer it.
+VITE_FS_ENABLED = _env_bool("HONEYPOT_VITE_FS_ENABLED")
+# Prefix that introduces the filesystem passthrough. Lowercase compare.
+_VITE_FS_PREFIX = "/@fs/"
+# Cap on how many leading directory segments we strip while searching for
+# a matching trap. Bounds the lookup so a deeply nested request can't turn
+# into an unbounded dict walk.
+VITE_FS_MAX_SUFFIX_WALK = max(
+    int((os.environ.get("HONEYPOT_VITE_FS_MAX_SUFFIX_WALK") or "12").strip() or "12"),
+    1,
+)
 # Tool names that trigger the AWS canary path when passed to `tools/call`.
 # A real MCP server hosting these tools would return credentials or file
 # contents; we mint a canary and embed it in the tool-call result so
@@ -17785,9 +17824,9 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     # cloud creds via `VITE_*` prefixes thinking they're build-time-
     # only, so an opportunistic harvester treats anything matching
     # `VITE_AWS_*` / `VITE_API_KEY` as live creds and replays.
-    # Companion `/@fs/` arbitrary-file-read primitive entries (under
-    # `bash-history`) handle the FS-walk pivot that scanners chain
-    # after the env probe.
+    # The `/@fs/` FS-walk pivot that scanners chain after this probe is
+    # handled by `resolve_vite_fs`, which re-uses every entry in this
+    # table rather than duplicating paths under an `/@fs/` prefix.
     CanaryTrap(
         "vite-env",
         ("/@vite/env",),
@@ -19220,6 +19259,99 @@ def find_canary_trap(path: str) -> "CanaryTrap | None":
     if not CANARY_TRAPS_ENABLED:
         return None
     return _TRAP_BY_PATH.get(path.lower())
+
+
+@dataclass(frozen=True)
+class ViteFsResolution:
+    """Outcome of resolving a `/@fs/<absolute path>` request.
+
+    `trap` is None for a miss — we still return the parsed fields so the
+    requested path lands in the log line even when nothing answers it.
+    """
+
+    requested_path: str      # absolute FS path after traversal collapse
+    raw_suffix: str          # everything after `/@fs/`, before collapse
+    trap: "CanaryTrap | None"
+    match_depth: int         # leading segments dropped to find `trap`
+    # True when the walk landed on bare `/.env`, which is served by
+    # `_send_env` rather than by an entry in the trap table.
+    bare_env: bool = False
+
+    @property
+    def resolved(self) -> bool:
+        """Whether anything will answer this read."""
+        return self.trap is not None or self.bare_env
+
+
+def _collapse_fs_path(segments: "list[str]") -> "list[str]":
+    """Resolve `.` / `..` against a segment list, POSIX-style.
+
+    In practice `normalize_path` has already collapsed `..` by the time a
+    request reaches dispatch, so the traversal branch here is belt-and-
+    braces rather than the hot path — deliberately kept so this function
+    is correct standalone and doesn't silently depend on an upstream
+    normalisation step it can't see. `.` and empty segments (`//`) do
+    still arrive.
+
+    A `..` that would escape the root is dropped rather than raising:
+    real path resolution clamps at `/`.
+    """
+    out: list[str] = []
+    for seg in segments:
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            if out:
+                out.pop()
+            continue
+        out.append(seg)
+    return out
+
+
+def resolve_vite_fs(path: str) -> "ViteFsResolution | None":
+    """Parse a `/@fs/...` request and find the trap that should answer it.
+
+    Returns None when `path` is not an `/@fs/` request at all. Otherwise
+    always returns a resolution — `trap` is None when nothing matched.
+
+    Matching walks leading directory segments off the requested absolute
+    path and looks each suffix up in the exact-path trap table, longest
+    first. `/@fs/usr/src/app/.env` tries `/usr/src/app/.env`,
+    `/src/app/.env`, `/app/.env`, `/.env` and stops at the first hit, so
+    an absolute prefix we have never seen still lands on the renderer for
+    the file the scanner actually asked for.
+    """
+    lowered = path.lower()
+    if not lowered.startswith(_VITE_FS_PREFIX):
+        return None
+    raw_suffix = path[len(_VITE_FS_PREFIX):]
+    collapsed = _collapse_fs_path(raw_suffix.split("/"))
+    if not collapsed:
+        # `/@fs/` alone, or a request that traversed itself back to root.
+        return ViteFsResolution("/", raw_suffix, None, 0)
+    requested = "/" + "/".join(collapsed)
+
+    trap = None
+    depth = 0
+    bare_env = False
+    if CANARY_TRAPS_ENABLED:
+        # `collapsed[i:]` for increasing i — drop one leading directory
+        # per step. The final step is the bare filename under `/`, which
+        # is where the webroot-relative trap entries live.
+        for i in range(min(len(collapsed), VITE_FS_MAX_SUFFIX_WALK + 1)):
+            candidate = "/" + "/".join(collapsed[i:])
+            lowered_candidate = candidate.lower()
+            found = _TRAP_BY_PATH.get(lowered_candidate)
+            if found is not None:
+                trap = found
+                depth = i
+                break
+            if lowered_candidate == "/.env":
+                # Not in the trap table — `/.env` kept its own handler.
+                bare_env = True
+                depth = i
+                break
+    return ViteFsResolution(requested, raw_suffix, trap, depth, bare_env)
 
 
 
@@ -25180,12 +25312,23 @@ async def _send_canary_trap(
     user_agent: str,
     proto: str,
     log_context: dict[str, object],
+    result_prefix: str = "",
+    extra_log: "dict[str, object] | None" = None,
 ) -> web.Response:
+    """Serve `trap`'s renderer with a freshly issued canary.
+
+    `result_prefix` and `extra_log` let a caller that reached this trap by
+    an indirect route (currently the `/@fs/` resolver) keep its own
+    result tag and log fields without duplicating the issue/render/log
+    body. They default to empty so the direct path is unchanged.
+    """
+    log_context = {**log_context, **(extra_log or {})}
+    tag = f"{result_prefix}{trap.name}"
     tracebit_response = await _get_or_issue_canary(
         trap.canary_types, client_ip, request_id, host, user_agent, path, proto,
     )
     if tracebit_response is None:
-        append_log({**log_context, "status": 502, "result": f"{trap.name}-error"})
+        append_log({**log_context, "status": 502, "result": f"{tag}-error"})
         return web.Response(
             status=502, body=b"upstream credential issue failed\n",
             headers={"Content-Type": "text/plain; charset=utf-8"},
@@ -25195,7 +25338,7 @@ async def _send_canary_trap(
         body = trap.render(tracebit_response)
     except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
         append_log({
-            **log_context, "status": 502, "result": f"{trap.name}-render-error",
+            **log_context, "status": 502, "result": f"{tag}-render-error",
             "error": str(exc)[:400],
         })
         return web.Response(
@@ -25212,11 +25355,67 @@ async def _send_canary_trap(
     append_log({
         **log_context,
         "status": 200,
-        "result": trap.name,
+        "result": tag,
         "canaryTypes": [k for k, v in tracebit_response.items() if v],
         "bytes": len(body),
     })
     return response
+
+
+async def _send_vite_fs(
+    request: web.Request,
+    resolution: "ViteFsResolution",
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.Response:
+    """Answer a `/@fs/<absolute path>` read.
+
+    Hit: delegate to the resolved trap so the body is byte-identical to
+    what a bare probe for the same file would get, tagged `vite-fs-<trap>`
+    so the FS-walk population stays separable from the webroot one.
+
+    Miss: 404, which is what a real dev server returns for a file that
+    isn't there. The requested path is logged either way — the dictionary
+    is the point, and the misses describe the parts of the filesystem the
+    scanner expects to find that we've chosen not to furnish.
+    """
+    extra_log: dict[str, object] = {
+        # The absolute path the scanner named. This is the whole point of
+        # the trap: it is the only field anywhere in flux that records an
+        # attacker's belief about the target's on-disk layout.
+        "viteFsRequestedPath": resolution.requested_path[:512],
+        "viteFsRawSuffix": resolution.raw_suffix[:512],
+        # 0 means the absolute path matched a trap entry outright; higher
+        # means we had to strip that many leading directories to find the
+        # file, i.e. the scanner used a prefix we've never catalogued.
+        "viteFsMatchDepth": resolution.match_depth,
+    }
+    if not resolution.resolved:
+        append_log({
+            **log_context, **extra_log,
+            "status": 404, "result": "vite-fs-miss",
+        })
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+    if resolution.trap is None:
+        # Bare `/.env` — served by the original handler, not the table.
+        return await _send_env(
+            request, request_id, path,
+            client_ip, host, user_agent, proto, log_context,
+            result_prefix="vite-fs-", extra_log=extra_log,
+        )
+    return await _send_canary_trap(
+        request, resolution.trap, request_id, path,
+        client_ip, host, user_agent, proto, log_context,
+        result_prefix="vite-fs-", extra_log=extra_log,
+    )
 
 
 def _build_backup_archive_body(r: dict[str, object], ext_family: str) -> tuple[bytes, str]:
@@ -25658,14 +25857,26 @@ async def _send_env(
     user_agent: str,
     proto: str,
     log_context: dict[str, object],
+    result_prefix: str = "",
+    extra_log: "dict[str, object] | None" = None,
 ) -> web.Response:
+    """Serve the bare `/.env` payload.
+
+    `/.env` predates the CanaryTrap table and still has its own handler
+    rather than an entry in it, so the `/@fs/` resolver reaches it here
+    instead of through `_send_canary_trap`. `result_prefix` / `extra_log`
+    mirror that function's signature for the same reason: a caller that
+    arrived indirectly keeps its own tag and fields without a second copy
+    of this body.
+    """
+    log_context = {**log_context, **(extra_log or {})}
     try:
         tracebit_response = await issue_credentials(request_id, client_ip, host, user_agent, path, proto)
     except aiohttp.ClientResponseError as exc:
         append_log({
             **log_context,
             "status": 502,
-            "result": "tracebit-http-error",
+            "result": f"{result_prefix}tracebit-http-error",
             "tracebitStatus": exc.status,
             "error": (exc.message or "")[:400],
         })
@@ -25675,7 +25886,7 @@ async def _send_env(
         )
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
         append_log({
-            **log_context, "status": 502, "result": "tracebit-error",
+            **log_context, "status": 502, "result": f"{result_prefix}tracebit-error",
             "error": str(exc)[:400],
         })
         return web.Response(
@@ -25685,7 +25896,7 @@ async def _send_env(
 
     payload = format_env_payload(tracebit_response).encode("utf-8")
     append_log({
-        **log_context, "status": 200, "result": "issued",
+        **log_context, "status": 200, "result": f"{result_prefix}issued",
         "types": [key for key, value in tracebit_response.items() if value],
     })
     return web.Response(
@@ -25941,6 +26152,21 @@ async def handle(request: web.Request) -> web.StreamResponse:
         crawler_token = _match_robots_crawler_ua(user_agent)
         if crawler_token is not None:
             return await _handle_robots_txt(request, log_context, crawler_token)
+
+    # `/@fs/` resolution runs ahead of the tarpit on purpose. Most of what
+    # arrives on this prefix is `.env`-suffixed, which `is_tarpit_path`
+    # would otherwise claim — and the generic drip issues no canary, so
+    # taking the tarpit here would trade a replay-detectable credential
+    # for a held connection on the one surface that also tells us the
+    # attacker's assumed filesystem layout. With the trap disabled (or no
+    # API key) the branch falls through and those paths tarpit as before.
+    if API_KEY and VITE_FS_ENABLED:
+        vite_fs = resolve_vite_fs(path)
+        if vite_fs is not None:
+            return await _send_vite_fs(
+                request, vite_fs, request_id, path,
+                client_ip, host, user_agent, proto, log_context,
+            )
 
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)
