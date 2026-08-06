@@ -15622,3 +15622,386 @@ async def test_threecx_post_auth_probe_records_bearer_presence(flux_client):
     )
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["threecxBearerPresent"] is False
+
+
+# ---------------------------------------------------------------------------
+# Application-config family
+# ---------------------------------------------------------------------------
+
+APP_CONFIG_DISPATCH_CASES = [
+    # Generic PHP config — the `define()` shape.
+    ("/config.php", "app-config-php"),
+    ("/configuration.php", "app-config-php"),
+    ("/settings.php", "app-config-php"),
+    ("/local.config.php", "app-config-php"),
+    ("/config/config.php", "app-config-php"),
+    ("/includes/config.php", "app-config-php"),
+    ("/inc/config.php", "app-config-php"),
+    ("/include/config.php", "app-config-php"),
+    ("/application/config/config.php", "app-config-php"),
+    # Backup / editor rotation siblings.
+    ("/config.php.bak", "app-config-php"),
+    ("/config.php.old", "app-config-php"),
+    ("/config.php.save", "app-config-php"),
+    ("/config.php.orig", "app-config-php"),
+    ("/config.php.swp", "app-config-php"),
+    ("/config.php~", "app-config-php"),
+    ("/config.php.txt", "app-config-php"),
+    ("/configuration.php.bak", "app-config-php"),
+    ("/configuration.php.old", "app-config-php"),
+    ("/configuration.php~", "app-config-php"),
+    ("/settings.php.bak", "app-config-php"),
+    ("/settings.php~", "app-config-php"),
+    # App-layout webroot prefixes.
+    ("/app/config.php", "app-config-php"),
+    ("/storage/config.php", "app-config-php"),
+    ("/public_html/config.php", "app-config-php"),
+    ("/htdocs/config/config.php", "app-config-php"),
+    # DB config gets its own renderer (per-driver connection blocks).
+    ("/config/database.php", "app-config-php-database"),
+    ("/config/database.php.bak", "app-config-php-database"),
+    ("/config/database.php~", "app-config-php-database"),
+    ("/config/db.php", "app-config-php-database"),
+    ("/config/connection.php", "app-config-php-database"),
+    ("/application/config/database.php", "app-config-php-database"),
+    ("/app/config/database.php", "app-config-php-database"),
+    ("/www/config/database.php", "app-config-php-database"),
+    # Mail config — separate harvest target from DB config.
+    ("/config/mail.php", "app-config-php-mail"),
+    ("/config/mailer.php", "app-config-php-mail"),
+    ("/config/email.php", "app-config-php-mail"),
+    ("/config/smtp.php", "app-config-php-mail"),
+    ("/config/mail.php.bak", "app-config-php-mail"),
+    ("/backend/config/mail.php", "app-config-php-mail"),
+    # Third-party integration key bag.
+    ("/config/services.php", "app-config-php-services"),
+    ("/config/api.php", "app-config-php-services"),
+    ("/config/keys.php", "app-config-php-services"),
+    ("/config/credentials.php", "app-config-php-services"),
+    ("/config/app.php", "app-config-php-services"),
+    ("/config/secrets.php", "app-config-php-services"),
+    ("/config/services.php.bak", "app-config-php-services"),
+    ("/config/app.php.bak", "app-config-php-services"),
+    ("/app/config/app.php", "app-config-php-services"),
+    # Python — Django settings.py / Flask config.py.
+    ("/settings.py", "app-config-python"),
+    ("/config.py", "app-config-python"),
+    ("/app/settings.py", "app-config-python"),
+    ("/app/config.py", "app-config-python"),
+    ("/config/settings.py", "app-config-python"),
+    ("/instance/config.py", "app-config-python"),
+    ("/project/settings.py", "app-config-python"),
+    ("/settings.py.bak", "app-config-python"),
+    ("/config.py.bak", "app-config-python"),
+    ("/settings.py~", "app-config-python"),
+    ("/local_settings.py", "app-config-python"),
+    ("/production_settings.py", "app-config-python"),
+    # Generic YAML.
+    ("/config.yaml", "app-config-yaml"),
+    ("/config.yml", "app-config-yaml"),
+    ("/secrets.yml", "app-config-yaml"),
+    ("/secrets.yaml", "app-config-yaml"),
+    ("/bootstrap.yml", "app-config-yaml"),
+    ("/bootstrap.yaml", "app-config-yaml"),
+    ("/config/storage.yml", "app-config-yaml"),
+    ("/config/config.yml", "app-config-yaml"),
+    ("/config/config.yaml", "app-config-yaml"),
+    ("/config.yml.bak", "app-config-yaml"),
+    ("/config.yaml.bak", "app-config-yaml"),
+    ("/config.yml~", "app-config-yaml"),
+    ("/app/config.yml", "app-config-yaml"),
+    ("/storage/config.yaml", "app-config-yaml"),
+    # TOML.
+    ("/config.toml", "app-config-toml"),
+    ("/config.toml.bak", "app-config-toml"),
+    ("/config.toml~", "app-config-toml"),
+    ("/config/config.toml", "app-config-toml"),
+    ("/settings.toml", "app-config-toml"),
+    ("/backend/config.toml", "app-config-toml"),
+    # JSON — files plus the runtime-introspection endpoints.
+    ("/env.json", "app-config-json"),
+    ("/local.settings.json", "app-config-json"),
+    ("/config.json.bak", "app-config-json"),
+    ("/api/config", "app-config-json"),
+    ("/api/v1/config", "app-config-json"),
+    ("/api/v2/config", "app-config-json"),
+    ("/api/settings", "app-config-json"),
+    ("/api/config.json", "app-config-json"),
+    # Java properties.
+    ("/bootstrap.properties", "app-config-properties"),
+    ("/config/bootstrap.properties", "app-config-properties"),
+    ("/config.properties", "app-config-properties"),
+    ("/config/application.properties", "app-config-properties"),
+    ("/bootstrap.properties.bak", "app-config-properties"),
+    ("/app/config.properties", "app-config-properties"),
+]
+
+
+@pytest.mark.parametrize("path,expected_trap", APP_CONFIG_DISPATCH_CASES)
+def test_app_config_trap_dispatch(path, expected_trap):
+    """Every generic application-config path routes to the renderer for
+    its serialization format. Grouping is by format, not by framework:
+    a `.php` probe must get parseable PHP and a `.toml` probe parseable
+    TOML, because a harvester that loads the file rather than grepping it
+    is exactly the population this trap is trying to separate out."""
+    trap = tbenv._TRAP_BY_PATH[path.lower()]
+    assert trap.name == expected_trap, (
+        f"{path!r} routes to {trap.name!r}; expected {expected_trap!r}"
+    )
+
+
+@pytest.mark.parametrize("path,expected_trap", [
+    # Framework-specific siblings keep their dedicated renderers — the
+    # generic family must not swallow them.
+    ("/config/database.yml", "rails-database-yml"),
+    ("/config/secrets.yml", "rails-secrets-yml"),
+    ("/config/master.key", "rails-master-key"),
+    ("/env.php", "env-production"),
+    ("/application.yml", "application-yml"),
+    ("/application.yaml", "application-yml"),
+    ("/settings.json", "config-json"),
+])
+def test_app_config_does_not_shadow_framework_traps(path, expected_trap):
+    """The app-config family is deliberately the *generic* sibling set.
+    `/config/database.yml` is Rails', `/env.php` is Magento's,
+    `/application.yml` is the Spring trap's, `/settings.json` is
+    config-json's. Adding a broad format-keyed family is the obvious way
+    to accidentally re-home them, so pin ownership."""
+    trap = tbenv._TRAP_BY_PATH[path.lower()]
+    assert trap.name == expected_trap, (
+        f"{path!r} routes to {trap.name!r}; expected {expected_trap!r}"
+    )
+
+
+@pytest.mark.parametrize("path", [
+    "/config.php",
+    "/config/database.php",
+    "/config/mail.php",
+    "/config/services.php",
+    "/settings.py",
+    "/config.yaml",
+    "/config.toml",
+    "/env.json",
+    "/api/config",
+    "/bootstrap.properties",
+    "/app/config.php",
+    "/config.php.bak",
+])
+def test_app_config_paths_do_not_match_tarpit(path):
+    """Tarpit dispatch runs before CanaryTrap lookup. Any app-config path
+    that matched `is_tarpit_path` would drip junk bytes and issue no
+    canary — the exact failure mode that made these paths worth trapping
+    in the first place."""
+    assert not tbenv.is_tarpit_path(path), (
+        f"{path!r} matches is_tarpit_path — tarpit would shadow the "
+        f"app-config canary trap"
+    )
+
+
+def test_app_config_family_covers_expected_formats():
+    """Nine format-keyed families, all carrying the AWS canary type."""
+    families = {
+        t.name: t for t in tbenv.CANARY_TRAPS if t.name.startswith("app-config")
+    }
+    assert set(families) == {
+        "app-config-php",
+        "app-config-php-database",
+        "app-config-php-mail",
+        "app-config-php-services",
+        "app-config-python",
+        "app-config-yaml",
+        "app-config-toml",
+        "app-config-json",
+        "app-config-properties",
+    }
+    for name, trap in families.items():
+        assert trap.canary_types == ("aws",), f"{name} lost its AWS canary type"
+        assert trap.paths, f"{name} has no paths"
+
+
+@pytest.mark.parametrize("renderer_name", [
+    "render_php_config",
+    "render_php_database_config",
+    "render_php_mail_config",
+    "render_php_services_config",
+    "render_python_settings",
+    "render_generic_config_yaml",
+    "render_generic_config_toml",
+    "render_app_config_json",
+    "render_java_properties",
+])
+def test_app_config_renderers_are_per_hit_unique(renderer_name):
+    """Nothing fixed: two consecutive renders of the same file must
+    differ. A hardcoded credential literal gives zero detection on replay
+    and ships the same string from every host, which turns the whole
+    deployment into one fingerprint."""
+    render = getattr(tbenv, renderer_name)
+    body_1 = render(FAKE_TRACEBIT).decode("utf-8")
+    body_2 = render(FAKE_TRACEBIT).decode("utf-8")
+    assert body_1 != body_2, f"{renderer_name} is byte-stable across renders"
+    # The AWS canary is supplied per-request, so it is the one value that
+    # legitimately repeats within a fixed test fixture.
+    assert "AKIAFAKEEXAMPLE01" in body_1
+    assert "AKIAFAKEEXAMPLE01" in body_2
+
+
+def test_render_php_config_shape():
+    """Generic PHP config must parse as PHP: `<?php` opener and
+    `define()` constants for the DB / SMTP / AWS slots."""
+    body = tbenv.render_php_config(FAKE_TRACEBIT).decode("utf-8")
+    assert body.startswith("<?php\n")
+    for marker in (
+        "define('DB_HOST', 'db.internal');",
+        "define('DB_PASSWORD', '",
+        "define('SMTP_PASSWORD', '",
+        "define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');",
+        "define('AWS_SECRET_ACCESS_KEY', 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY');",
+        "define('APP_KEY', '",
+    ):
+        assert marker in body, f"missing {marker!r} in config.php render"
+    # DB and SMTP passwords are independently random.
+    db = re.search(r"define\('DB_PASSWORD', '([^']+)'\)", body).group(1)
+    smtp = re.search(r"define\('SMTP_PASSWORD', '([^']+)'\)", body).group(1)
+    assert db != smtp
+
+
+def test_render_php_database_config_shape():
+    """Laravel-shaped `return [...]` with per-driver connection blocks;
+    every driver's password independently random, AWS canary in the
+    backup block."""
+    body = tbenv.render_php_database_config(FAKE_TRACEBIT).decode("utf-8")
+    assert body.startswith("<?php\n")
+    for marker in (
+        "return [",
+        "'default' => 'mysql',",
+        "'driver' => 'mysql',",
+        "'driver' => 'pgsql',",
+        "'client' => 'phpredis',",
+        "'key' => 'AKIAFAKEEXAMPLE01',",
+    ):
+        assert marker in body, f"missing {marker!r} in config/database.php render"
+    passwords = re.findall(r"'password' => '([^']+)'", body)
+    assert len(passwords) == 3, passwords
+    assert len(set(passwords)) == 3, f"driver passwords collide: {passwords}"
+
+
+def test_render_php_mail_config_shape():
+    """Mail config carries an SMTP password, an SES block holding the AWS
+    canary, and a SendGrid `SG.`-prefixed key."""
+    body = tbenv.render_php_mail_config(FAKE_TRACEBIT).decode("utf-8")
+    assert body.startswith("<?php\n")
+    for marker in (
+        "'transport' => 'smtp',",
+        "'transport' => 'ses',",
+        "'key' => 'AKIAFAKEEXAMPLE01',",
+        "'host' => 'smtp.sendgrid.net',",
+    ):
+        assert marker in body, f"missing {marker!r} in config/mail.php render"
+    assert re.search(r"'password' => 'SG\.[^']+'", body), "no SendGrid-shaped key"
+
+
+def test_render_php_services_config_shape():
+    """The integration key bag: AWS canary plus Stripe / Mailgun / JWT
+    synthetics, each per-hit random."""
+    body = tbenv.render_php_services_config(FAKE_TRACEBIT).decode("utf-8")
+    for marker in (
+        "'app_key' => 'base64:",
+        "'key' => 'AKIAFAKEEXAMPLE01',",
+        "'secret' => 'sk_live_",
+        "'webhook_secret' => 'whsec_",
+        "'jwt' => [",
+    ):
+        assert marker in body, f"missing {marker!r} in config/services.php render"
+
+
+def test_render_python_settings_shape_and_compiles():
+    """Django settings must be importable Python — a harvester that
+    `exec`s the file to resolve the values must not hit a SyntaxError."""
+    body = tbenv.render_python_settings(FAKE_TRACEBIT).decode("utf-8")
+    compile(body, "settings.py", "exec")
+    for marker in (
+        "SECRET_KEY = '",
+        "DEBUG = False",
+        "'ENGINE': 'django.db.backends.postgresql',",
+        "AWS_ACCESS_KEY_ID = 'AKIAFAKEEXAMPLE01'",
+        "EMAIL_HOST_PASSWORD = '",
+        "CELERY_BROKER_URL = 'redis://:",
+    ):
+        assert marker in body, f"missing {marker!r} in settings.py render"
+
+
+def test_render_generic_config_toml_parses():
+    """TOML must round-trip through a real parser, with the AWS canary in
+    the `[s3]` table."""
+    tomllib = pytest.importorskip("tomllib")
+    body = tbenv.render_generic_config_toml(FAKE_TRACEBIT).decode("utf-8")
+    parsed = tomllib.loads(body)
+    assert parsed["s3"]["access_key_id"] == "AKIAFAKEEXAMPLE01"
+    assert parsed["s3"]["secret_access_key"] == (
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    )
+    assert parsed["database"]["password"] != parsed["redis"]["password"]
+    assert parsed["app"]["env"] == "production"
+
+
+def test_render_app_config_json_parses():
+    """JSON must round-trip, with the AWS canary under `aws` and every
+    password slot independently random."""
+    body = tbenv.render_app_config_json(FAKE_TRACEBIT).decode("utf-8")
+    parsed = json.loads(body)
+    assert parsed["aws"]["accessKeyId"] == "AKIAFAKEEXAMPLE01"
+    assert parsed["app"]["debug"] is False
+    passwords = {
+        parsed["database"]["password"],
+        parsed["redis"]["password"],
+        parsed["smtp"]["password"],
+    }
+    assert len(passwords) == 3, "password slots collide"
+
+
+def test_render_generic_config_yaml_shape():
+    """Spring/Helm-shaped YAML with nested `datasource` / `storage`
+    blocks; AWS canary under `storage`."""
+    body = tbenv.render_generic_config_yaml(FAKE_TRACEBIT).decode("utf-8")
+    for marker in (
+        "datasource:",
+        "  url: jdbc:postgresql://db.internal:5432/app_production",
+        "storage:",
+        "  accessKeyId: AKIAFAKEEXAMPLE01",
+        "  secretAccessKey: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "mail:",
+    ):
+        assert marker in body, f"missing {marker!r} in config.yaml render"
+    passwords = re.findall(r"^\s+password: (\S+)$", body, re.M)
+    assert len(passwords) == 3, passwords
+    assert len(set(passwords)) == 3, f"password slots collide: {passwords}"
+
+
+def test_render_java_properties_shape():
+    """Spring Boot `key=value` properties; AWS canary under the
+    `cloud.aws.credentials.*` keys."""
+    body = tbenv.render_java_properties(FAKE_TRACEBIT).decode("utf-8")
+    for marker in (
+        "spring.datasource.url=jdbc:postgresql://db.internal:5432/app_production",
+        "spring.datasource.password=",
+        "cloud.aws.credentials.accessKey=AKIAFAKEEXAMPLE01",
+        "cloud.aws.credentials.secretKey=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "jwt.secret=",
+    ):
+        assert marker in body, f"missing {marker!r} in bootstrap.properties render"
+    # No key may carry an empty value — a blank credential slot reads as
+    # "this file is a stub" to anything inspecting it. Split on the FIRST
+    # `=` only: base64 values legitimately carry trailing `=` padding.
+    for line in body.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        assert value, f"empty value for {key!r}"
+
+
+def test_app_config_disabled_when_canary_traps_off(monkeypatch):
+    """`CANARY_TRAPS_ENABLED=false` must take the whole family offline
+    along with every other CanaryTrap — the family adds no separate
+    switch of its own."""
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", False)
+    assert tbenv.CANARY_TRAPS_ENABLED is False
