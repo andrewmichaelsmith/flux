@@ -684,3 +684,134 @@ async def test_integration_tarpit_drips_then_client_disconnects(live_server, mon
     # depending on whether the server tried to write after we closed. Start is
     # the reliable signal.
     assert any(e["result"] == "tarpit" for e in entries), entries
+
+
+async def test_integration_fake_git_small_bodies_ignore_drip_capacity(
+    live_server, monkeypatch,
+):
+    """A saturated slow-drip semaphore must not 503 responses that were
+    never going to drip.
+
+    The send loop sleeps *between* chunks, so a body that fits in one
+    chunk is an ordinary fast reply. Charging it a concurrency slot meant
+    a source sweeping many `/.git/` directories — whose autoindex bodies
+    are small — could exhaust the semaphore on responses that hold no
+    connection open, and get `503 busy` back. That both drops the
+    engagement and is a tell: a real exposed repository does not answer a
+    directory walk with `busy`.
+    """
+    async def fake_issue(*_a, **_kw):
+        return FAKE_TRACEBIT
+
+    monkeypatch.setattr(tbenv, "issue_credentials", fake_issue)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_DRIP_INTERVAL_MS", 0)
+    # Semaphore fully occupied by (notional) in-flight drips.
+    monkeypatch.setattr(tbenv, "TARPIT_MAX_CONNECTIONS", 4)
+    monkeypatch.setattr(tbenv, "_active_slow_drips", 4)
+    tbenv._FAKE_GIT_CACHE.clear()
+
+    base, log_path = live_server
+    headers = {"X-Forwarded-For": "203.0.113.71"}
+    async with aiohttp.ClientSession() as session:
+        # Directory autoindex — the shape a `/.git/` sweep actually walks.
+        for path in ("/.git/", "/.git/refs/", "/.git/hooks/", "/.git/HEAD"):
+            async with session.get(f"{base}{path}", headers=headers) as resp:
+                assert resp.status == 200, f"{path} returned {resp.status}"
+                assert await resp.read()
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert not [e for e in entries if e.get("result") == "fake-git-capacity"], (
+        "small fake-git bodies were charged against the drip semaphore"
+    )
+    # The counter is left exactly as it was found — no leaked decrement.
+    assert tbenv._active_slow_drips == 4
+
+
+async def test_integration_fake_git_large_body_still_honours_capacity(
+    live_server, monkeypatch,
+):
+    """The semaphore must still bound genuinely-slow responses: a body
+    larger than one drip chunk is what the cap exists for."""
+    async def fake_issue(*_a, **_kw):
+        return FAKE_TRACEBIT
+
+    monkeypatch.setattr(tbenv, "issue_credentials", fake_issue)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_DRIP_INTERVAL_MS", 0)
+    # One-byte chunks, so any non-empty body counts as a multi-chunk drip.
+    monkeypatch.setattr(tbenv, "FAKE_GIT_DRIP_BYTES", 1)
+    monkeypatch.setattr(tbenv, "TARPIT_MAX_CONNECTIONS", 2)
+    monkeypatch.setattr(tbenv, "_active_slow_drips", 2)
+    tbenv._FAKE_GIT_CACHE.clear()
+
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/.git/HEAD", headers={"X-Forwarded-For": "203.0.113.72"},
+        ) as resp:
+            assert resp.status == 503
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e.get("result") == "fake-git-capacity" for e in entries)
+
+
+async def test_integration_fake_git_head_request_never_takes_a_slot(
+    live_server, monkeypatch,
+):
+    """`HEAD` sends no body, so it is never a drip regardless of size."""
+    async def fake_issue(*_a, **_kw):
+        return FAKE_TRACEBIT
+
+    monkeypatch.setattr(tbenv, "issue_credentials", fake_issue)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_DRIP_INTERVAL_MS", 0)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_DRIP_BYTES", 1)
+    monkeypatch.setattr(tbenv, "TARPIT_MAX_CONNECTIONS", 1)
+    monkeypatch.setattr(tbenv, "_active_slow_drips", 1)
+    tbenv._FAKE_GIT_CACHE.clear()
+
+    base, _log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.head(
+            f"{base}/.git/HEAD", headers={"X-Forwarded-For": "203.0.113.73"},
+        ) as resp:
+            assert resp.status == 200
+    assert tbenv._active_slow_drips == 1
+
+
+async def test_integration_fake_git_autoindex_never_drips(live_server, monkeypatch):
+    """A directory listing larger than one chunk still must not drip.
+
+    `/.git/hooks/` renders a long autoindex — bigger than the drip chunk —
+    so a size-only rule would still have charged it a slot and slept
+    between chunks. Real `autoindex` output is generated in memory and
+    returned immediately, and a `/.git/` sweep walks these in bursts, so
+    listings are served fast and uncharged regardless of length.
+    """
+    async def fake_issue(*_a, **_kw):
+        return FAKE_TRACEBIT
+
+    monkeypatch.setattr(tbenv, "issue_credentials", fake_issue)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    # A drip interval long enough that any sleep would blow the timeout,
+    # and a chunk size small enough to force many chunks.
+    monkeypatch.setattr(tbenv, "FAKE_GIT_DRIP_INTERVAL_MS", 30_000)
+    monkeypatch.setattr(tbenv, "FAKE_GIT_DRIP_BYTES", 32)
+    monkeypatch.setattr(tbenv, "TARPIT_MAX_CONNECTIONS", 1)
+    monkeypatch.setattr(tbenv, "_active_slow_drips", 1)
+    tbenv._FAKE_GIT_CACHE.clear()
+
+    base, log_path = live_server
+    headers = {"X-Forwarded-For": "203.0.113.74"}
+    async with aiohttp.ClientSession() as session:
+        for path in ("/.git/", "/.git/hooks/", "/.git/info/", "/.git/branches/"):
+            async with asyncio.timeout(5):
+                async with session.get(f"{base}{path}", headers=headers) as resp:
+                    assert resp.status == 200, f"{path} returned {resp.status}"
+                    body = await resp.read()
+            assert body, f"{path} served an empty listing"
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert not [e for e in entries if e.get("result") == "fake-git-capacity"]
+    assert tbenv._active_slow_drips == 1

@@ -52,7 +52,7 @@ Every line has a `result` identifying what the handler did, and a
 | `fake-git-miss` | 404 | `commitSha`, `gitKey` | Path resolved to the repo but wasn't a file in it. `gitKey` is the canonical `/.git/...` lookup key (lowercased, prefix-stripped) — so `/login/.GiT/FOO` logs `path=/login/.GiT/FOO`, `gitKey=/.git/foo`. |
 | `fake-git-error` | 502 | — | Canary issuance failed. |
 | `fake-git-disconnect` | 200 | `fakeGitBytesSent`, `commitSha` | Scanner hung up mid-drip. |
-| `fake-git-capacity` | 503 | — | Tarpit semaphore full. |
+| `fake-git-capacity` | 503 | — | Tarpit semaphore full. Only reachable for responses that actually drip — a repo *file* larger than one drip chunk. `HEAD`, single-chunk bodies, and directory autoindexes are served immediately and never charge a slot, so a `/.git/` directory sweep cannot exhaust the semaphore. |
 
 ### Tarpit + fingerprint modules
 

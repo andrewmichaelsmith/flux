@@ -26228,7 +26228,32 @@ async def _send_fake_git(
     else:
         content_type = "text/plain; charset=utf-8"
 
-    if _active_slow_drips >= TARPIT_MAX_CONNECTIONS:
+    # Decide whether this response actually drips, and charge the
+    # concurrency semaphore only if it does.
+    #
+    # Three kinds of response are not drips and must not spend a slot:
+    #
+    #   * `HEAD` — sends no body at all.
+    #   * Single-chunk bodies — the send loop sleeps *between* chunks, so
+    #     a body that fits in one chunk is already an ordinary fast reply.
+    #   * Directory autoindexes — a real `mod_autoindex` / `autoindex on`
+    #     listing is generated in memory and returned immediately. Dripping
+    #     one is both less faithful and, because a `/.git/` sweep walks many
+    #     directories in a burst, the fastest way to exhaust the semaphore.
+    #
+    # That last case is what made this worth changing: with every response
+    # charged a slot, a source enumerating `/.git/` subdirectories could
+    # saturate the cap and start receiving `503 busy`. That drops the
+    # engagement, and it is a tell — a real exposed repository does not
+    # answer a directory walk with `busy`. Repo *files* still drip, which
+    # is where the tarpit value actually is.
+    is_autoindex = git_key.endswith("/")
+    will_drip = (
+        request.method != "HEAD"
+        and not is_autoindex
+        and len(content) > FAKE_GIT_DRIP_BYTES
+    )
+    if will_drip and _active_slow_drips >= TARPIT_MAX_CONNECTIONS:
         append_log({**log_context, "status": 503, "result": "fake-git-capacity"})
         return web.Response(
             status=503, body=b"busy\n",
@@ -26237,7 +26262,8 @@ async def _send_fake_git(
                 "Cache-Control": "no-store",
             },
         )
-    _active_slow_drips += 1
+    if will_drip:
+        _active_slow_drips += 1
     try:
         response = web.StreamResponse(status=200, headers={
             "Content-Type": content_type,
@@ -26270,7 +26296,7 @@ async def _send_fake_git(
                 chunk = content[offset:offset + FAKE_GIT_DRIP_BYTES]
                 await response.write(chunk)
                 bytes_sent += len(chunk)
-                if offset + FAKE_GIT_DRIP_BYTES < len(content):
+                if will_drip and offset + FAKE_GIT_DRIP_BYTES < len(content):
                     await asyncio.sleep(interval_s)
         except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientConnectionError):
             # Scanners regularly close the socket between SYN-ACK and the
@@ -26286,7 +26312,8 @@ async def _send_fake_git(
             })
         return response
     finally:
-        _active_slow_drips -= 1
+        if will_drip:
+            _active_slow_drips -= 1
 
 
 def _match_robots_crawler_ua(user_agent: str) -> str | None:
