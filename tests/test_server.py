@@ -9017,6 +9017,27 @@ async def test_dispatch_rejects_unsupported_methods(flux_client):
     assert resp.status == 405
 
 
+async def test_dispatch_logs_rejected_methods(flux_client):
+    """A rejected method must still leave a row. The gate fronts every
+    trap, so anything it turns away is invisible otherwise — including
+    PUT-delivered exploitation of the CVEs the traps imitate."""
+    resp = await flux_client.put("/SDK/webLanguage", data=b"x")
+    assert resp.status == 405
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["result"] == "method-not-allowed"
+    assert last["status"] == 405
+    assert last["method"] == "PUT"
+    assert last["path"] == "/SDK/webLanguage"
+
+
+async def test_dispatch_rejected_method_response_is_unchanged(flux_client):
+    """Logging the rejection must not alter what the client sees — same
+    status, same bytes as before the log line was added."""
+    resp = await flux_client.delete("/anything")
+    assert resp.status == 405
+    assert await resp.read() == b"method not allowed\n"
+
+
 # --- Confluence trap (CVE-2022-26134 OGNL RCE bait) ---
 
 

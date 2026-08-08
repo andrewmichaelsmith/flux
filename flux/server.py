@@ -27056,10 +27056,29 @@ async def _send_env(
 
 async def handle(request: web.Request) -> web.StreamResponse:
     method = request.method
-    if method not in ("GET", "HEAD", "POST"):
-        return web.Response(status=405, body=b"method not allowed\n")
-
     request_id = str(uuid.uuid4())
+
+    if method not in ("GET", "HEAD", "POST"):
+        # The response is unchanged — what is new is that the rejection
+        # leaves a row. This gate sits in front of every trap, so a method
+        # it turns away reaches no handler and, until now, produced no log
+        # line anywhere: that traffic was not merely unhandled, it was
+        # unmeasurable. It matters because some of the CVEs these traps
+        # imitate are delivered by PUT — CVE-2021-36260 ships its command
+        # in a `PUT /SDK/webLanguage` body — so the blind spot is not
+        # evenly spread over noise, it points at exactly the surfaces the
+        # traps exist to watch. Logging first makes the size of the gap
+        # answerable; whether to widen the gate is a separate decision and
+        # should be made from that number rather than from a guess.
+        body = b"method not allowed\n"
+        append_log({
+            **_log_context_from_request(request, request_id, 0, ""),
+            "status": 405,
+            "result": "method-not-allowed",
+            "bytes": len(body),
+        })
+        return web.Response(status=405, body=body)
+
     # Some exploitation clients send meaningful bodies on GET (notably
     # PHPUnit eval-stdin probes). Read a capped body for GET/POST, but only
     # stamp bodySha256 when bytes were actually present so ordinary GET rows
