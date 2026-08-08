@@ -1613,14 +1613,53 @@ _SOHO_ROUTER_CMDI_INDICATORS = (
 
 # Downloader invocations worth naming explicitly in the log — knowing
 # *which* fetch tool a worker reaches for is a cheap family split.
-_SOHO_ROUTER_DOWNLOADERS = ("wget", "curl", "tftp", "busybox", "ftpget", "nc")
+_PAYLOAD_DOWNLOADERS = ("wget", "curl", "tftp", "busybox", "ftpget", "nc")
 
 # Payload / stage-2 URLs inside an injected command. Covers the bare
 # `http://host/bin` form plus the `tftp -g -r <file> <host>` shape that
 # carries no scheme.
-_SOHO_ROUTER_URL_RE = re.compile(
+_PAYLOAD_URL_RE = re.compile(
     r"(?:https?|ftp|tftp)://[^\s\"'<>`|;)&]{3,300}", re.I
 )
+
+# XML namespace *declarations* — `xmlns="..."` / `xmlns:pfx="..."` — are
+# stripped before URL matching. This is deliberately structural rather than
+# a host denylist: a denylist only covers vendors we have already seen, and
+# ONVIF CVE-2024-7029 payloads in the wild carry
+# `xmlns:nu="http://www.huawei.com/vehicle/nu"`, which no standards-body
+# list would have contained. Anything declaring a namespace is protocol
+# vocabulary by construction, whoever minted it.
+_XMLNS_DECL_RE = re.compile(
+    r"""xmlns(?::[\w.-]+)?\s*=\s*(?P<q>["'])(?:(?!(?P=q)).)*(?P=q)""",
+    re.I | re.S,
+)
+
+# Namespace URIs that arrive *outside* an xmlns attribute, where the
+# structural strip above cannot see them. HNAP1 is the case that matters:
+# CVE-2015-2051 puts the command in the SOAPAction header, whose value is
+# the bare namespace with the injection appended —
+# `http://purenetworks.com/HNAP1/<command>` — so every single request would
+# otherwise log a "payload URL" and bury the genuine dropper next to it.
+# Prefix-matched: the URL regex stops at the shell metacharacter that
+# separates namespace from command, so the two arrive as distinct matches
+# and only the namespace is dropped.
+_NAMESPACE_URL_PREFIXES = (
+    "http://purenetworks.com/hnap1",
+    "http://schemas.xmlsoap.org/",
+    "https://schemas.xmlsoap.org/",
+    "http://www.w3.org/",
+    "https://www.w3.org/",
+    "http://www.onvif.org/",
+    "https://www.onvif.org/",
+    "http://docs.oasis-open.org/",
+    "https://docs.oasis-open.org/",
+    "http://schemas.microsoft.com/",
+    "https://schemas.microsoft.com/",
+    "http://tempuri.org/",
+    "http://www.hikvision.com/",
+    "https://www.hikvision.com/",
+)
+
 _SOHO_ROUTER_TFTP_RE = re.compile(
     # `-r` is excluded from the generic flag class on purpose: letting it
     # match there lets the flag group swallow `-r <file>` and the host
@@ -1643,14 +1682,21 @@ def _extract_payload_urls(*parts: str) -> list[str]:
     form (`wget http://host/bin`) and the scheme-less TFTP form
     (`tftp -g -r bin host`) are recognised; the latter is normalised to
     a `tftp://host/file` URL so downstream consumers see one shape.
+
+    XML/SOAP namespace URIs are dropped — see `_NAMESPACE_URL_PREFIXES`.
     """
     found: list[str] = []
     seen: set[str] = set()
     for part in parts:
         if not part:
             continue
-        for match in _SOHO_ROUTER_URL_RE.findall(part):
+        # Replace with a space rather than deleting, so stripping a
+        # declaration can never join two neighbouring tokens into one.
+        part = _XMLNS_DECL_RE.sub(" ", part)
+        for match in _PAYLOAD_URL_RE.findall(part):
             url = match.rstrip(".,'\")")
+            if url.lower().startswith(_NAMESPACE_URL_PREFIXES):
+                continue
             if url.lower() not in seen:
                 seen.add(url.lower())
                 found.append(url)
@@ -1675,7 +1721,7 @@ def _extract_downloaders(*parts: str) -> list[str]:
     # `=` and quotes are boundaries too: the command almost always arrives
     # as the value of a form field (`cmd=tftp -g ...`), so a class that
     # only allows whitespace/shell metacharacters misses the first token.
-    return [tool for tool in _SOHO_ROUTER_DOWNLOADERS
+    return [tool for tool in _PAYLOAD_DOWNLOADERS
             if re.search(rf"""(?:^|[\s;&|`(/='"]){re.escape(tool)}(?:\s|$)""", haystack)]
 
 
@@ -21858,6 +21904,13 @@ async def _handle_ivanti_vpn(
         body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
 
     has_cmd_injection = _ivanti_has_cmd_injection(body_preview, query)
+    # Form/query surface — `+` means space here, so `unquote_plus`.
+    ivanti_payload_urls = _extract_payload_urls(
+        unquote_plus(query), unquote_plus(body_preview),
+    )
+    ivanti_downloaders = _extract_downloaders(
+        unquote_plus(query), unquote_plus(body_preview),
+    )
 
     if lpath in {
         "/dana-na/auth/url_default/welcome.cgi",
@@ -22001,6 +22054,13 @@ async def _handle_fortigate_vpn(
         body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
 
     has_cmd_injection = _fortigate_has_cmd_injection(body_preview, query)
+    # Form/query surface — `+` means space here, so `unquote_plus`.
+    fortigate_payload_urls = _extract_payload_urls(
+        unquote_plus(query), unquote_plus(body_preview),
+    )
+    fortigate_downloaders = _extract_downloaders(
+        unquote_plus(query), unquote_plus(body_preview),
+    )
 
     set_cookie_value: str | None = None
 
@@ -22627,6 +22687,13 @@ async def _handle_citrix_gateway(
         body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
 
     has_cmd_injection = _citrix_has_cmd_injection(body_preview, path, query)
+    # Form/query surface — `+` means space here, so `unquote_plus`.
+    citrix_payload_urls = _extract_payload_urls(
+        unquote_plus(query), unquote_plus(body_preview),
+    )
+    citrix_downloaders = _extract_downloaders(
+        unquote_plus(query), unquote_plus(body_preview),
+    )
 
     set_cookie_value: str | None = None
 
@@ -23133,6 +23200,15 @@ async def _handle_hikvision(
         body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
 
     has_cmdi = _hikvision_has_cmdi(query_string or "", body_preview)
+    # CVE-2021-36260 ships the command in an XML body element; the query
+    # string is a form-encoded surface. Decode each with the matching rule
+    # (see the HNAP1 note on `+`).
+    hikvision_payload_urls = _extract_payload_urls(
+        unquote_plus(query_string or ""), unquote(body_preview),
+    )
+    hikvision_downloaders = _extract_downloaders(
+        unquote_plus(query_string or ""), unquote(body_preview),
+    )
 
     if lpath == "/sdk/weblanguage":
         result_tag = "hikvision-sdk-weblanguage"
@@ -23185,6 +23261,10 @@ async def _handle_hikvision(
         "hikvisionHasCmdInjection": has_cmdi,
         "bytes": len(body),
     }
+    if hikvision_payload_urls:
+        log_entry["hikvisionPayloadUrls"] = hikvision_payload_urls
+    if hikvision_downloaders:
+        log_entry["hikvisionDownloaders"] = hikvision_downloaders
     if body_preview:
         log_entry["bodyPreview"] = body_preview
     append_log(log_entry)
@@ -23237,6 +23317,9 @@ async def _handle_onvif(
     soap_action_header = request.headers.get("SOAPAction", "").strip().strip('"')
     soap_action_body = _onvif_soap_action_from_body(body_preview)
     has_cmdi = _onvif_has_cmdi(body_preview)
+    # SOAP body — `unquote`, not `unquote_plus` (see the HNAP1 note).
+    onvif_payload_urls = _extract_payload_urls(unquote(body_preview))
+    onvif_downloaders = _extract_downloaders(unquote(body_preview))
 
     body = _render_onvif_get_device_information()
 
@@ -23251,6 +23334,10 @@ async def _handle_onvif(
         "onvifHasCmdInjection": has_cmdi,
         "bytes": len(body),
     }
+    if onvif_payload_urls:
+        log_entry["onvifPayloadUrls"] = onvif_payload_urls
+    if onvif_downloaders:
+        log_entry["onvifDownloaders"] = onvif_downloaders
     if body_preview:
         log_entry["bodyPreview"] = body_preview
     append_log(log_entry)
@@ -23489,6 +23576,16 @@ async def _handle_hnap1(
         body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
 
     has_cmdi = _hnap1_has_cmdi(soap_action, query_string or "", body_preview)
+    # CVE-2015-2051 ships the command inside the SOAPAction URI, so that
+    # header is the primary source here. Decode it and the XML body with
+    # plain `unquote`, not `unquote_plus`: `+` is a literal plus in a URI
+    # and in XML, and only means space in a query string / urlencoded body.
+    hnap1_payload_urls = _extract_payload_urls(
+        unquote(soap_action), unquote_plus(query_string or ""), unquote(body_preview),
+    )
+    hnap1_downloaders = _extract_downloaders(
+        unquote(soap_action), unquote_plus(query_string or ""), unquote(body_preview),
+    )
 
     if method == "POST":
         # Generic SOAP "OK" envelope. Real HNAP1 endpoints respond with an
@@ -23559,6 +23656,10 @@ async def _handle_hnap1(
     }
     if soap_action_preview:
         log_entry["hnap1SoapAction"] = soap_action_preview
+    if hnap1_payload_urls:
+        log_entry["hnap1PayloadUrls"] = hnap1_payload_urls
+    if hnap1_downloaders:
+        log_entry["hnap1Downloaders"] = hnap1_downloaders
     if body_preview:
         log_entry["bodyPreview"] = body_preview
     append_log(log_entry)
