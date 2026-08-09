@@ -6,8 +6,9 @@ Matches these paths (exact, case-insensitive; configurable via
 | Method | Path | Response |
 | --- | --- | --- |
 | GET  | `/sse` | `text/event-stream` handshake — one `event: endpoint` frame pointing at `/mcp/messages` |
-| POST | `/mcp`, `/mcp/`, `/mcp/messages` | JSON-RPC 2.0 dispatch (see below) |
-| GET / HEAD / other | `/mcp`, `/mcp/`, `/mcp/messages` | `405` + JSON-RPC error envelope |
+| POST | `/mcp`, `/mcp/`, `/mcp/messages`, `/api/mcp`, `/api/mcp/` | JSON-RPC 2.0 dispatch (see below) |
+| GET with `Accept: text/event-stream` | same as POST set | Streamable-HTTP server-to-client stream — same `event: endpoint` handshake as `/sse` |
+| GET / HEAD / other | same as POST set | `405` + JSON-RPC error envelope |
 
 `/mcp.json`, `/.cursor/mcp.json`, `/.mcp/config.json`, and the other
 on-disk MCP config filenames are covered by the `mcp-config` CanaryTrap
@@ -82,3 +83,19 @@ See [`../LOGS.md`](../LOGS.md) for the `mcp-server-*` result tags and
 the `mcpJsonrpcMethod` / `mcpToolName` / `mcpResourceUri` /
 `mcpToolArgsPreview` / `mcpHasAuth` / `mcpAuthTokenSha256` /
 `mcpAuthTokenPreview` / `mcpClientName` / `mcpClientVersion` fields.
+
+## Transport shapes
+
+The endpoint set covers both MCP HTTP transports. The older HTTP+SSE
+transport opens its stream on a dedicated `/sse` path; Streamable HTTP,
+which replaced it, serves the server-to-client stream from a `GET` on
+the *same* endpoint as the JSON-RPC `POST`, selected by an
+`Accept: text/event-stream` request header. Answering those GETs 405
+ended the walk one request before the `POST` that carries `tools/call` —
+which is where the canary lives — so the handshake is honoured instead.
+A `GET` without that Accept header is not a transport handshake and
+still gets the 405 a real server returns.
+
+`/api/mcp` and `/api/mcp/` are the same JSON-RPC endpoint mounted one
+segment deeper behind an API gateway; scanner dictionaries walk both
+spellings.

