@@ -268,6 +268,24 @@ Common extras include `cmdInjectionPath`, `cmdSource`, `cmdKey`, `cmd`,
 `cmdFamily`, `outputBytes`, `bodyPreview`, and `decodedCommand` for decoded
 PHP-CGI `base64_decode(...)` payloads.
 
+### Cloud instance / container role-credential service
+
+Every line carries `imdsKind` (which protocol step) and `imdsRole` (the
+role segment **as the client sent it**, `""` for the listing steps). A
+`cloud-imds-role-list` followed by a `cloud-imds-role-credentials` from
+the same source, naming the role the listing returned, is the two-step
+chain — that pair is the signal this trap exists to produce. See
+[docs](./docs/cloud-imds.md).
+
+| `result` | `status` | Extras | Meaning |
+| --- | --- | --- | --- |
+| `cloud-imds-index` | 200 | `bytes: int` | Metadata-root key listing. No canary issued. |
+| `cloud-imds-iam-index` | 200 | `bytes: int` | `iam/` subtree listing. No canary issued. |
+| `cloud-imds-role-list` | 200 | `bytes: int` | Role **name** only, no secret. No canary issued. |
+| `cloud-imds-role-credentials` | 200 | `canaryTypes: [..]`, `bytes: int` | Instance-metadata credential envelope. |
+| `cloud-imds-ecs-credentials` | 200 | `canaryTypes: [..]`, `bytes: int` | Container credential-provider envelope. |
+| `cloud-imds-<kind>-error` | 502 | — | Canary issuance failed. Only the credential kinds can produce this. |
+
 ### Canary-backed file traps
 
 One log line per hit. All entries share the same shape:

@@ -22,7 +22,7 @@ import uuid
 import zipfile
 import zlib
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, parse_qsl, quote, unquote, unquote_plus
@@ -741,6 +741,79 @@ VITE_FS_MAX_SUFFIX_WALK = max(
     int((os.environ.get("HONEYPOT_VITE_FS_MAX_SUFFIX_WALK") or "12").strip() or "12"),
     1,
 )
+# --- Cloud instance / container role-credential service -----------------
+# Credential-harvester dictionaries have grown a distinct branch that asks
+# for *ephemeral role* credentials rather than long-lived key files:
+# instance-metadata paths (`/latest/meta-data/iam/security-credentials/`),
+# container credential-provider paths (`/v2/credentials`,
+# `/ecs/task-credentials`), and STS session-token dumps. They arrive at
+# ordinary webroot, not at the link-local metadata address — the scanner
+# is betting the target is a reverse proxy, an SSRF relay, or an app that
+# mounted the metadata tree under its own document root.
+#
+# Every one of those returned 404 here, which is the wrong answer twice
+# over. It loses a credential-shaped surface that is *more* attractive
+# than a static key file (role credentials imply a live workload, and a
+# harvester that believes it holds a session token tends to use it while
+# it still looks valid). And it collapses two very different clients into
+# one indistinguishable miss.
+#
+# That second point is what this trap is actually for. The metadata
+# service is a **two-step** protocol: the listing endpoint returns only a
+# role *name*, and the caller must issue a second request naming that
+# role to receive credentials. A dictionary sweeper fires the listing
+# path because it is in the list, reads a body that contains no secret,
+# and moves on. A client that genuinely implements the metadata protocol
+# — an SSRF chain, a cloud-credential-stealing module — parses the role
+# name and comes back for it. Serving both steps turns a single 404 into
+# a behavioural discriminator we cannot otherwise observe, and only the
+# second step spends a canary.
+#
+# The role name is deliberately ordinary non-secret filler. It has to be
+# stable for the chain to be followable, and it carries no credential
+# value, so a fixed default is safe where a fixed *key* never would be.
+CLOUD_IMDS_ENABLED = _env_bool("HONEYPOT_CLOUD_IMDS_ENABLED")
+# Instance-profile role name handed out by the listing step and echoed by
+# the credential step. Non-credential filler — see the note above.
+CLOUD_IMDS_ROLE_NAME = (
+    os.environ.get("HONEYPOT_CLOUD_IMDS_ROLE_NAME") or "ec2-app-instance-role"
+).strip() or "ec2-app-instance-role"
+# Lifetime advertised in the `Expiration` field. Real role credentials are
+# short-lived; a plausible window is part of what makes the envelope worth
+# replaying quickly, which is exactly the behaviour we want to measure.
+CLOUD_IMDS_CREDENTIAL_TTL_S = max(
+    int((os.environ.get("HONEYPOT_CLOUD_IMDS_CREDENTIAL_TTL_S") or "3600").strip() or "3600"),
+    60,
+)
+# Prefixes under which the metadata tree is served. `/latest/...` is the
+# canonical form; the others are the shapes observed when a dictionary
+# re-roots the same tree under a webroot-relative directory.
+_CLOUD_IMDS_ROOTS: tuple[str, ...] = (
+    "/latest/meta-data",
+    "/aws/metadata",
+    "/.aws/metadata",
+)
+# Path segment that introduces the role listing under a metadata root.
+_CLOUD_IMDS_ROLE_SUFFIX = "/iam/security-credentials"
+# Container credential-provider endpoints. The real relative-URI form is
+# `/v2/credentials/<uuid>`; the rest are the webroot-relative names the
+# harvester dictionaries ask for directly.
+_CLOUD_IMDS_ECS_PATHS: frozenset[str] = frozenset({
+    "/v2/credentials",
+    "/ecs/task-credentials",
+    "/ecs/task-credentials.json",
+    "/aws/ecs/task-credentials",
+    "/aws/ecs/task-credentials.json",
+    "/aws/iam/ecs-task-credentials.json",
+    "/.aws/ecs-task-credentials",
+    "/.aws/ecs-task-credentials.json",
+    "/k8s/eks/credentials",
+})
+_CLOUD_IMDS_ECS_PREFIX = "/v2/credentials/"
+# Account number embedded in the container-provider `RoleArn`. Filler, not
+# a secret — an ARN identifies a role, it does not authenticate to it.
+_CLOUD_IMDS_FILLER_ACCOUNT = "402113355019"
+
 # Tool names that trigger the AWS canary path when passed to `tools/call`.
 # A real MCP server hosting these tools would return credentials or file
 # contents; we mint a canary and embed it in the tool-call result so
@@ -11206,6 +11279,60 @@ def render_aws_credentials_json(r: dict[str, object]) -> bytes:
     return (json.dumps(body, indent=2) + "\n").encode("utf-8")
 
 
+def _cloud_imds_expiry() -> str:
+    """`Expiration` value for a role-credential envelope.
+
+    Computed per response rather than fixed so the window always looks
+    live. A stale-looking expiry is the cheapest possible tell that the
+    envelope was canned.
+    """
+    expires_at = datetime.now(UTC) + timedelta(seconds=CLOUD_IMDS_CREDENTIAL_TTL_S)
+    return expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def render_imds_role_credentials(r: dict[str, object]) -> bytes:
+    """Instance-metadata role-credential envelope.
+
+    The exact document a metadata service returns for
+    `.../iam/security-credentials/<role>`: a `Code`/`LastUpdated` header
+    pair, the `AWS-HMAC` type marker, then the key/secret/token triple
+    and an expiry. Credential-stealing modules parse these field names
+    directly rather than grepping bytes, so the envelope has to be shaped
+    correctly for the canary to be picked up at all.
+    """
+    aws = _aws(r)
+    now = datetime.now(UTC)
+    body = {
+        "Code": "Success",
+        "LastUpdated": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "Type": "AWS-HMAC",
+        "AccessKeyId": aws.get("awsAccessKeyId", ""),
+        "SecretAccessKey": aws.get("awsSecretAccessKey", ""),
+        "Token": aws.get("awsSessionToken", ""),
+        "Expiration": _cloud_imds_expiry(),
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
+def render_ecs_task_credentials(r: dict[str, object]) -> bytes:
+    """Container credential-provider envelope.
+
+    Differs from the instance-metadata document in two ways that a client
+    implementing the container provider actually keys on: there is a
+    `RoleArn` instead of a `Code`/`Type` pair, and the field is `Token`
+    rather than `SessionToken`. The ARN is non-credential filler.
+    """
+    aws = _aws(r)
+    body = {
+        "RoleArn": f"arn:aws:iam::{_CLOUD_IMDS_FILLER_ACCOUNT}:role/{CLOUD_IMDS_ROLE_NAME}",
+        "AccessKeyId": aws.get("awsAccessKeyId", ""),
+        "SecretAccessKey": aws.get("awsSecretAccessKey", ""),
+        "Token": aws.get("awsSessionToken", ""),
+        "Expiration": _cloud_imds_expiry(),
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
 def render_k8s_secret_manifest(r: dict[str, object]) -> bytes:
     """Kubernetes multi-document YAML — Secret + ConfigMap + Deployment.
     The Secret carries the Tracebit AWS canary as base64-encoded `data:`
@@ -17443,6 +17570,28 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # Treated as the AWS-INI shape rather than the CSV shape;
             # the CSV form is owned by the `aws-credentials-csv` trap.
             "/credentials",
+            # Undotted `aws/` directory and one-off webroot spellings.
+            # A harvester that has given up on guessing the home
+            # directory falls back to asking whether the credential file
+            # was copied somewhere servable — under a deploy directory,
+            # a vendored tree, a scratch path, or an "internal" route it
+            # assumes is unauthenticated. Same INI body either way.
+            "/aws/credentials",
+            "/aws_credentials.txt",
+            "/aws/s3/credentials.bak",
+            "/aws/iam/temporary-credentials",
+            "/data/aws/credentials",
+            "/hidden/.aws/credentials",
+            "/tmp/.aws/credentials",
+            "/vendor/.aws/credentials",
+            "/vendor/aws/credentials",
+            "/internal/aws/credentials",
+            "/internal-api/aws/credentials",
+            "/internal-api/iam/credentials",
+            "/s3/.aws/credentials",
+            "/s3/public/credentials",
+            "/api/.aws/credentials",
+            "/admin/.aws/credentials",
         ),
         ("aws",),
         render_aws_credentials_ini,
@@ -17495,6 +17644,28 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/aws-credentials.json",
             "/aws_credentials.json",
             "/.aws/credentials.json",
+            # Non-dotfile / API-route forms of the same envelope. The
+            # dotfile spellings above assume the harvester is reading a
+            # home directory; these assume it is reading a route on a
+            # service that proxies its own credentials back out. Both
+            # spellings appear in the same sweeps, and only the dotfile
+            # half was answered.
+            "/aws/credentials.json",
+            "/aws/iam/credentials.json",
+            "/aws/iam/temp-creds.json",
+            "/aws/s3/credentials.json",
+            "/s3-credentials.json",
+            "/s3-credentials.bak",
+            "/api/aws/credentials",
+            "/api/v1/aws/credentials",
+            "/api/v1/credentials",
+            "/private/aws_credentials.json",
+            "/secrets/aws.json",
+            # `/.well-known/` is meant for service-discovery documents, so
+            # a credentials file published there is pure harvester
+            # speculation — but it is speculation that recurs, and the
+            # renderer costs nothing to point at one more path.
+            "/.well-known/credentials.json",
         ),
         ("aws",),
         render_aws_credentials_json,
@@ -17703,6 +17874,12 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # `"type": "service_account"` regardless of filename.
             "/.gcp/credentials",
             "/root/.gcp/credentials",
+            # `.gcloud/` is the directory `gcloud` actually creates, so
+            # this is the better-informed sibling of the `.gcp/` guesses
+            # above and turns up in the same sweeps. The `.json` spelling
+            # is deliberately absent — `firebase-json` already owns it.
+            "/.gcloud/credentials",
+            "/secrets/gcp.json",
             *_app_layout_variants(".gcp/credentials"),
             *_app_layout_variants(".gcp/credentials.json"),
         ),
@@ -20402,7 +20579,78 @@ def resolve_vite_fs(path: str) -> "ViteFsResolution | None":
     return ViteFsResolution(requested, raw_suffix, trap, depth, bare_env)
 
 
+@dataclass(frozen=True)
+class CloudImdsRequest:
+    """Which step of the role-credential protocol a request is asking for.
 
+    `role` is the role the client named — empty for the listing and index
+    steps, which is exactly the distinction the trap exists to measure.
+    """
+
+    kind: str   # "index" | "iam-index" | "role-list" | "role-credentials" | "ecs-credentials"
+    role: str = ""
+
+    @property
+    def issues_canary(self) -> bool:
+        """Only the steps that hand back a credential spend a canary.
+
+        The walk-the-tree steps return directory listings with no secret
+        in them, so answering a broad sweep costs nothing upstream.
+        """
+        return self.kind in ("role-credentials", "ecs-credentials")
+
+
+def resolve_cloud_imds(path: str) -> "CloudImdsRequest | None":
+    """Map a request onto a step of the metadata / container-credential
+    protocol, or None when it is not one.
+
+    Trailing slashes are accepted everywhere because the canonical
+    listing paths carry one and dictionaries copy them inconsistently.
+    The role segment is taken verbatim rather than compared against
+    `CLOUD_IMDS_ROLE_NAME`: a client that invents a role name is still
+    performing step two, and which name it guessed is worth logging.
+    """
+    lowered = path.lower()
+    bare = lowered.rstrip("/") or "/"
+
+    if bare in _CLOUD_IMDS_ECS_PATHS:
+        return CloudImdsRequest("ecs-credentials")
+    if lowered.startswith(_CLOUD_IMDS_ECS_PREFIX):
+        remainder = path[len(_CLOUD_IMDS_ECS_PREFIX):].strip("/")
+        if remainder:
+            return CloudImdsRequest("ecs-credentials", remainder)
+
+    for root in _CLOUD_IMDS_ROOTS:
+        if bare == root:
+            return CloudImdsRequest("index")
+        if bare == f"{root}/iam":
+            return CloudImdsRequest("iam-index")
+        listing = f"{root}{_CLOUD_IMDS_ROLE_SUFFIX}"
+        if bare == listing:
+            return CloudImdsRequest("role-list")
+        if lowered.startswith(f"{listing}/"):
+            role = path[len(listing) + 1:].strip("/")
+            if role:
+                return CloudImdsRequest("role-credentials", role)
+    return None
+
+
+# Directory listings returned by the walk-the-tree steps. Ordinary
+# metadata keys — no secret in either, which is why neither spends a
+# canary. `iam/` and `placement/` keep their trailing slash because that
+# is how a metadata service marks a subtree, and a client that follows
+# the protocol uses exactly that marker to decide where to recurse.
+_CLOUD_IMDS_INDEX_BODY = b"\n".join([
+    b"ami-id", b"hostname", b"iam/", b"instance-id", b"instance-type",
+    b"local-hostname", b"local-ipv4", b"mac", b"placement/",
+    b"public-ipv4", b"security-groups",
+]) + b"\n"
+_CLOUD_IMDS_IAM_INDEX_BODY = b"info\nsecurity-credentials/\n"
+
+
+# ============================================================================
+# Async HTTP handler — aiohttp
+# ============================================================================
 
 
 # ============================================================================
@@ -26683,6 +26931,93 @@ async def _send_canary_trap(
     return response
 
 
+async def _send_cloud_imds(
+    request: web.Request,
+    imds: "CloudImdsRequest",
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.Response:
+    """Answer one step of the role-credential protocol.
+
+    The listing steps are served straight from a constant: they contain no
+    secret, so they need no canary and cost nothing upstream. Only a
+    request that names a role — or hits a container credential-provider
+    endpoint — mints one.
+
+    `imdsRole` goes in the log line for every step so the two-request
+    chain is reconstructable: a `role-list` followed by a
+    `role-credentials` naming the role we just handed out is a client that
+    parsed our response, which is the behaviour this trap is here to
+    separate from a flat dictionary sweep.
+    """
+    log_context = {
+        **log_context,
+        "imdsKind": imds.kind,
+        "imdsRole": imds.role,
+    }
+
+    if not imds.issues_canary:
+        body = (
+            _CLOUD_IMDS_IAM_INDEX_BODY if imds.kind == "iam-index"
+            else _CLOUD_IMDS_INDEX_BODY if imds.kind == "index"
+            else (CLOUD_IMDS_ROLE_NAME + "\n").encode("utf-8")
+        )
+        append_log({
+            **log_context, "status": 200, "result": f"cloud-imds-{imds.kind}",
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=200,
+            body=b"" if request.method == "HEAD" else body,
+            headers={
+                "Content-Type": "text/plain",
+                "Cache-Control": "no-store",
+                # Real metadata services advertise the document size even
+                # on HEAD; keeping it consistent avoids a length mismatch
+                # between the HEAD probe and the GET that follows it.
+                "Content-Length": str(len(body)),
+            },
+        )
+
+    tracebit_response = await _get_or_issue_canary(
+        ("aws",), client_ip, request_id, host, user_agent, path, proto,
+    )
+    if tracebit_response is None:
+        append_log({
+            **log_context, "status": 502,
+            "result": f"cloud-imds-{imds.kind}-error",
+        })
+        return web.Response(
+            status=502, body=b"upstream credential issue failed\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    render = (
+        render_ecs_task_credentials if imds.kind == "ecs-credentials"
+        else render_imds_role_credentials
+    )
+    body = render(tracebit_response)
+    append_log({
+        **log_context, "status": 200, "result": f"cloud-imds-{imds.kind}",
+        "canaryTypes": [k for k, v in tracebit_response.items() if v],
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200,
+        body=b"" if request.method == "HEAD" else body,
+        headers={
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
 async def _send_vite_fs(
     request: web.Request,
     resolution: "ViteFsResolution",
@@ -27703,6 +28038,18 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 client_ip, host, user_agent, proto, log_context,
             )
 
+    # Ahead of the tarpit for the same reason `/@fs/` is: the listing
+    # steps are what make the credential step reachable, and a drip on
+    # `/latest/meta-data/` would break the chain before the client ever
+    # learns the role name.
+    if API_KEY and CLOUD_IMDS_ENABLED:
+        imds = resolve_cloud_imds(path)
+        if imds is not None:
+            return await _send_cloud_imds(
+                request, imds, request_id, path,
+                client_ip, host, user_agent, proto, log_context,
+            )
+
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)
 
@@ -27765,6 +28112,8 @@ def main() -> int:
             active.append("fake-git")
         if CANARY_TRAPS_ENABLED:
             active.append("canary-file-traps")
+        if CLOUD_IMDS_ENABLED:
+            active.append("cloud-imds")
         if BACKUP_ARCHIVE_ENABLED:
             active.append("backup-archive")
     else:

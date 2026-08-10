@@ -614,6 +614,7 @@ def test_all_trap_families_default_on():
     assert tbenv.TARPIT_ENABLED
     assert tbenv.FINGERPRINT_PATHS_ENABLED
     assert tbenv.CANARY_TRAPS_ENABLED
+    assert tbenv.CLOUD_IMDS_ENABLED
     assert tbenv.FAKE_GIT_ENABLED, (
         "FAKE_GIT_ENABLED should default to True — the per-IP cache bounds "
         "quota burn and the dispatch still requires TRACEBIT_API_KEY."
