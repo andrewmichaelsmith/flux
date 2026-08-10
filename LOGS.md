@@ -42,7 +42,7 @@ Every line has a `result` identifying what the handler did, and a
 | --- | --- | --- | --- |
 | `issued` | 200 | `types: [..]` | `.env` canary issued and served. |
 | `tracebit-http-error` | 502 | `tracebitStatus: int`, `error: str<=400` | Tracebit API returned a non-2xx. |
-| `tracebit-error` | 502 | `error: str<=400` | URLError / TimeoutError / ValueError from Tracebit. |
+| `tracebit-error` | 502 | `error: str<=400` | Connection error / timeout / malformed response from Tracebit. `error` is `"<ExceptionClass>"` or `"<ExceptionClass>: <message>"` — the class name is always present, because several of these exceptions (`TimeoutError` in particular) carry no message and previously logged an empty string. |
 
 ### Fake `/.git/*` tree
 

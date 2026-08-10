@@ -16514,3 +16514,38 @@ def test_cgi_traversal_command_extraction_variants():
     assert tbenv.extract_cgi_traversal_command(
         b"echo Content-Type: text/plain; echo;",
     ) == ""
+
+
+# --- Exception detail in the `error` log field ---
+
+
+def test_exc_detail_names_message_less_exceptions():
+    """A timeout carries no message, so `str(exc)` alone logs an empty
+    string and the telemetry can't tell a timeout from a reset."""
+    import asyncio as _asyncio
+
+    assert tbenv._exc_detail(_asyncio.TimeoutError()) == "TimeoutError"
+    assert tbenv._exc_detail(ValueError()) == "ValueError"
+
+
+def test_exc_detail_keeps_the_message_when_there_is_one():
+    assert tbenv._exc_detail(ValueError("bad json")) == "ValueError: bad json"
+
+
+async def test_canary_issuance_timeout_logs_a_usable_error(flux_client, monkeypatch):
+    """Regression: issuance failures were logging `error: ""`, which made
+    every 502 on a canary path indistinguishable from every other."""
+    import asyncio as _asyncio
+
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+
+    async def _timeout(*args, **kwargs):
+        raise _asyncio.TimeoutError()
+
+    monkeypatch.setattr(tbenv, "issue_credentials", _timeout)
+
+    resp = await flux_client.get("/.env", headers={"X-Forwarded-For": "203.0.113.90"})
+    assert resp.status == 502
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "tracebit-error"
+    assert entry["error"] == "TimeoutError"

@@ -3263,6 +3263,23 @@ def _rotate_log_if_needed() -> None:
             continue
 
 
+def _exc_detail(exc: BaseException) -> str:
+    """Render an exception for the `error` log field.
+
+    `str(exc)` alone is not enough. Several of the exceptions we catch
+    around canary issuance carry no message at all — `asyncio.TimeoutError`
+    is the common one — so the field lands as an empty string and the log
+    says a request failed without saying how. A timeout, a connection
+    reset and a malformed response are three different upstream problems
+    with three different fixes, and they were indistinguishable in the
+    telemetry. Lead with the class name so the failure mode is always
+    present, and append the message only when there is one.
+    """
+    name = type(exc).__name__
+    message = str(exc)
+    return f"{name}: {message}" if message else name
+
+
 def append_log(payload: dict[str, object]) -> None:
     """Append one JSONL telemetry line to the sink. Best-effort — any
     OS-level failure at the mkdir / open / write step (volume full,
@@ -26908,7 +26925,7 @@ async def _send_canary_trap(
     except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
         append_log({
             **log_context, "status": 502, "result": f"{tag}-render-error",
-            "error": str(exc)[:400],
+            "error": _exc_detail(exc)[:400],
         })
         return web.Response(
             status=502, body=b"render error\n",
@@ -27188,7 +27205,7 @@ async def _send_backup_archive(
     except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
         append_log({
             **log_context, "status": 502, "result": "backup-archive-render-error",
-            "error": str(exc)[:400],
+            "error": _exc_detail(exc)[:400],
         })
         return web.Response(
             status=502, body=b"render error\n",
@@ -27570,7 +27587,7 @@ async def _send_env(
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
         append_log({
             **log_context, "status": 502, "result": f"{result_prefix}tracebit-error",
-            "error": str(exc)[:400],
+            "error": _exc_detail(exc)[:400],
         })
         return web.Response(
             status=502, body=b"upstream credential issue failed\n",
