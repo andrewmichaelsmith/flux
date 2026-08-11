@@ -9,7 +9,7 @@ CVE-2022-27510 auth bypass) land in the access log.
 | Path | Methods | Response |
 | --- | --- | --- |
 | `/vpn/index.html` | `GET`, `HEAD`, `POST` | NetScaler Gateway login HTML scaffold posting to `/cgi/login`; embeds the configured NetScaler version banner in an HTML comment for fingerprint scrapers |
-| `/logon/LogonPoint/index.html` | `GET`, `HEAD`, `POST` | StoreFront LogonPoint variant of the same form scaffold (same POST action) |
+| `/logon/LogonPoint/index.html`, `/logon/LogonPoint/custom.html`, `/logon/LogonPoint/tmindex.html` | `GET`, `HEAD`, `POST` | StoreFront LogonPoint variant of the same form scaffold (same POST action) |
 | `/vpn/js/rdx/core/lang/rdx_en.json.gz` | `GET`, `HEAD`, `POST` | Tiny JSON locale stub linked from the login page |
 | `/cgi/login` | `GET`, `HEAD`, `POST` | Generic auth-failure HTML; `Set-Cookie: NSC_AAAC=<per-request hex>` |
 | `/p/u/doAuthentication.do` | `GET`, `HEAD`, `POST` | Same response shape as `/cgi/login` (alternate Gateway POST endpoint) |

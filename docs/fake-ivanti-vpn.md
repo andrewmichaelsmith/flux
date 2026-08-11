@@ -38,6 +38,20 @@ The DSID cookie minted on `login.cgi` is per-request `uuid4().hex` — never
 a fixed literal across the fleet — so replay analysis can distinguish
 distinct sessions and so the value carries no cross-sensor fingerprint.
 
+## Sign-in realms
+
+Ivanti/Pulse sign-in URLs are per-realm and realms are named by the
+administrator; `url_default` and `url_admin` are only the two stock names.
+The matcher accepts `/dana-na/auth/url_<realm>/welcome.cgi` and
+`.../login.cgi` for any realm token (`url_1`, `url_2`, `url_corp-vpn`, …)
+and records the token as `ivantiRealm` on the log line. Which realms a
+source enumerates — the stock name only, or a numeric sweep — is a
+behavioural discriminator between tools that otherwise share a TLS
+fingerprint. The bare `/dana-na` and `/dana-na/` index is served the
+default welcome page; it is the step that follows the
+`nc_gina_ver.txt` version fetch, and it previously answered 404, ending
+the sequence one request in.
+
 ## Why
 
 Enterprise multi-target scanner dictionaries added Ivanti-shaped paths in

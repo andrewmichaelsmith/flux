@@ -6,6 +6,7 @@ import base64
 import bz2
 import gzip
 import hashlib
+import html
 import io
 import ipaddress
 import json
@@ -906,10 +907,25 @@ PHP_CGI_LIVENESS_POWERED_BY = (
 # they try, whether they present harvested session cookies, whether the
 # TFA payload carries an exploit.
 SONICWALL_ENABLED = _env_bool("HONEYPOT_SONICWALL_ENABLED")
+# The three API paths above are step 2+ of the chain. Step 1 -- the human
+# -facing SSL VPN portal a scanner fingerprints before it decides the host
+# is a SonicWall at all -- was never in the table, so the portal answered
+# 404 and the API chain below it was only ever reached by tools that
+# skipped straight to the API. Serving the portal is what makes the
+# existing bait chain reachable from a normal fingerprint-then-exploit
+# sequence.
+_SONICWALL_PORTAL_PATHS = (
+    "/auth.html",
+    "/sonicui/7/sslvpn-portal/",
+    "/sonicui/7/login/",
+    "/cgi-bin/welcome",
+    "/cgi-bin/sslvpnclient",
+)
 _SONICWALL_DEFAULT_PATHS = ",".join([
     "/api/sonicos/is-sslvpn-enabled",
     "/api/sonicos/auth",
     "/api/sonicos/tfa",
+    *_SONICWALL_PORTAL_PATHS,
 ])
 SONICWALL_PATHS = {
     value.strip().lower()
@@ -973,12 +989,36 @@ _IVANTI_VPN_DEFAULT_PATHS = ",".join([
     # plausible dotted version keeps the probe alive so the follow-on
     # /dana-na/ probe lands on our handler instead of a 404.
     "/dana-na/nc/nc_gina_ver.txt",
+    # Bare index. The nc_gina_ver.txt note above already assumed the
+    # follow-on `/dana-na/` probe landed on this handler -- it did not,
+    # because neither spelling was in the table, so the second step of the
+    # sequence the trap was built around answered 404.
+    "/dana-na",
+    "/dana-na/",
 ])
 IVANTI_VPN_PATHS = {
     value.strip().lower()
     for value in (os.environ.get("HONEYPOT_IVANTI_VPN_PATHS_CSV") or _IVANTI_VPN_DEFAULT_PATHS).split(",")
     if value.strip()
 }
+
+# Ivanti/Pulse sign-in URLs are per-realm, and an appliance's realms are
+# named by the administrator. `url_default` and `url_admin` are only the
+# two stock names; deployments routinely carry `url_1`, `url_2`, ... and
+# arbitrary labels. Scanners enumerate the numbered ones looking for a
+# realm whose auth policy is weaker than the default, so an exact-match
+# table answers the stock names and 404s the enumeration -- which is the
+# part that actually discriminates one scanning tool from another.
+# Matching the realm shape lets the trap answer all of them and record
+# WHICH realm tokens each source asked for.
+_IVANTI_REALM_PATH_RE = re.compile(
+    r"^/dana-na/auth/url_(?P<realm>[a-z0-9][a-z0-9._-]{0,31})/(?P<page>welcome|login)\.cgi$"
+)
+
+
+def _ivanti_realm_match(path: str) -> "re.Match[str] | None":
+    """Match a per-realm Ivanti sign-in URL, e.g. /dana-na/auth/url_2/welcome.cgi."""
+    return _IVANTI_REALM_PATH_RE.match(path)
 
 # --- Fake IBM Aspera Faspex portal (CVE-2022-47986 bait) ----------------
 # CMS expansion fleets started probing `/aspera/faspex/` in late April 2026.
@@ -1062,6 +1102,10 @@ _CITRIX_GATEWAY_DEFAULT_PATHS = ",".join([
     # Gateway / NetScaler ADC SSL VPN landing pages
     "/vpn/index.html",
     "/logon/logonpoint/index.html",
+    # LogonPoint ships several themed index pages; only index.html was
+    # listed, so the custom/tmindex spellings answered 404.
+    "/logon/logonpoint/custom.html",
+    "/logon/logonpoint/tmindex.html",
     # Language pack stub fetched by the Gateway login JS
     "/vpn/js/rdx/core/lang/rdx_en.json.gz",
     # Credential POST endpoints (real Citrix Gateway paths)
@@ -1180,6 +1224,11 @@ SOPHOS_VPN_ENABLED = _env_bool("HONEYPOT_SOPHOS_VPN_ENABLED")
 _SOPHOS_VPN_DEFAULT_PATHS = ",".join([
     "/svpn/index.cgi",
     "/userportal/webpages/myaccount/login.jsp",
+    # Sophos ships two portal entry points; only the /userportal/ family
+    # was listed, so the .jsp landing page and the form's own controller
+    # target both answered 404.
+    "/enduserportal.jsp",
+    "/userportal/controller",
     "/userportal/",
     "/userportal/webpages/",
 ])
@@ -3708,7 +3757,8 @@ def is_cisco_webvpn_path(path: str) -> bool:
 def is_ivanti_vpn_path(path: str) -> bool:
     if not IVANTI_VPN_ENABLED:
         return False
-    return path.lower() in IVANTI_VPN_PATHS
+    lp = path.lower()
+    return lp in IVANTI_VPN_PATHS or _ivanti_realm_match(lp) is not None
 
 
 def is_aspera_faspex_path(path: str) -> bool:
@@ -9144,6 +9194,32 @@ def render_spring_gateway_global_filters() -> bytes:
         "org.springframework.cloud.gateway.filter.WebsocketRoutingFilter@1": 2147483646,
     }
     return (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+
+
+def render_sonicwall_portal_html(host: str) -> bytes:
+    """SonicOS SSL VPN portal login page.
+
+    The form posts to `/api/sonicos/auth`, which is already a trap path --
+    a scanner that fingerprints the portal and then follows the form lands
+    directly in the existing CVE-2024-53704 bait chain instead of having to
+    know the API route up front.
+    """
+    safe_host = html.escape(host or "sonicwall")
+    return (
+        "<!DOCTYPE html>\n<html><head>\n"
+        f"<title>SonicWall - Virtual Office - {safe_host}</title>\n"
+        '<meta name="viewport" content="width=device-width, initial-scale=1" />\n'
+        "</head><body>\n"
+        '<div id="virtualOffice">\n'
+        "<h2>SSL VPN Virtual Office</h2>\n"
+        '<form method="post" action="/api/sonicos/auth" id="loginForm">\n'
+        '<input type="text" name="username" placeholder="Username" />\n'
+        '<input type="password" name="password" placeholder="Password" />\n'
+        '<input type="text" name="domain" value="LocalDomain" />\n'
+        '<button type="submit">Log In</button>\n'
+        "</form>\n</div>\n"
+        "</body></html>\n"
+    ).encode("utf-8")
 
 
 def render_sonicwall_is_sslvpn_enabled() -> bytes:
@@ -22154,8 +22230,13 @@ async def _handle_sonicwall(
     path: str,
     request_body: bytes,
 ) -> web.Response:
-    """Dispatch a fake SonicOS SSL VPN response by path. All 200 + JSON; the
-    whole point is to look live enough that the exploit chain proceeds."""
+    """Dispatch a fake SonicOS SSL VPN response by path.
+
+    The portal paths answer HTML, the `/api/sonicos/*` chain answers JSON;
+    both 200. The whole point is to look live enough that the exploit chain
+    proceeds, and the portal is what leads a fingerprint-first scanner into
+    that chain.
+    """
     lpath = path.lower()
     method = request.method
     content_type_req = request.headers.get("Content-Type", "")
@@ -22175,7 +22256,16 @@ async def _handle_sonicwall(
     if request_body:
         body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
 
-    if lpath == "/api/sonicos/is-sslvpn-enabled":
+    content_type_resp = "application/json; charset=utf-8"
+    set_cookie_value: str | None = None
+
+    if lpath in _SONICWALL_PORTAL_PATHS:
+        result_tag = "sonicwall-portal"
+        body = render_sonicwall_portal_html(str(log_context.get("host", "")))
+        content_type_resp = "text/html; charset=utf-8"
+        # Per-request session value; never a fixed literal across the fleet.
+        set_cookie_value = f"swap={uuid.uuid4().hex}; Path=/; Secure; HttpOnly"
+    elif lpath == "/api/sonicos/is-sslvpn-enabled":
         result_tag = "sonicwall-is-sslvpn-enabled"
         body = render_sonicwall_is_sslvpn_enabled()
     elif lpath == "/api/sonicos/auth":
@@ -22208,12 +22298,15 @@ async def _handle_sonicwall(
         log_entry["bodyPreview"] = body_preview
     append_log(log_entry)
 
+    sonicwall_headers = {
+        "Content-Type": content_type_resp,
+        "Cache-Control": "no-store",
+    }
+    if set_cookie_value:
+        sonicwall_headers["Set-Cookie"] = set_cookie_value
     return web.Response(
         status=200, body=body,
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "Cache-Control": "no-store",
-        },
+        headers=sonicwall_headers,
     )
 
 
@@ -22417,15 +22510,29 @@ async def _handle_ivanti_vpn(
         unquote_plus(query), unquote_plus(body_preview),
     )
 
+    # Realm token, when the request used a per-realm sign-in URL. Recorded
+    # so the log shows WHICH realms a source enumerated -- `url_default`
+    # only, or a numeric sweep -- which separates tools that share a JA4.
+    realm_match = _ivanti_realm_match(lpath)
+    ivanti_realm = realm_match.group("realm") if realm_match else ""
+
     if lpath in {
         "/dana-na/auth/url_default/welcome.cgi",
         "/dana-na/auth/url_admin/welcome.cgi",
         "/dana-na/auth/welcome.cgi",
-    }:
+    } or (realm_match is not None and realm_match.group("page") == "welcome"):
         result_tag = "ivanti-welcome"
         body = render_ivanti_welcome_html(host)
         content_type = "text/html; charset=utf-8"
-    elif lpath == "/dana-na/auth/url_default/login.cgi":
+    elif lpath in ("/dana-na", "/dana-na/"):
+        # Bare index. Real appliances redirect this to the default realm's
+        # welcome page; serving that page directly keeps the sequence going.
+        result_tag = "ivanti-index"
+        body = render_ivanti_welcome_html(host)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/dana-na/auth/url_default/login.cgi" or (
+        realm_match is not None and realm_match.group("page") == "login"
+    ):
         result_tag = "ivanti-login-post"
         # Per-request DSID so the scanner gets a consistent token to replay
         # in any follow-on `/dana-ws/` request, but every hit generates a
@@ -22471,6 +22578,8 @@ async def _handle_ivanti_vpn(
         "ivantiHasCmdInjection": has_cmd_injection,
         "bytes": len(body),
     }
+    if ivanti_realm:
+        log_entry["ivantiRealm"] = ivanti_realm
     if request_body and result_tag == "ivanti-login-post":
         username, has_password = extract_ivanti_form(request_body, content_type_req)
         if username:

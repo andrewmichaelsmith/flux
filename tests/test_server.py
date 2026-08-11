@@ -4432,14 +4432,50 @@ def test_ivanti_vpn_default_paths_match_observed_sequence():
 def test_ivanti_vpn_path_non_match():
     for path in [
         "/",
-        "/dana-na/",
         "/dana-na/auth/",
-        "/dana-na/auth/login.cgi",  # missing url_default/
+        "/dana-na/auth/login.cgi",  # missing url_<realm>/
         "/dana-cached/hc/",
         "/dana-cached/hc/HostCheckerInstaller.tar",  # unsupported suffix
+        "/dana-na/auth/url_/welcome.cgi",  # empty realm token
+        "/dana-na/auth/url_default/logout.cgi",  # not a sign-in page
+        "/dana-nautilus/auth/url_1/welcome.cgi",  # prefix must be exact
         "/.env",
     ]:
         assert not tbenv.is_ivanti_vpn_path(path), f"unexpected match: {path}"
+
+
+def test_ivanti_vpn_bare_index_matches():
+    """The bare index is the second step of the sequence the trap was built
+    around -- the nc_gina_ver.txt fetch is followed by /dana-na/. Both
+    spellings used to 404, which ended the sequence there."""
+    for path in ("/dana-na", "/dana-na/", "/DANA-NA/"):
+        assert tbenv.is_ivanti_vpn_path(path), f"expected match: {path}"
+
+
+def test_ivanti_vpn_numbered_realm_paths_match():
+    """Realms are administrator-named; url_default/url_admin are only the
+    stock two. Scanners enumerate the numbered ones looking for a realm with
+    a weaker auth policy, and that enumeration is the discriminating part."""
+    for path in [
+        "/dana-na/auth/url_1/welcome.cgi",
+        "/dana-na/auth/url_2/welcome.cgi",
+        "/dana-na/auth/url_7/welcome.cgi",
+        "/dana-na/auth/url_2/login.cgi",
+        "/dana-na/auth/url_corp-vpn/welcome.cgi",
+        "/dana-na/auth/url_Default/welcome.cgi",
+    ]:
+        assert tbenv.is_ivanti_vpn_path(path), f"expected match: {path}"
+
+
+def test_ivanti_realm_token_is_extracted():
+    m = tbenv._ivanti_realm_match("/dana-na/auth/url_2/welcome.cgi")
+    assert m is not None
+    assert m.group("realm") == "2"
+    assert m.group("page") == "welcome"
+    m2 = tbenv._ivanti_realm_match("/dana-na/auth/url_corp-vpn/login.cgi")
+    assert m2 is not None
+    assert m2.group("realm") == "corp-vpn"
+    assert m2.group("page") == "login"
 
 
 def test_ivanti_vpn_disabled_returns_false(monkeypatch):
@@ -16650,3 +16686,109 @@ def test_no_handler_emits_a_distinctive_failure_literal():
     body_line = 'body=b"upstream credential issue failed'
     assert source.count(body_line) == 0
     assert source.count('body=b"render error') == 0
+
+
+# --- Edge-appliance portal variant coverage --------------------------------
+#
+# The portal traps are the highest-yield family flux runs, but each one
+# matched an exact-path table that had drifted from what scanners actually
+# request. These pin the variants that were falling through to a 404.
+
+def test_sonicwall_portal_paths_match():
+    """The portal is step 1 of the chain; only the /api/sonicos/* steps
+    were listed, so a fingerprint-first scanner 404'd before reaching it."""
+    for path in [
+        "/auth.html",
+        "/sonicui/7/sslvpn-portal/",
+        "/sonicui/7/login/",
+        "/cgi-bin/welcome",
+        "/cgi-bin/sslvpnclient",
+    ]:
+        assert tbenv.is_sonicwall_path(path), f"expected match: {path}"
+
+
+def test_sonicwall_api_chain_still_matches():
+    for path in ["/api/sonicos/is-sslvpn-enabled", "/api/sonicos/auth", "/api/sonicos/tfa"]:
+        assert tbenv.is_sonicwall_path(path), f"expected match: {path}"
+
+
+async def test_sonicwall_portal_serves_html_and_points_at_the_api_chain(flux_client):
+    resp = await flux_client.get(
+        "/sonicui/7/sslvpn-portal/", headers={"X-Forwarded-For": "203.0.113.60"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/html")
+    body = (await resp.read()).decode()
+    # The form target is itself a trap path, so following it continues the chain.
+    assert 'action="/api/sonicos/auth"' in body
+    assert tbenv.is_sonicwall_path("/api/sonicos/auth")
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "sonicwall-portal"
+    assert entry["status"] == 200
+
+
+async def test_sonicwall_portal_session_cookie_is_per_hit_unique(flux_client):
+    seen = set()
+    for i in range(3):
+        resp = await flux_client.get(
+            "/auth.html", headers={"X-Forwarded-For": f"203.0.113.6{i}"},
+        )
+        cookie = resp.headers.get("Set-Cookie", "")
+        assert cookie.startswith("swap=")
+        seen.add(cookie)
+    assert len(seen) == 3, "session cookie must never be a fixed literal"
+
+
+async def test_sonicwall_api_chain_still_serves_json(flux_client):
+    resp = await flux_client.get(
+        "/api/sonicos/is-sslvpn-enabled", headers={"X-Forwarded-For": "203.0.113.64"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("application/json")
+
+
+async def test_ivanti_numbered_realm_is_logged(flux_client):
+    """The realm token a source enumerates is the actor-discriminating bit."""
+    resp = await flux_client.get(
+        "/dana-na/auth/url_3/welcome.cgi", headers={"X-Forwarded-For": "203.0.113.65"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "ivanti-welcome"
+    assert entry["ivantiRealm"] == "3"
+
+
+async def test_ivanti_bare_index_serves_the_welcome_page(flux_client):
+    resp = await flux_client.get(
+        "/dana-na/", headers={"X-Forwarded-For": "203.0.113.66"},
+    )
+    assert resp.status == 200
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "ivanti-index"
+    assert "ivantiRealm" not in entry
+
+
+def test_sophos_portal_variants_match():
+    for path in ["/EndUserPortal.jsp", "/userportal/Controller"]:
+        assert tbenv.is_sophos_vpn_path(path), f"expected match: {path}"
+
+
+def test_citrix_logonpoint_variants_match():
+    for path in [
+        "/logon/LogonPoint/index.html",
+        "/logon/LogonPoint/custom.html",
+        "/logon/LogonPoint/tmindex.html",
+    ]:
+        assert tbenv.is_citrix_gateway_path(path), f"expected match: {path}"
+
+
+def test_portal_expansion_does_not_swallow_unrelated_paths():
+    """`/auth.html` and `/cgi-bin/welcome` are generic enough to be worth
+    pinning: nothing adjacent should start matching the SonicWall trap."""
+    for path in [
+        "/auth", "/authorize", "/auth.php", "/oauth.html",
+        "/cgi-bin/", "/cgi-bin/welcome.cgi", "/cgi-bin/luci",
+        "/sonicui/", "/sonicui/7/", "/logon/LogonPoint/", "/userportal/",
+    ]:
+        assert not tbenv.is_sonicwall_path(path), f"unexpected sonicwall match: {path}"
