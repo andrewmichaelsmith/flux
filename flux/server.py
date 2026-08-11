@@ -23315,7 +23315,15 @@ async def _handle_citrix_gateway(
         result_tag = "citrix-vpn-index"
         body = render_citrix_gateway_index_html(host, CITRIX_GATEWAY_VERSION)
         content_type = "text/html; charset=utf-8"
-    elif lpath == "/logon/logonpoint/index.html":
+    elif lpath in {
+        "/logon/logonpoint/index.html",
+        # LogonPoint ships several themed entry pages. They are the same
+        # form scaffold with the same POST action, so they share a renderer;
+        # they are listed here rather than only in the path table because
+        # this handler defensively 404s anything it has no branch for.
+        "/logon/logonpoint/custom.html",
+        "/logon/logonpoint/tmindex.html",
+    }:
         result_tag = "citrix-logonpoint"
         body = render_citrix_logonpoint_html(host, CITRIX_GATEWAY_VERSION)
         content_type = "text/html; charset=utf-8"

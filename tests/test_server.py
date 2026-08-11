@@ -16783,6 +16783,56 @@ def test_citrix_logonpoint_variants_match():
         assert tbenv.is_citrix_gateway_path(path), f"expected match: {path}"
 
 
+# Matching the path is only half the contract. Several of these handlers
+# dispatch again internally and defensively 404 anything they have no branch
+# for, so a path can be in the table and still answer 404 -- which is exactly
+# what a live probe caught for the two Citrix LogonPoint variants after the
+# predicate-only tests above passed. Assert the actual response for every
+# path this change added.
+_ADDED_PORTAL_PATHS = [
+    # SonicWall portal
+    ("/auth.html", "sonicwall-portal"),
+    ("/sonicui/7/sslvpn-portal/", "sonicwall-portal"),
+    ("/sonicui/7/login/", "sonicwall-portal"),
+    ("/cgi-bin/welcome", "sonicwall-portal"),
+    ("/cgi-bin/sslvpnclient", "sonicwall-portal"),
+    # Ivanti index + realms
+    ("/dana-na", "ivanti-index"),
+    ("/dana-na/", "ivanti-index"),
+    ("/dana-na/auth/url_1/welcome.cgi", "ivanti-welcome"),
+    ("/dana-na/auth/url_2/welcome.cgi", "ivanti-welcome"),
+    ("/dana-na/auth/url_7/welcome.cgi", "ivanti-welcome"),
+    ("/dana-na/auth/url_corp-vpn/welcome.cgi", "ivanti-welcome"),
+    # Sophos
+    ("/EndUserPortal.jsp", "sophos-vpn-login"),
+    ("/userportal/Controller", "sophos-vpn-login"),
+    # Citrix LogonPoint themed entry pages
+    ("/logon/LogonPoint/custom.html", "citrix-logonpoint"),
+    ("/logon/LogonPoint/tmindex.html", "citrix-logonpoint"),
+]
+
+
+@pytest.mark.parametrize("path,expected_result", _ADDED_PORTAL_PATHS)
+async def test_added_portal_paths_actually_answer_200(flux_client, path, expected_result):
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.70"})
+    assert resp.status == 200, f"{path} still falls through to 404"
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == expected_result, f"{path} -> {entry['result']}"
+    assert entry["status"] == 200
+
+
+@pytest.mark.parametrize("path", [p for p, _ in _ADDED_PORTAL_PATHS])
+async def test_added_portal_paths_never_log_a_miss_or_not_handled(flux_client, path):
+    """The failure mode these guard against is a path that matches its trap
+    but hits the handler's defensive 404 branch."""
+    await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.71"})
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] != "not-handled"
+    assert not str(entry["result"]).endswith("-miss"), (
+        f"{path} matched its trap but fell into the handler's defensive 404"
+    )
+
+
 def test_portal_expansion_does_not_swallow_unrelated_paths():
     """`/auth.html` and `/cgi-bin/welcome` are generic enough to be worth
     pinning: nothing adjacent should start matching the SonicWall trap."""
