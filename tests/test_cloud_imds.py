@@ -208,7 +208,7 @@ async def test_issuance_failure_is_logged_not_crashed(flux_client, monkeypatch):
         "/ecs/task-credentials",
         headers={"X-Forwarded-For": "203.0.113.73"},
     )
-    assert resp.status == 502
+    assert resp.status == 404
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "cloud-imds-ecs-credentials-error"
 

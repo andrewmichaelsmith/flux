@@ -36,13 +36,22 @@ Every line has a `result` identifying what the handler did, and a
 | --- | --- | --- | --- |
 | `not-handled` | 404 | — | Path didn't match any trap; fell through to 404. |
 
+**Canary-issuance and renderer failures also answer `404 not found\n`** —
+byte-identical to `not-handled` above. They previously answered
+`502 upstream credential issue failed` (and `502 render error`), which no
+ordinary web server emits, so one upstream blip made every canary-backed
+trap on every sensor announce itself at once with a fleet-wide-unique
+fingerprint. The client can no longer tell an issuance failure from a path
+that was never there; the `result` tag and `error` field below keep the
+failure fully diagnosable in the log.
+
 ### `/.env` canary
 
 | `result` | `status` | Extras | Meaning |
 | --- | --- | --- | --- |
 | `issued` | 200 | `types: [..]` | `.env` canary issued and served. |
-| `tracebit-http-error` | 502 | `tracebitStatus: int`, `error: str<=400` | Tracebit API returned a non-2xx. |
-| `tracebit-error` | 502 | `error: str<=400` | Connection error / timeout / malformed response from Tracebit. `error` is `"<ExceptionClass>"` or `"<ExceptionClass>: <message>"` — the class name is always present, because several of these exceptions (`TimeoutError` in particular) carry no message and previously logged an empty string. |
+| `tracebit-http-error` | 404 | `tracebitStatus: int`, `error: str<=400` | Tracebit API returned a non-2xx. |
+| `tracebit-error` | 404 | `error: str<=400` | Connection error / timeout / malformed response from Tracebit. `error` is `"<ExceptionClass>"` or `"<ExceptionClass>: <message>"` — the class name is always present, because several of these exceptions (`TimeoutError` in particular) carry no message and previously logged an empty string. |
 
 ### Fake `/.git/*` tree
 
@@ -50,7 +59,7 @@ Every line has a `result` identifying what the handler did, and a
 | --- | --- | --- | --- |
 | `fake-git` | 200 | `commitSha`, `rootTreeSha`, `secretsBlobSha`, `canaryTypes`, `fakeGitBytes`, `fakeGitDripBytes`, `fakeGitDripIntervalMs` | Object served from the synthetic repo. Includes `/.git/credentials`, which returns a Git credential-store line with a GitLab username/password canary. |
 | `fake-git-miss` | 404 | `commitSha`, `gitKey` | Path resolved to the repo but wasn't a file in it. `gitKey` is the canonical `/.git/...` lookup key (lowercased, prefix-stripped) — so `/login/.GiT/FOO` logs `path=/login/.GiT/FOO`, `gitKey=/.git/foo`. |
-| `fake-git-error` | 502 | — | Canary issuance failed. |
+| `fake-git-error` | 404 | — | Canary issuance failed. |
 | `fake-git-disconnect` | 200 | `fakeGitBytesSent`, `commitSha` | Scanner hung up mid-drip. |
 | `fake-git-capacity` | 503 | — | Tarpit semaphore full. Only reachable for responses that actually drip — a repo *file* larger than one drip chunk. `HEAD`, single-chunk bodies, and directory autoindexes are served immediately and never charge a slot, so a `/.git/` directory sweep cannot exhaust the semaphore. |
 
@@ -284,7 +293,7 @@ chain — that pair is the signal this trap exists to produce. See
 | `cloud-imds-role-list` | 200 | `bytes: int` | Role **name** only, no secret. No canary issued. |
 | `cloud-imds-role-credentials` | 200 | `canaryTypes: [..]`, `bytes: int` | Instance-metadata credential envelope. |
 | `cloud-imds-ecs-credentials` | 200 | `canaryTypes: [..]`, `bytes: int` | Container credential-provider envelope. |
-| `cloud-imds-<kind>-error` | 502 | — | Canary issuance failed. Only the credential kinds can produce this. |
+| `cloud-imds-<kind>-error` | 404 | — | Canary issuance failed. Only the credential kinds can produce this. |
 
 ### Canary-backed file traps
 
@@ -293,8 +302,8 @@ One log line per hit. All entries share the same shape:
 | `result` | `status` | Extras |
 | --- | --- | --- |
 | `<trap-name>` | 200 | `canaryTypes: [..]`, `bytes: int` |
-| `<trap-name>-error` | 502 | — (upstream canary issuance failed) |
-| `<trap-name>-render-error` | 502 | `error: str<=400` (renderer raised) |
+| `<trap-name>-error` | 404 | — (upstream canary issuance failed) |
+| `<trap-name>-render-error` | 404 | `error: str<=400` (renderer raised) |
 
 See the [canary file trap table in the README](./README.md#canary-file-trap-table)
 for the full list of `<trap-name>` values and the paths each one matches.

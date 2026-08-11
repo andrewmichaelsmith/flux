@@ -3280,6 +3280,47 @@ def _exc_detail(exc: BaseException) -> str:
     return f"{name}: {message}" if message else name
 
 
+# Status + body returned to the client when a canary-backed trap cannot
+# produce its payload — upstream issuance failed, or a renderer raised.
+# Deliberately byte-identical to the router's `not-handled` fallback and
+# to `fake-git-miss`, so a scanner that catches a trap mid-outage sees the
+# single most common response on the internet and learns nothing.
+CREDENTIAL_FAILURE_STATUS = 404
+CREDENTIAL_FAILURE_BODY = b"not found\n"
+
+
+def _credential_failure_response() -> web.Response:
+    """Response for a canary-backed trap that can't serve its payload.
+
+    These paths used to answer `502 upstream credential issue failed` (and
+    `502 render error` on a renderer bug). Both were deception leaks, and
+    the body string was the worse half: no ordinary web server emits either
+    literal, so a single upstream blip made every canary-backed trap on
+    every sensor announce itself simultaneously with a fleet-wide-unique
+    fingerprint — greppable, and stable enough to index. `append_log`
+    already declines to propagate a 500 for exactly this reason ("a 500
+    fingerprints the sensor as broken and drives scanners away"), and the
+    command-injection surface already resolves the same dilemma by
+    refusing to 502. This generalises that call to the remaining traps.
+
+    404-as-if-absent is chosen over the command-injection precedent of a
+    static 200 because it needs no per-trap synthetic body, and therefore
+    cannot regress the rule that every credential-shaped field is per-hit
+    unique. The cost is a little engagement during an upstream outage,
+    which is rare and brief; the benefit is that the failure mode is
+    indistinguishable from a path that was never there.
+
+    The telemetry is unaffected — callers keep their distinct `result`
+    tags and error detail, so issuance failures stay diagnosable in the
+    trap log even though the client can no longer tell them apart.
+    """
+    return web.Response(
+        status=CREDENTIAL_FAILURE_STATUS,
+        body=CREDENTIAL_FAILURE_BODY,
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+    )
+
+
 def append_log(payload: dict[str, object]) -> None:
     """Append one JSONL telemetry line to the sink. Best-effort — any
     OS-level failure at the mkdir / open / write step (volume full,
@@ -10510,8 +10551,8 @@ _FAKE_GIT_LOCK: asyncio.Lock | None = None
 _FAKE_GIT_CACHE: dict[str, tuple[float, dict[str, bytes], dict[str, object]]] = {}
 # Single-flight gate: same shape as `_CANARY_INFLIGHT`. A burst of concurrent
 # `<prefix>/.git/config` probes from one IP would otherwise all bypass the
-# empty cache, all call `issue_credentials`, and most of them 502 when the
-# upstream rate-limits.
+# empty cache, all call `issue_credentials`, and most of them fail issuance
+# when the upstream rate-limits.
 _FAKE_GIT_INFLIGHT: dict[str, "asyncio.Future[tuple[dict[str, bytes], dict[str, object]] | None]"] = {}
 
 
@@ -11163,7 +11204,7 @@ async def _get_or_issue_canary(
     requests that arrive before the first issuance returns share one in-flight
     Future via `_CANARY_INFLIGHT` — without this single-flight gate, a burst
     of N parallel hits on the same key all bypass the empty cache and all hit
-    the upstream API, which then rate-limits and 502s every trap response.
+    the upstream API, which then rate-limits and fails every trap response.
     """
     now = time.monotonic()
     cache_key = (client_ip or f"_anon-{request_id}", types)
@@ -26914,23 +26955,17 @@ async def _send_canary_trap(
         trap.canary_types, client_ip, request_id, host, user_agent, path, proto,
     )
     if tracebit_response is None:
-        append_log({**log_context, "status": 502, "result": f"{tag}-error"})
-        return web.Response(
-            status=502, body=b"upstream credential issue failed\n",
-            headers={"Content-Type": "text/plain; charset=utf-8"},
-        )
+        append_log({**log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": f"{tag}-error"})
+        return _credential_failure_response()
 
     try:
         body = trap.render(tracebit_response)
     except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
         append_log({
-            **log_context, "status": 502, "result": f"{tag}-render-error",
+            **log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": f"{tag}-render-error",
             "error": _exc_detail(exc)[:400],
         })
-        return web.Response(
-            status=502, body=b"render error\n",
-            headers={"Content-Type": "text/plain; charset=utf-8"},
-        )
+        return _credential_failure_response()
 
     response = web.Response(status=200, body=body)
     response.headers["Content-Type"] = trap.content_type
@@ -27006,13 +27041,10 @@ async def _send_cloud_imds(
     )
     if tracebit_response is None:
         append_log({
-            **log_context, "status": 502,
+            **log_context, "status": CREDENTIAL_FAILURE_STATUS,
             "result": f"cloud-imds-{imds.kind}-error",
         })
-        return web.Response(
-            status=502, body=b"upstream credential issue failed\n",
-            headers={"Content-Type": "text/plain; charset=utf-8"},
-        )
+        return _credential_failure_response()
 
     render = (
         render_ecs_task_credentials if imds.kind == "ecs-credentials"
@@ -27195,22 +27227,16 @@ async def _send_backup_archive(
         ("aws",), client_ip, request_id, host, user_agent, path, proto,
     )
     if tracebit_response is None:
-        append_log({**log_context, "status": 502, "result": "backup-archive-error"})
-        return web.Response(
-            status=502, body=b"upstream credential issue failed\n",
-            headers={"Content-Type": "text/plain; charset=utf-8"},
-        )
+        append_log({**log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": "backup-archive-error"})
+        return _credential_failure_response()
     try:
         body, content_type = _build_backup_archive_body(tracebit_response, ext_family)
     except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
         append_log({
-            **log_context, "status": 502, "result": "backup-archive-render-error",
+            **log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": "backup-archive-render-error",
             "error": _exc_detail(exc)[:400],
         })
-        return web.Response(
-            status=502, body=b"render error\n",
-            headers={"Content-Type": "text/plain; charset=utf-8"},
-        )
+        return _credential_failure_response()
     response = web.Response(status=200, body=body)
     response.headers["Content-Type"] = content_type
     response.headers["Cache-Control"] = "no-store"
@@ -27252,11 +27278,8 @@ async def _send_fake_git(
     global _active_slow_drips
     result = await _fake_git_get_or_build(client_ip, request_id, host, user_agent, path, proto)
     if result is None:
-        append_log({**log_context, "status": 502, "result": "fake-git-error"})
-        return web.Response(
-            status=502, body=b"upstream credential issue failed\n",
-            headers={"Content-Type": "text/plain; charset=utf-8"},
-        )
+        append_log({**log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": "fake-git-error"})
+        return _credential_failure_response()
 
     files, meta = result
     content = files.get(git_key)
@@ -27575,24 +27598,18 @@ async def _send_env(
     except aiohttp.ClientResponseError as exc:
         append_log({
             **log_context,
-            "status": 502,
+            "status": CREDENTIAL_FAILURE_STATUS,
             "result": f"{result_prefix}tracebit-http-error",
             "tracebitStatus": exc.status,
             "error": (exc.message or "")[:400],
         })
-        return web.Response(
-            status=502, body=b"upstream credential issue failed\n",
-            headers={"Content-Type": "text/plain; charset=utf-8"},
-        )
+        return _credential_failure_response()
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
         append_log({
-            **log_context, "status": 502, "result": f"{result_prefix}tracebit-error",
+            **log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": f"{result_prefix}tracebit-error",
             "error": _exc_detail(exc)[:400],
         })
-        return web.Response(
-            status=502, body=b"upstream credential issue failed\n",
-            headers={"Content-Type": "text/plain; charset=utf-8"},
-        )
+        return _credential_failure_response()
 
     payload = format_env_payload(tracebit_response).encode("utf-8")
     append_log({

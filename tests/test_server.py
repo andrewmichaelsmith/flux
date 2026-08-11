@@ -16534,7 +16534,8 @@ def test_exc_detail_keeps_the_message_when_there_is_one():
 
 async def test_canary_issuance_timeout_logs_a_usable_error(flux_client, monkeypatch):
     """Regression: issuance failures were logging `error: ""`, which made
-    every 502 on a canary path indistinguishable from every other."""
+    every issuance failure on a canary path indistinguishable from every
+    other. The client sees the generic 404; the log keeps the detail."""
     import asyncio as _asyncio
 
     monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
@@ -16545,7 +16546,107 @@ async def test_canary_issuance_timeout_logs_a_usable_error(flux_client, monkeypa
     monkeypatch.setattr(tbenv, "issue_credentials", _timeout)
 
     resp = await flux_client.get("/.env", headers={"X-Forwarded-For": "203.0.113.90"})
-    assert resp.status == 502
+    assert resp.status == 404
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "tracebit-error"
     assert entry["error"] == "TimeoutError"
+
+
+# --- Canary-issuance failure must not fingerprint the sensor ---------------
+#
+# A single upstream blip used to make every canary-backed trap answer
+# `502 upstream credential issue failed` at once. The status was unusual for
+# those paths and the body literal appears on no real web server, so the
+# pair was a fleet-wide-unique fingerprint. These tests pin the property
+# that the client-visible failure is indistinguishable from an absent path,
+# while the log keeps the per-trap detail.
+
+_CREDENTIAL_TRAP_PROBES = [
+    ("/.env", "tracebit-error"),
+    ("/.git/HEAD", "fake-git-error"),
+    ("/ecs/task-credentials", "cloud-imds-ecs-credentials-error"),
+    ("/.aws/credentials", None),
+    ("/backup.tar.gz", None),
+]
+
+
+@pytest.mark.parametrize("path,expected_result", _CREDENTIAL_TRAP_PROBES)
+async def test_issuance_failure_is_indistinguishable_from_a_missing_path(
+    flux_client, monkeypatch, path, expected_result,
+):
+    """Every canary-backed trap answers exactly what an unrouted path answers."""
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "CLOUD_IMDS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "BACKUP_ARCHIVE_ENABLED", True)
+    tbenv._FAKE_GIT_CACHE.clear()
+
+    async def _fail(*_a, **_kw):
+        return None
+
+    async def _raise(*_a, **_kw):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fail)
+    monkeypatch.setattr(tbenv, "issue_credentials", _raise)
+
+    # Baseline: a path no trap claims.
+    baseline = await flux_client.get(
+        "/definitely-not-a-trap-path-9f3a", headers={"X-Forwarded-For": "203.0.113.91"},
+    )
+    baseline_body = await baseline.read()
+    assert baseline.status == 404
+
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.91"})
+    body = await resp.read()
+
+    assert resp.status == baseline.status, f"{path} is distinguishable by status"
+    assert body == baseline_body, f"{path} is distinguishable by body"
+    assert b"upstream credential issue failed" not in body
+    assert b"render error" not in body
+
+    if expected_result is not None:
+        results = [e.get("result") for e in _log_entries(flux_client.log_path)]
+        assert expected_result in results, f"{path} lost its telemetry tag"
+
+
+async def test_render_failure_is_also_indistinguishable(flux_client, monkeypatch):
+    """A renderer bug used to leak `502 render error`. It must look absent too."""
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+
+    async def _ok(*_a, **_kw):
+        return {"aws": {"access_key_id": "AKIAEXAMPLE", "secret_access_key": "s3cr3t"}}
+
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _ok)
+
+    import dataclasses
+
+    trap = tbenv.find_canary_trap("/.aws/credentials")
+    assert trap is not None
+
+    def _boom(_response):
+        raise RuntimeError("renderer bug")
+
+    # CanaryTrap is a frozen dataclass, so swap the lookup rather than the field.
+    broken = dataclasses.replace(trap, render=_boom)
+    monkeypatch.setattr(tbenv, "find_canary_trap", lambda _path: broken)
+
+    resp = await flux_client.get(
+        "/.aws/credentials", headers={"X-Forwarded-For": "203.0.113.92"},
+    )
+    body = await resp.read()
+    assert resp.status == 404
+    assert body == b"not found\n"
+    assert b"render error" not in body
+
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"].endswith("-render-error")
+    assert entry["status"] == 404
+
+
+def test_no_handler_emits_a_distinctive_failure_literal():
+    """Guard against a new trap reintroducing a fingerprinting error body."""
+    source = pathlib.Path(tbenv.__file__).read_text()
+    body_line = 'body=b"upstream credential issue failed'
+    assert source.count(body_line) == 0
+    assert source.count('body=b"render error') == 0

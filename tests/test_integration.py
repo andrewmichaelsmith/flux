@@ -430,8 +430,9 @@ async def test_integration_env_serves_canary_payload(live_server, monkeypatch):
     assert issued and "aws" in issued[-1]["types"]
 
 
-async def test_integration_env_502s_when_tracebit_raises(live_server, monkeypatch):
-    """Upstream Tracebit failures must return 502 + logged error, not 500."""
+async def test_integration_env_hides_tracebit_failure(live_server, monkeypatch):
+    """Upstream issuance failures must be logged but must not be visible to
+    the client — the response is the generic 404, not a distinctive 502."""
     async def boom(*_a, **_kw):
         raise aiohttp.ClientConnectionError("connection refused")
 
@@ -441,13 +442,13 @@ async def test_integration_env_502s_when_tracebit_raises(live_server, monkeypatc
         async with session.get(
             f"{base}/.env", headers={"X-Forwarded-For": "203.0.113.31"},
         ) as resp:
-            assert resp.status == 502
+            assert resp.status == 404
 
     entries = [json.loads(line) for line in log_path.read_text().splitlines()]
     assert any(e["result"] == "tracebit-error" for e in entries)
 
 
-async def test_integration_env_502s_on_tracebit_http_error(live_server, monkeypatch):
+async def test_integration_env_hides_tracebit_http_error(live_server, monkeypatch):
     """ClientResponseError is logged with the upstream status code."""
     from yarl import URL
     from multidict import CIMultiDict, CIMultiDictProxy
@@ -467,7 +468,7 @@ async def test_integration_env_502s_on_tracebit_http_error(live_server, monkeypa
         async with session.get(
             f"{base}/.env", headers={"X-Forwarded-For": "203.0.113.32"},
         ) as resp:
-            assert resp.status == 502
+            assert resp.status == 404
 
     entries = [json.loads(line) for line in log_path.read_text().splitlines()]
     http_errs = [e for e in entries if e.get("result") == "tracebit-http-error"]
@@ -610,7 +611,7 @@ async def test_integration_fake_git_credentials_leaf_serves_canary(live_server, 
     assert not any(e.get("result") == "fake-git-miss" and e.get("path") == "/.git/credentials" for e in entries)
 
 
-async def test_integration_fake_git_502s_when_tracebit_fails(live_server, monkeypatch):
+async def test_integration_fake_git_hides_tracebit_failure(live_server, monkeypatch):
     async def boom(*_a, **_kw):
         raise aiohttp.ClientConnectionError("nope")
 
@@ -623,7 +624,7 @@ async def test_integration_fake_git_502s_when_tracebit_fails(live_server, monkey
         async with session.get(
             f"{base}/.git/HEAD", headers={"X-Forwarded-For": "203.0.113.41"},
         ) as resp:
-            assert resp.status == 502
+            assert resp.status == 404
 
     entries = [json.loads(line) for line in log_path.read_text().splitlines()]
     assert any(e["result"] == "fake-git-error" for e in entries)
