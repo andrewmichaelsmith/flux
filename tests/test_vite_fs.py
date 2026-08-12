@@ -275,3 +275,107 @@ async def test_bare_webroot_probe_keeps_its_own_result_tag(flux_client):
     assert resp.status == 200
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "proc-environ"
+
+
+# --- World-readable system files ---------------------------------------
+
+
+@pytest.mark.parametrize("path,expected", [
+    ("/@fs/etc/passwd", "/etc/passwd"),
+    ("/@fs/etc/nginx/nginx.conf", "/etc/nginx/nginx.conf"),
+])
+def test_system_files_resolve(path, expected):
+    """The credential walk never matches an absolute system path, so
+    these used to fall out as misses."""
+    resolution = tbenv.resolve_vite_fs(path)
+    assert resolution.system_file == expected
+    assert resolution.resolved
+    assert resolution.trap is None
+
+
+def test_system_file_match_is_exact_not_walked():
+    """A system file only means something where it really lives. The
+    suffix walk must not turn an arbitrary prefix into a passwd hit."""
+    for path in (
+        "/@fs/var/www/etc/passwd",
+        "/@fs/passwd",
+        "/@fs/etc/passwd.bak",
+        "/@fs/etc/shadow",
+        "/@fs/etc/nginx/sites-enabled/default",
+    ):
+        assert tbenv.resolve_vite_fs(path).system_file == ""
+
+
+def test_system_files_do_not_shadow_a_credential_trap():
+    """Ordering guard: the trap table is consulted first, so adding
+    system files can never steal a read that used to issue a canary."""
+    resolution = tbenv.resolve_vite_fs("/@fs/root/.aws/credentials")
+    assert resolution.trap is not None
+    assert resolution.system_file == ""
+
+
+def test_system_files_respect_their_switch(monkeypatch):
+    monkeypatch.setattr(tbenv, "VITE_FS_SYSTEM_FILES_ENABLED", False)
+    resolution = tbenv.resolve_vite_fs("/@fs/etc/passwd")
+    assert resolution.system_file == ""
+    assert not resolution.resolved
+
+
+def test_aws_credentials_backup_suffix_resolves():
+    """`.bak` and `.old` were covered; the dictionary also walks the
+    spelled-out `.backup`, which was the one suffix left 404ing."""
+    resolution = tbenv.resolve_vite_fs("/@fs/root/.aws/credentials.backup")
+    assert resolution.trap is not None
+    assert resolution.trap.name == "aws-credentials-file"
+
+
+async def test_passwd_read_is_served_and_tagged(flux_client):
+    """The oracle a scanner uses to confirm the read primitive works
+    must answer, and must stay separable in the log."""
+    resp = await flux_client.get(
+        "/@fs/etc/passwd",
+        headers={"X-Forwarded-For": "203.0.113.30"},
+    )
+    assert resp.status == 200
+    body = await resp.text()
+    assert body.startswith("root:x:0:0:")
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "vite-fs-etc-passwd"
+    assert entry["viteFsRequestedPath"] == "/etc/passwd"
+
+
+async def test_nginx_conf_read_is_served_and_tagged(flux_client):
+    resp = await flux_client.get(
+        "/@fs/etc/nginx/nginx.conf",
+        headers={"X-Forwarded-For": "203.0.113.31"},
+    )
+    assert resp.status == 200
+    body = await resp.text()
+    assert "worker_connections" in body
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "vite-fs-etc-nginx-conf"
+
+
+async def test_system_file_body_carries_no_credential(flux_client):
+    """These bodies are static and shared across the fleet, so nothing
+    secret-shaped may appear in them."""
+    resp = await flux_client.get(
+        "/@fs/etc/nginx/nginx.conf",
+        headers={"X-Forwarded-For": "203.0.113.32"},
+    )
+    body = await resp.text()
+    for marker in ("AKIA", "password", "secret", "BEGIN "):
+        assert marker.lower() not in body.lower()
+
+
+async def test_unlisted_system_path_still_misses(flux_client):
+    """Scope guard: this is a fixed list, not an answer-everything
+    switch. An unlisted system file must still 404 and log the miss."""
+    resp = await flux_client.get(
+        "/@fs/etc/shadow",
+        headers={"X-Forwarded-For": "203.0.113.33"},
+    )
+    assert resp.status == 404
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "vite-fs-miss"
+    assert entry["viteFsRequestedPath"] == "/etc/shadow"

@@ -43,9 +43,40 @@ for a file that isn't there. Answering everything would be an obvious
 tell, and the miss is still logged — the paths we decline to furnish are
 as descriptive of the tooling as the ones we serve.
 
+## World-readable system files
+
+The suffix walk above only ever consults the credential trap table, which
+is webroot-relative. An absolute system path has no suffix that appears in
+it, so every such read fell out as a miss.
+
+That inverted the exploit. `/etc/passwd` is the file a scanner reads
+*first*, to confirm the read primitive actually works, before walking to
+anything worth stealing. Serving the credential files while 404ing the
+oracle that gates them is backwards twice over: no real `server.fs.deny`
+bypass fails on a world-readable file, so the mismatch is a tell, and a
+scanner that gates on the oracle leaves before it ever reaches a canary.
+
+So a fixed table of system files is answered statically, checked **after**
+the credential walk has missed — it can never shadow a trap that would
+have issued a canary — and matched **exactly**, not walked, because a
+system file only means anything at the path it really lives at
+(`/@fs/var/www/etc/passwd` is still a miss).
+
+| Path | Body |
+| --- | --- |
+| `/etc/passwd` | The same account list the command-injection trap prints for `cat /etc/passwd`, so a scanner probing both surfaces sees one consistent host |
+| `/etc/nginx/nginx.conf` | The unmodified packaged config — no vhost, no upstream, nothing that reflects real deployment shape |
+
+These bodies carry no credential, so no canary is spent and no per-IP
+quota applies. Keeping the list fixed is the point: answering every system
+path a scanner can name would be its own obvious tell, and the misses stay
+worth reading.
+
 ## What it logs
 
-Result tag is `vite-fs-<trap>` on a hit and `vite-fs-miss` otherwise. The
+Result tag is `vite-fs-<trap>` on a hit, `vite-fs-etc-passwd` /
+`vite-fs-etc-nginx-conf` for a system file, and `vite-fs-miss`
+otherwise. The
 prefix keeps the filesystem-walk population separable from the webroot
 population: the same body served for `/.aws/credentials` and for
 `/@fs/root/.aws/credentials` represents two different scanner behaviours
@@ -87,3 +118,4 @@ correctly, since it is no longer an `/@fs/` read.
 | --- | --- | --- |
 | `HONEYPOT_VITE_FS_ENABLED` | `true` | Master switch |
 | `HONEYPOT_VITE_FS_MAX_SUFFIX_WALK` | `12` | Max leading directories stripped during resolution |
+| `HONEYPOT_VITE_FS_SYSTEM_FILES_ENABLED` | `true` | Answer the world-readable system-file list |

@@ -742,6 +742,17 @@ VITE_FS_MAX_SUFFIX_WALK = max(
     int((os.environ.get("HONEYPOT_VITE_FS_MAX_SUFFIX_WALK") or "12").strip() or "12"),
     1,
 )
+# World-readable system files answered on the filesystem-read surface.
+# The trap table is webroot-relative and credential-shaped, so an absolute
+# system path never matched it and every such read 404'd. That inverted
+# the exploit: a scanner reads `/etc/passwd` first to confirm the read
+# primitive actually works, then walks to the credential files. Serving
+# the credentials but 404ing the oracle that gates them is both a tell —
+# no real arbitrary-read bypass fails on a world-readable file — and a
+# way to lose scanners before they ever reach a canary. Scoped to a fixed
+# list of files carrying no secret; this is not an answer-everything
+# switch, which would be its own obvious tell.
+VITE_FS_SYSTEM_FILES_ENABLED = _env_bool("HONEYPOT_VITE_FS_SYSTEM_FILES_ENABLED")
 # --- Cloud instance / container role-credential service -----------------
 # Credential-harvester dictionaries have grown a distinct branch that asks
 # for *ephemeral role* credentials rather than long-lived key files:
@@ -12039,6 +12050,45 @@ def render_fake_passwd() -> bytes:
     ).encode("utf-8")
 
 
+def render_stock_nginx_conf() -> bytes:
+    """Stock distro `/etc/nginx/nginx.conf`. Deliberately the unmodified
+    packaged file — the interesting thing about a scanner reading it is
+    that it asked, not what it found. Anything bespoke here would leak
+    real deployment shape, so the body carries no vhost, no upstream, no
+    path that isn't in the distribution default."""
+    return (
+        "user www-data;\n"
+        "worker_processes auto;\n"
+        "pid /run/nginx.pid;\n"
+        "include /etc/nginx/modules-enabled/*.conf;\n"
+        "\n"
+        "events {\n"
+        "\tworker_connections 768;\n"
+        "}\n"
+        "\n"
+        "http {\n"
+        "\tsendfile on;\n"
+        "\ttcp_nopush on;\n"
+        "\ttypes_hash_max_size 2048;\n"
+        "\tserver_tokens off;\n"
+        "\n"
+        "\tinclude /etc/nginx/mime.types;\n"
+        "\tdefault_type application/octet-stream;\n"
+        "\n"
+        "\tssl_protocols TLSv1.2 TLSv1.3;\n"
+        "\tssl_prefer_server_ciphers on;\n"
+        "\n"
+        "\taccess_log /var/log/nginx/access.log;\n"
+        "\terror_log /var/log/nginx/error.log;\n"
+        "\n"
+        "\tgzip on;\n"
+        "\n"
+        "\tinclude /etc/nginx/conf.d/*.conf;\n"
+        "\tinclude /etc/nginx/sites-enabled/*;\n"
+        "}\n"
+    ).encode("utf-8")
+
+
 def render_printenv_dump(r: dict[str, object], *, host: str = "") -> bytes:
     """Plausible `printenv`/CGI-environment block with AWS_* values bound to
     a Tracebit canary. Synthesised non-credential context (hostname, PWD,
@@ -17704,6 +17754,11 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # regardless of suffix.
             "/.aws/credentials.bak",
             "/.aws/credentials.old",
+            # `.backup` spelled out. Observed being walked against the
+            # home-dir variant while `.bak`/`.old` were already covered,
+            # so the dictionary carries all three suffixes and we were
+            # 404ing exactly one of them.
+            "/.aws/credentials.backup",
             # Webroot / home-dir prefixes — scanner dictionaries walk
             # the home-dir variants alongside `.boto`, `.ssh/id_rsa`,
             # and `.bash_history`. A path-traversal-style misconfigured
@@ -20641,6 +20696,27 @@ for _trap in CANARY_TRAPS:
         _TRAP_BY_PATH[_p.lower()] = _trap
 
 
+# Absolute system paths answered on the filesystem-read surface, mapped to
+# (log-tag suffix, renderer, content type). Matched exactly against the
+# collapsed absolute path — unlike the trap table these are not walked,
+# because a system file only means anything at the location it really
+# lives at. None of these bodies carry a credential, so no canary is spent
+# and no per-IP quota applies: they exist to make the read primitive
+# behave the way a real one does, not to be harvested.
+_VITE_FS_SYSTEM_FILES: "dict[str, tuple[str, Callable[[], bytes], str]]" = {
+    "/etc/passwd": (
+        "etc-passwd",
+        render_fake_passwd,
+        "text/plain; charset=utf-8",
+    ),
+    "/etc/nginx/nginx.conf": (
+        "etc-nginx-conf",
+        render_stock_nginx_conf,
+        "text/plain; charset=utf-8",
+    ),
+}
+
+
 def find_canary_trap(path: str) -> "CanaryTrap | None":
     if not CANARY_TRAPS_ENABLED:
         return None
@@ -20662,11 +20738,14 @@ class ViteFsResolution:
     # True when the walk landed on bare `/.env`, which is served by
     # `_send_env` rather than by an entry in the trap table.
     bare_env: bool = False
+    # Key into `_VITE_FS_SYSTEM_FILES` when the request named a system
+    # file we answer statically. Empty otherwise.
+    system_file: str = ""
 
     @property
     def resolved(self) -> bool:
         """Whether anything will answer this read."""
-        return self.trap is not None or self.bare_env
+        return self.trap is not None or self.bare_env or bool(self.system_file)
 
 
 def _collapse_fs_path(segments: "list[str]") -> "list[str]":
@@ -20737,7 +20816,17 @@ def resolve_vite_fs(path: str) -> "ViteFsResolution | None":
                 bare_env = True
                 depth = i
                 break
-    return ViteFsResolution(requested, raw_suffix, trap, depth, bare_env)
+
+    system_file = ""
+    if trap is None and not bare_env and VITE_FS_SYSTEM_FILES_ENABLED:
+        # Exact match only, and only once the credential walk has missed,
+        # so this can never shadow a trap that would have answered.
+        if requested.lower() in _VITE_FS_SYSTEM_FILES:
+            system_file = requested.lower()
+
+    return ViteFsResolution(
+        requested, raw_suffix, trap, depth, bare_env, system_file,
+    )
 
 
 @dataclass(frozen=True)
@@ -27252,6 +27341,21 @@ async def _send_vite_fs(
         return web.Response(
             status=404, body=b"not found\n",
             headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+    if resolution.system_file:
+        # World-readable system file. Static body, no canary spent — the
+        # signal is the request, and the response exists so the read
+        # primitive behaves like a real one for the scanner's own
+        # confirmation step.
+        tag, render, content_type = _VITE_FS_SYSTEM_FILES[resolution.system_file]
+        body = render()
+        append_log({
+            **log_context, **extra_log,
+            "status": 200, "result": f"vite-fs-{tag}",
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": content_type},
         )
     if resolution.trap is None:
         # Bare `/.env` — served by the original handler, not the table.
