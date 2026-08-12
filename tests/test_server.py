@@ -5,6 +5,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import pathlib
 import re
 
@@ -15221,13 +15222,15 @@ def test_append_log_swallows_oserror_on_write(tmp_path, monkeypatch):
     monkeypatch.setattr(tbenv, "LOG_PATH", log_path)
     monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 0)
     monkeypatch.setattr(tbenv, "LOG_ROTATIONS", 4)
-    # Simulate a wedged sink: any open() for write raises ENOSPC.
-    real_open = pathlib.Path.open
-    def _fail_open(self, mode="r", *args, **kwargs):
-        if self == log_path and ("a" in mode or "w" in mode):
+    # Simulate a wedged sink: opening the log for append raises ENOSPC.
+    # append_log goes through os.open/os.write so that one record is one
+    # syscall, so the failure has to be injected at that layer.
+    real_os_open = os.open
+    def _fail_open(path, flags, *args, **kwargs):
+        if str(path) == str(log_path) and (flags & os.O_APPEND):
             raise OSError(28, "No space left on device")
-        return real_open(self, mode, *args, **kwargs)
-    monkeypatch.setattr(pathlib.Path, "open", _fail_open)
+        return real_os_open(path, flags, *args, **kwargs)
+    monkeypatch.setattr(os, "open", _fail_open)
     # Must return normally, not raise. Handler above stays 200.
     tbenv.append_log({"result": "not-handled", "seq": 0})
     # Sink was never created (open failed) — telemetry line is lost,
@@ -16842,3 +16845,66 @@ def test_portal_expansion_does_not_swallow_unrelated_paths():
         "/sonicui/", "/sonicui/7/", "/logon/LogonPoint/", "/userportal/",
     ]:
         assert not tbenv.is_sonicwall_path(path), f"unexpected sonicwall match: {path}"
+
+
+def test_append_log_writes_each_record_in_one_syscall(tmp_path, monkeypatch):
+    """One record must be exactly one write(). Buffered text-mode writes
+    split a record across syscalls, and because a second appender can be
+    running against the same path (restart overlap), two split writes
+    interleave into a spliced line that is not valid JSON. Downstream
+    readers drop such lines silently, so the telemetry loss — including
+    canary-issuance records — is invisible."""
+    log_path = tmp_path / "env-canary.jsonl"
+    monkeypatch.setattr(tbenv, "LOG_PATH", log_path)
+    monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 0)
+    writes = []
+    real_write = os.write
+    def _counting_write(fd, data):
+        writes.append(data)
+        return real_write(fd, data)
+    monkeypatch.setattr(os, "write", _counting_write)
+    # Padded well past the 8 KiB text-buffer size that used to force a
+    # mid-record flush.
+    tbenv.append_log({"result": "not-handled", "pad": "x" * 40000})
+    assert len(writes) == 1
+    assert writes[0].endswith(b"\n")
+    assert json.loads(log_path.read_text())["pad"] == "x" * 40000
+
+
+def test_append_log_opens_append_only(tmp_path, monkeypatch):
+    """O_APPEND is what makes the single write atomic against other
+    appenders; a seek-then-write would reintroduce the splice."""
+    log_path = tmp_path / "env-canary.jsonl"
+    monkeypatch.setattr(tbenv, "LOG_PATH", log_path)
+    monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 0)
+    seen = []
+    real_os_open = os.open
+    def _record_open(path, flags, *args, **kwargs):
+        if str(path) == str(log_path):
+            seen.append(flags)
+        return real_os_open(path, flags, *args, **kwargs)
+    monkeypatch.setattr(os, "open", _record_open)
+    tbenv.append_log({"result": "not-handled"})
+    assert seen and all(f & os.O_APPEND for f in seen)
+
+
+def test_append_log_interleaved_writers_keep_lines_parseable(tmp_path, monkeypatch):
+    """Records from two writers may land in any order, but no line may
+    ever contain a fragment of another record."""
+    log_path = tmp_path / "env-canary.jsonl"
+    monkeypatch.setattr(tbenv, "LOG_PATH", log_path)
+    monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 0)
+    for i in range(50):
+        tbenv.append_log({"result": "not-handled", "seq": i, "pad": "y" * 9000})
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 50
+    assert sorted(json.loads(line)["seq"] for line in lines) == list(range(50))
+
+
+def test_append_log_drops_unserialisable_payload(tmp_path, monkeypatch):
+    """A bad value must not propagate out of the request handler."""
+    log_path = tmp_path / "env-canary.jsonl"
+    monkeypatch.setattr(tbenv, "LOG_PATH", log_path)
+    monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 0)
+    tbenv.append_log({"result": "not-handled", "bad": object()})
+    assert not log_path.exists() or log_path.read_text() == ""

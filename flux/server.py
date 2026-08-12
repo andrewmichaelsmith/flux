@@ -3377,17 +3377,44 @@ def append_log(payload: dict[str, object]) -> None:
     volume never propagates a 500 out of the request handler that
     called us. A 500 fingerprints the sensor as broken and drives
     scanners away; losing a single telemetry line is preferable.
-    Rotation is already best-effort inside `_rotate_log_if_needed`."""
+    Rotation is already best-effort inside `_rotate_log_if_needed`.
+
+    The record is serialised first and handed to a single `os.write()` on
+    an `O_APPEND` descriptor. Buffered text-mode writes could split one
+    record across more than one syscall, and `_rotate_log_if_needed`
+    already documents that a second appender can be running against the
+    same path (a service restart overlap is enough). Two interleaved
+    multi-syscall writes splice into a line that is not valid JSON —
+    `{"bodyBytesRead": 0,{"bodyBytesRead": 0, ...` — so every downstream
+    reader drops it. That silently loses telemetry, including
+    canary-issuance records, and the loss is invisible because a corrupt
+    line looks the same as no line at all. One `O_APPEND` write per
+    record is atomic against other appenders on a regular file, so
+    records can no longer splice."""
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
     _rotate_log_if_needed()
     try:
-        with LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        line = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+    except (TypeError, ValueError):
+        # A non-serialisable value must not propagate out of the request
+        # handler. Nothing loggable, so drop the line.
+        return
+    try:
+        fd = os.open(LOG_PATH, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     except OSError:
         return
+    try:
+        os.write(fd, line)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _is_internal_ip(value: str) -> bool:

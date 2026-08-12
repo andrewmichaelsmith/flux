@@ -311,9 +311,13 @@ for the full list of `<trap-name>` values and the paths each one matches.
 ## Caveats
 
 - Lines are not fsync'd; a hard reboot can drop the last few entries.
-- `append_log` opens the file per call without locking. POSIX `write()` is
-  atomic for blocks under `PIPE_BUF` (4096 on Linux) — most flux log lines
-  are well under that, but a webshell line with a large `bodyPreview` could
-  theoretically tear under heavy concurrent writers. Swap in a log shipper
-  if you care about this.
+- `append_log` opens the file per call without locking, but each record is
+  serialised up front and handed to a single `os.write()` on an `O_APPEND`
+  descriptor, which is atomic against other appenders on a regular file.
+  This used to be a buffered text-mode write, which could split one record
+  across several syscalls; with two writers live at once (a service restart
+  overlap is enough) those splits spliced into lines that were not valid
+  JSON, and every reader dropped them silently — so the loss, including
+  canary-issuance records, was invisible. If you add a writer here, keep
+  the one-record-one-`write()` property; the tests assert it.
 - No rotation is built in. Wire up logrotate or equivalent.
