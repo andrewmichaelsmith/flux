@@ -18379,7 +18379,8 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     CanaryTrap(
         "firebase-json",
         (
-            "/firebase.json", "/google-services.json",
+            "/firebase.json", "/firebase-config.json",
+            "/google-services.json",
             "/serviceaccount.json", "/service-account.json",
             # Firebase Admin SDK + GCP service-account key file names that
             # multi-platform credential scanners enumerate alongside the
@@ -19246,6 +19247,42 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/home/ec2-user/.ssh/id_rsa.pem",
             "/home/admin/.ssh/id_rsa.pem",
             "/home/deploy/.ssh/id_rsa.pem",
+            # Web-server TLS key filenames, at webroot and under the
+            # conventional `ssl/`, `certs/`, `private/`, `keys/`
+            # directories. These are the names an operator gives the key
+            # a TLS listener loads (`ssl_certificate_key`,
+            # `SSLCertificateKeyFile`), and secrets-hunter dictionaries
+            # walk them as their own group: a leaked TLS key has resale
+            # value an ssh identity does not, so the filenames travel
+            # together in the list even though the on-disk formats
+            # differ. Every one of them answered 404 while the `.ssh/`
+            # filenames next to them in the same sweep issued a canary.
+            #
+            # Same private-key body as the `.pem` set above, for the same
+            # reason: the client greps the response for a
+            # `BEGIN ... PRIVATE KEY` header rather than parsing it, and
+            # what makes answering worth it is that the key walked away
+            # with is per-request and monitored on use.
+            "/server.key",
+            "/server.pem",
+            "/privatekey.key",
+            "/private-key",
+            "/host.key",
+            "/localhost.key",
+            "/key.pem",
+            "/privkey.pem",
+            "/ssl/server.key",
+            "/ssl/localhost.key",
+            "/ssl/private.key",
+            "/ssl/key.pem",
+            "/ssl/privkey.pem",
+            "/certs/server.key",
+            "/certs/privkey.pem",
+            "/private/server.key",
+            "/keys/server.key",
+            "/keys/private.pem",
+            "/nginx/ssl/server.key",
+            "/conf/ssl/server.key",
         ),
         ("ssh",),
         render_ssh_private_key,
@@ -20594,6 +20631,18 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/config/settings.py",
             "/instance/config.py",
             "/project/settings.py",
+            # `core/` and `backend/` are the two project-package names
+            # `django-admin startproject` conventions produce most often
+            # once the project is not named after the site, and both were
+            # being probed at the same breadth as the layouts already
+            # listed while answering 404 — a gap in the layout matrix
+            # rather than a new family.
+            "/core/settings.py",
+            "/core/config.py",
+            "/backend/settings.py",
+            "/backend/config.py",
+            "/src/settings.py",
+            "/src/config.py",
             "/settings.py.bak",
             "/config.py.bak",
             "/settings.py~",
@@ -20624,6 +20673,10 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/config.yml.bak",
             "/config.yaml.bak",
             "/config.yml~",
+            # Tool-specific dotdir configs probed alongside the bare
+            # `config.yaml` in the same sweep.
+            "/.hermes/config.yaml",
+            "/.hermes/config.yml",
             *_app_layout_variants("config.yml"),
             *_app_layout_variants("config.yaml"),
         ),
@@ -20664,6 +20717,25 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/api/v2/config",
             "/api/settings",
             "/api/config.json",
+            # Versioned siblings of the same introspection endpoint. The
+            # sweep that walks `/api/v1/config` walks `/api/v1/settings`
+            # and `/api/v1/env` in the same pass; only the `config`
+            # spelling was answered, so two thirds of the same request
+            # burst fell through to a 404.
+            # `/api/env` is intentionally absent: owned by `env-production`.
+            "/api/v1/settings",
+            "/api/v2/settings",
+            "/api/v1/env",
+            "/api/v2/env",
+            # Front-end runtime-config bundles. A SPA that cannot read
+            # env vars in the browser ships its resolved settings as a
+            # static JSON file next to the bundle, which is why these
+            # names sit in the dictionary beside the on-disk configs.
+            # `/configuration.json`, `/runtime-config.json` and
+            # `/appsettings.local.json` are intentionally absent: owned by
+            # `webapp-config-bundle-json` / `appsettings-json`.
+            "/app-config.json",
+            "/push_config.json",
         ),
         ("aws",),
         render_app_config_json,

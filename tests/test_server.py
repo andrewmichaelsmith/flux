@@ -680,6 +680,25 @@ def test_tarpit_enabled_by_default():
     assert tbenv.TARPIT_ENABLED
 
 
+def test_no_path_is_claimed_by_two_traps():
+    """`_TRAP_BY_PATH` is built by iterating `CANARY_TRAPS` in order, so a
+    path listed under two traps silently resolves to whichever trap is
+    declared later — the earlier trap's renderer becomes unreachable for
+    that path with no error anywhere. Adding a plausible-looking filename
+    to a growing path table is exactly how that happens, so assert the
+    registry has no overlap at all rather than trusting review to catch it.
+    """
+    owners: dict[str, list[str]] = {}
+    for trap in tbenv.CANARY_TRAPS:
+        for path in trap.paths:
+            owners.setdefault(path.lower(), []).append(trap.name)
+    collisions = {p: names for p, names in owners.items() if len(names) > 1}
+    assert not collisions, (
+        f"paths claimed by more than one CanaryTrap: {collisions}. "
+        f"The last-declared trap wins; drop the duplicate or move the path."
+    )
+
+
 @pytest.mark.parametrize("path", [
     # Regression: dispatch order in `handle()` runs the tarpit check
     # before the canary-trap lookup, so any path that matches both was
@@ -843,6 +862,7 @@ FAKE_TRACEBIT = {
     ("/backup.sql", b"AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01"),
     ("/config.json", b'"access_key_id": "AKIAFAKEEXAMPLE01"'),
     ("/firebase.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
+    ("/firebase-config.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
     ("/firebase-adminsdk.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
     ("/gcp-service-account.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
     ("/.config/gcloud/application_default_credentials.json", b'"private_key_id": "AKIAFAKEEXAMPLE01"'),
@@ -1051,6 +1071,30 @@ FAKE_TRACEBIT = {
     ("/home/deploy/.ssh/cert.pem", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/root/.ssh/cert.pem", b"BEGIN OPENSSH PRIVATE KEY"),
     ("/home/ubuntu/.ssh/id_rsa.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    # Web-server TLS key filenames — same private-key body as the `.pem`
+    # set above. These are the names a TLS listener's key carries on
+    # disk, and they answered 404 while the `.ssh/` filenames the same
+    # sweep walks issued a canary.
+    ("/server.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/server.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/privatekey.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/private-key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/host.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/localhost.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/key.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/privkey.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/ssl/server.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/ssl/localhost.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/ssl/private.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/ssl/key.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/ssl/privkey.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/certs/server.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/certs/privkey.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/private/server.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/keys/server.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/keys/private.pem", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/nginx/ssl/server.key", b"BEGIN OPENSSH PRIVATE KEY"),
+    ("/conf/ssl/server.key", b"BEGIN OPENSSH PRIVATE KEY"),
     # Common scanner-dict typo for known_hosts — same render as the canonical.
     ("/.ssh/know_hosts", b"203.0.113.99 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
     ("/authorized_keys", b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKE"),
@@ -15761,6 +15805,16 @@ APP_CONFIG_DISPATCH_CASES = [
     ("/settings.py~", "app-config-python"),
     ("/local_settings.py", "app-config-python"),
     ("/production_settings.py", "app-config-python"),
+    # `core/` and `backend/` project-package layouts — the two names
+    # startproject produces most often when the package is not named
+    # after the site. Probed at the same breadth as the layouts above
+    # while answering 404.
+    ("/core/settings.py", "app-config-python"),
+    ("/core/config.py", "app-config-python"),
+    ("/backend/settings.py", "app-config-python"),
+    ("/backend/config.py", "app-config-python"),
+    ("/src/settings.py", "app-config-python"),
+    ("/src/config.py", "app-config-python"),
     # Generic YAML.
     ("/config.yaml", "app-config-yaml"),
     ("/config.yml", "app-config-yaml"),
@@ -15774,6 +15828,8 @@ APP_CONFIG_DISPATCH_CASES = [
     ("/config.yml.bak", "app-config-yaml"),
     ("/config.yaml.bak", "app-config-yaml"),
     ("/config.yml~", "app-config-yaml"),
+    ("/.hermes/config.yaml", "app-config-yaml"),
+    ("/.hermes/config.yml", "app-config-yaml"),
     ("/app/config.yml", "app-config-yaml"),
     ("/storage/config.yaml", "app-config-yaml"),
     # TOML.
@@ -15792,6 +15848,15 @@ APP_CONFIG_DISPATCH_CASES = [
     ("/api/v2/config", "app-config-json"),
     ("/api/settings", "app-config-json"),
     ("/api/config.json", "app-config-json"),
+    # Versioned siblings of the same introspection endpoint — walked in
+    # the same pass as `/api/v1/config`, previously unanswered.
+    ("/api/v1/settings", "app-config-json"),
+    ("/api/v2/settings", "app-config-json"),
+    ("/api/v1/env", "app-config-json"),
+    ("/api/v2/env", "app-config-json"),
+    # Front-end runtime-config bundles.
+    ("/app-config.json", "app-config-json"),
+    ("/push_config.json", "app-config-json"),
     # Java properties.
     ("/bootstrap.properties", "app-config-properties"),
     ("/config/bootstrap.properties", "app-config-properties"),
