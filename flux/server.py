@@ -826,6 +826,56 @@ _CLOUD_IMDS_ECS_PREFIX = "/v2/credentials/"
 # a secret — an ARN identifies a role, it does not authenticate to it.
 _CLOUD_IMDS_FILLER_ACCOUNT = "402113355019"
 
+# --- SSRF metadata relay -------------------------------------------------
+# The metadata tree above is asked for two ways. The direct form puts the
+# metadata path at our webroot and `resolve_cloud_imds` answers it. The
+# other form asks *us* to fetch it: a URL-taking parameter on a
+# server-side fetch endpoint, pointed at the link-local metadata address.
+# That is the shape a scanner uses when it believes the target is a
+# fetcher/renderer/webhook rather than a proxy, and it is the shape
+# credential-harvester tooling actually emits — one entry path swept with
+# several parameter spellings, because the client cannot know which name
+# the application used.
+SSRF_RELAY_ENABLED = _env_bool("HONEYPOT_SSRF_RELAY_ENABLED")
+# Entry paths that plausibly take a URL and fetch it server-side. Matched
+# with a trailing slash tolerated. None belongs to another trap — the
+# SSRF non-collision test keeps it that way.
+_SSRF_RELAY_ENTRY_PATHS: frozenset[str] = frozenset({
+    "/fetch", "/api/fetch", "/v1/fetch",
+    "/proxy", "/api/proxy", "/v1/proxy",
+    "/render", "/api/render",
+    "/preview", "/api/preview",
+    "/screenshot", "/thumbnail",
+    "/webhook/test", "/api/webhook/test",
+    "/url", "/api/url",
+    "/import", "/api/import",
+})
+# Hosts whose metadata tree uses the EC2 `/latest/meta-data/...` layout.
+# Alibaba Cloud mirrors that layout at its own link-local address, so it
+# resolves through the same table rather than needing its own.
+_SSRF_AWS_METADATA_HOSTS: frozenset[str] = frozenset({
+    "169.254.169.254",
+    "169.254.170.2",
+    "100.100.100.200",
+    "instance-data",
+    "instance-data.ec2.internal",
+    "metadata.ec2.internal",
+})
+# Hosts serving the GCP metadata tree.
+_SSRF_GCP_METADATA_HOSTS: frozenset[str] = frozenset({
+    "metadata.google.internal",
+    "metadata.goog",
+    "metadata",
+})
+_SSRF_GCP_ROOT = "/computemetadata/v1"
+# Non-secret filler. A service-account address identifies a principal; it
+# does not authenticate as one, so a constant is safe here for the same
+# reason `CLOUD_IMDS_ROLE_NAME` is.
+SSRF_GCP_SERVICE_ACCOUNT = (
+    os.environ.get("HONEYPOT_SSRF_GCP_SERVICE_ACCOUNT")
+    or "app-runtime@prod-platform-284915.iam.gserviceaccount.com"
+).strip() or "app-runtime@prod-platform-284915.iam.gserviceaccount.com"
+
 # Tool names that trigger the AWS canary path when passed to `tools/call`.
 # A real MCP server hosting these tools would return credentials or file
 # contents; we mint a canary and embed it in the tool-call result so
@@ -11429,6 +11479,63 @@ def render_aws_env_dotenv(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_shell_rc(r: dict[str, object]) -> bytes:
+    """`~/.bashrc` / `~/.profile` / `~/.zshrc` — an interactive shell rc
+    with cloud credentials exported from it.
+
+    This is asked for because it is where credentials genuinely end up:
+    the documented fix for "the CLI can't see my keys" is an `export`
+    line in the rc file, and it survives there long after the tool that
+    needed it is gone. A harvester greps the raw bytes for the AKIA /
+    secret pair exactly as it would in a `.env`, so the file only has to
+    read like a real one — hence the ordinary interactive-shell
+    boilerplate around the block that matters.
+
+    Every secret-shaped value is per-hit: the AWS pair is the issued
+    canary, the registry token is a per-hit synthetic. The non-secret
+    filler (paths, aliases, region, registry host) is fixed, which is
+    what makes the file look lived-in rather than generated.
+    """
+    aws = _aws(r)
+    return (
+        "# ~/.bashrc: executed by bash(1) for non-login shells.\n"
+        "case $- in\n"
+        "    *i*) ;;\n"
+        "      *) return;;\n"
+        "esac\n"
+        "\n"
+        "HISTCONTROL=ignoreboth\n"
+        "HISTSIZE=1000\n"
+        "HISTFILESIZE=2000\n"
+        "shopt -s histappend checkwinsize\n"
+        "\n"
+        "if [ -x /usr/bin/dircolors ]; then\n"
+        "    alias ls='ls --color=auto'\n"
+        "    alias grep='grep --color=auto'\n"
+        "fi\n"
+        "alias ll='ls -alF'\n"
+        "alias ..='cd ..'\n"
+        "alias dc='docker compose'\n"
+        "alias k='kubectl'\n"
+        "\n"
+        "export EDITOR=vim\n"
+        "export LANG=en_US.UTF-8\n"
+        "export PATH=\"$HOME/.local/bin:$HOME/bin:$PATH\"\n"
+        "\n"
+        "# deploy creds - aws cli wasn't picking up ~/.aws/credentials\n"
+        f"export AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"export AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"export AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "export AWS_DEFAULT_REGION=us-east-1\n"
+        "\n"
+        f"export REGISTRY_TOKEN={_fake_db_password()}\n"
+        "export REGISTRY_HOST=registry.internal.svc.cluster.local\n"
+        "\n"
+        "[ -f ~/.bash_aliases ] && . ~/.bash_aliases\n"
+        "[ -f ~/.nvm/nvm.sh ] && . ~/.nvm/nvm.sh\n"
+    ).encode("utf-8")
+
+
 def render_aws_credentials_json(r: dict[str, object]) -> bytes:
     """`/aws.json` — JSON-shaped AWS credentials object matching the
     `aws sts get-session-token --output json` envelope (capitalised
@@ -17745,6 +17852,39 @@ def _app_layout_variants(canonical: str) -> tuple[str, ...]:
 
 CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     CanaryTrap(
+        "shell-rc",
+        (
+            # Interactive-shell rc files, walked in the same sweep as the
+            # `.env` / `.aws/credentials` dictionary. They are asked for
+            # because an `export AWS_ACCESS_KEY_ID=` line in an rc file is
+            # the documented workaround for a CLI that cannot see the
+            # credentials file, so this is a place credentials genuinely
+            # survive.
+            "/.bashrc",
+            "/.bash_profile",
+            "/.bash_login",
+            "/.profile",
+            "/.zshrc",
+            "/.zprofile",
+            "/.zshenv",
+            "/.kshrc",
+            "/.cshrc",
+            # Home-dir spellings — the same sweep that asks for
+            # `/@fs/root/.env` asks for the rc file by absolute path.
+            "/root/.bashrc",
+            "/root/.bash_profile",
+            "/root/.profile",
+            "/root/.zshrc",
+            "/home/ubuntu/.bashrc",
+            "/home/ubuntu/.profile",
+            *_app_layout_variants(".bashrc"),
+            *_app_layout_variants(".profile"),
+        ),
+        ("aws",),
+        render_shell_rc,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
         "aws-credentials-file",
         (
             "/.aws/credentials",
@@ -18095,6 +18235,16 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # above and turns up in the same sweeps. The `.json` spelling
             # is deliberately absent — `firebase-json` already owns it.
             "/.gcloud/credentials",
+            # Bare service-account filenames a developer picks when
+            # downloading the key by hand. Probed by the same sweep that
+            # walks `/gcp-credentials.json`, and 404ing them while
+            # answering the canonical spelling splits one dictionary
+            # across two outcomes for no reason.
+            # (`/service-account.json` and `/serviceaccount.json` are
+            # deliberately absent: `firebase-json` already owns them.)
+            "/sa.json",
+            "/gcp-service.json",
+            "/gc-service.json",
             "/secrets/gcp.json",
             *_app_layout_variants(".gcp/credentials"),
             *_app_layout_variants(".gcp/credentials.json"),
@@ -20968,6 +21118,133 @@ _CLOUD_IMDS_INDEX_BODY = b"\n".join([
     b"public-ipv4", b"security-groups",
 ]) + b"\n"
 _CLOUD_IMDS_IAM_INDEX_BODY = b"info\nsecurity-credentials/\n"
+
+
+@dataclass
+class SsrfRelayRequest:
+    """An SSRF entry path pointed at a cloud metadata endpoint.
+
+    `param` and `target` are the enumeration payload: which parameter
+    spelling the client guessed, and which metadata document it wanted.
+    `imds` is set when the target resolves onto a step of the EC2-layout
+    protocol, in which case the relay answers with the very same body the
+    direct trap would — the client asked us to fetch metadata, so what
+    comes back has to be metadata, not a wrapper.
+    """
+
+    param: str
+    target: str
+    host: str
+    target_path: str
+    cloud: str                      # "aws" | "gcp" | "unknown"
+    imds: "CloudImdsRequest | None" = None
+    gcp_kind: str = ""              # "index" | "sa-index" | "email" | "token" | ""
+
+    @property
+    def issues_canary(self) -> bool:
+        return self.imds is not None and self.imds.issues_canary
+
+
+def _ssrf_candidate_urls(query_string: str) -> list[tuple[str, str]]:
+    """`(param, value)` pairs whose value could be a URL.
+
+    Values are decoded twice. A single decode is what the transport
+    already did; harvester tooling routinely double-encodes the target so
+    that a naive filter looking for the literal metadata address on the
+    wire does not see it, and a fetcher that unquotes before dereferencing
+    still resolves it.
+    """
+    if not query_string:
+        return []
+    out: list[tuple[str, str]] = []
+    try:
+        pairs = parse_qsl(query_string, keep_blank_values=True)
+    except (ValueError, UnicodeDecodeError):
+        return []
+    for key, value in pairs[:40]:
+        if not value:
+            continue
+        for candidate in (value, unquote(value)):
+            if "://" in candidate or candidate.startswith("//"):
+                out.append((key[:64], candidate[:512]))
+                break
+    return out
+
+
+def _ssrf_split_url(url: str) -> tuple[str, str]:
+    """`(host, path)` from a URL, without importing a parser that would
+    also try to validate it. Scanner-supplied targets are frequently
+    malformed on purpose, and a strict parse would drop exactly the
+    requests worth recording.
+    """
+    rest = url.split("://", 1)[1] if "://" in url else url.lstrip("/")
+    # Strip credentials, which is itself an SSRF filter-bypass idiom
+    # (`http://expected-host@169.254.169.254/`).
+    if "@" in rest.split("/", 1)[0]:
+        rest = rest.split("@", 1)[1]
+    authority, _, tail = rest.partition("/")
+    host = authority.split(":", 1)[0].strip().lower().rstrip(".")
+    path = "/" + tail.split("?", 1)[0].split("#", 1)[0]
+    return host, path
+
+
+def resolve_ssrf_relay(path: str, query_string: str) -> "SsrfRelayRequest | None":
+    """Map a fetch-style request onto the metadata document it points at.
+
+    Returns None unless the entry path is one we serve *and* some
+    parameter names a cloud metadata host. Requiring the metadata host is
+    what keeps this from behaving like an open proxy: a target we do not
+    emulate is logged and refused, never fetched. flux makes no outbound
+    request on any branch here.
+    """
+    bare = (path.lower().rstrip("/") or "/")
+    if bare not in _SSRF_RELAY_ENTRY_PATHS:
+        return None
+
+    for param, url in _ssrf_candidate_urls(query_string):
+        host, target_path = _ssrf_split_url(url)
+        if not host:
+            continue
+        lowered = target_path.lower()
+        if host in _SSRF_AWS_METADATA_HOSTS:
+            return SsrfRelayRequest(
+                param=param, target=url, host=host, target_path=target_path,
+                cloud="aws", imds=resolve_cloud_imds(target_path),
+            )
+        if host in _SSRF_GCP_METADATA_HOSTS:
+            return SsrfRelayRequest(
+                param=param, target=url, host=host, target_path=target_path,
+                cloud="gcp", gcp_kind=_resolve_ssrf_gcp_kind(lowered),
+            )
+    return None
+
+
+def _resolve_ssrf_gcp_kind(lowered_path: str) -> str:
+    """Which step of the GCP metadata tree a path names.
+
+    Mirrors the AWS split deliberately: the listing steps carry no secret
+    and cost nothing, and only the token endpoint hands back something
+    credential-shaped.
+    """
+    bare = lowered_path.rstrip("/") or "/"
+    if not bare.startswith(_SSRF_GCP_ROOT):
+        return ""
+    tail = bare[len(_SSRF_GCP_ROOT):].strip("/")
+    if not tail:
+        return "index"
+    if tail.endswith("/token") or tail.endswith("/identity"):
+        return "token"
+    if tail.endswith("/email"):
+        return "email"
+    if tail.endswith("service-accounts") or tail.endswith("service-accounts/default"):
+        return "sa-index"
+    return "index"
+
+
+# Directory listings for the GCP tree. Same reasoning as the EC2 bodies
+# above: no secret in them, so a sweep across the tree spends no canary.
+_SSRF_GCP_INDEX_BODY = b"instance/\nproject/\n"
+_SSRF_GCP_SA_INDEX_BODY = b"aliases\nemail\nidentity\nscopes\ntoken\n"
 
 
 # ============================================================================
@@ -27298,6 +27575,7 @@ async def _send_cloud_imds(
     user_agent: str,
     proto: str,
     log_context: dict[str, object],
+    result_prefix: str = "cloud-imds",
 ) -> web.Response:
     """Answer one step of the role-credential protocol.
 
@@ -27311,6 +27589,13 @@ async def _send_cloud_imds(
     `role-credentials` naming the role we just handed out is a client that
     parsed our response, which is the behaviour this trap is here to
     separate from a flat dictionary sweep.
+
+    `result_prefix` distinguishes how the request arrived. The metadata
+    tree is reachable directly at our webroot and indirectly through the
+    SSRF relay, and the two say different things about the client, so
+    they must not share a result tag — but they serve byte-identical
+    bodies, because a relay that returned something other than what the
+    metadata service returns is not worth following.
     """
     log_context = {
         **log_context,
@@ -27325,7 +27610,7 @@ async def _send_cloud_imds(
             else (CLOUD_IMDS_ROLE_NAME + "\n").encode("utf-8")
         )
         append_log({
-            **log_context, "status": 200, "result": f"cloud-imds-{imds.kind}",
+            **log_context, "status": 200, "result": f"{result_prefix}-{imds.kind}",
             "bytes": len(body),
         })
         return web.Response(
@@ -27347,7 +27632,7 @@ async def _send_cloud_imds(
     if tracebit_response is None:
         append_log({
             **log_context, "status": CREDENTIAL_FAILURE_STATUS,
-            "result": f"cloud-imds-{imds.kind}-error",
+            "result": f"{result_prefix}-{imds.kind}-error",
         })
         return _credential_failure_response()
 
@@ -27357,7 +27642,7 @@ async def _send_cloud_imds(
     )
     body = render(tracebit_response)
     append_log({
-        **log_context, "status": 200, "result": f"cloud-imds-{imds.kind}",
+        **log_context, "status": 200, "result": f"{result_prefix}-{imds.kind}",
         "canaryTypes": [k for k, v in tracebit_response.items() if v],
         "bytes": len(body),
     })
@@ -27369,6 +27654,117 @@ async def _send_cloud_imds(
             "Cache-Control": "no-store",
             "Content-Length": str(len(body)),
         },
+    )
+
+
+def _ssrf_plain_response(request: web.Request, body: bytes) -> web.Response:
+    return web.Response(
+        status=200,
+        body=b"" if request.method == "HEAD" else body,
+        headers={
+            "Content-Type": "text/plain",
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
+async def _send_ssrf_relay(
+    request: web.Request,
+    relay: "SsrfRelayRequest",
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.Response:
+    """Answer a fetch-style request that pointed at a metadata endpoint.
+
+    flux makes no outbound request here — the target is resolved against
+    a table and answered from the same renderers the direct metadata trap
+    uses. What comes back is therefore what the metadata service would
+    have returned, which is the only response a client that chained this
+    can act on.
+
+    Every line carries `ssrfParam` and `ssrfTarget`. That is as much the
+    point of the trap as the credential is: the client sweeps parameter
+    spellings against one entry path because it cannot know which name
+    the application used, so the log records the dictionary it is working
+    from. A second request naming the role from our first response —
+    through the relay — is a client that parsed the metadata document,
+    not one replaying a static list.
+    """
+    log_context = {
+        **log_context,
+        "ssrfParam": relay.param,
+        "ssrfTarget": relay.target,
+        "ssrfHost": relay.host,
+        "ssrfTargetPath": relay.target_path,
+        "ssrfCloud": relay.cloud,
+    }
+
+    if relay.imds is not None:
+        return await _send_cloud_imds(
+            request, relay.imds, request_id, path,
+            client_ip, host, user_agent, proto, log_context,
+            result_prefix="ssrf-relay-aws",
+        )
+
+    if relay.cloud == "gcp" and relay.gcp_kind in ("index", "sa-index", "email"):
+        body = (
+            _SSRF_GCP_SA_INDEX_BODY if relay.gcp_kind == "sa-index"
+            else (SSRF_GCP_SERVICE_ACCOUNT + "\n").encode("utf-8")
+            if relay.gcp_kind == "email"
+            else _SSRF_GCP_INDEX_BODY
+        )
+        append_log({
+            **log_context, "status": 200,
+            "result": f"ssrf-relay-gcp-{relay.gcp_kind}", "bytes": len(body),
+        })
+        return _ssrf_plain_response(request, body)
+
+    if relay.cloud == "gcp" and relay.gcp_kind == "token":
+        # Per-hit synthetic. Tracebit issues no GCP-shaped credential, so
+        # this cannot be a monitored canary — but it must still be unique
+        # per hit, because a fixed literal would be one string shared
+        # across every deployment, and worth nothing on replay anyway.
+        # What this branch measures is whether the client walked the tree
+        # to reach it, which the log records either way.
+        token = "ya29.c." + secrets.token_urlsafe(96)
+        payload = {
+            "access_token": token,
+            "expires_in": 3599,
+            "token_type": "Bearer",
+        }
+        body = json.dumps(payload).encode("utf-8")
+        append_log({
+            **log_context, "status": 200, "result": "ssrf-relay-gcp-token",
+            "syntheticToken": True, "bytes": len(body),
+        })
+        return web.Response(
+            status=200,
+            body=b"" if request.method == "HEAD" else body,
+            headers={
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store",
+                "Content-Length": str(len(body)),
+            },
+        )
+
+    # A metadata host we serve, asked for a document we do not emulate
+    # (`/latest/user-data`, an instance-identity document, a project-level
+    # GCP key). A real metadata service 404s an unknown key, so this is
+    # the honest answer as well as the cheap one — and the log still keeps
+    # the target, which is the part worth having: it names the next
+    # documents this tooling wants.
+    append_log({
+        **log_context, "status": 404, "result": "ssrf-relay-unmatched",
+    })
+    return web.Response(
+        status=404, body=b"not found\n",
+        headers={"Content-Type": "text/plain; charset=utf-8"},
     )
 
 
@@ -28404,6 +28800,19 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 client_ip, host, user_agent, proto, log_context,
             )
 
+    # Directly after the metadata tree, and ahead of the tarpit, for the
+    # same reason: this is the indirect way into that tree, and the
+    # listing steps are what make the credential step reachable. The
+    # branch only fires when a parameter names a metadata host, so an
+    # ordinary request to one of these entry paths still falls through.
+    if API_KEY and SSRF_RELAY_ENABLED and CLOUD_IMDS_ENABLED:
+        relay = resolve_ssrf_relay(path, query_string)
+        if relay is not None:
+            return await _send_ssrf_relay(
+                request, relay, request_id, path,
+                client_ip, host, user_agent, proto, log_context,
+            )
+
     if TARPIT_ENABLED and (is_tarpit_path(path) or is_fingerprint_path(path)):
         return await _send_tarpit(request, request_id, path, log_context, query_string)
 
@@ -28468,6 +28877,8 @@ def main() -> int:
             active.append("canary-file-traps")
         if CLOUD_IMDS_ENABLED:
             active.append("cloud-imds")
+            if SSRF_RELAY_ENABLED:
+                active.append("ssrf-relay")
         if BACKUP_ARCHIVE_ENABLED:
             active.append("backup-archive")
     else:

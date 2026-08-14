@@ -295,6 +295,31 @@ chain — that pair is the signal this trap exists to produce. See
 | `cloud-imds-ecs-credentials` | 200 | `canaryTypes: [..]`, `bytes: int` | Container credential-provider envelope. |
 | `cloud-imds-<kind>-error` | 404 | — | Canary issuance failed. Only the credential kinds can produce this. |
 
+### SSRF relay onto the metadata tree
+
+The same documents, reached through a URL-taking parameter on a
+fetch-style entry path instead of directly. Every line adds `ssrfParam`
+(the parameter spelling the client guessed), `ssrfTarget` (the URL as
+sent, ≤512 chars), `ssrfHost`, `ssrfTargetPath` and `ssrfCloud`
+(`aws`/`gcp`). The AWS branch also carries the full `imdsKind` /
+`imdsRole` pair, because it is the same handler — so the two-step chain
+above is reconstructable through the relay too. See
+[docs](./docs/ssrf-metadata-relay.md).
+
+| `result` | `status` | Extras | Meaning |
+| --- | --- | --- | --- |
+| `ssrf-relay-aws-<kind>` | 200 | as `cloud-imds-<kind>` | EC2-layout metadata step served through the relay. Canary only on the credential kinds. |
+| `ssrf-relay-aws-<kind>-error` | 404 | — | Canary issuance failed on a relayed credential step. |
+| `ssrf-relay-gcp-index` | 200 | `bytes: int` | GCP metadata tree listing. No canary issued. |
+| `ssrf-relay-gcp-sa-index` | 200 | `bytes: int` | Service-account key listing. No canary issued. |
+| `ssrf-relay-gcp-email` | 200 | `bytes: int` | Service-account address (non-secret filler). No canary issued. |
+| `ssrf-relay-gcp-token` | 200 | `syntheticToken: true`, `bytes: int` | Per-hit synthetic bearer token — **not** a monitored canary; Tracebit issues no GCP-shaped credential. The token itself is never logged. |
+| `ssrf-relay-unmatched` | 404 | — | Metadata host we serve, document we do not emulate. Logged for the target, which names what the tooling wants next. |
+
+A request to an entry path whose parameters name no metadata host is not
+claimed by this trap at all — it falls through to `not-handled`, and
+flux never makes an outbound request on any branch.
+
 ### Canary-backed file traps
 
 One log line per hit. All entries share the same shape:

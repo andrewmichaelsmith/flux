@@ -104,6 +104,17 @@ when `TRACEBIT_API_KEY` is unset — the dispatch requires both.
 | `FAKE_GIT_REMOTE_HOST` | `github.com` | Host portion of the generated canary URL. |
 | `FAKE_GIT_REMOTE_PATH` | `internal/tools.git` | Path portion of the generated canary URL. |
 
+## SSRF relay onto the metadata tree
+
+Requires a Tracebit key, and requires `HONEYPOT_CLOUD_IMDS_ENABLED` —
+the relay serves the same tree as the direct metadata trap and is
+dispatched behind it, so it cannot outlive it.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_SSRF_RELAY_ENABLED` | on | Master switch. Answers fetch-style entry paths (`/fetch`, `/proxy`, `/render`, `/preview`, `/webhook/test`, …) whose parameters name a cloud metadata host. Fires only on a metadata target, so it never behaves like a working open proxy; flux makes no outbound request on any branch. |
+| `HONEYPOT_SSRF_GCP_SERVICE_ACCOUNT` | `app-runtime@prod-platform-284915.iam.gserviceaccount.com` | Filler service-account address returned by the GCP `…/default/email` step. Non-secret — an address identifies a principal, it does not authenticate as one. |
+
 ## Fake webshell
 
 No Tracebit key required.
