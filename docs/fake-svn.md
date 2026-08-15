@@ -17,11 +17,18 @@ layouts Subversion has used.
 | `GET`, `HEAD` | `/.svn/all-wcprops`, `/.svn/dir-prop-base` | per-directory property files |
 | `GET`, `HEAD` | `<prefix>/.svn/<child>` | same, for apps deployed at a subpath; the `.svn` segment is case-insensitive |
 
+A directory asked for without its trailing slash — `/.svn/auth/svn.simple`
+is the common spelling — gets a `301` to the slash-terminated form, which
+is what Apache (`DirectorySlash On`, the default) and nginx do. Whether
+the client follows it is a signal in itself; most bare-socket dictionary
+scanners do not.
+
 Log tags `fake-svn` (200, with `svnKey`, `svnRevision`, `svnRepoUuid`,
-`svnAuthCached`, `canaryTypes`, `bytes`), `fake-svn-miss` (404, a child
-that resolved to the tree but isn't a file in it), and `fake-svn-error`
-(canary issuance failed — answers the same `404 not found` body as an
-unrouted path, so the failure is invisible to the client).
+`svnAuthCached`, `canaryTypes`, `bytes`), `fake-svn-redirect` (301, with
+`location`), `fake-svn-miss` (404, a child that resolved to the tree but
+isn't a file in it), and `fake-svn-error` (canary issuance failed —
+answers the same `404 not found` body as an unrouted path, so the failure
+is invisible to the client).
 
 Enabled by `FAKE_SVN_ENABLED` (default on). Requires `TRACEBIT_API_KEY`
 like every canary-backed trap; a keyless deployment 404s it.

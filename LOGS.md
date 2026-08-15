@@ -68,6 +68,7 @@ failure fully diagnosable in the log.
 | `result` | `status` | Extras | Meaning |
 | --- | --- | --- | --- |
 | `fake-svn` | 200 | `svnKey`, `svnRevision`, `svnRepoUuid`, `svnAuthCached`, `canaryTypes`, `bytes` | File served from the synthetic working copy. `svnKey` is the canonical `/.svn/...` lookup key (lowercased, prefix-stripped), so it records which layout the client asked for — `entries` / `text-base/` is a pre-1.7 dumper, `wc.db` / `pristine/` is 1.7+, and a `pristine/` fetch following a `wc.db` fetch means the client parsed the database and resolved a checksum out of it. |
+| `fake-svn-redirect` | 301 | `svnKey`, `svnRevision`, `location` | A directory asked for without its trailing slash (`/.svn/auth/svn.simple`), answered the way Apache `DirectorySlash On` and nginx do. `location` is built from the request path, so a prefixed probe is redirected within its own prefix. Whether the client comes back for the slash-terminated form is itself a signal — most bare-socket dictionary scanners do not follow redirects. |
 | `fake-svn-miss` | 404 | `svnKey`, `svnRevision` | Path resolved to the working copy but wasn't a file in it. |
 | `fake-svn-error` | 404 | — | Canary issuance failed. |
 

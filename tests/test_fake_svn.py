@@ -269,6 +269,51 @@ async def test_dispatch_serves_wc_db_with_a_sqlite_content_type(flux_client, mon
     assert (await resp.read()).startswith(b"SQLite format 3\x00")
 
 
+@pytest.mark.parametrize("path,location", [
+    ("/.svn/auth/svn.simple", "/.svn/auth/svn.simple/"),
+    ("/.svn/auth", "/.svn/auth/"),
+    ("/.svn/text-base", "/.svn/text-base/"),
+    ("/.svn/pristine", "/.svn/pristine/"),
+])
+async def test_directory_without_trailing_slash_redirects(
+    flux_client, monkeypatch, path, location,
+):
+    """Apache's `DirectorySlash On` and nginx both 301 a directory asked
+    for without its trailing slash. The bare `auth/svn.simple` spelling is
+    one of the most requested paths in the dictionary, so treating it as a
+    miss would 404 the most credential-relevant probe the trap gets."""
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "FAKE_SVN_ENABLED", True)
+    monkeypatch.setattr(tbenv, "issue_credentials", _fake_canary)
+
+    resp = await flux_client.get(
+        path, headers={"X-Forwarded-For": "203.0.113.27"}, allow_redirects=False,
+    )
+    assert resp.status == 301
+    assert resp.headers["Location"] == location
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "fake-svn-redirect"
+    assert entry["location"] == location
+
+
+async def test_prefixed_directory_redirect_keeps_the_clients_own_prefix(
+    flux_client, monkeypatch,
+):
+    """The redirect target is built from the request path, not the lookup
+    key, so an app deployed at a subpath is sent somewhere that exists."""
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "FAKE_SVN_ENABLED", True)
+    monkeypatch.setattr(tbenv, "issue_credentials", _fake_canary)
+
+    resp = await flux_client.get(
+        "/login/.svn/auth/svn.simple",
+        headers={"X-Forwarded-For": "203.0.113.28"},
+        allow_redirects=False,
+    )
+    assert resp.status == 301
+    assert resp.headers["Location"] == "/login/.svn/auth/svn.simple/"
+
+
 async def test_unknown_child_is_a_logged_miss_not_a_bare_404(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
     monkeypatch.setattr(tbenv, "FAKE_SVN_ENABLED", True)

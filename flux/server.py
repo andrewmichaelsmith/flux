@@ -28842,6 +28842,33 @@ async def _send_fake_svn(
 
     files, meta = result
     content = files.get(svn_key)
+
+    if content is None and f"{svn_key}/" in files:
+        # Directory asked for without its trailing slash. Both Apache
+        # (`DirectorySlash On`, the default) and nginx answer that with a
+        # 301 to the slash-terminated form rather than serving the index
+        # inline, so that is what a really-exposed working copy would do.
+        #
+        # This matters more than it looks: the bare `auth/svn.simple`
+        # spelling — the credential-cache directory — is one of the most
+        # requested paths in the whole dictionary, and treating it as a
+        # miss would 404 the single most credential-relevant probe the
+        # trap receives. Answering with the redirect also measures
+        # something the 200 could not: whether the client follows
+        # redirects at all, which most bare-socket dictionary scanners
+        # do not.
+        location = f"{path.rstrip('/')}/"
+        append_log({
+            **log_context, "status": 301, "result": "fake-svn-redirect",
+            "svnKey": svn_key,
+            "svnRevision": meta.get("svnRevision", ""),
+            "location": location,
+        })
+        return web.Response(
+            status=301, body=b"",
+            headers={"Location": location, "Content-Type": "text/html; charset=utf-8"},
+        )
+
     if content is None:
         append_log({
             **log_context, "status": 404, "result": "fake-svn-miss",
