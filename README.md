@@ -245,7 +245,10 @@ case-insensitive exact matches.
 | Heroku app metadata — [docs](./docs/heroku-config.md) | `/app.json` | `aws` | `heroku-app-json` |
 | .NET Core appsettings — [docs](./docs/heroku-config.md) | `/appsettings.json` plus `.production.json`, `.development.json`, `.staging.json`, `.local.json` variants | `aws` | `appsettings-json` |
 | IIS web.config — [docs](./docs/heroku-config.md) | `/web.config` plus editor-leftover suffix variants (`.bak`, `.old`, `.orig`, `.save`) | `aws` | `iis-web-config` |
-| PHP Composer auth.json — [docs](./docs/heroku-config.md) | `/auth.json` | `gitlab-username-password` | `composer-auth-json` |
+| PHP Composer auth.json — [docs](./docs/heroku-config.md) | `/auth.json`, `/.hermes/auth.json` | `gitlab-username-password` | `composer-auth-json` |
+| VS Code debug-launch config | `/.vscode/launch.json`, `/.vscode/tasks.json`, plus app-layout prefixed variants. The `env` block of a launch configuration is where a developer parks the credentials a debug run needs, and `.vscode/` is not in most default ignore files | `aws` | `vscode-launch-json` |
+| Firebase Hosting SDK config | `/__/firebase/init.json`, `/__/firebase/init.js` — the client config a hosted app fetches from Firebase Hosting's reserved namespace. Distinct from the service-account family above: this one confirms the site is a live Firebase project and carries the API key | `aws` | `firebase-init-json`, `firebase-init-js` |
+| Elixir / Phoenix runtime config | `/config/runtime.exs`, `/config/prod.exs`, `/config/releases.exs`, `/config/dev.exs`, `/config/config.exs`, plus app-layout prefixed variants. `runtime.exs` is evaluated on boot, which is why it is the sibling that holds `secret_key_base`, the database URL and cloud credentials | `aws` | `elixir-config-exs` |
 | Dockerfile source — [docs](./docs/heroku-config.md) | `/Dockerfile` plus environment-suffixed variants (`.prod`, `.production`, `.dev`, `.development`, `.local`, `.staging`, `.worker`, `.build`) and `/Containerfile` | `aws` | `dockerfile` |
 | OpenAI config file | `/.openai/config.json` | `aws` (†) | `openai-config` |
 | Anthropic config file | `/.anthropic/config.json` | `aws` (†) | `anthropic-config` |
