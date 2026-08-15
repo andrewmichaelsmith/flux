@@ -12,6 +12,7 @@ These tests pin the routing, the two layouts staying mutually
 consistent, the three independent canary placements, and the rule that
 matters most: nothing secret-shaped may be a fixed literal.
 """
+import hashlib
 import sqlite3
 import tempfile
 
@@ -109,7 +110,6 @@ def test_wc_db_is_a_real_database_naming_real_pristine_files(wc):
         sha1 = checksum[len("$sha1$"):]
         pristine_key = f"/.svn/pristine/{sha1[:2]}/{sha1}.svn-base"
         assert pristine_key in files, f"{relpath} names a pristine file that isn't served"
-        import hashlib
         assert hashlib.sha1(files[pristine_key]).hexdigest() == sha1
 
 
@@ -127,7 +127,6 @@ def test_text_base_matches_pristine_for_root_level_files(wc):
     same pristine copy — the bytes must agree or a client that fetches
     both sees an inconsistent working copy."""
     files, _meta = wc
-    import hashlib
     env_body = files["/.svn/text-base/.env.svn-base"]
     sha1 = hashlib.sha1(env_body).hexdigest()
     assert files[f"/.svn/pristine/{sha1[:2]}/{sha1}.svn-base"] == env_body
@@ -177,11 +176,9 @@ def test_auth_cache_is_svn_hash_dump_format_with_the_canary(wc):
 
 def test_pristine_env_holds_the_canary(wc):
     files, _meta = wc
-    import hashlib
     env_body = files["/.svn/text-base/.env.svn-base"].decode()
     assert "AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01\n" in env_body
     assert "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n" in env_body
-    del hashlib
 
 
 def test_no_fixed_credential_literals_across_builds():
@@ -204,11 +201,43 @@ def test_mint_failure_leaves_no_secret_material_in_the_repo_url():
     """When the canary mint fails the URL must degrade to a bare host
     rather than emit a malformed or half-populated credential."""
     files, meta = tbenv._build_fake_svn_wc({})
-    entries = files["/.svn/entries"].decode()
-    assert "@" not in entries.split("\n")[3], entries.split("\n")[3]
+
+    # Assert on every URL the working copy records, not on a fixed line
+    # index — the record layout has empty fields either side of it, so a
+    # positional check silently lands on the wrong line and passes for
+    # the wrong reason.
+    url_lines = [
+        line for line in files["/.svn/entries"].decode().splitlines()
+        if line.startswith("https://")
+    ]
+    assert url_lines, "entries records no repository URL at all"
+    for line in url_lines:
+        assert "@" not in line, f"userinfo survived a failed mint: {line}"
+
+    with tempfile.NamedTemporaryFile(suffix=".db") as handle:
+        handle.write(files["/.svn/wc.db"])
+        handle.flush()
+        connection = sqlite3.connect(handle.name)
+        try:
+            (root,) = connection.execute("SELECT root FROM REPOSITORY").fetchone()
+        finally:
+            connection.close()
+    assert "@" not in root, root
+
     assert meta["svnAuthCached"] is False
     assert not any(k.startswith("/.svn/auth/svn.simple/") and len(k) > len("/.svn/auth/svn.simple/")
                    for k in files), "no auth cache without credentials to put in it"
+
+
+def test_repo_url_line_is_where_the_userinfo_lands_on_success():
+    """Counterpart to the mint-failure case above: on the happy path the
+    same URL lines are the ones that must carry the credential."""
+    files, _meta = tbenv._build_fake_svn_wc(FAKE_TRACEBIT)
+    url_lines = [
+        line for line in files["/.svn/entries"].decode().splitlines()
+        if line.startswith("https://")
+    ]
+    assert any("AKIAFAKEEXAMPLE01:" in line for line in url_lines), url_lines
 
 
 # --- dispatch ---------------------------------------------------------
