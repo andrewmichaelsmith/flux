@@ -15,6 +15,7 @@ import os
 import posixpath
 import re
 import secrets
+import sqlite3
 import string
 import sys
 import tarfile
@@ -198,6 +199,27 @@ FAKE_GIT_COMMIT_MESSAGE = (os.environ.get("FAKE_GIT_COMMIT_MESSAGE") or "Initial
 FAKE_GIT_REMOTE_URL = (os.environ.get("FAKE_GIT_REMOTE_URL") or "").strip()
 FAKE_GIT_REMOTE_HOST = (os.environ.get("FAKE_GIT_REMOTE_HOST") or "github.com").strip()
 FAKE_GIT_REMOTE_PATH = (os.environ.get("FAKE_GIT_REMOTE_PATH") or "internal/tools.git").strip().lstrip("/")
+
+# --- Fake /.svn/ working-copy configuration ---
+# The Subversion sibling of the /.git/ tree above. Scanner dictionaries walk
+# `.svn/entries`, `.svn/wc.db` and `.svn/auth/svn.simple` in the same sweep
+# that walks `.git/config`, and a working copy left in a webroot is a real,
+# long-lived exposure class — which is why those paths are still probed
+# heavily years after Subversion stopped being the default VCS.
+#
+# Same default-on rationale as fake-git: the per-IP cache bounds canary
+# issuance and the dispatch still requires TRACEBIT_API_KEY.
+FAKE_SVN_ENABLED = _env_bool("FAKE_SVN_ENABLED")
+FAKE_SVN_CACHE_TTL_SECONDS = max(int((os.environ.get("FAKE_SVN_CACHE_TTL_SECONDS") or "3600").strip() or "3600"), 60)
+FAKE_SVN_CACHE_MAX_ENTRIES = max(int((os.environ.get("FAKE_SVN_CACHE_MAX_ENTRIES") or "1024").strip() or "1024"), 16)
+# Repository the working copy claims to be checked out from. Rebuilt
+# per-request with the Tracebit canary as HTTPS Basic userinfo (the same
+# trick as FAKE_GIT_REMOTE_URL) unless overridden here.
+FAKE_SVN_REPO_URL = (os.environ.get("FAKE_SVN_REPO_URL") or "").strip()
+FAKE_SVN_REPO_HOST = (os.environ.get("FAKE_SVN_REPO_HOST") or "svn.internal-tools.lan").strip()
+FAKE_SVN_REPO_PATH = (os.environ.get("FAKE_SVN_REPO_PATH") or "svn/deploy-tools").strip().strip("/")
+FAKE_SVN_AUTHOR = (os.environ.get("FAKE_SVN_AUTHOR") or "ops").strip()
+FAKE_SVN_REVISION = max(int((os.environ.get("FAKE_SVN_REVISION") or "1487").strip() or "1487"), 1)
 
 # --- Fake webshell configuration (Azure WP Webshell Checker intel, 2026-04-20) ---
 # Default-enabled: the trap is cheap, logs are cheap, and we want to see what
@@ -3615,6 +3637,33 @@ def extract_git_path(path: str) -> str | None:
     if lower.startswith("/.git/"):
         return lower
     idx = lower.find("/.git/")
+    if idx > 0:
+        return lower[idx:]
+    return None
+
+
+def extract_svn_path(path: str) -> str | None:
+    """Return the canonical `/.svn/...` lookup key, or None if `path` isn't
+    a request for a /.svn working copy.
+
+    Mirrors extract_git_path(): accepts the bare directory, any child, the
+    `<prefix>/.svn/<child>` form scanners use for apps deployed at a
+    subpath, and is case-insensitive on the `.svn` segment.
+
+    Note the dispatch order in handle(): fake-git is consulted first, so a
+    path that contains BOTH segments (`/.git/config/.svn/entries` — a
+    scanner appending the svn dictionary to every git path it tried) is
+    still classified as a fake-git miss. That keeps the existing signal
+    intact rather than reclassifying it as svn traffic.
+    """
+    if not path:
+        return None
+    lower = path.lower()
+    if lower == "/.svn" or lower == "/.svn/":
+        return "/.svn/"
+    if lower.startswith("/.svn/"):
+        return lower
+    idx = lower.find("/.svn/")
     if idx > 0:
         return lower[idx:]
     return None
@@ -11318,6 +11367,475 @@ async def _fake_git_get_or_build(
     except BaseException:
         async with lock:
             _FAKE_GIT_INFLIGHT.pop(cache_key, None)
+        if not waiter.done():
+            waiter.set_result(None)
+        raise
+
+
+# --- Fake /.svn/ working copy ---
+#
+# The Subversion sibling of _build_fake_repo() above. Two generations of
+# working-copy layout are answered deliberately:
+#
+#   * pre-1.7 — `.svn/entries` in the plain-text record format, with
+#     pristine copies under `.svn/text-base/<name>.svn-base`.
+#   * 1.7+    — `.svn/wc.db`, a real SQLite database, with pristine copies
+#     under `.svn/pristine/<xx>/<sha1>.svn-base`.
+#
+# Both are served because the trap exists to observe *which* generation a
+# client implements and whether it follows the format it asked for through
+# to the pristine copy that actually holds file contents. Answering only
+# one layout drops half the population at its first request, and the two
+# dictionaries are walked in comparable volume.
+#
+# There are three independent places a credential can be picked up, which
+# is what makes the response worth more than a flat 200:
+#
+#   1. the repository URL in `entries` / `wc.db` carries the canary as
+#      HTTPS Basic userinfo — a client that reads only the metadata file
+#      still leaves with a live credential (same idea as the fake-git
+#      remote-origin URL);
+#   2. `.svn/auth/svn.simple/<realm-hash>` is Subversion's own saved
+#      -credential cache, in its real hash-dump serialization;
+#   3. the pristine copy of the config file holds the same canary in a
+#      dotenv/YAML body.
+#
+# Which of the three a client takes is the measurement: it separates
+# "grabbed the first file in the dictionary" from "implemented the
+# working-copy format and walked it".
+
+_FAKE_SVN_LOCK: asyncio.Lock | None = None
+_FAKE_SVN_CACHE: dict[str, tuple[float, dict[str, bytes], dict[str, object]]] = {}
+_FAKE_SVN_INFLIGHT: dict[str, "asyncio.Future[tuple[dict[str, bytes], dict[str, object]] | None]"] = {}
+
+
+def _get_fake_svn_lock() -> asyncio.Lock:
+    global _FAKE_SVN_LOCK
+    if _FAKE_SVN_LOCK is None:
+        _FAKE_SVN_LOCK = asyncio.Lock()
+    return _FAKE_SVN_LOCK
+
+
+def _build_fake_svn_repo_url(tracebit_response: dict[str, object]) -> str:
+    """Build the repository root URL recorded in the working copy.
+
+    Same rationale as _build_fake_git_remote_url(): when no operator
+    override is set, the Tracebit AWS canary goes in as HTTPS Basic
+    userinfo so a client that reads only `entries` (or only the
+    REPOSITORY row of `wc.db`) still walks away with a live credential.
+    Falls back to a bare URL with no secret material if the mint failed.
+    """
+    if FAKE_SVN_REPO_URL:
+        return FAKE_SVN_REPO_URL
+    base = f"{FAKE_SVN_REPO_HOST}/{FAKE_SVN_REPO_PATH}"
+    aws = _aws(tracebit_response)
+    access_key = str(aws.get("awsAccessKeyId") or "").strip()
+    secret = str(aws.get("awsSecretAccessKey") or "").strip()
+    if not access_key or not secret:
+        return f"https://{base}"
+    return f"https://{access_key}:{quote(secret, safe='')}@{base}"
+
+
+def _svn_hash_dump(pairs: tuple[tuple[str, str], ...]) -> bytes:
+    """Serialize key/value pairs in Subversion's hash-dump format.
+
+    This is the on-disk format of `.svn/auth/svn.simple/<md5>` and
+    `.svn/all-wcprops`: for each entry a `K <len>` line, the key, a
+    `V <len>` line, the value, and a trailing `END`. Lengths are byte
+    counts, so a tool validating them against the payload sees a
+    well-formed file.
+    """
+    out: list[bytes] = []
+    for key, value in pairs:
+        key_bytes = key.encode("utf-8")
+        value_bytes = value.encode("utf-8")
+        out.append(b"K %d\n%s\n" % (len(key_bytes), key_bytes))
+        out.append(b"V %d\n%s\n" % (len(value_bytes), value_bytes))
+    out.append(b"END\n")
+    return b"".join(out)
+
+
+def _build_fake_svn_wc(
+    tracebit_response: dict[str, object] | None = None,
+) -> tuple[dict[str, bytes], dict[str, object]]:
+    """Build a Subversion working copy as a path->bytes map.
+
+    Layout: root/{.env, README.md, deploy.sh, config/database.yml}. The
+    canary lives in the `.env` pristine copy, in the repository URL, and
+    in the saved-credential cache.
+    """
+    response = tracebit_response or {}
+    repo_url = _build_fake_svn_repo_url(response)
+    # The realmstring is what svn hashes to name the auth-cache file, and
+    # it never carries userinfo — so derive it from the bare host/path,
+    # not from the canary-bearing URL above.
+    realmstring = f"<https://{FAKE_SVN_REPO_HOST}:443> deploy-tools"
+    realm_hash = hashlib.md5(realmstring.encode("utf-8")).hexdigest()
+    repo_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{FAKE_SVN_REPO_HOST}/{FAKE_SVN_REPO_PATH}"))
+    revision = FAKE_SVN_REVISION
+    committed = datetime.now(UTC) - timedelta(days=19)
+    committed_iso = committed.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+    readme_body = (
+        "deploy-tools\n"
+        "============\n\n"
+        "Deploy helpers for the production stack.\n\n"
+        "Credentials are read from `.env`; see `config/database.yml` for\n"
+        "the per-environment database settings.\n"
+    )
+    deploy_body = (
+        "#!/bin/sh\n"
+        "# Wrapper around the release task. Reads credentials from .env.\n"
+        "set -eu\n"
+        ". \"$(dirname \"$0\")/.env\"\n"
+        "exec ./bin/release \"$@\"\n"
+    )
+    database_body = (
+        "production:\n"
+        "  adapter: postgresql\n"
+        "  host: db.internal\n"
+        "  database: app_production\n"
+        "  username: app_prod\n"
+        f"  password: {_fake_db_password()}\n"
+        "  pool: 25\n"
+    )
+    # The tracked `.env` — a dotenv body, not the YAML `secrets.yml` shape
+    # the git tree uses, because that is what a checked-in `.env` beside a
+    # `deploy.sh` that sources it actually looks like.
+    aws = _aws(response)
+    env_body = (
+        "APP_ENV=production\n"
+        "APP_DEBUG=false\n"
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "AWS_DEFAULT_REGION=us-east-1\n"
+        "DATABASE_URL=postgresql://app_prod@db.internal/app_production\n"
+    )
+
+    # (working-copy relative path, body) in the order svn stores them.
+    wc_files: tuple[tuple[str, str], ...] = (
+        (".env", env_body),
+        ("README.md", readme_body),
+        ("config/database.yml", database_body),
+        ("deploy.sh", deploy_body),
+    )
+
+    files: dict[str, bytes] = {}
+    checksums: dict[str, str] = {}
+    for relpath, body in wc_files:
+        raw = body.encode("utf-8")
+        sha1 = hashlib.sha1(raw).hexdigest()
+        checksums[relpath] = sha1
+        # 1.7+ pristine store: .svn/pristine/<first two hex>/<sha1>.svn-base
+        files[f"/.svn/pristine/{sha1[:2]}/{sha1}.svn-base"] = raw
+        # pre-1.7 pristine store: .svn/text-base/<name>.svn-base, which is
+        # per-directory — only the root-level names live at the wc root.
+        if "/" not in relpath:
+            files[f"/.svn/text-base/{relpath}.svn-base"] = raw
+
+    # --- pre-1.7 `.svn/entries` ---------------------------------------
+    # Record format: a `\f`-separated list of entries, the first being the
+    # directory itself. Field order is the one svn 1.6 writes; trailing
+    # empty fields are meaningful and deliberately preserved.
+    def _entry(name: str, kind: str, checksum: str = "") -> str:
+        return "\n".join((
+            name, kind, "", "", "", "", "", str(revision), committed_iso,
+            checksum, committed_iso, str(revision), FAKE_SVN_AUTHOR,
+        )) + "\n"
+
+    entries_records = [
+        "\n".join((
+            "", "dir", "", repo_url, f"https://{FAKE_SVN_REPO_HOST}/{FAKE_SVN_REPO_PATH}",
+            "", committed_iso, str(revision), FAKE_SVN_AUTHOR, "", "", "", "", "",
+            repo_uuid,
+        )) + "\n",
+    ]
+    for relpath, _body in wc_files:
+        if "/" in relpath:
+            continue
+        entries_records.append(_entry(relpath, "file", checksums[relpath]))
+    entries_records.append(_entry("config", "dir"))
+    entries_body = f"{revision}\n\n" + "\x0c\n".join(entries_records)
+    files["/.svn/entries"] = entries_body.encode("utf-8")
+    files["/.svn/format"] = b"10\n"
+
+    files["/.svn/all-wcprops"] = _svn_hash_dump((
+        ("svn:wc:ra_dav:version-url", f"/{FAKE_SVN_REPO_PATH}/!svn/ver/{revision}"),
+    ))
+    files["/.svn/dir-prop-base"] = _svn_hash_dump((
+        ("svn:ignore", "*.log\ntmp\n"),
+    ))
+
+    # --- Subversion's saved-credential cache --------------------------
+    # `.svn/auth/svn.simple/<md5(realmstring)>` is where `svn --username
+    # ... --password ...` parks credentials when the client is allowed to
+    # cache them. Harvesters ask for it directly because, unlike the rest
+    # of the working copy, it is a credential file by design.
+    gitlab = _gitlab_creds(response, "gitlab-username-password")
+    gitlab_credentials = gitlab.get("credentials") if isinstance(gitlab, dict) else None
+    if isinstance(gitlab_credentials, dict):
+        svn_username = str(gitlab_credentials.get("username") or "").strip()
+        svn_password = str(gitlab_credentials.get("password") or "").strip()
+    else:
+        svn_username = ""
+        svn_password = ""
+    if svn_username and svn_password:
+        auth_body = _svn_hash_dump((
+            ("svn:realmstring", realmstring),
+            ("username", svn_username),
+            ("password", svn_password),
+            ("passtype", "simple"),
+        ))
+        files[f"/.svn/auth/svn.simple/{realm_hash}"] = auth_body
+        # Bare-directory probes are common — the dictionary asks for
+        # `.svn/auth/svn.simple` far more often than for the hashed
+        # filename it cannot guess. An autoindex is what an exposed
+        # working copy would answer with, and it hands over the one
+        # filename the client needs next.
+        files["/.svn/auth/svn.simple/"] = _svn_autoindex(
+            "/.svn/auth/svn.simple", (realm_hash,),
+        )
+        files["/.svn/auth/"] = _svn_autoindex("/.svn/auth", ("svn.simple/",))
+
+    # --- 1.7+ `wc.db` --------------------------------------------------
+    files["/.svn/wc.db"] = _build_fake_svn_wc_db(
+        repo_url, repo_uuid, revision, checksums, committed,
+    )
+
+    root_entries = ["entries", "format", "all-wcprops", "dir-prop-base", "wc.db", "pristine/", "text-base/"]
+    if f"/.svn/auth/svn.simple/{realm_hash}" in files:
+        root_entries.insert(0, "auth/")
+    files["/.svn/"] = _svn_autoindex("/.svn", tuple(root_entries))
+    files["/.svn/text-base/"] = _svn_autoindex(
+        "/.svn/text-base",
+        tuple(f"{relpath}.svn-base" for relpath, _b in wc_files if "/" not in relpath),
+    )
+    files["/.svn/pristine/"] = _svn_autoindex(
+        "/.svn/pristine",
+        tuple(sorted({f"{sha1[:2]}/" for sha1 in checksums.values()})),
+    )
+
+    meta: dict[str, object] = {
+        "svnRevision": revision,
+        "svnRepoUuid": repo_uuid,
+        "svnRealmHash": realm_hash,
+        "svnFileCount": len(wc_files),
+        "svnAuthCached": bool(svn_username and svn_password),
+    }
+    return files, meta
+
+
+def _svn_autoindex(display_path: str, entries: tuple[str, ...]) -> bytes:
+    """Apache-style autoindex body, matching the fake-git tree's listing.
+
+    Same reasoning as there: a 404 on a bare directory reads as "not
+    really exposed" and ends the walk, while a listing keeps the client
+    moving toward files we do answer.
+    """
+    body = [
+        "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n",
+        "<html>\n",
+        " <head>\n",
+        f"  <title>Index of {display_path}</title>\n",
+        " </head>\n",
+        " <body>\n",
+        f"<h1>Index of {display_path}</h1>\n",
+        "<pre>      <a href=\"?C=N;O=D\">Name</a>\n",
+        "      <hr>\n",
+        "      <a href=\"../\">Parent Directory</a>\n",
+    ]
+    for entry in entries:
+        body.append(f"      <a href=\"{entry}\">{entry}</a>\n")
+    body.append("      <hr>\n</pre>\n</body></html>\n")
+    return "".join(body).encode("utf-8")
+
+
+def _build_fake_svn_wc_db(
+    repo_url: str,
+    repo_uuid: str,
+    revision: int,
+    checksums: dict[str, str],
+    committed: datetime,
+) -> bytes:
+    """Build a real SQLite `wc.db` for the 1.7+ working-copy layout.
+
+    Tools that understand modern working copies open this with SQLite and
+    read NODES to learn the file list and each file's `$sha1$...`
+    checksum, which is what names the pristine file they fetch next. A
+    stub or a text file breaks at the first query, so this builds a
+    genuine database with the subset of the schema those queries touch.
+    """
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE REPOSITORY (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              root TEXT UNIQUE NOT NULL,
+              uuid TEXT NOT NULL
+            );
+            CREATE TABLE WCROOT (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              local_abspath TEXT UNIQUE
+            );
+            CREATE TABLE PRISTINE (
+              checksum TEXT NOT NULL PRIMARY KEY,
+              compression INTEGER,
+              size INTEGER NOT NULL,
+              refcount INTEGER NOT NULL,
+              md5_checksum TEXT
+            );
+            CREATE TABLE NODES (
+              wc_id INTEGER NOT NULL,
+              local_relpath TEXT NOT NULL,
+              op_depth INTEGER NOT NULL,
+              parent_relpath TEXT,
+              repos_id INTEGER,
+              repos_path TEXT,
+              revision INTEGER,
+              presence TEXT NOT NULL,
+              depth TEXT,
+              kind TEXT NOT NULL,
+              changed_revision INTEGER,
+              changed_date INTEGER,
+              changed_author TEXT,
+              checksum TEXT,
+              translated_size INTEGER,
+              last_mod_time INTEGER,
+              PRIMARY KEY (wc_id, local_relpath, op_depth)
+            );
+            CREATE TABLE ACTUAL_NODE (
+              wc_id INTEGER NOT NULL,
+              local_relpath TEXT NOT NULL,
+              parent_relpath TEXT,
+              PRIMARY KEY (wc_id, local_relpath)
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO REPOSITORY (id, root, uuid) VALUES (1, ?, ?)",
+            (repo_url, repo_uuid),
+        )
+        connection.execute(
+            "INSERT INTO WCROOT (id, local_abspath) VALUES (1, NULL)",
+        )
+        # svn stores changed_date as microseconds since the epoch.
+        changed_date = int(committed.timestamp() * 1_000_000)
+        last_mod_time = int(committed.timestamp())
+        connection.execute(
+            "INSERT INTO NODES (wc_id, local_relpath, op_depth, parent_relpath,"
+            " repos_id, repos_path, revision, presence, depth, kind,"
+            " changed_revision, changed_date, changed_author)"
+            " VALUES (1, '', 0, NULL, 1, '', ?, 'normal', 'infinity', 'dir', ?, ?, ?)",
+            (revision, revision, changed_date, FAKE_SVN_AUTHOR),
+        )
+        directories = {
+            relpath.rsplit("/", 1)[0] for relpath in checksums if "/" in relpath
+        }
+        for directory in sorted(directories):
+            connection.execute(
+                "INSERT INTO NODES (wc_id, local_relpath, op_depth, parent_relpath,"
+                " repos_id, repos_path, revision, presence, depth, kind,"
+                " changed_revision, changed_date, changed_author)"
+                " VALUES (1, ?, 0, '', 1, ?, ?, 'normal', 'infinity', 'dir', ?, ?, ?)",
+                (directory, directory, revision, revision, changed_date, FAKE_SVN_AUTHOR),
+            )
+        for relpath, sha1 in sorted(checksums.items()):
+            parent = relpath.rsplit("/", 1)[0] if "/" in relpath else ""
+            connection.execute(
+                "INSERT INTO NODES (wc_id, local_relpath, op_depth, parent_relpath,"
+                " repos_id, repos_path, revision, presence, depth, kind,"
+                " changed_revision, changed_date, changed_author, checksum,"
+                " translated_size, last_mod_time)"
+                " VALUES (1, ?, 0, ?, 1, ?, ?, 'normal', NULL, 'file', ?, ?, ?, ?, NULL, ?)",
+                (
+                    relpath, parent, relpath, revision, revision, changed_date,
+                    FAKE_SVN_AUTHOR, f"$sha1${sha1}", last_mod_time,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO PRISTINE (checksum, compression, size, refcount)"
+                " VALUES (?, NULL, 0, 1)",
+                (f"$sha1${sha1}",),
+            )
+            connection.execute(
+                "INSERT INTO ACTUAL_NODE (wc_id, local_relpath, parent_relpath)"
+                " VALUES (1, ?, ?)",
+                (relpath, parent),
+            )
+        connection.commit()
+        return connection.serialize()
+    finally:
+        connection.close()
+
+
+async def _fake_svn_get_or_build(
+    client_ip: str,
+    request_id: str,
+    host: str,
+    user_agent: str,
+    path: str,
+    proto: str,
+) -> tuple[dict[str, bytes], dict[str, object]] | None:
+    """Return the cached working copy for this IP, or mint a canary and
+    build one. Same per-IP cache + in-flight coalescing as fake-git, so a
+    dictionary sweep across dozens of `.svn/*` paths costs one issuance
+    and sees one self-consistent working copy.
+    """
+    now = time.monotonic()
+    cache_key = client_ip or f"_anon-{request_id}"
+    lock = _get_fake_svn_lock()
+    async with lock:
+        entry = _FAKE_SVN_CACHE.get(cache_key)
+        if entry and entry[0] > now:
+            return entry[1], entry[2]
+        inflight = _FAKE_SVN_INFLIGHT.get(cache_key)
+        if inflight is not None:
+            waiter = inflight
+            is_issuer = False
+        else:
+            waiter = asyncio.get_event_loop().create_future()
+            _FAKE_SVN_INFLIGHT[cache_key] = waiter
+            is_issuer = True
+
+    if not is_issuer:
+        try:
+            return await waiter
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+
+    try:
+        try:
+            tracebit_response = await issue_credentials(
+                request_id, client_ip, host, user_agent, path, proto,
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            async with lock:
+                _FAKE_SVN_INFLIGHT.pop(cache_key, None)
+            if not waiter.done():
+                waiter.set_result(None)
+            return None
+
+        files, meta = _build_fake_svn_wc(tracebit_response)
+        meta["canaryTypes"] = [key for key, value in tracebit_response.items() if value]
+
+        expiry = now + FAKE_SVN_CACHE_TTL_SECONDS
+        async with lock:
+            expired = [k for k, v in _FAKE_SVN_CACHE.items() if v[0] <= now]
+            for k in expired:
+                del _FAKE_SVN_CACHE[k]
+            if len(_FAKE_SVN_CACHE) >= FAKE_SVN_CACHE_MAX_ENTRIES:
+                oldest_key = min(_FAKE_SVN_CACHE, key=lambda k: _FAKE_SVN_CACHE[k][0])
+                del _FAKE_SVN_CACHE[oldest_key]
+            _FAKE_SVN_CACHE[cache_key] = (expiry, files, meta)
+            _FAKE_SVN_INFLIGHT.pop(cache_key, None)
+        if not waiter.done():
+            waiter.set_result((files, meta))
+        return files, meta
+    except BaseException:
+        async with lock:
+            _FAKE_SVN_INFLIGHT.pop(cache_key, None)
         if not waiter.done():
             waiter.set_result(None)
         raise
@@ -28109,6 +28627,68 @@ async def _send_fake_git(
             _active_slow_drips -= 1
 
 
+async def _send_fake_svn(
+    request: web.Request,
+    request_id: str,
+    path: str,
+    svn_key: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.StreamResponse:
+    """Serve the fake /.svn working copy.
+
+    `path` is the raw (normalized) request path, logged as-is so prefix
+    probes stay distinguishable from direct `/.svn/` fetches. `svn_key` is
+    the canonical lowercase lookup key from extract_svn_path().
+
+    Unlike fake-git this never drips: a working copy is a handful of small
+    files, and the tarpit value there came from large loose objects that
+    have no equivalent here.
+    """
+    result = await _fake_svn_get_or_build(client_ip, request_id, host, user_agent, path, proto)
+    if result is None:
+        append_log({**log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": "fake-svn-error"})
+        return _credential_failure_response()
+
+    files, meta = result
+    content = files.get(svn_key)
+    if content is None:
+        append_log({
+            **log_context, "status": 404, "result": "fake-svn-miss",
+            "svnKey": svn_key,
+            "svnRevision": meta.get("svnRevision", ""),
+        })
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    if svn_key.endswith("/"):
+        content_type = "text/html; charset=utf-8"
+    elif svn_key == "/.svn/wc.db":
+        content_type = "application/x-sqlite3"
+    else:
+        content_type = "text/plain; charset=utf-8"
+
+    append_log({
+        **log_context, "status": 200, "result": "fake-svn",
+        "svnKey": svn_key,
+        "svnRevision": meta.get("svnRevision", ""),
+        "svnRepoUuid": meta.get("svnRepoUuid", ""),
+        "svnAuthCached": meta.get("svnAuthCached", False),
+        "canaryTypes": meta.get("canaryTypes", []),
+        "bytes": len(content),
+    })
+    return web.Response(
+        status=200,
+        body=b"" if request.method == "HEAD" else content,
+        headers={"Content-Type": content_type, "Cache-Control": "no-store"},
+    )
+
+
 def _match_robots_crawler_ua(user_agent: str) -> str | None:
     """Return the crawler-token that matched, or None.
 
@@ -28824,6 +29404,18 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 client_ip, host, user_agent, proto, log_context,
             )
 
+    # After fake-git deliberately: a path carrying both segments
+    # (`/.git/config/.svn/entries`) is a scanner appending the svn
+    # dictionary to every git path it tried, and stays classified as a
+    # fake-git miss rather than being reclassified as svn traffic.
+    if FAKE_SVN_ENABLED and API_KEY:
+        svn_key = extract_svn_path(path)
+        if svn_key is not None:
+            return await _send_fake_svn(
+                request, request_id, path, svn_key,
+                client_ip, host, user_agent, proto, log_context,
+            )
+
     if API_KEY:
         trap = find_canary_trap(path)
         if trap is not None:
@@ -28873,6 +29465,8 @@ def main() -> int:
         active.append("env-canary")
         if FAKE_GIT_ENABLED:
             active.append("fake-git")
+        if FAKE_SVN_ENABLED:
+            active.append("fake-svn")
         if CANARY_TRAPS_ENABLED:
             active.append("canary-file-traps")
         if CLOUD_IMDS_ENABLED:

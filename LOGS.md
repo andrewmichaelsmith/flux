@@ -63,6 +63,18 @@ failure fully diagnosable in the log.
 | `fake-git-disconnect` | 200 | `fakeGitBytesSent`, `commitSha` | Scanner hung up mid-drip. |
 | `fake-git-capacity` | 503 | — | Tarpit semaphore full. Only reachable for responses that actually drip — a repo *file* larger than one drip chunk. `HEAD`, single-chunk bodies, and directory autoindexes are served immediately and never charge a slot, so a `/.git/` directory sweep cannot exhaust the semaphore. |
 
+### Fake `/.svn/*` working copy
+
+| `result` | `status` | Extras | Meaning |
+| --- | --- | --- | --- |
+| `fake-svn` | 200 | `svnKey`, `svnRevision`, `svnRepoUuid`, `svnAuthCached`, `canaryTypes`, `bytes` | File served from the synthetic working copy. `svnKey` is the canonical `/.svn/...` lookup key (lowercased, prefix-stripped), so it records which layout the client asked for — `entries` / `text-base/` is a pre-1.7 dumper, `wc.db` / `pristine/` is 1.7+, and a `pristine/` fetch following a `wc.db` fetch means the client parsed the database and resolved a checksum out of it. |
+| `fake-svn-miss` | 404 | `svnKey`, `svnRevision` | Path resolved to the working copy but wasn't a file in it. |
+| `fake-svn-error` | 404 | — | Canary issuance failed. |
+
+A path carrying both segments (`/.git/config/.svn/entries` — a scanner
+appending the svn dictionary to every git path it tried) is dispatched to
+fake-git and logs `fake-git-miss`, not `fake-svn`.
+
 ### Tarpit + fingerprint modules
 
 | `result` | `status` | Extras | Meaning |

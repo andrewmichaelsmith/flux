@@ -621,6 +621,10 @@ def test_all_trap_families_default_on():
         "FAKE_GIT_ENABLED should default to True — the per-IP cache bounds "
         "quota burn and the dispatch still requires TRACEBIT_API_KEY."
     )
+    assert tbenv.FAKE_SVN_ENABLED, (
+        "FAKE_SVN_ENABLED should default to True — same per-IP cache and "
+        "same TRACEBIT_API_KEY requirement as the git tree."
+    )
     assert tbenv.VITE_FS_ENABLED
     assert tbenv.VITE_FS_SYSTEM_FILES_ENABLED
     assert tbenv.WEBSHELL_ENABLED

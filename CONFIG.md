@@ -104,6 +104,22 @@ when `TRACEBIT_API_KEY` is unset — the dispatch requires both.
 | `FAKE_GIT_REMOTE_HOST` | `github.com` | Host portion of the generated canary URL. |
 | `FAKE_GIT_REMOTE_PATH` | `internal/tools.git` | Path portion of the generated canary URL. |
 
+## Fake `/.svn/*` working copy
+
+Requires `TRACEBIT_API_KEY`, same as the git tree. See
+[`docs/fake-svn.md`](./docs/fake-svn.md).
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `FAKE_SVN_ENABLED` | **on** | Master switch. |
+| `FAKE_SVN_CACHE_TTL_SECONDS` | `3600` | Per-IP cache TTL — keeps checksums and the pristine store consistent across a scanner's fan-out. |
+| `FAKE_SVN_CACHE_MAX_ENTRIES` | `1024` | |
+| `FAKE_SVN_REPO_URL` | *unset* | Operator override for the repository root URL recorded in `entries` and `wc.db`. When unset (default), the URL is built per-request with the Tracebit canary as HTTPS Basic userinfo, so a client that reads only the metadata file still leaves with a live credential. Set a static string to suppress that embedding. |
+| `FAKE_SVN_REPO_HOST` | `svn.internal-tools.lan` | Host portion of the generated URL, and the host in the auth-cache realmstring. |
+| `FAKE_SVN_REPO_PATH` | `svn/deploy-tools` | Path portion of the generated URL. |
+| `FAKE_SVN_AUTHOR` | `ops` | Commit author recorded in `entries` and in `wc.db` `NODES`. |
+| `FAKE_SVN_REVISION` | `1487` | Revision the working copy claims to be at. |
+
 ## SSRF relay onto the metadata tree
 
 Requires a Tracebit key, and requires `HONEYPOT_CLOUD_IMDS_ENABLED` —
