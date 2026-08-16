@@ -24,6 +24,7 @@ Every line includes these — they're built in `_handle()` before dispatch.
 | `headers` | object | Subset: `Host`, all `X-Forwarded-*`, `True-Client-Ip`, `X-Real-Ip`, `X-Client-Ip`, `X-Azure-Clientip`, `X-Azure-Socketip`, `X-Originating-Ip`, `X-Host`, `Cf-Connecting-Ip`, `Content-Type`, `Content-Length`. Values truncated to 512 chars. |
 | `bodyBytesRead` | int | 0 unless the request read a capped body (`GET`/`POST` payloads). |
 | `bodySha256` | string | SHA256 hex when body bytes were present, or `""`. |
+| `trapWalkDepth` | int | Present only when an exact-path canary trap was reached after dropping leading app-layout directory segments (`/admin/aws.json` -> depth 1). Absent means the path arrived at the location the trap table lists. |
 
 ## Result tags
 
@@ -52,6 +53,12 @@ failure fully diagnosable in the log.
 | `issued` | 200 | `types: [..]` | `.env` canary issued and served. |
 | `tracebit-http-error` | 404 | `tracebitStatus: int`, `error: str<=400` | Tracebit API returned a non-2xx. |
 | `tracebit-error` | 404 | `error: str<=400` | Connection error / timeout / malformed response from Tracebit. `error` is `"<ExceptionClass>"` or `"<ExceptionClass>: <message>"` — the class name is always present, because several of these exceptions (`TimeoutError` in particular) carry no message and previously logged an empty string. |
+
+### Deploy-sync config
+
+| `result` | `status` | Extras | Meaning |
+| --- | --- | --- | --- |
+| `deploy-sync-config` | 200 | `bytes` | Editor-plugin deploy config served. Carries a per-hit SSH credential minted by the renderer, not a Tracebit canary, so `canaryTypes` is empty and no upstream call is made. The username served is `deploy_<first 8 hex of sha256(requestId)>` — recompute it from this line's `requestId` to tie an SSH authentication attempt back to this request. |
 
 ### Fake `/.git/*` tree
 

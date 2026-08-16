@@ -85,6 +85,7 @@ burning quota.
 | `CANARY_TRAPS_ENABLED` | **on** | Master switch. |
 | `CANARY_TRAP_CACHE_TTL_SECONDS` | `3600` | Per-(IP, canary types) TTL. |
 | `CANARY_TRAP_CACHE_MAX_ENTRIES` | `1024` | |
+| `HONEYPOT_TRAP_PATH_WALK_ENABLED` | **on** | Let an exact-path trap also answer when the file arrives nested under a recognised app-layout directory (`/admin/aws.json`). Capped at two segments; every segment dropped must be a known layout name, so arbitrary parents still 404. See [docs/trap-path-walk.md](./docs/trap-path-walk.md). |
 
 ## Fake `/.git/*` tree
 

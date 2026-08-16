@@ -615,6 +615,11 @@ def test_all_trap_families_default_on():
     assert tbenv.TARPIT_ENABLED
     assert tbenv.FINGERPRINT_PATHS_ENABLED
     assert tbenv.CANARY_TRAPS_ENABLED
+    assert tbenv.TRAP_PATH_WALK_ENABLED, (
+        "HONEYPOT_TRAP_PATH_WALK_ENABLED should default to True — dredging "
+        "dictionaries walk `<layout dir>/<secret file>`, so without the walk "
+        "the majority of a sweep 404s on files we already answer at root."
+    )
     assert tbenv.CLOUD_IMDS_ENABLED
     assert tbenv.SSRF_RELAY_ENABLED
     assert tbenv.FAKE_GIT_ENABLED, (

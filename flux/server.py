@@ -11861,6 +11861,11 @@ CANARY_TRAP_CACHE_MAX_ENTRIES = max(
     int((os.environ.get("CANARY_TRAP_CACHE_MAX_ENTRIES") or "1024").strip() or "1024"), 16,
 )
 CANARY_TRAPS_ENABLED = _env_bool("CANARY_TRAPS_ENABLED")
+# Whether an exact-path trap miss may retry after dropping known
+# app-layout directory segments (see `resolve_canary_trap`). Separate
+# switch so the walk can be turned off without disabling the traps
+# themselves if it ever proves too permissive in the wild.
+TRAP_PATH_WALK_ENABLED = _env_bool("HONEYPOT_TRAP_PATH_WALK_ENABLED")
 
 
 def _get_canary_lock() -> asyncio.Lock:
@@ -13690,9 +13695,18 @@ def render_sftp_config_json(r: dict[str, object]) -> bytes:
         creds = {}
     username = str(creds.get("username", "") or "deploy")
     password = str(creds.get("password", "") or "")
+    # Name the host the request actually arrived for. A deploy config
+    # found on `example.com` that points at `deploy.internal` tells a
+    # harvester nothing it can act on; one that points back at
+    # `example.com:22` is both what a real single-box deployment looks
+    # like and a target the harvester can reach — which is where our SSH
+    # honeypot is listening.
+    request_host = str(r.get("_requestHost") or "").strip().lower()
+    if not request_host or "/" in request_host or " " in request_host:
+        request_host = "deploy.internal"
     return json.dumps({
         "name": "production",
-        "host": "deploy.internal",
+        "host": request_host,
         "protocol": "sftp",
         "port": 22,
         "username": username,
@@ -13703,6 +13717,58 @@ def render_sftp_config_json(r: dict[str, object]) -> bytes:
         "openSsh": False,
         "ignore": [".git", ".vscode", "node_modules"],
     }, indent=2).encode("utf-8")
+
+
+def _deploy_ssh_identity(r: dict[str, object]) -> tuple[str, str, str]:
+    """Return `(host, username, password)` for a deploy-credential file.
+
+    The username is derived from the request id rather than drawn fresh,
+    so it is reproducible from the trap log line alone: the log already
+    carries `requestId`, and `deploy_<first 8 hex of sha256(requestId)>`
+    recovers the exact string that was served. Nothing extra has to be
+    recorded for a later replay to be attributable to one request.
+
+    The password is a per-hit synthetic. It is deliberately NOT a
+    Tracebit canary: Tracebit's credential types alert on replay against
+    *their* hosted endpoints, and an SSH deploy credential does not
+    replay there. What makes this pair worth serving is the username —
+    it is unique per hit and it is a shape our own SSH honeypot logs on
+    every authentication attempt, successful or not.
+
+    Neither field is a fixed literal, so no string here is shared between
+    two hits or between two sensors.
+    """
+    host = str(r.get("_requestHost") or "").strip().lower()
+    if not host or "/" in host or " " in host:
+        host = "deploy.internal"
+    request_id = str(r.get("_requestId") or "")
+    digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:8]
+    return host, f"deploy_{digest}", secrets.token_urlsafe(18)
+
+
+def render_deploy_sync_json(r: dict[str, object]) -> bytes:
+    """`remote-sync.json` / `ftp-sync.json` / `deployment-config.json` and
+    friends — the editor-plugin deploy configs that store an SFTP target
+    in plaintext at the project root.
+
+    Shaped like the real plugin files: an SFTP target on port 22 pointing
+    at the host the request arrived for, with an upload root under the
+    webroot. The credential is an SSH one, which is the whole point —
+    see `_deploy_ssh_identity`."""
+    host, username, password = _deploy_ssh_identity(r)
+    return json.dumps({
+        "remotePath": "/var/www/app",
+        "host": host,
+        "port": 22,
+        "username": username,
+        "password": password,
+        "protocol": "sftp",
+        "uploadOnSave": True,
+        "autoDelete": False,
+        "ignore": ["\\.git", "\\.svn", "node_modules", "\\.DS_Store"],
+        "watch": ["src", "public"],
+        "connectTimeout": 10000,
+    }, indent=4).encode("utf-8")
 
 
 def render_firebase_json(r: dict[str, object]) -> bytes:
@@ -19925,6 +19991,29 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_pprof_dump,
         "text/plain; charset=utf-8",
     ),
+    # Editor-plugin deploy configs. Unlike every other trap here, the
+    # credential served is an SSH one aimed at our own SSH honeypot: the
+    # username is unique per hit and reproducible from the trap log, so a
+    # later authentication attempt carrying it proves the same operator
+    # harvested over HTTPS and replayed over SSH — and names the IP that
+    # did the replaying, which the HTTPS side alone cannot.
+    CanaryTrap(
+        "deploy-sync-config",
+        (
+            "/remote-sync.json",
+            "/ftp-sync.json",
+            "/deployment-config.json",
+            "/ftpsync.settings",
+            "/.ftpsync.settings",
+            "/.vscode/remote-sync.json",
+            "/.vscode/deployment-config.json",
+            "/deploy-config.json",
+            "/deploy.json",
+        ),
+        (),
+        render_deploy_sync_json,
+        "application/json; charset=utf-8",
+    ),
     CanaryTrap(
         "phpinfo",
         (
@@ -19932,6 +20021,25 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/info.php",
             "/php.php",
             "/test.php",
+            # Long-tail phpinfo aliases. A secrets sweep that walks the
+            # phpinfo family walks all of these under every layout
+            # directory it knows, and the env table phpinfo prints is a
+            # credential surface, so a miss here is a missed issuance
+            # rather than a missed fingerprint.
+            "/php-info.php",
+            "/phpinfo2.php",
+            "/infophp.php",
+            "/infos.php",
+            "/iinfo.php",
+            "/phpversion.php",
+            "/php_version.php",
+            "/old_phpinfo.php",
+            "/linusadmin-phpinfo.php",
+            "/temp.php",
+            "/time.php",
+            "/asdf.php",
+            "/x.php",
+            "/1.php",
             # Underscore + extensionless + 1-2 char variants — scanner
             # dictionaries walk these aliases when probing for legacy
             # admin-uploaded phpinfo scripts. Same render shape works:
@@ -21642,6 +21750,80 @@ _VITE_FS_SYSTEM_FILES: "dict[str, tuple[str, Callable[[], bytes], str]]" = {
         "text/plain; charset=utf-8",
     ),
 }
+
+
+# Directory names a credential file is plausibly nested under when a
+# project is deployed into a subdirectory of the webroot. Secret-dredging
+# dictionaries do not walk a flat list of filenames — they walk the
+# cross-product of `<layout dir>/<secret filename>`, so the same
+# `aws.json` / `config.json` / `phpinfo.php` leaf arrives dozens of times
+# under a different parent each time. Answering only the bare filename
+# turns the overwhelming majority of such a sweep into 404s.
+#
+# `_ENV_WEBROOT_PREFIXES` already curates this vocabulary for the `.env`
+# family; the extras below are layout names observed leading a credential
+# leaf that the `.env` list had no reason to carry.
+_TRAP_WALK_EXTRA_PREFIXES: tuple[str, ...] = (
+    "account", "adm", "administration", "admins", "apis",
+    "cloud", "common", "configuration", "core", "crm",
+    "data", "default", "deploy", "devops", "env", "etc",
+    "files", "info", "infra", "json", "keys",
+    "media", "new", "root", "secret", "secrets", "services", "settings",
+    "sql", "srv", "upload", "uploads", "user", "users", "var",
+)
+
+_TRAP_WALK_PREFIXES: frozenset[str] = frozenset(
+    p.lower()
+    for p in (
+        *_ENV_WEBROOT_PREFIXES,
+        *_APP_LAYOUT_CRED_PREFIXES,
+        *_TRAP_WALK_EXTRA_PREFIXES,
+    )
+)
+
+# How many leading directory segments the walk may drop. Two covers
+# effectively all of the nesting real dictionaries use (`/admin/x.json`,
+# `/admin/config/x.json`); going deeper buys almost nothing and widens
+# the surface on which we answer paths a real server would not.
+TRAP_WALK_MAX_DEPTH = 2
+
+
+def resolve_canary_trap(path: str) -> "tuple[CanaryTrap | None, int]":
+    """Find the trap that should answer `path`, tolerating app-layout nesting.
+
+    Exact match first, so a path with its own table entry always keeps its
+    own renderer. On a miss, drop leading directory segments one at a time
+    and retry — but only while every segment dropped is a known layout
+    directory name, and only up to `TRAP_WALK_MAX_DEPTH`.
+
+    The vocabulary gate is the point: `/admin/aws.json` is a file a real
+    deployment could plausibly have, so answering it is camouflage;
+    `/9f2a1c/aws.json` is not, and answering *that* would advertise that
+    this host says yes to anything. Returns `(trap, depth)` where `depth`
+    is the number of segments dropped — 0 for an exact hit.
+    """
+    # Both the exact hit and every walk step go through `find_canary_trap`
+    # so there is a single lookup seam — the enabled-check, the lowercasing
+    # and any test that substitutes the lookup all keep applying to the
+    # nested case exactly as they do to the bare one.
+    exact = find_canary_trap(path)
+    if exact is not None:
+        return exact, 0
+    if not (TRAP_PATH_WALK_ENABLED and CANARY_TRAPS_ENABLED):
+        return None, 0
+
+    segments = [s for s in path.split("/") if s]
+    # Need at least one directory plus the leaf to have anything to drop.
+    for depth in range(1, min(len(segments), TRAP_WALK_MAX_DEPTH + 1)):
+        if segments[depth - 1].lower() not in _TRAP_WALK_PREFIXES:
+            # The first non-layout segment ends the walk — a dictionary
+            # word we do not recognise means we are no longer looking at
+            # a plausible deployment layout.
+            return None, 0
+        found = find_canary_trap("/" + "/".join(segments[depth:]))
+        if found is not None:
+            return found, depth
+    return None, 0
 
 
 def find_canary_trap(path: str) -> "CanaryTrap | None":
@@ -28238,15 +28420,33 @@ async def _send_canary_trap(
     """
     log_context = {**log_context, **(extra_log or {})}
     tag = f"{result_prefix}{trap.name}"
-    tracebit_response = await _get_or_issue_canary(
-        trap.canary_types, client_ip, request_id, host, user_agent, path, proto,
-    )
-    if tracebit_response is None:
-        append_log({**log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": f"{tag}-error"})
-        return _credential_failure_response()
+    if trap.canary_types:
+        tracebit_response = await _get_or_issue_canary(
+            trap.canary_types, client_ip, request_id, host, user_agent, path, proto,
+        )
+        if tracebit_response is None:
+            append_log({**log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": f"{tag}-error"})
+            return _credential_failure_response()
+    else:
+        # Traps whose renderer mints its own per-hit credential need no
+        # Tracebit issuance. Calling the API anyway would spend quota on
+        # a canary nothing reads and would make an upstream blip 404 a
+        # trap that has no upstream dependency.
+        tracebit_response = {}
 
     try:
-        body = trap.render(tracebit_response)
+        # Renderers that need to stay self-consistent with the host the
+        # client actually asked for read `_requestHost`. A deploy config
+        # naming `deploy.internal` is obviously bait; one naming the host
+        # the scanner just fetched it from is what a real checked-in
+        # config looks like. Enriching only the dict handed to `render`
+        # keeps `canaryTypes` below computed over the unmodified Tracebit
+        # response.
+        body = trap.render({
+            **tracebit_response,
+            "_requestHost": host,
+            "_requestId": request_id,
+        })
     except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
         append_log({
             **log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": f"{tag}-render-error",
@@ -29631,10 +29831,17 @@ async def handle(request: web.Request) -> web.StreamResponse:
             )
 
     if API_KEY:
-        trap = find_canary_trap(path)
+        trap, trap_walk_depth = resolve_canary_trap(path)
         if trap is not None:
             return await _send_canary_trap(
                 request, trap, request_id, path, client_ip, host, user_agent, proto, log_context,
+                # Only stamped when the walk actually moved, so the field's
+                # presence is exactly the "this arrived nested under an
+                # app-layout directory" signal and unnested traffic keeps
+                # its existing log shape.
+                extra_log=(
+                    {"trapWalkDepth": trap_walk_depth} if trap_walk_depth else None
+                ),
             )
 
     # Backup-archive pattern trap runs after exact-path canary lookup so
