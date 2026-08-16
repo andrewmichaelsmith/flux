@@ -21,7 +21,12 @@ an upload root under the webroot, ignore/watch lists. Three fields are
 per-hit:
 
 - **`host`** — the host the request actually arrived for, taken from
-  `X-Forwarded-Host` / `Host`. A deploy config found on `example.com`
+  `X-Forwarded-Host` / `Host`, and only when it looks like a real
+  external name. A reverse proxy that rewrites `Host` to its upstream
+  address yields a loopback literal, which is both useless as a target
+  and identical on every host behind such a proxy; address literals,
+  `localhost`, `.local` names and single-label names fall back to the
+  `deploy.internal` placeholder instead. A deploy config found on `example.com`
   that names `deploy.internal` is inert; one that names `example.com:22`
   is both what a single-box deployment really looks like and a target the
   finder can reach.

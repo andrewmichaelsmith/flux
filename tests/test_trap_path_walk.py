@@ -290,3 +290,52 @@ def test_sftp_config_keeps_its_placeholder_without_a_host():
         }},
     }))
     assert body["host"] == "deploy.internal"
+
+
+# --------------------------------------------------------------------------
+# host plausibility
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("host", [
+    "127.0.0.1", "0.0.0.0", "10.0.0.5", "192.168.1.1", "::1", "[::1]",
+    "localhost", "localhost.localdomain", "box.local", "upstream", "",
+    "a b", "a/b",
+])
+def test_implausible_deploy_hosts_fall_back(host):
+    """A reverse proxy that rewrites Host to its upstream address makes
+    every sensor emit the same loopback literal — a fleet-wide constant
+    in a file that is otherwise unique per hit, and not a target anyone
+    could act on. Anything that is not a real external name falls back."""
+    assert tbenv._plausible_deploy_host({"_requestHost": host}) == "deploy.internal"
+
+
+def test_missing_host_key_falls_back():
+    assert tbenv._plausible_deploy_host({}) == "deploy.internal"
+
+
+@pytest.mark.parametrize("host", [
+    "shop.example.com", "example.com", "a.b.c.example.org", "xn--80ak6aa92e.com",
+])
+def test_plausible_deploy_hosts_are_used(host):
+    assert tbenv._plausible_deploy_host({"_requestHost": host}) == host
+
+
+def test_host_is_normalised_to_lowercase():
+    assert tbenv._plausible_deploy_host({"_requestHost": "Shop.Example.COM "}) == "shop.example.com"
+
+
+def test_both_deploy_renderers_reject_a_loopback_host():
+    """Regression: the first deployment served `127.0.0.1` because nginx
+    rewrites Host to the proxy_pass target."""
+    body = json.loads(tbenv.render_deploy_sync_json({
+        "_requestHost": "127.0.0.1", "_requestId": "x",
+    }))
+    assert body["host"] == "deploy.internal"
+
+    sftp = json.loads(tbenv.render_sftp_config_json({
+        "_requestHost": "127.0.0.1",
+        "http": {"gitlab-username-password": {
+            "credentials": {"username": "u", "password": "p"},
+        }},
+    }))
+    assert sftp["host"] == "deploy.internal"

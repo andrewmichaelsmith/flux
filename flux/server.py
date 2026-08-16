@@ -13701,9 +13701,7 @@ def render_sftp_config_json(r: dict[str, object]) -> bytes:
     # `example.com:22` is both what a real single-box deployment looks
     # like and a target the harvester can reach — which is where our SSH
     # honeypot is listening.
-    request_host = str(r.get("_requestHost") or "").strip().lower()
-    if not request_host or "/" in request_host or " " in request_host:
-        request_host = "deploy.internal"
+    request_host = _plausible_deploy_host(r)
     return json.dumps({
         "name": "production",
         "host": request_host,
@@ -13717,6 +13715,40 @@ def render_sftp_config_json(r: dict[str, object]) -> bytes:
         "openSsh": False,
         "ignore": [".git", ".vscode", "node_modules"],
     }, indent=2).encode("utf-8")
+
+
+_DEPLOY_HOST_FALLBACK = "deploy.internal"
+
+
+def _plausible_deploy_host(r: dict[str, object]) -> str:
+    """The hostname to name as the deploy target, or a placeholder.
+
+    `_requestHost` is whatever `clean_host` derived from
+    `X-Forwarded-Host` / `Host`. Where a reverse proxy rewrites `Host` to
+    its upstream address, that arrives as a loopback literal — and
+    serving `127.0.0.1` is worse than serving nothing: it is not a
+    deploy target anybody could act on, and because every host behind
+    such a proxy produces the identical string it is a fleet-wide
+    constant in a file that is otherwise unique per hit.
+
+    So the value has to look like a real external hostname before it is
+    used: a dotted name, not an address literal, not a loopback or
+    `.local`/`localhost` name.
+    """
+    host = str(r.get("_requestHost") or "").strip().lower()
+    if not host or " " in host or "/" in host:
+        return _DEPLOY_HOST_FALLBACK
+    if host in ("localhost", "localhost.localdomain") or host.endswith(".local"):
+        return _DEPLOY_HOST_FALLBACK
+    # Address literals: IPv6 in brackets, or an all-numeric dotted quad.
+    if host.startswith("[") or ":" in host:
+        return _DEPLOY_HOST_FALLBACK
+    labels = host.split(".")
+    if len(labels) < 2:
+        return _DEPLOY_HOST_FALLBACK
+    if all(label.isdigit() for label in labels):
+        return _DEPLOY_HOST_FALLBACK
+    return host
 
 
 def _deploy_ssh_identity(r: dict[str, object]) -> tuple[str, str, str]:
@@ -13738,9 +13770,7 @@ def _deploy_ssh_identity(r: dict[str, object]) -> tuple[str, str, str]:
     Neither field is a fixed literal, so no string here is shared between
     two hits or between two sensors.
     """
-    host = str(r.get("_requestHost") or "").strip().lower()
-    if not host or "/" in host or " " in host:
-        host = "deploy.internal"
+    host = _plausible_deploy_host(r)
     request_id = str(r.get("_requestId") or "")
     digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:8]
     return host, f"deploy_{digest}", secrets.token_urlsafe(18)
