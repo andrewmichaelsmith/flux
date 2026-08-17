@@ -858,6 +858,32 @@ _CLOUD_IMDS_FILLER_ACCOUNT = "402113355019"
 # credential-harvester tooling actually emits — one entry path swept with
 # several parameter spellings, because the client cannot know which name
 # the application used.
+# --- Laravel Debugbar stored-request browser ----------------------------
+# Debugbar keeps the last N requests it profiled in a server-side store so
+# the developer can page back through them after the fact. That store is
+# reachable over HTTP at `/_debugbar/open`, and on a misconfigured
+# deployment (`APP_DEBUG=true` shipped to production, or the package left
+# in `require` rather than `require-dev`) it needs no authentication.
+#
+# What makes it worth answering is that it is a **two-step** surface, in
+# the same way the metadata service is. `op=list` returns only metadata
+# about the stored requests — ids, method, URI, timestamp — and carries no
+# secret. The credentials live one request further on: `op=get&id=<id>`
+# returns that request's full captured payload, which for a Laravel app
+# includes the `$_ENV` dump and the bound database queries.
+#
+# So the id is the discriminator. A dictionary sweeper fires `/_debugbar/
+# open` because the path is in its list, reads a body with nothing
+# greppable in it, and moves on. A client that parses the listing and
+# comes back naming an id we just handed it has implemented the protocol,
+# and that is a different and much smaller population. `debugbarIdKnown`
+# records which of the two we are looking at.
+LARAVEL_DEBUGBAR_ENABLED = _env_bool("HONEYPOT_LARAVEL_DEBUGBAR_ENABLED")
+# How many stored requests the listing advertises. Debugbar's own default
+# storage keeps far more, but a handful is what a lightly-used app has and
+# keeps the listing readable.
+LARAVEL_DEBUGBAR_STORED_REQUESTS = 5
+
 SSRF_RELAY_ENABLED = _env_bool("HONEYPOT_SSRF_RELAY_ENABLED")
 # Entry paths that plausibly take a URL and fetch it server-side. Matched
 # with a trailing slash tolerated. None belongs to another trap — the
@@ -20079,6 +20105,13 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/pinfo.php",
             "/i.php",
             "/pi.php",
+            # `.cgi` spellings. These arrive almost entirely under
+            # `/cgi-bin/`, but a leaf the nested resolver is willing to
+            # answer must exist in this table for it to have anything to
+            # resolve onto, and a root-level probe for one is no less
+            # plausible than the `.php` spelling.
+            "/phpinfo.cgi",
+            "/info.cgi",
         ),
         ("aws",),
         render_phpinfo,
@@ -21817,6 +21850,62 @@ _TRAP_WALK_PREFIXES: frozenset[str] = frozenset(
 # the surface on which we answer paths a real server would not.
 TRAP_WALK_MAX_DEPTH = 2
 
+# --- phpinfo() under an arbitrary parent ---------------------------------
+# The layout walk above gates on the *parent* directory, because for a
+# credential leaf the parent is what makes the request plausible:
+# `/admin/aws.json` is a file a real deployment might have, `/9f2a1c/
+# aws.json` is not.
+#
+# phpinfo inverts that test. A phpinfo page is not part of any framework's
+# layout — it is a file an operator drops by hand, wherever they happened
+# to be standing, and then forgets. So the parent carries no information
+# and scanners know it: the observed sweeps walk this leaf under hundreds
+# of distinct parents, most of them appearing exactly once. Gating on a
+# parent vocabulary is the wrong shape for this family and loses the large
+# majority of the sweep.
+#
+# Here the *leaf* is the whole signal, so the leaf list is what has to be
+# tight. Only names that are unambiguously a phpinfo probe are eligible.
+# Deliberately excluded are the generic stems the root-level trap also
+# answers (`test.php`, `x.php`, `1.php`, `temp.php`, `i.php`, …): those
+# collide with webshell-drop dictionaries, and answering them under any
+# parent would make this an answer-everything switch, which is its own
+# tell.
+PHPINFO_NESTED_ENABLED = _env_bool("HONEYPOT_PHPINFO_NESTED_ENABLED")
+
+_PHPINFO_NESTED_LEAVES: frozenset[str] = frozenset((
+    "phpinfo.php", "phpinfo.cgi", "phpinfo",
+    "php-info.php", "php_info.php", "phpinfo2.php",
+    "old_phpinfo.php", "linusadmin-phpinfo.php",
+    "info.php", "info.cgi", "infophp.php", "infos.php",
+    "iinfo.php", "pinfo.php",
+    "phpversion.php", "php_version.php",
+))
+
+# Observed nesting runs to three parents (`/crm/backend/phpinfo.php`,
+# `/prod/api/info.php`). Four bounds the lookup with headroom; past that a
+# real operator's stray debug file stops being a plausible explanation.
+PHPINFO_NESTED_MAX_DEPTH = 4
+
+
+def _nested_phpinfo_trap(path: str) -> "tuple[CanaryTrap | None, int]":
+    """Resolve `<any parents>/phpinfo.php` onto the phpinfo trap.
+
+    Returns `(trap, depth)` with `depth` the number of leading segments
+    dropped, matching `resolve_canary_trap`'s contract so the caller
+    stamps `trapWalkDepth` the same way for both walks.
+    """
+    if not (PHPINFO_NESTED_ENABLED and CANARY_TRAPS_ENABLED):
+        return None, 0
+    segments = [s for s in path.split("/") if s]
+    # Need at least one parent — the bare leaf is the root-level trap's
+    # own entry and must keep resolving through the exact lookup.
+    if len(segments) < 2 or len(segments) > PHPINFO_NESTED_MAX_DEPTH + 1:
+        return None, 0
+    if segments[-1].lower() not in _PHPINFO_NESTED_LEAVES:
+        return None, 0
+    return find_canary_trap("/" + segments[-1]), len(segments) - 1
+
 
 def resolve_canary_trap(path: str) -> "tuple[CanaryTrap | None, int]":
     """Find the trap that should answer `path`, tolerating app-layout nesting.
@@ -21840,7 +21929,9 @@ def resolve_canary_trap(path: str) -> "tuple[CanaryTrap | None, int]":
     if exact is not None:
         return exact, 0
     if not (TRAP_PATH_WALK_ENABLED and CANARY_TRAPS_ENABLED):
-        return None, 0
+        # The leaf-gated resolver is a separate surface with its own
+        # switch, so it stays reachable when the layout walk is off.
+        return _nested_phpinfo_trap(path)
 
     segments = [s for s in path.split("/") if s]
     # Need at least one directory plus the leaf to have anything to drop.
@@ -21849,11 +21940,15 @@ def resolve_canary_trap(path: str) -> "tuple[CanaryTrap | None, int]":
             # The first non-layout segment ends the walk — a dictionary
             # word we do not recognise means we are no longer looking at
             # a plausible deployment layout.
-            return None, 0
+            break
         found = find_canary_trap("/" + "/".join(segments[depth:]))
         if found is not None:
             return found, depth
-    return None, 0
+    # Every layout-walk exit lands here: out of depth, unknown parent, or
+    # no table entry at any depth. None of those say anything about a leaf
+    # that is diagnostic on its own, so the leaf-gated resolver gets its
+    # turn before the request becomes a 404.
+    return _nested_phpinfo_trap(path)
 
 
 def find_canary_trap(path: str) -> "CanaryTrap | None":
@@ -21965,6 +22060,88 @@ def resolve_vite_fs(path: str) -> "ViteFsResolution | None":
 
     return ViteFsResolution(
         requested, raw_suffix, trap, depth, bare_env, system_file,
+    )
+
+
+_DEBUGBAR_PREFIX = "/_debugbar"
+
+
+@dataclass(frozen=True)
+class LaravelDebugbarRequest:
+    """Which step of the Debugbar stored-request protocol was asked for.
+
+    `stored_id` is the id the client named on a `op=get`; empty for every
+    other step. `id_known` records whether that id is one this host would
+    have advertised — the listing is deterministic per host, so an id we
+    never issued means the client guessed rather than read.
+    """
+
+    kind: str   # "index" | "open-list" | "open-get" | "asset-js" | "asset-css" | "clockwork"
+    stored_id: str = ""
+    id_known: bool = False
+
+    @property
+    def issues_canary(self) -> bool:
+        """Only the payload fetch spends a canary.
+
+        The listing and the assets contain no secret, so a flat sweep over
+        the whole `/_debugbar/` surface costs nothing upstream — the same
+        trade the metadata tree makes for its directory steps.
+        """
+        return self.kind == "open-get"
+
+
+def _debugbar_stored_ids(host: str) -> "tuple[str, ...]":
+    """The stored-request ids this host advertises.
+
+    Deterministic per host so a client that reads the listing and comes
+    back with one of these is recognisable as having parsed our response.
+    These are identifiers, not secrets — Debugbar's own ids are just
+    storage keys — so a stable derivation is correct here and does not
+    conflict with the per-hit rule that governs credential-shaped fields.
+    """
+    seed = hashlib.sha256(f"debugbar:{host.lower()}".encode("utf-8")).hexdigest()
+    return tuple(
+        # Debugbar's FilesystemStorage names entries `X` + 32 hex.
+        "X" + hashlib.sha256(f"{seed}:{i}".encode("utf-8")).hexdigest()[:32]
+        for i in range(LARAVEL_DEBUGBAR_STORED_REQUESTS)
+    )
+
+
+def resolve_laravel_debugbar(
+    path: str, query_string: str, host: str,
+) -> "LaravelDebugbarRequest | None":
+    """Map a request onto a step of the Debugbar stored-request protocol.
+
+    `op` defaults to the listing when absent, which is what Debugbar's own
+    JS does on first load. An `op=get` with no id is still step two as far
+    as intent goes — the client knows the protocol — so it is logged as
+    `open-get` with an empty id rather than being folded back into the
+    listing.
+    """
+    lowered = path.lower().rstrip("/") or "/"
+    if lowered != _DEBUGBAR_PREFIX and not lowered.startswith(_DEBUGBAR_PREFIX + "/"):
+        return None
+
+    if lowered in (_DEBUGBAR_PREFIX, _DEBUGBAR_PREFIX + "/"):
+        return LaravelDebugbarRequest("index")
+    if lowered == _DEBUGBAR_PREFIX + "/assets/javascript":
+        return LaravelDebugbarRequest("asset-js")
+    if lowered == _DEBUGBAR_PREFIX + "/assets/stylesheets":
+        return LaravelDebugbarRequest("asset-css")
+    if lowered == _DEBUGBAR_PREFIX + "/clockwork":
+        return LaravelDebugbarRequest("clockwork")
+    if lowered != _DEBUGBAR_PREFIX + "/open":
+        return None
+
+    params = parse_qs(query_string or "", keep_blank_values=True)
+    op = (params.get("op", [""])[0] or "").strip().lower()
+    if op != "get":
+        return LaravelDebugbarRequest("open-list")
+
+    stored_id = (params.get("id", [""])[0] or "").strip()
+    return LaravelDebugbarRequest(
+        "open-get", stored_id, stored_id in _debugbar_stored_ids(host),
     )
 
 
@@ -28500,6 +28677,245 @@ async def _send_canary_trap(
     return response
 
 
+_DEBUGBAR_SAMPLE_ROUTES: tuple[tuple[str, str], ...] = (
+    ("GET", "/admin/settings"),
+    ("POST", "/admin/settings/storage"),
+    ("GET", "/api/v1/orders"),
+    ("POST", "/api/v1/auth/login"),
+    ("GET", "/dashboard"),
+)
+
+
+def _debugbar_meta(host: str, stored_id: str, index: int) -> dict[str, object]:
+    """The `__meta` block Debugbar stores alongside every captured request.
+
+    Times run backwards from a fixed offset per index rather than from the
+    clock, so two fetches of the same id do not disagree about when the
+    request happened.
+    """
+    method, uri = _DEBUGBAR_SAMPLE_ROUTES[index % len(_DEBUGBAR_SAMPLE_ROUTES)]
+    utime = 1755000000.0 - (index * 137.42)
+    return {
+        "id": stored_id,
+        "datetime": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(utime)),
+        "utime": utime,
+        "method": method,
+        "uri": uri,
+        "ip": "10.0.0.%d" % (11 + index),
+    }
+
+
+def render_debugbar_listing(host: str) -> bytes:
+    """`op=list` — stored-request metadata only, no secret anywhere.
+
+    This is deliberately not worth harvesting. It exists to name the ids
+    that make step two reachable, which is what separates a client that
+    reads our response from one walking a path list.
+    """
+    ids = _debugbar_stored_ids(host)
+    listing = [_debugbar_meta(host, sid, i) for i, sid in enumerate(ids)]
+    return json.dumps(listing, indent=2).encode("utf-8")
+
+
+def render_debugbar_stored_request(
+    r: dict[str, object], host: str, stored_id: str, index: int,
+) -> bytes:
+    """`op=get&id=<id>` — one captured request, in full.
+
+    The AWS canary goes in the `request.env` dump, which is the slot a
+    real Debugbar RequestDataCollector fills from `$_ENV` and the slot a
+    harvester greps. It is repeated in a query binding because the
+    `queries` panel is the other place a Laravel app leaks credentials,
+    and a payload that carried it in only one of the two would read as
+    hand-made to anyone who has seen a real dump. Every other
+    credential-shaped field is a per-hit synthetic.
+    """
+    aws = _aws(r)
+    key_id = str(aws.get("awsAccessKeyId", "") or "")
+    secret = str(aws.get("awsSecretAccessKey", "") or "")
+    token = str(aws.get("awsSessionToken", "") or "")
+    meta = _debugbar_meta(host, stored_id, index)
+    db_password = _fake_db_password()
+    app_key = "base64:" + base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+
+    payload: dict[str, object] = {
+        "__meta": meta,
+        "php": {"version": "8.2.12", "interface": "fpm-fcgi"},
+        "messages": {
+            "count": 1,
+            "messages": [{
+                "message": "settings.storage.updated",
+                "message_html": None,
+                "is_string": True,
+                "label": "info",
+                "time": meta["utime"],
+            }],
+        },
+        "time": {
+            "start": meta["utime"],
+            "end": float(meta["utime"]) + 0.184,
+            "duration": 0.184,
+            "duration_str": "184ms",
+        },
+        "memory": {"peak_usage": 4194304, "peak_usage_str": "4MB"},
+        "queries": {
+            "nb_statements": 2,
+            "statements": [
+                {
+                    "sql": "select * from `settings` where `key` = ? limit 1",
+                    "type": "query",
+                    "bindings": ["storage.s3"],
+                    "duration": 0.0021,
+                    "connection": "mysql",
+                },
+                {
+                    "sql": (
+                        "update `settings` set `value` = ?, `secret` = ? "
+                        "where `key` = ?"
+                    ),
+                    "type": "query",
+                    "bindings": [key_id, secret, "storage.s3"],
+                    "duration": 0.0038,
+                    "connection": "mysql",
+                },
+            ],
+        },
+        "request": {
+            "path_info": meta["uri"],
+            "status_code": 200,
+            "request_query": [],
+            "request_request": {"driver": "s3"},
+            "session_attributes": {
+                "_token": secrets.token_urlsafe(24),
+                "login_web": secrets.token_hex(20),
+            },
+            "env": {
+                "APP_ENV": "production",
+                "APP_DEBUG": "true",
+                "APP_KEY": app_key,
+                "APP_URL": f"https://{host}",
+                "DB_CONNECTION": "mysql",
+                "DB_HOST": "127.0.0.1",
+                "DB_DATABASE": "app_prod",
+                "DB_USERNAME": "app_prod",
+                "DB_PASSWORD": db_password,
+                "REDIS_PASSWORD": _fake_db_password(),
+                "MAIL_PASSWORD": _fake_db_password(),
+                "FILESYSTEM_DISK": "s3",
+                "AWS_ACCESS_KEY_ID": key_id,
+                "AWS_SECRET_ACCESS_KEY": secret,
+                "AWS_SESSION_TOKEN": token,
+                "AWS_DEFAULT_REGION": "us-east-1",
+                "AWS_BUCKET": "app-prod-uploads",
+            },
+        },
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+# Assets carry no secret; they exist so a client that renders the toolbar
+# does not get a broken page and give up before step two.
+_DEBUGBAR_JS = (
+    b"/*! DebugBar | (c) Maxime Bouroumeau-Fuseau and contributors */\n"
+    b"if(typeof PhpDebugBar==='undefined'){var PhpDebugBar={};}\n"
+    b"(function(w){PhpDebugBar.DebugBar=function(){};"
+    b"PhpDebugBar.DebugBar.prototype.openHandler=null;})(window);\n"
+)
+_DEBUGBAR_CSS = (
+    b"/*! DebugBar */\n"
+    b"div.phpdebugbar{font-size:13px;background:#fff;border-top:1px solid #ccc}\n"
+    b"div.phpdebugbar-header{background:#f5f5f5;min-height:37px}\n"
+)
+
+
+async def _send_laravel_debugbar(
+    request: web.Request,
+    dbg: "LaravelDebugbarRequest",
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.Response:
+    """Answer one step of the Debugbar stored-request protocol.
+
+    `debugbarOp` and `debugbarIdKnown` go in the log line for every step,
+    so a `open-list` followed by an `open-get` naming an id from that
+    listing is reconstructable from the log alone — that chain is the
+    behaviour this trap exists to separate from a flat path sweep.
+    """
+    log_context = {
+        **log_context,
+        "debugbarOp": dbg.kind,
+        "debugbarStoredId": dbg.stored_id,
+        "debugbarIdKnown": dbg.id_known,
+    }
+
+    if not dbg.issues_canary:
+        if dbg.kind == "asset-js":
+            body, ctype = _DEBUGBAR_JS, "application/javascript; charset=utf-8"
+        elif dbg.kind == "asset-css":
+            body, ctype = _DEBUGBAR_CSS, "text/css; charset=utf-8"
+        elif dbg.kind == "clockwork":
+            # Debugbar ships a Clockwork-compatible shim that returns an
+            # empty object when the integration is not configured.
+            body, ctype = b"{}\n", "application/json"
+        else:
+            # `index` and `open-list` both answer with the listing. A bare
+            # `/_debugbar` is what a scanner tries before it knows the
+            # `open` sub-path exists, and answering it with the listing is
+            # what makes the sub-path discoverable at all.
+            body = render_debugbar_listing(host)
+            ctype = "application/json"
+        append_log({
+            **log_context, "status": 200,
+            "result": f"laravel-debugbar-{dbg.kind}", "bytes": len(body),
+        })
+        return web.Response(
+            status=200,
+            body=b"" if request.method == "HEAD" else body,
+            headers={
+                "Content-Type": ctype,
+                "Cache-Control": "no-store",
+                "Content-Length": str(len(body)),
+            },
+        )
+
+    tracebit_response = await _get_or_issue_canary(
+        ("aws",), client_ip, request_id, host, user_agent, path, proto,
+    )
+    if tracebit_response is None:
+        append_log({
+            **log_context, "status": CREDENTIAL_FAILURE_STATUS,
+            "result": "laravel-debugbar-open-get-error",
+        })
+        return _credential_failure_response()
+
+    ids = _debugbar_stored_ids(host)
+    # An id we never advertised still gets a payload — a client that
+    # guessed is worth keeping on the hook, and Debugbar itself does not
+    # distinguish. Which of the two happened is already in the log line.
+    index = ids.index(dbg.stored_id) if dbg.id_known else 0
+    stored_id = dbg.stored_id or ids[0]
+    body = render_debugbar_stored_request(tracebit_response, host, stored_id, index)
+    append_log({
+        **log_context, "status": 200, "result": "laravel-debugbar-open-get",
+        "canaryTypes": [k for k, v in tracebit_response.items() if v],
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200,
+        body=b"" if request.method == "HEAD" else body,
+        headers={
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
 async def _send_cloud_imds(
     request: web.Request,
     imds: "CloudImdsRequest",
@@ -29821,6 +30237,18 @@ async def handle(request: web.Request) -> web.StreamResponse:
         if imds is not None:
             return await _send_cloud_imds(
                 request, imds, request_id, path,
+                client_ip, host, user_agent, proto, log_context,
+            )
+
+    # Ahead of the tarpit for the same reason the metadata tree is: the
+    # listing step is what makes the payload step reachable, and dripping
+    # `/_debugbar/open` would break the chain before the client ever
+    # learns a stored-request id.
+    if API_KEY and LARAVEL_DEBUGBAR_ENABLED:
+        dbg = resolve_laravel_debugbar(path, query_string, host)
+        if dbg is not None:
+            return await _send_laravel_debugbar(
+                request, dbg, request_id, path,
                 client_ip, host, user_agent, proto, log_context,
             )
 

@@ -620,7 +620,17 @@ def test_all_trap_families_default_on():
         "dictionaries walk `<layout dir>/<secret file>`, so without the walk "
         "the majority of a sweep 404s on files we already answer at root."
     )
+    assert tbenv.PHPINFO_NESTED_ENABLED, (
+        "HONEYPOT_PHPINFO_NESTED_ENABLED should default to True — phpinfo "
+        "sweeps walk the leaf under hundreds of one-off parents, which the "
+        "layout-vocabulary walk cannot cover."
+    )
     assert tbenv.CLOUD_IMDS_ENABLED
+    assert tbenv.LARAVEL_DEBUGBAR_ENABLED, (
+        "HONEYPOT_LARAVEL_DEBUGBAR_ENABLED should default to True — only "
+        "the op=get step spends a canary, so the listing steps cost "
+        "nothing upstream."
+    )
     assert tbenv.SSRF_RELAY_ENABLED
     assert tbenv.FAKE_GIT_ENABLED, (
         "FAKE_GIT_ENABLED should default to True — the per-IP cache bounds "

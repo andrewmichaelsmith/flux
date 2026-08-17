@@ -24,7 +24,10 @@ Every line includes these — they're built in `_handle()` before dispatch.
 | `headers` | object | Subset: `Host`, all `X-Forwarded-*`, `True-Client-Ip`, `X-Real-Ip`, `X-Client-Ip`, `X-Azure-Clientip`, `X-Azure-Socketip`, `X-Originating-Ip`, `X-Host`, `Cf-Connecting-Ip`, `Content-Type`, `Content-Length`. Values truncated to 512 chars. |
 | `bodyBytesRead` | int | 0 unless the request read a capped body (`GET`/`POST` payloads). |
 | `bodySha256` | string | SHA256 hex when body bytes were present, or `""`. |
-| `trapWalkDepth` | int | Present only when an exact-path canary trap was reached after dropping leading app-layout directory segments (`/admin/aws.json` -> depth 1). Absent means the path arrived at the location the trap table lists. |
+| `trapWalkDepth` | int | Present only when an exact-path canary trap was reached after dropping leading directory segments (`/admin/aws.json` -> depth 1). Also stamped when the phpinfo family resolved under an unrecognised parent (`/wp-admin/phpinfo.php` -> depth 1). Absent means the path arrived at the location the trap table lists. |
+| `debugbarOp` | string | Laravel Debugbar only: which step of the stored-request protocol was asked for — `index`, `open-list`, `open-get`, `asset-js`, `asset-css`, `clockwork`. |
+| `debugbarStoredId` | string | The stored-request id the client named on `op=get`; `""` on every other step. |
+| `debugbarIdKnown` | bool | True when `debugbarStoredId` is one this host advertises. An `open-list` followed by an `open-get` with `debugbarIdKnown=true` from the same source is a client that parsed our listing rather than replaying a path — see [docs/laravel-debugbar.md](./docs/laravel-debugbar.md). |
 
 ## Result tags
 
@@ -314,6 +317,24 @@ chain — that pair is the signal this trap exists to produce. See
 | `cloud-imds-role-credentials` | 200 | `canaryTypes: [..]`, `bytes: int` | Instance-metadata credential envelope. |
 | `cloud-imds-ecs-credentials` | 200 | `canaryTypes: [..]`, `bytes: int` | Container credential-provider envelope. |
 | `cloud-imds-<kind>-error` | 404 | — | Canary issuance failed. Only the credential kinds can produce this. |
+
+### Laravel Debugbar stored-request browser
+
+Every line carries `debugbarOp`, `debugbarStoredId` and
+`debugbarIdKnown`. A `laravel-debugbar-open-list` followed by a
+`laravel-debugbar-open-get` with `debugbarIdKnown=true` from the same
+source is the two-step chain — a client that parsed the listing rather
+than replaying a path. See [docs](./docs/laravel-debugbar.md).
+
+| `result` | `status` | Extras | Meaning |
+| --- | --- | --- | --- |
+| `laravel-debugbar-index` | 200 | `bytes: int` | Bare `/_debugbar`; answers with the listing. No canary issued. |
+| `laravel-debugbar-open-list` | 200 | `bytes: int` | Stored-request metadata only, no secret. No canary issued. |
+| `laravel-debugbar-open-get` | 200 | `canaryTypes: [..]`, `bytes: int` | One captured request in full, canary in `request.env` and in a query binding. |
+| `laravel-debugbar-asset-js` | 200 | `bytes: int` | DebugBar JS stub. No canary issued. |
+| `laravel-debugbar-asset-css` | 200 | `bytes: int` | DebugBar CSS stub. No canary issued. |
+| `laravel-debugbar-clockwork` | 200 | `bytes: int` | Unconfigured Clockwork shim (`{}`). No canary issued. |
+| `laravel-debugbar-open-get-error` | 404 | — | Canary issuance failed. Only `open-get` can produce this. |
 
 ### SSRF relay onto the metadata tree
 

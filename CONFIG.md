@@ -86,6 +86,17 @@ burning quota.
 | `CANARY_TRAP_CACHE_TTL_SECONDS` | `3600` | Per-(IP, canary types) TTL. |
 | `CANARY_TRAP_CACHE_MAX_ENTRIES` | `1024` | |
 | `HONEYPOT_TRAP_PATH_WALK_ENABLED` | **on** | Let an exact-path trap also answer when the file arrives nested under a recognised app-layout directory (`/admin/aws.json`). Capped at two segments; every segment dropped must be a known layout name, so arbitrary parents still 404. See [docs/trap-path-walk.md](./docs/trap-path-walk.md). |
+| `HONEYPOT_PHPINFO_NESTED_ENABLED` | **on** | Answer the phpinfo() family under *any* parent directory, up to four segments deep (`/wp-admin/phpinfo.php`, `/crm/backend/phpinfo.php`). Gated on the leaf filename rather than the parent, because a phpinfo page belongs to no framework layout. Only unambiguous phpinfo leaf names are eligible — the generic stems (`test.php`, `x.php`, `1.php`) stay root-only. See [docs/phpinfo-nested.md](./docs/phpinfo-nested.md). |
+
+## Laravel Debugbar
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HONEYPOT_LARAVEL_DEBUGBAR_ENABLED` | **on** | Serve the Debugbar stored-request browser at `/_debugbar/*`. Only the `op=get` payload step mints a canary; the listing and asset steps are free. See [docs/laravel-debugbar.md](./docs/laravel-debugbar.md). |
+
+Requires a Tracebit key: the dispatch is gated on `TRACEBIT_API_KEY`, so
+a keyless deployment 404s the whole surface rather than serving a
+listing that leads nowhere.
 
 ## Fake `/.git/*` tree
 

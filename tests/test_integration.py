@@ -979,3 +979,85 @@ async def test_integration_vite_fs_resolves_new_cloud_artifacts(live_server):
     assert any(
         e.get("result") == "vite-fs-aws-amplify-exports-js" for e in entries
     ), [e.get("result") for e in entries]
+
+
+async def test_integration_debugbar_two_step_chain(live_server):
+    """Listing then payload, over a real socket. The listing must be
+    harvest-worthless and the payload must carry the canary — that split
+    is what makes the second request meaningful."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/_debugbar/open", headers={"X-Forwarded-For": "203.0.113.60"},
+        ) as resp:
+            assert resp.status == 200
+            listing = json.loads(await resp.text())
+    assert b"AKIAFAKEINTEG01" not in json.dumps(listing).encode()
+
+    stored_id = listing[1]["id"]
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/_debugbar/open?op=get&id={stored_id}",
+            headers={"X-Forwarded-For": "203.0.113.60"},
+        ) as resp:
+            assert resp.status == 200
+            payload = await resp.read()
+    assert b"AKIAFAKEINTEG01" in payload
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    got = [e for e in entries if str(e.get("result", "")).startswith("laravel-debugbar")]
+    assert [e["result"] for e in got] == [
+        "laravel-debugbar-open-list", "laravel-debugbar-open-get",
+    ], [e.get("result") for e in got]
+    # The discriminator: this client read our listing.
+    assert got[1]["debugbarIdKnown"] is True
+    assert got[1]["debugbarStoredId"] == stored_id
+
+
+async def test_integration_debugbar_guessed_id_is_flagged(live_server):
+    """A client that never read the listing still gets a payload, but the
+    log says it guessed."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/_debugbar/open?op=get&id=Xnotours",
+            headers={"X-Forwarded-For": "203.0.113.61"},
+        ) as resp:
+            assert resp.status == 200
+            assert b"AKIAFAKEINTEG01" in await resp.read()
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    got = next(e for e in entries if e.get("result") == "laravel-debugbar-open-get")
+    assert got["debugbarIdKnown"] is False
+    assert got["debugbarStoredId"] == "Xnotours"
+
+
+async def test_integration_debugbar_disabled_switch_404s(live_server, monkeypatch):
+    base, log_path = live_server
+    monkeypatch.setattr(tbenv, "LARAVEL_DEBUGBAR_ENABLED", False)
+    async with aiohttp.ClientSession() as session:
+        for path in ("/_debugbar/open", "/_debugbar", "/_debugbar/open?op=get&id=X1"):
+            async with session.get(
+                f"{base}{path}", headers={"X-Forwarded-For": "203.0.113.62"},
+            ) as resp:
+                assert resp.status == 404, path
+
+
+async def test_integration_phpinfo_nested_under_unknown_parent(live_server):
+    """The leaf resolver reaches the real phpinfo renderer and its canary,
+    not just a matcher."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        for path in ("/wp-admin/phpinfo.php", "/cgi-bin/info.cgi",
+                     "/crm/backend/phpinfo.php"):
+            async with session.get(
+                f"{base}{path}", headers={"X-Forwarded-For": "203.0.113.63"},
+            ) as resp:
+                assert resp.status == 200, path
+                assert b"AKIAFAKEINTEG01" in await resp.read(), path
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    got = [e for e in entries if e.get("result") == "phpinfo"]
+    assert len(got) == 3, [e.get("result") for e in entries]
+    # `trapWalkDepth` is the "arrived nested" signal and must be stamped.
+    assert [e.get("trapWalkDepth") for e in got] == [1, 1, 2]
