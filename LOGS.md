@@ -116,6 +116,12 @@ Augmenting-module extras inside `tarpit.modules`:
 | --- | --- | --- | --- |
 | `webshell-probe` | 200 | webshell fields | Hit matching a webshell path without an extractable command. |
 | `webshell-command` | 200 | webshell fields + `command`, `commandSource`, `commandKey`, `simulatedOutputBytes` | Hit with a command we extracted. |
+| `webshell-sweep-observed` | 404 | `webshellSweepDistinct: int` | A root-level `*.php` name no trap claimed, from a source that has not yet asked for enough distinct such names to open the shell-jacking sweep gate. Body is byte-identical to `not-handled`, so the client cannot tell the gate exists. See [docs/webshell-sweep.md](./docs/webshell-sweep.md). |
+
+`webshellSweepDistinct` also appears on `webshell-probe` / `webshell-command`
+lines that the sweep gate admitted (never on a curated-list hit). It counts the
+distinct unclaimed `*.php` names that source has asked for in the current
+window — i.e. how wide its dictionary is.
 
 Webshell extras (both variants):
 

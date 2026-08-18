@@ -347,6 +347,104 @@ WEBSHELL_COMMAND_KEYS = (
 )
 WEBSHELL_COMMAND_HEADERS = ("X-Cmd", "X-Exec", "X-Command")
 
+# --- Shell-jacking sweep gate -------------------------------------------------
+# `WEBSHELL_PATHS` above is a hand-curated literal list, and it cannot keep up.
+# Shell-jacking scanners walk an effectively unbounded dictionary of root-level
+# `*.php` filenames looking for a shell somebody else already planted, and the
+# dictionary is per-cohort: each new scanner family brings its own names, so a
+# literal list is always one cohort behind and rots between reviews.
+#
+# Rather than keep appending literals, match the *shape* of the sweep and gate
+# on the *behaviour*: a source that asks for several distinct unclaimed
+# root-level `.php` names inside one window is enumerating, and every name it
+# asks for after that gets the same fake shell the literal list serves.
+#
+# The gate is what makes this safe to run. Answering 200 to any `*.php` would
+# be a fleet-wide tell — a single probe for a random filename would prove the
+# host fabricates responses. Below the threshold the response is the
+# byte-identical `not found\n` 404 the router already returns, so a scanner
+# testing one or two throwaway names learns nothing; to reach a 200 it first
+# has to exhibit the sweep behaviour we are trying to observe.
+#
+# The distinct-name count is itself the intel: it records how wide each source's
+# dictionary is, which a literal-match trap cannot measure.
+WEBSHELL_SWEEP_ENABLED = _env_bool("HONEYPOT_WEBSHELL_SWEEP_ENABLED")
+# Distinct unclaimed root-level `.php` names one source must ask for before the
+# gate opens. 3 is deliberately low: observed sweeps walk tens to hundreds of
+# names, so the gate opens early enough to capture most of the dictionary while
+# still costing a one-off prober nothing but a 404.
+WEBSHELL_SWEEP_MIN_DISTINCT = max(
+    int((os.environ.get("HONEYPOT_WEBSHELL_SWEEP_MIN_DISTINCT") or "3").strip() or "3"), 2,
+)
+WEBSHELL_SWEEP_TTL_SECONDS = max(
+    int((os.environ.get("HONEYPOT_WEBSHELL_SWEEP_TTL_SECONDS") or "3600").strip() or "3600"), 60,
+)
+# Bound the tracking table the same way the canary cache is bounded, so a
+# spoofed-source flood cannot grow it without limit.
+WEBSHELL_SWEEP_MAX_SOURCES = max(
+    int((os.environ.get("HONEYPOT_WEBSHELL_SWEEP_MAX_SOURCES") or "4096").strip() or "4096"), 64,
+)
+WEBSHELL_SWEEP_MAX_PATHS_PER_SOURCE = max(
+    int((os.environ.get("HONEYPOT_WEBSHELL_SWEEP_MAX_PATHS_PER_SOURCE") or "512").strip() or "512"),
+    8,
+)
+# Single-segment root-level `.php` filename. Anchored and length-bounded so it
+# cannot match nested drop paths (those are the literal list's job) or absurd
+# generated names.
+_WEBSHELL_SWEEP_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.php$", re.IGNORECASE)
+# Names that stay 404 no matter how much sweeping a source does. These are
+# ordinary front-controller filenames a crawler or a mistyped link can ask for
+# innocently; serving a shell page there would put trap output in front of
+# non-scanner traffic without telling us anything a real sweep would not.
+_WEBSHELL_SWEEP_NEVER = frozenset({
+    "/index.php", "/home.php", "/main.php",
+})
+# src_ip -> (expiry, {lowercased paths seen})
+_WEBSHELL_SWEEP_SEEN: dict[str, tuple[float, set[str]]] = {}
+
+
+def is_webshell_sweep_candidate(path: str) -> bool:
+    """True for a root-level `*.php` name that no other trap claimed.
+
+    Callers must run this only after every exact-path trap has had its turn,
+    which is what makes "unclaimed" true: the dispatch reaches here last.
+    """
+    if not path:
+        return False
+    lowered = path.lower()
+    if lowered in _WEBSHELL_SWEEP_NEVER:
+        return False
+    if lowered in WEBSHELL_PATHS:
+        # Already served by the literal list; not a gate decision.
+        return False
+    return bool(_WEBSHELL_SWEEP_RE.match(path))
+
+
+def webshell_sweep_observe(src_ip: str, path: str, now: float | None = None) -> int:
+    """Record one candidate probe; return the distinct count for this source.
+
+    Entries expire after `WEBSHELL_SWEEP_TTL_SECONDS`, so a source that probes
+    one name a day never accumulates its way through the gate.
+    """
+    if not src_ip:
+        return 0
+    moment = time.time() if now is None else now
+    entry = _WEBSHELL_SWEEP_SEEN.get(src_ip)
+    if entry is None or entry[0] <= moment:
+        entry = (moment + WEBSHELL_SWEEP_TTL_SECONDS, set())
+        _WEBSHELL_SWEEP_SEEN[src_ip] = entry
+    seen = entry[1]
+    if len(seen) < WEBSHELL_SWEEP_MAX_PATHS_PER_SOURCE:
+        seen.add(path.lower())
+    if len(_WEBSHELL_SWEEP_SEEN) > WEBSHELL_SWEEP_MAX_SOURCES:
+        for key in [k for k, v in _WEBSHELL_SWEEP_SEEN.items() if v[0] <= moment]:
+            del _WEBSHELL_SWEEP_SEEN[key]
+        while len(_WEBSHELL_SWEEP_SEEN) > WEBSHELL_SWEEP_MAX_SOURCES:
+            oldest = min(_WEBSHELL_SWEEP_SEEN, key=lambda k: _WEBSHELL_SWEEP_SEEN[k][0])
+            del _WEBSHELL_SWEEP_SEEN[oldest]
+    return len(seen)
+
+
 # --- File-upload responder (KCFinder / jquery.filer / blueimp jQuery File Upload) ---
 # Scanners that look for legacy PHP file-upload libraries walk a long list
 # of webroot prefix variants — `/kcfinder/upload.php`,
@@ -30312,6 +30410,27 @@ async def handle(request: web.Request) -> web.StreamResponse:
             request, request_id, path, client_ip, host, user_agent, proto, log_context,
         )
 
+    # Shell-jacking sweep gate. Runs last on purpose: everything above has
+    # already claimed its own paths, so whatever reaches here is a root-level
+    # `*.php` name no trap wanted — exactly the shape a shell-jacking sweep
+    # walks. Sources under the distinct-name threshold fall through to the
+    # same 404 below and cannot tell the gate exists.
+    if WEBSHELL_ENABLED and WEBSHELL_SWEEP_ENABLED and is_webshell_sweep_candidate(path):
+        distinct = webshell_sweep_observe(client_ip, path)
+        if distinct >= WEBSHELL_SWEEP_MIN_DISTINCT:
+            return await _handle_webshell(
+                request, {**log_context, "webshellSweepDistinct": distinct},
+                path, query_string, request_body,
+            )
+        append_log({
+            **log_context, "status": 404, "result": "webshell-sweep-observed",
+            "webshellSweepDistinct": distinct,
+        })
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
     if path != "/.env" or not API_KEY:
         append_log({**log_context, "status": 404, "result": "not-handled"})
         return web.Response(
@@ -30363,6 +30482,8 @@ def main() -> int:
         active.append("tarpit")
     if WEBSHELL_ENABLED:
         active.append("webshell")
+        if WEBSHELL_SWEEP_ENABLED:
+            active.append("webshell-sweep")
     if FILE_UPLOAD_ENABLED:
         active.append("file-upload")
     if LLM_ENDPOINT_ENABLED:

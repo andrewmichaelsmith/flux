@@ -153,6 +153,11 @@ No Tracebit key required.
 | `HONEYPOT_WEBSHELL_PATHS_CSV` | *(built-in default list)* | Override to add/remove paths without a code change. |
 | `HONEYPOT_WEBSHELL_BODY_READ_LIMIT` | `65536` | Max body bytes read off the wire. |
 | `HONEYPOT_WEBSHELL_BODY_DECODE_LIMIT` | `8192` | Max body bytes decoded for the log `bodyPreview`. |
+| `HONEYPOT_WEBSHELL_SWEEP_ENABLED` | on | Shell-jacking sweep gate — serve the webshell on any unclaimed root-level `*.php` name once a source has swept. Requires `HONEYPOT_WEBSHELL_ENABLED`. See [docs/webshell-sweep.md](./docs/webshell-sweep.md). |
+| `HONEYPOT_WEBSHELL_SWEEP_MIN_DISTINCT` | `3` | Distinct unclaimed `*.php` names one source must ask for before the gate opens. Floor 2. |
+| `HONEYPOT_WEBSHELL_SWEEP_TTL_SECONDS` | `3600` | Window the distinct-name count is kept for. Floor 60. |
+| `HONEYPOT_WEBSHELL_SWEEP_MAX_SOURCES` | `4096` | Bound on the per-source tracking table. Floor 64. |
+| `HONEYPOT_WEBSHELL_SWEEP_MAX_PATHS_PER_SOURCE` | `512` | Bound on names remembered per source. Floor 8. |
 
 ## Fake file-upload responder
 

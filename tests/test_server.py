@@ -643,6 +643,12 @@ def test_all_trap_families_default_on():
     assert tbenv.VITE_FS_ENABLED
     assert tbenv.VITE_FS_SYSTEM_FILES_ENABLED
     assert tbenv.WEBSHELL_ENABLED
+    assert tbenv.WEBSHELL_SWEEP_ENABLED, (
+        "HONEYPOT_WEBSHELL_SWEEP_ENABLED should default to True — the literal "
+        "shell-name list cannot track a per-cohort dictionary, and the "
+        "distinct-name gate keeps a one-off prober on the same 404 the router "
+        "already returns."
+    )
     assert tbenv.FILE_UPLOAD_ENABLED
     assert tbenv.LLM_ENDPOINT_ENABLED
     assert tbenv.MCP_SERVER_ENABLED
@@ -14675,6 +14681,10 @@ async def test_dispatch_adminer_post_without_api_key_still_captures(flux_client,
 
 async def test_dispatch_adminer_disabled_falls_through(flux_client, monkeypatch):
     monkeypatch.setattr(tbenv, "ADMINER_ENABLED", False)
+    # With adminer off, `/adminer.php` is a genuinely unclaimed root-level
+    # `.php` name, so the shell-jacking sweep gate would observe it. Disable
+    # the gate so this test stays about the adminer dispatch alone.
+    monkeypatch.setattr(tbenv, "WEBSHELL_SWEEP_ENABLED", False)
     resp = await flux_client.get(
         "/adminer.php",
         headers={"X-Forwarded-For": "203.0.113.213"},
