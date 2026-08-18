@@ -733,8 +733,12 @@ async def test_integration_fake_git_small_bodies_ignore_drip_capacity(
 async def test_integration_fake_git_large_body_still_honours_capacity(
     live_server, monkeypatch,
 ):
-    """The semaphore must still bound genuinely-slow responses: a body
-    larger than one drip chunk is what the cap exists for."""
+    """At the drip cap a would-be drip is served in one shot, not refused.
+
+    The semaphore still bounds concurrent *slow* responses — this request
+    takes no slot and holds nothing — but the client gets the file instead of
+    `503 busy`, which no really-exposed repository answers a file fetch with.
+    """
     async def fake_issue(*_a, **_kw):
         return FAKE_TRACEBIT
 
@@ -752,10 +756,16 @@ async def test_integration_fake_git_large_body_still_honours_capacity(
         async with session.get(
             f"{base}/.git/HEAD", headers={"X-Forwarded-For": "203.0.113.72"},
         ) as resp:
-            assert resp.status == 503
+            assert resp.status == 200
+            assert await resp.read() == b"ref: refs/heads/main\n"
 
     entries = [json.loads(line) for line in log_path.read_text().splitlines()]
-    assert any(e.get("result") == "fake-git-capacity" for e in entries)
+    assert any(e.get("result") == "fake-git-undripped" for e in entries)
+    assert not any(e.get("result") == "fake-git-capacity" for e in entries), (
+        "the drip cap must no longer refuse the request with `busy`"
+    )
+    # The slot counter is untouched: an undripped response holds nothing.
+    assert tbenv._active_slow_drips == 2
 
 
 async def test_integration_fake_git_head_request_never_takes_a_slot(

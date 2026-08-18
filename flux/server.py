@@ -3094,6 +3094,19 @@ _ADMINER_DEFAULT_PATHS = ",".join([
     "/adminer-4.7.9.php",
     "/adminer-4.7.8.php",
     "/adminer-4.7.7.php",
+    # Spellings that kept falling through to the router's 404: the
+    # underscore-prefixed drop names, the remaining webroot prefixes, and the
+    # missing-separator typo that dictionary generators produce. `/_adminer/`
+    # and `/_adminer/index.php` complete the pair whose `adminer.php` form was
+    # already covered.
+    "/_adminer.php",
+    "/_adminer/",
+    "/_adminer/index.php",
+    "/adminadminer.php",
+    "/web/adminer.php",
+    "/data/adminer.php",
+    "/php/adminer.php",
+    "/public/adminer.php",
 ])
 ADMINER_PATHS = frozenset(
     value.strip().lower()
@@ -11256,6 +11269,15 @@ def _build_fake_repo(
         ).encode("utf-8"),
         "/.git/info/sparse-checkout": b"",
         "/.git/info/packs": b"",
+        # Two entries repo dumpers ask for that a real checkout does have and
+        # this tree was missing, so they fell out as misses mid-walk:
+        #   * `branches/` is the legacy remote shorthand directory. Modern git
+        #     still creates it and leaves it empty, so an empty autoindex is
+        #     the faithful answer.
+        #   * `remotes/origin/HEAD` is the symref recording the remote's
+        #     default branch, written by `clone` and by `remote set-head`.
+        "/.git/branches/": _autoindex("/.git/branches", ()),
+        "/.git/remotes/origin/head": b"ref: refs/remotes/origin/main\n",
         "/.git/logs/head": reflog_line.encode("utf-8"),
         "/.git/logs/refs/heads/main": reflog_line.encode("utf-8"),
         "/.git/logs/refs/heads/master": reflog_line.encode("utf-8"),
@@ -29448,6 +29470,36 @@ async def _send_fake_git(
 
     files, meta = result
     content = files.get(git_key)
+
+    if content is None and f"{git_key}/" in files:
+        # Directory asked for without its trailing slash — the same gap the
+        # working-copy tree had, and the same fix. Apache (`DirectorySlash
+        # On`, the default) and nginx both answer a bare directory name with
+        # a 301 to the slash-terminated form rather than serving the index
+        # inline, so that is what a really-exposed repository does.
+        #
+        # Every directory in this tree was reachable only by its
+        # slash-terminated spelling, so a dumper walking `refs/heads`,
+        # `objects/pack`, `hooks` or `branches` bare got a 404 for a
+        # directory the tree does have. The redirect also measures whether
+        # the client follows redirects at all, which most bare-socket
+        # dictionary scanners do not.
+        #
+        # `Location` comes from the request path, not the canonical lookup
+        # key, so a repository probed under a subpath prefix is redirected
+        # inside its own prefix.
+        location = f"{path.rstrip('/')}/"
+        append_log({
+            **log_context, "status": 301, "result": "fake-git-redirect",
+            "commitSha": meta.get("commitSha", ""),
+            "gitKey": git_key,
+            "location": location,
+        })
+        return web.Response(
+            status=301, body=b"",
+            headers={"Location": location, "Content-Type": "text/html; charset=utf-8"},
+        )
+
     if content is None:
         append_log({
             **log_context, "status": 404, "result": "fake-git-miss",
@@ -29496,11 +29548,24 @@ async def _send_fake_git(
         and len(content) > FAKE_GIT_DRIP_BYTES
     )
     if will_drip and _active_slow_drips >= TARPIT_MAX_CONNECTIONS:
-        append_log({**log_context, "status": 503, "result": "fake-git-capacity"})
+        # Cap reached. Serve the file in one shot instead of refusing it.
+        #
+        # `503 busy` was the old answer, and it is the same class of tell the
+        # rest of this file works to avoid: a real exposed repository does not
+        # answer a file fetch with `busy`, and a source parallel enough to
+        # saturate the cap gets a burst of them all at once — a fleet-wide
+        # signature available to anyone who opens enough sockets. Dropping the
+        # drip costs the tarpit hold for these responses but keeps the
+        # engagement, keeps the canary in the served body, and spends no slot,
+        # so the undripped path cannot itself exhaust anything.
+        append_log({
+            **log_context, "status": 200, "result": "fake-git-undripped",
+            "fakeGitBytes": len(content),
+        })
         return web.Response(
-            status=503, body=b"busy\n",
+            status=200, body=content,
             headers={
-                "Content-Type": "text/plain; charset=utf-8",
+                "Content-Type": content_type,
                 "Cache-Control": "no-store",
             },
         )

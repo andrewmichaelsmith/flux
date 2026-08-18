@@ -14463,6 +14463,17 @@ def test_adminer_enabled_by_default():
     "/wp-content/plugins/adminer/adminer.php",
     "/adminer-4.8.1.php",
     "/adminer-4.7.9.php",
+    # Spellings that used to fall through to the router's 404: underscore-
+    # prefixed drop names, remaining webroot prefixes, and the
+    # missing-separator typo dictionary generators produce.
+    "/_adminer.php",
+    "/_adminer/",
+    "/_adminer/index.php",
+    "/adminadminer.php",
+    "/web/adminer.php",
+    "/data/adminer.php",
+    "/php/adminer.php",
+    "/public/adminer.php",
     # Case-insensitive.
     "/Adminer.php",
     "/ADMINER/adminer.php",
