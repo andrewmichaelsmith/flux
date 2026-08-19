@@ -143,6 +143,21 @@ dispatched behind it, so it cannot outlive it.
 | `HONEYPOT_SSRF_RELAY_ENABLED` | on | Master switch. Answers fetch-style entry paths (`/fetch`, `/proxy`, `/render`, `/preview`, `/webhook/test`, …) whose parameters name a cloud metadata host. Fires only on a metadata target, so it never behaves like a working open proxy; flux makes no outbound request on any branch. |
 | `HONEYPOT_SSRF_GCP_SERVICE_ACCOUNT` | `app-runtime@prod-platform-284915.iam.gserviceaccount.com` | Filler service-account address returned by the GCP `…/default/email` step. Non-secret — an address identifies a principal, it does not authenticate as one. |
 
+## Observability / debug surface
+
+No Tracebit key required — the surface issues no canary on any branch.
+The credential-bearing endpoints its bodies point at (`/actuator/env`,
+`/.env`, the config-file table) mint their own, so sweeping this surface
+costs nothing upstream.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_OBSERVABILITY_ENABLED` | on | Master switch. Answers the operational endpoints a framework exposes for monitoring: the Spring actuator discovery index, Prometheus exposition, Go expvar, health probes, Apache `mod_info`, nginx `stub_status`, ELMAH, and the profiler index. Exact-path matching only, dispatched after every exact-path trap, so closer-fitting neighbours (`/server-status`, `/debug/pprof/`, `/_profiler`) keep their own handlers. |
+| `HONEYPOT_OBSERVABILITY_PATHS_CSV` | see `_OBSERVABILITY_DEFAULT_PATHS` | Overrides the served path set. |
+| `HONEYPOT_OBSERVABILITY_DB_HOST` | `db-prod-01.internal` | Internal database host named by `/metrics`, `/debug/vars`, `/health` and the ELMAH connection string. Non-secret filler — a hostname authenticates nothing — and deliberately stable, since the chain is only followable if the name a client reads is the one it can come back for. |
+| `HONEYPOT_OBSERVABILITY_CACHE_HOST` | `redis-prod-01.internal` | Same, for the cache tier. |
+| `HONEYPOT_OBSERVABILITY_APP_NAME` | `payments-api` | Application name used in metric labels, paths and the profiler index. |
+
 ## Fake webshell
 
 No Tracebit key required.

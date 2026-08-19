@@ -1788,6 +1788,72 @@ SERVER_STATUS_PATHS = {
 SERVER_STATUS_APACHE_VERSION = (
     os.environ.get("HONEYPOT_SERVER_STATUS_APACHE_VERSION") or "Apache/2.4.58 (Ubuntu)"
 ).strip()
+
+# --- Observability / debug surface -------------------------------------
+#
+# The operational endpoints an app framework exposes for monitoring:
+# Prometheus exposition, Go expvar, health probes, Apache mod_info, nginx
+# stub_status, the Spring actuator discovery index, ELMAH, and the
+# profiler index. Each answers with the disclosure the real endpoint
+# leaks, and that disclosure NAMES A FURTHER TARGET — an internal
+# database host, a config file path, a link to another endpoint. That is
+# the point of the family: a dictionary sweeper reads the body and moves
+# on, while a client that parses it and comes back for what it named
+# identifies itself as something else entirely.
+#
+# No branch issues a canary. The credential-bearing follow-ups these
+# bodies point at (`/actuator/env`, `/.env`, the config-file table) mint
+# their own, so a broad sweep across this surface costs nothing upstream
+# and the spend happens only once a client actually follows a lead.
+OBSERVABILITY_ENABLED = _env_bool("HONEYPOT_OBSERVABILITY_ENABLED")
+_OBSERVABILITY_DEFAULT_PATHS = ",".join([
+    # Spring Boot actuator discovery index. The canary-trap table already
+    # answers 18 endpoints beneath `/actuator`; without the index a
+    # client that discovers rather than guesses reaches none of them.
+    "/actuator", "/actuator/",
+    # Prometheus text exposition.
+    "/metrics", "/metrics/", "/prometheus", "/actuator/prometheus",
+    # Go expvar.
+    "/debug/vars",
+    # Health / readiness probes.
+    "/health", "/health/", "/healthz", "/_health", "/api/health",
+    "/readyz", "/livez", "/health/ready", "/health/live", "/api/status",
+    # Apache mod_info.
+    "/server-info", "/server-info/",
+    # nginx stub_status and its common aliases.
+    "/nginx_status", "/basic_status", "/stub_status", "/nginx-status",
+    # ELMAH (ASP.NET error log).
+    "/elmah.axd", "/elmah",
+    # Profiler indexes.
+    "/debug", "/_debug", "/debug/profiler", "/profiler",
+    "/__profiler__", "/_profiler/panel.html",
+])
+OBSERVABILITY_PATHS = {
+    value.strip().lower()
+    for value in (
+        os.environ.get("HONEYPOT_OBSERVABILITY_PATHS_CSV")
+        or _OBSERVABILITY_DEFAULT_PATHS
+    ).split(",")
+    if value.strip()
+}
+# Non-secret filler naming the "internal" estate the disclosures point
+# at. Fixed is correct here and only here: these are host and service
+# names, which authenticate nothing, and the chain is only followable if
+# the name a client reads in /metrics is the one it can come back for.
+# Anything credential-shaped in these bodies is per-hit synthetic.
+OBSERVABILITY_DB_HOST = (
+    os.environ.get("HONEYPOT_OBSERVABILITY_DB_HOST") or "db-prod-01.internal"
+).strip()
+OBSERVABILITY_CACHE_HOST = (
+    os.environ.get("HONEYPOT_OBSERVABILITY_CACHE_HOST") or "redis-prod-01.internal"
+).strip()
+OBSERVABILITY_APP_NAME = (
+    os.environ.get("HONEYPOT_OBSERVABILITY_APP_NAME") or "payments-api"
+).strip()
+# Process start, so advertised uptimes and counters advance across the
+# life of the process instead of being frozen. A stale, identical uptime
+# on every hit is the cheapest possible tell that a body is canned.
+_OBSERVABILITY_START = time.time()
 HNAP1_PATHS = {
     value.strip().lower()
     for value in (os.environ.get("HONEYPOT_HNAP1_PATHS_CSV") or _HNAP1_DEFAULT_PATHS).split(",")
@@ -4210,6 +4276,42 @@ def is_server_status_path(path: str) -> bool:
     # path component only.
     lp = path.lower().split("?", 1)[0]
     return lp in SERVER_STATUS_PATHS
+
+
+def observability_kind(path: str) -> str | None:
+    """Which observability disclosure `path` asks for, or None.
+
+    Exact-match only, never a prefix. `/debug` and `/status` are generic
+    enough that a prefix rule would swallow neighbours flux already
+    answers with a better-targeted body — `/debug/pprof/` (pprof-dump)
+    and `/server-status` (mod_status) both live under prefixes this
+    table contains.
+    """
+    if not OBSERVABILITY_ENABLED:
+        return None
+    lp = path.lower().split("?", 1)[0]
+    if lp not in OBSERVABILITY_PATHS:
+        return None
+    if lp in ("/actuator", "/actuator/"):
+        return "actuator-index"
+    if lp in ("/metrics", "/metrics/", "/prometheus", "/actuator/prometheus"):
+        return "metrics"
+    if lp == "/debug/vars":
+        return "expvar"
+    if lp in ("/server-info", "/server-info/"):
+        return "server-info"
+    if lp in ("/nginx_status", "/basic_status", "/stub_status", "/nginx-status"):
+        return "nginx-status"
+    if lp in ("/elmah.axd", "/elmah"):
+        return "elmah"
+    if lp in ("/debug", "/_debug", "/debug/profiler", "/profiler",
+              "/__profiler__", "/_profiler/panel.html"):
+        return "profiler-index"
+    return "health"
+
+
+def is_observability_path(path: str) -> bool:
+    return observability_kind(path) is not None
 
 
 # OGNL / Java-runtime indicators surfaced when CVE-2024-36401 (or related
@@ -20203,6 +20305,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # credential surface, so a miss here is a missed issuance
             # rather than a missed fingerprint.
             "/php-info.php",
+            # Underscore-prefixed spellings. The nested walk resolves
+            # `<parents>/phpinfo.php` by its leaf, but a root-level leaf
+            # carrying a prefix is one segment deep, so the walk never
+            # sees it and only an exact entry answers — the same gap the
+            # `_adminer.php` spellings had.
+            "/_phpinfo.php",
+            "/_info.php",
+            "/phpinfo/index.php",
             "/phpinfo2.php",
             "/infophp.php",
             "/infos.php",
@@ -21573,6 +21683,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
                 "env.prod.js", "env.production.js", "env.local.js",
                 "config.dev.js", "config.development.js",
                 "config.prod.js", "config.production.js", "config.local.js",
+                # Framework-specific spellings of the same runtime-config
+                # bundle, each observed being swept alongside the generic
+                # names above while falling through to a 404. Note
+                # `aws-exports.js` is deliberately absent — the dedicated
+                # `aws-amplify-exports-js` trap owns that name with a
+                # closer-fitting body.
+                "aws-config.js", "__env.js",
+                "configuration.js", "app.config.js",
             )
         ),
         ("aws",),
@@ -21995,6 +22113,7 @@ PHPINFO_NESTED_ENABLED = _env_bool("HONEYPOT_PHPINFO_NESTED_ENABLED")
 
 _PHPINFO_NESTED_LEAVES: frozenset[str] = frozenset((
     "phpinfo.php", "phpinfo.cgi", "phpinfo",
+    "_phpinfo.php", "_info.php",
     "php-info.php", "php_info.php", "phpinfo2.php",
     "old_phpinfo.php", "linusadmin-phpinfo.php",
     "info.php", "info.cgi", "infophp.php", "infos.php",
@@ -26207,6 +26326,284 @@ async def _handle_server_status(
     )
 
 
+# --- Observability / debug surface renderers ---------------------------
+#
+# Every body below is written so that reading it tells a client where to
+# go next. That is deliberate: the follow-up request is the measurement,
+# and it is the only thing that separates a client which parses a
+# disclosure from one which merely collected a 200.
+
+# The endpoints the canary-trap table actually answers beneath
+# `/actuator`. The index advertises exactly this set and nothing else —
+# advertising an endpoint we then 404 is the cheapest possible tell that
+# the index is canned.
+_ACTUATOR_INDEX_ENDPOINTS: tuple[str, ...] = (
+    "env", "health", "configprops", "mappings", "threaddump", "heapdump",
+    "logfile", "httptrace", "jolokia", "flyway", "scheduledtasks",
+    "refresh", "prometheus", "trace", "dump", "healthcheck",
+)
+
+
+def _observability_uptime_s() -> int:
+    """Seconds since process start, floored to a plausible-looking uptime."""
+    return max(int(time.time() - _OBSERVABILITY_START), 0) + 86_400
+
+
+def _render_actuator_index(base: str) -> bytes:
+    links: dict[str, object] = {
+        "self": {"href": f"{base}/actuator", "templated": False},
+    }
+    for name in _ACTUATOR_INDEX_ENDPOINTS:
+        links[name] = {"href": f"{base}/actuator/{name}", "templated": False}
+    return json.dumps({"_links": links}, indent=2).encode("utf-8")
+
+
+def _render_prometheus_metrics() -> bytes:
+    up = _observability_uptime_s()
+    app = OBSERVABILITY_APP_NAME
+    db = OBSERVABILITY_DB_HOST
+    cache = OBSERVABILITY_CACHE_HOST
+    lines = [
+        "# HELP process_uptime_seconds The uptime of the Java virtual machine",
+        "# TYPE process_uptime_seconds gauge",
+        f"process_uptime_seconds{{application=\"{app}\",}} {up}.0",
+        "# HELP jvm_memory_used_bytes The amount of used memory",
+        "# TYPE jvm_memory_used_bytes gauge",
+        f"jvm_memory_used_bytes{{application=\"{app}\",area=\"heap\",id=\"G1 Old Gen\",}} 4.71859e+08",
+        "# HELP hikaricp_connections Total connections",
+        "# TYPE hikaricp_connections gauge",
+        f"hikaricp_connections{{application=\"{app}\",pool=\"{db}:5432/{app}\",}} 10.0",
+        "# HELP hikaricp_connections_active Active connections",
+        "# TYPE hikaricp_connections_active gauge",
+        f"hikaricp_connections_active{{application=\"{app}\",pool=\"{db}:5432/{app}\",}} 3.0",
+        "# HELP lettuce_command_completion_seconds Latency of Redis commands",
+        "# TYPE lettuce_command_completion_seconds summary",
+        f"lettuce_command_completion_seconds_count{{application=\"{app}\","
+        f"remote=\"{cache}:6379\",command=\"GET\",}} 918233.0",
+        "# HELP spring_cloud_config_client Config server the app booted from",
+        "# TYPE spring_cloud_config_client gauge",
+        f"spring_cloud_config_client{{application=\"{app}\","
+        f"uri=\"http://config.internal:8888\",profile=\"prod\",}} 1.0",
+        "# HELP http_server_requests_seconds Duration of HTTP server request handling",
+        "# TYPE http_server_requests_seconds summary",
+        f"http_server_requests_seconds_count{{application=\"{app}\",method=\"GET\","
+        "status=\"200\",uri=\"/actuator/env\",} 4.0",
+        f"http_server_requests_seconds_count{{application=\"{app}\",method=\"POST\","
+        "status=\"200\",uri=\"/api/v1/payments\",} 220417.0",
+        "",
+    ]
+    return "\n".join(lines).encode("utf-8")
+
+
+def _render_expvar() -> bytes:
+    app = OBSERVABILITY_APP_NAME
+    payload = {
+        "cmdline": [
+            f"/usr/local/bin/{app}",
+            f"-config=/etc/{app}/config.yaml",
+            "-env-file=/opt/app/.env",
+            "-listen=0.0.0.0:8080",
+        ],
+        "memstats": {
+            "Alloc": 27394832, "TotalAlloc": 918273645, "Sys": 74448896,
+            "NumGC": 1184, "HeapObjects": 148223, "NumGoroutine": 47,
+        },
+        "uptime_seconds": _observability_uptime_s(),
+        "db": {
+            "dsn_host": f"{OBSERVABILITY_DB_HOST}:5432",
+            "open_connections": 3, "max_open": 25,
+        },
+        "cache": {"addr": f"{OBSERVABILITY_CACHE_HOST}:6379", "hits": 8812344},
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def _render_health_json() -> bytes:
+    payload = {
+        "status": "UP",
+        "components": {
+            "db": {
+                "status": "UP",
+                "details": {
+                    "database": "PostgreSQL",
+                    "host": OBSERVABILITY_DB_HOST,
+                    "validationQuery": "isValid()",
+                },
+            },
+            "redis": {
+                "status": "UP",
+                "details": {"version": "7.2.4", "host": OBSERVABILITY_CACHE_HOST},
+            },
+            "diskSpace": {
+                "status": "UP",
+                "details": {"total": 62725623808, "free": 21903597568, "path": "/opt/app/."},
+            },
+            "ping": {"status": "UP"},
+        },
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def _render_server_info_html(host: str) -> bytes:
+    app = OBSERVABILITY_APP_NAME
+    return (
+        "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\">\n"
+        "<html><head><title>Server Information</title></head><body>"
+        f"<h1>Apache Server Information for {html.escape(host)}</h1>"
+        "<dl><dt><strong>Server Version:</strong> "
+        f"{SERVER_STATUS_APACHE_VERSION}</dt>"
+        "<dt><strong>Server Built:</strong> 2024-04-10T12:02:15</dt></dl><hr />"
+        "<h2>Server Settings</h2>"
+        "<dl><dt><strong>Server Root:</strong> <code>/etc/apache2</code></dt>"
+        "<dt><strong>Config File:</strong> <code>/etc/apache2/apache2.conf</code></dt>"
+        f"<dt><strong>Document Root:</strong> <code>/var/www/{app}/public</code></dt>"
+        "<dt><strong>Loaded Modules:</strong> <code>core_module (static), "
+        "so_module (static), http_module (static), mpm_event_module (shared), "
+        "rewrite_module (shared), ssl_module (shared), proxy_module (shared), "
+        "proxy_fcgi_module (shared), php8.2_module (shared), "
+        "info_module (shared), status_module (shared)</code></dt></dl><hr />"
+        "<h2>Included Configuration Files</h2>"
+        "<dl><dt><code>/etc/apache2/apache2.conf</code></dt>"
+        f"<dt><code>/etc/apache2/sites-enabled/{app}.conf</code></dt>"
+        f"<dt><code>/var/www/{app}/.env</code> (PHPIniDir / SetEnv source)</dt>"
+        "<dt><code>/etc/apache2/conf-enabled/security.conf</code></dt></dl>"
+        "<hr /></body></html>\n"
+    ).encode("utf-8")
+
+
+def _render_nginx_status() -> bytes:
+    up = max(_observability_uptime_s(), 1)
+    accepts = 41 * up + 1187
+    return (
+        "Active connections: 17 \n"
+        "server accepts handled requests\n"
+        f" {accepts} {accepts} {accepts * 3} \n"
+        "Reading: 0 Writing: 4 Waiting: 13 \n"
+    ).encode("utf-8")
+
+
+def _render_elmah_html(host: str) -> tuple[bytes, str]:
+    """ELMAH error log. The top entry's detail text carries a connection
+    string whose password is a per-hit synthetic — never a fixed literal,
+    which across a fleet would be one shared string and zero detection."""
+    password = _fake_db_password()
+    app = OBSERVABILITY_APP_NAME
+    conn = (
+        f"Server={OBSERVABILITY_DB_HOST};Database={app};"
+        f"User Id={app}_svc;Password={password};MultipleActiveResultSets=true"
+    )
+    body = (
+        "<!DOCTYPE html><html><head><title>Error log for "
+        f"{html.escape(host)}</title></head><body>"
+        f"<h1>Error Log for {html.escape(app)} (on {html.escape(host)})</h1>"
+        "<p>Errors 1 to 3 of 3</p>"
+        "<table border=\"1\" cellspacing=\"0\"><tr><th>Host</th><th>Code</th>"
+        "<th>Type</th><th>Error</th><th>User</th><th>Date</th></tr>"
+        "<tr><td>web-prod-02</td><td>500</td><td>SqlException</td>"
+        "<td>A network-related or instance-specific error occurred while "
+        "establishing a connection to SQL Server. "
+        f"ConnectionString: {html.escape(conn)}</td>"
+        "<td>svc_report</td><td>2 minutes ago</td></tr>"
+        "<tr><td>web-prod-02</td><td>500</td><td>InvalidOperationException</td>"
+        f"<td>Unable to resolve service for type 'ICacheClient' "
+        f"({html.escape(OBSERVABILITY_CACHE_HOST)}:6379)</td>"
+        "<td>svc_report</td><td>3 hours ago</td></tr>"
+        "<tr><td>web-prod-02</td><td>404</td><td>HttpException</td>"
+        "<td>The file '/admin/config.aspx' does not exist.</td>"
+        "<td>anonymous</td><td>yesterday</td></tr>"
+        "</table></body></html>\n"
+    ).encode("utf-8")
+    return body, conn
+
+
+def _render_profiler_index(base: str) -> bytes:
+    app = OBSERVABILITY_APP_NAME
+    rows = "".join(
+        f"<tr><td><a href=\"{base}/_profiler/{token}\">{token}</a></td>"
+        f"<td>200</td><td>GET</td><td>{url}</td></tr>"
+        for token, url in (
+            ("a3f19c", "/api/v1/payments"),
+            ("b71e40", "/actuator/env"),
+            ("c02d8a", "/login"),
+        )
+    )
+    return (
+        "<!DOCTYPE html><html><head><title>Symfony Profiler</title></head>"
+        f"<body><h1>Profiler — {html.escape(app)} (env: prod, debug: true)</h1>"
+        "<p>Latest requests. Configuration is loaded from "
+        "<code>config/packages/prod/framework.yaml</code> and "
+        "<code>.env.local</code>.</p>"
+        "<table><tr><th>Token</th><th>Status</th><th>Method</th><th>URL</th></tr>"
+        f"{rows}</table></body></html>\n"
+    ).encode("utf-8")
+
+
+async def _handle_observability(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    kind: str,
+) -> web.Response:
+    """Serve one operational-endpoint disclosure.
+
+    Issues no canary on any branch — see the config block. The bodies
+    name follow-up targets that have their own canary-backed handlers,
+    so the spend happens when a lead is followed rather than when the
+    surface is swept.
+    """
+    host = str(log_context.get("host", "")) or "localhost"
+    base = ""
+    extra: dict[str, object] = {}
+    server_header: str | None = None
+
+    if kind == "actuator-index":
+        body = _render_actuator_index(base)
+        content_type = "application/vnd.spring-boot.actuator.v3+json"
+        extra["obsAdvertised"] = len(_ACTUATOR_INDEX_ENDPOINTS)
+    elif kind == "metrics":
+        body = _render_prometheus_metrics()
+        content_type = "text/plain; version=0.0.4; charset=utf-8"
+    elif kind == "expvar":
+        body = _render_expvar()
+        content_type = "application/json; charset=utf-8"
+    elif kind == "health":
+        body = _render_health_json()
+        content_type = "application/vnd.spring-boot.actuator.v3+json"
+    elif kind == "server-info":
+        body = _render_server_info_html(host)
+        content_type = "text/html; charset=utf-8"
+        server_header = SERVER_STATUS_APACHE_VERSION
+    elif kind == "nginx-status":
+        body = _render_nginx_status()
+        content_type = "text/plain; charset=utf-8"
+        server_header = "nginx/1.24.0"
+    elif kind == "elmah":
+        body, conn = _render_elmah_html(host)
+        content_type = "text/html; charset=utf-8"
+        server_header = "Microsoft-IIS/10.0"
+        # Log the synthetic so a later replay attempt can be tied back to
+        # the hit that handed it out. The password itself is per-hit.
+        extra["obsConnectionString"] = conn
+    else:  # profiler-index
+        body = _render_profiler_index(base)
+        content_type = "text/html; charset=utf-8"
+
+    headers = {"Content-Type": content_type, "Cache-Control": "no-store"}
+    if server_header:
+        headers["Server"] = server_header
+
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": f"observability-{kind}",
+        "obsKind": kind,
+        "obsPath": path.split("?", 1)[0],
+        "bytes": len(body),
+        **extra,
+    })
+    return web.Response(status=200, body=body, headers=headers)
+
+
 async def _handle_geoserver(
     request: web.Request,
     log_context: dict[str, object],
@@ -30259,6 +30656,13 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_server_status_path(path):
         return await _handle_server_status(request, log_context, path, query_string)
 
+    # After every exact-path trap above, so a more specific handler
+    # (mod_status, pprof, the actuator endpoint table) always claims its
+    # own path first and this only sees what would otherwise 404.
+    _obs_kind = observability_kind(path)
+    if _obs_kind is not None:
+        return await _handle_observability(request, log_context, path, _obs_kind)
+
     if is_geoserver_path(path):
         return await _handle_geoserver(request, log_context, path, request_body)
 
@@ -30589,6 +30993,8 @@ def main() -> int:
         active.append("hnap1-router")
     if SERVER_STATUS_ENABLED:
         active.append("server-status")
+    if OBSERVABILITY_ENABLED:
+        active.append("observability")
     if GEOSERVER_ENABLED:
         active.append("geoserver")
     if COLDFUSION_ENABLED:

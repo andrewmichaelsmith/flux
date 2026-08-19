@@ -632,6 +632,11 @@ def test_all_trap_families_default_on():
         "nothing upstream."
     )
     assert tbenv.SSRF_RELAY_ENABLED
+    assert tbenv.OBSERVABILITY_ENABLED, (
+        "HONEYPOT_OBSERVABILITY_ENABLED should default to True — the "
+        "surface issues no canary on any branch, so a sweep across it "
+        "costs nothing upstream and only the leads it names spend one."
+    )
     assert tbenv.FAKE_GIT_ENABLED, (
         "FAKE_GIT_ENABLED should default to True — the per-IP cache bounds "
         "quota burn and the dispatch still requires TRACEBIT_API_KEY."
