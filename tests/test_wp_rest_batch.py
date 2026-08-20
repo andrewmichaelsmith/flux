@@ -60,6 +60,14 @@ def test_alias_resolves_to_the_canonical_rest_path(path, query, expected):
     ("/admin/index.php", "rest_route=/wp/v2/users"),
     # A route may not climb out of the REST namespace.
     ("/", "rest_route=/../../etc/passwd"),
+    # Near-misses on the parameter name. The cheap implementation of this
+    # resolver is a substring search over the query string, and each of
+    # these would rewrite under one: `rest_route` as another parameter's
+    # value, as a prefix, or as a suffix.
+    ("/", "x=rest_route"),
+    ("/", "note=rest_route=/wp/v2/users"),
+    ("/", "rest_routex=/wp/v2/users"),
+    ("/", "xrest_route=/batch/v1"),
 ])
 def test_alias_declines_everything_else(path, query):
     assert tbenv.wp_rest_route_alias(path, query) is None
