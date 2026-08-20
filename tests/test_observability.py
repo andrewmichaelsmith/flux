@@ -10,6 +10,7 @@ import json
 import re
 
 import pytest
+import pytest_asyncio
 
 import flux.server as tbenv
 
@@ -344,3 +345,92 @@ def test_prefixed_phpinfo_spellings_resolve_nested_too(path):
     trap, depth = tbenv.resolve_canary_trap(path)
     assert trap is not None and trap.name == "phpinfo"
     assert depth >= 1
+
+
+# --- classifier and dispatch must agree --------------------------------
+#
+# Every test above this line checks the classifier or a renderer in
+# isolation. Nothing checked that the `kind` string `observability_kind`
+# returns is the same one `_handle_observability` branches on — so a typo
+# in either would fall through to the handler's `else` and quietly serve
+# the profiler HTML for, say, `/actuator/info`, with the whole file still
+# green. These tests close that.
+
+@pytest_asyncio.fixture
+async def flux_client(aiohttp_client, monkeypatch, tmp_path):
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    monkeypatch.setattr(tbenv, "OBSERVABILITY_ENABLED", True)
+    client = await aiohttp_client(tbenv.create_app())
+    client.log_path = tmp_path / "env-canary.jsonl"
+    return client
+
+
+def _last_entry(log_path):
+    return json.loads(log_path.read_text().splitlines()[-1])
+
+
+# Each kind is pinned by a marker only its own renderer emits. Asserting
+# on the logged `obsKind` would NOT do: that field is written from the
+# classifier's return value, so it still reads correctly when the handler
+# takes the wrong branch — which is precisely the failure being guarded
+# against. The body is the only witness to which branch actually ran.
+@pytest.mark.parametrize("path,kind,marker", [
+    ("/actuator", "actuator-index", b'"_links"'),
+    ("/actuator/info", "actuator-info", b'"artifact"'),
+    ("/actuator/metrics", "actuator-metrics", b'"names"'),
+    ("/actuator/metrics/process.uptime", "actuator-metric", b'"measurements"'),
+    ("/actuator/beans", "actuator-beans", b'"contexts"'),
+    ("/actuator/loggers", "actuator-loggers", b'"effectiveLevel"'),
+    ("/actuator/auditevents", "actuator-auditevents", b'"principal"'),
+    ("/actuator/sessions", "actuator-sessions", b'"principalName"'),
+    ("/actuator/prometheus", "metrics", b"# HELP "),
+    ("/debug/vars", "expvar", b'"cmdline"'),
+    ("/healthz", "health", b'"status"'),
+    ("/server-info", "server-info", b"apache2.conf"),
+    ("/nginx_status", "nginx-status", b"Active connections:"),
+    ("/elmah.axd", "elmah", b"Password="),
+    ("/profiler", "profiler-index", b"/_profiler/"),
+])
+async def test_dispatch_serves_the_kind_the_classifier_chose(
+        flux_client, path, kind, marker):
+    resp = await flux_client.get(path)
+    assert resp.status == 200
+    body = await resp.read()
+    assert marker in body, (
+        f"{path} classified {kind} but the body is not that branch's")
+    entry = _last_entry(flux_client.log_path)
+    assert entry["obsKind"] == kind
+    assert entry["result"] == f"observability-{kind}"
+
+
+async def test_every_json_actuator_branch_returns_parseable_json(flux_client):
+    for path in ("/actuator", "/actuator/info", "/actuator/metrics",
+                 "/actuator/metrics/jvm.memory.used", "/actuator/beans",
+                 "/actuator/loggers", "/actuator/auditevents",
+                 "/actuator/sessions"):
+        resp = await flux_client.get(path)
+        assert resp.status == 200, path
+        assert "json" in resp.headers["Content-Type"], path
+        json.loads(await resp.read())
+
+
+async def test_unknown_meter_is_logged_as_a_guess(flux_client):
+    """`obsMeterKnown` is the signal that separates a client which read
+    the meter index from one which invented names."""
+    await flux_client.get("/actuator/metrics/jvm.memory.used")
+    assert _last_entry(flux_client.log_path)["obsMeterKnown"] is True
+    await flux_client.get("/actuator/metrics/totally.made.up")
+    entry = _last_entry(flux_client.log_path)
+    assert entry["obsMeterKnown"] is False
+    assert entry["obsMeterName"] == "totally.made.up"
+
+
+async def test_following_the_index_reaches_every_link(flux_client):
+    """The end-to-end version of the index guard: fetch the index, then
+    fetch everything it advertises, over the real dispatch path."""
+    resp = await flux_client.get("/actuator")
+    doc = json.loads(await resp.read())
+    for name, link in doc["_links"].items():
+        href = re.sub(r"\{[^}]+\}", "process.uptime", link["href"])
+        follow = await flux_client.get(href)
+        assert follow.status == 200, f"{name} -> {href} returned {follow.status}"
