@@ -1918,6 +1918,22 @@ _OBSERVABILITY_DEFAULT_PATHS = ",".join([
     # answers 18 endpoints beneath `/actuator`; without the index a
     # client that discovers rather than guesses reaches none of them.
     "/actuator", "/actuator/",
+    # Endpoints Spring Boot exposes that the canary-trap table does not
+    # cover, because none of them has a credential slot worth minting a
+    # canary for. `info` is the important one: Spring Boot exposes
+    # `health` and `info` by default and nothing else, so answering
+    # `health` while 404ing `info` is a shape no real configuration
+    # produces — it reads as "canned surface" to anyone who checks, and
+    # it does so identically on every host running this code. `beans`,
+    # `loggers`, `auditevents` and `sessions` are all in the wide-open
+    # `exposure.include=*` set that the rest of the advertised index
+    # implies, and all four are probed in practice.
+    "/actuator/info", "/actuator/beans", "/actuator/loggers",
+    "/actuator/auditevents", "/actuator/sessions",
+    # Spring's `/actuator/metrics` is a JSON name index, not the
+    # Prometheus text exposition — that is `/actuator/prometheus`, below.
+    # Conflating the two is itself a tell.
+    "/actuator/metrics",
     # Prometheus text exposition.
     "/metrics", "/metrics/", "/prometheus", "/actuator/prometheus",
     # Go expvar.
@@ -4473,12 +4489,31 @@ def observability_kind(path: str) -> str | None:
     if not OBSERVABILITY_ENABLED:
         return None
     lp = path.lower().split("?", 1)[0]
+    # `/actuator/metrics/{requiredMetricName}` is the one templated entry
+    # the index advertises, so it cannot be a fixed-set member. A client
+    # that reads the name index and comes back for a single meter is
+    # following a lead rather than sweeping, which is the distinction the
+    # whole surface exists to measure.
+    if lp.startswith("/actuator/metrics/") and len(lp) > len("/actuator/metrics/"):
+        return "actuator-metric" if OBSERVABILITY_ENABLED else None
     if lp not in OBSERVABILITY_PATHS:
         return None
     if lp in ("/actuator", "/actuator/"):
         return "actuator-index"
     if lp in ("/metrics", "/metrics/", "/prometheus", "/actuator/prometheus"):
         return "metrics"
+    if lp == "/actuator/metrics":
+        return "actuator-metrics"
+    if lp == "/actuator/info":
+        return "actuator-info"
+    if lp == "/actuator/beans":
+        return "actuator-beans"
+    if lp == "/actuator/loggers":
+        return "actuator-loggers"
+    if lp == "/actuator/auditevents":
+        return "actuator-auditevents"
+    if lp == "/actuator/sessions":
+        return "actuator-sessions"
     if lp == "/debug/vars":
         return "expvar"
     if lp in ("/server-info", "/server-info/"):
@@ -26795,6 +26830,37 @@ _ACTUATOR_INDEX_ENDPOINTS: tuple[str, ...] = (
     "env", "health", "configprops", "mappings", "threaddump", "heapdump",
     "logfile", "httptrace", "jolokia", "flyway", "scheduledtasks",
     "refresh", "prometheus", "trace", "dump", "healthcheck",
+    # Served by the observability surface rather than the canary table —
+    # no credential slot, so no canary spend.
+    "info", "beans", "loggers", "auditevents", "sessions", "metrics",
+)
+
+# The templated links Spring's own index carries. Advertising a template
+# and then answering the concrete form is what makes the per-meter
+# surface followable; advertising it and 404ing the follow-up would be
+# the same tell as advertising an endpoint we do not serve.
+_ACTUATOR_INDEX_TEMPLATED: tuple[tuple[str, str], ...] = (
+    ("metrics-requiredMetricName", "/actuator/metrics/{requiredMetricName}"),
+)
+
+# Meter names the metrics index advertises. Real Micrometer emits these
+# under Spring Boot with a JDBC pool and a web layer; the set is what
+# makes a follow-up request for one meter meaningful.
+_ACTUATOR_METER_NAMES: tuple[str, ...] = (
+    "jvm.memory.used", "jvm.memory.max", "jvm.gc.pause", "jvm.threads.live",
+    "system.cpu.usage", "process.uptime", "process.files.open",
+    "http.server.requests", "hikaricp.connections",
+    "hikaricp.connections.active", "hikaricp.connections.pending",
+    "tomcat.sessions.active.current", "logback.events",
+    "spring.data.repository.invocations",
+)
+
+# Non-credential filler, same rule as the fake WordPress author slugs:
+# account names authenticate nothing, and a name a client reads in one
+# disclosure is only useful to us if it is the name it can come back
+# with. Anything credential-shaped on this surface stays per-hit.
+_ACTUATOR_PRINCIPALS: tuple[str, ...] = (
+    "svc_deploy", "jenkins", "admin", "monitoring",
 )
 
 
@@ -26809,7 +26875,263 @@ def _render_actuator_index(base: str) -> bytes:
     }
     for name in _ACTUATOR_INDEX_ENDPOINTS:
         links[name] = {"href": f"{base}/actuator/{name}", "templated": False}
+    for name, template in _ACTUATOR_INDEX_TEMPLATED:
+        links[name] = {"href": f"{base}{template}", "templated": True}
     return json.dumps({"_links": links}, indent=2).encode("utf-8")
+
+
+def _iso_from_epoch(epoch: int) -> str:
+    """Spring's audit/session timestamps, `2026-08-20T05:14:22.000Z`."""
+    return datetime.fromtimestamp(epoch, UTC).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _render_actuator_info() -> bytes:
+    """`/actuator/info` — build and git metadata.
+
+    Exposed by default in Spring Boot alongside `health`, which is why
+    its absence was the loudest inconsistency on this surface. The body
+    is also the most economical lead on it: naming a repository, a branch
+    and an artifact tells a client where the credentials would be, and
+    every target it names has a handler of its own.
+    """
+    up = _observability_uptime_s()
+    payload = {
+        "app": {
+            "name": OBSERVABILITY_APP_NAME,
+            "description": f"{OBSERVABILITY_APP_NAME} service",
+            "version": "3.4.1",
+            "encoding": "UTF-8",
+            "java": {"version": "17.0.11"},
+        },
+        "build": {
+            "artifact": OBSERVABILITY_APP_NAME,
+            "name": OBSERVABILITY_APP_NAME,
+            "group": "com.internal.platform",
+            "version": "3.4.1",
+            "time": "2026-07-31T09:14:22.417Z",
+        },
+        "git": {
+            "branch": "release/3.4",
+            "commit": {
+                "id": "9f41c7a",
+                "time": "2026-07-31T09:11:06Z",
+            },
+        },
+        "build_info": {
+            "profiles": ["prod"],
+            "config_server": "http://config.internal:8888",
+        },
+        "uptime_seconds": up,
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def _render_actuator_metrics_names() -> bytes:
+    """`/actuator/metrics` — the JSON meter-name index.
+
+    Not the Prometheus text exposition: that is `/actuator/prometheus`,
+    and a surface that returns text here is not a Spring Boot surface.
+    """
+    return json.dumps({"names": list(_ACTUATOR_METER_NAMES)}, indent=2).encode("utf-8")
+
+
+def _render_actuator_metric(name: str) -> bytes:
+    """`/actuator/metrics/{name}` — one meter's measurements.
+
+    Unknown names get Spring's own 404 shape, so a client walking
+    invented meter names learns the same thing it would from the real
+    thing rather than being handed a fabricated hit for anything it asks.
+    """
+    if name not in _ACTUATOR_METER_NAMES:
+        return json.dumps({
+            "timestamp": utc_now(),
+            "status": 404,
+            "error": "Not Found",
+            "message": f"Unable to find metric with name: {name}",
+            "path": f"/actuator/metrics/{name}",
+        }, indent=2).encode("utf-8")
+
+    up = _observability_uptime_s()
+    if name == "process.uptime":
+        measurements = [{"statistic": "VALUE", "value": float(up)}]
+        available: list[dict[str, object]] = []
+        base_unit = "seconds"
+    elif name.startswith("hikaricp."):
+        measurements = [{"statistic": "VALUE", "value": 10.0}]
+        available = [{"tag": "pool", "values": [
+            f"{OBSERVABILITY_DB_HOST}:5432/{OBSERVABILITY_APP_NAME}"]}]
+        base_unit = None
+    elif name == "http.server.requests":
+        measurements = [
+            {"statistic": "COUNT", "value": 4_812_337.0},
+            {"statistic": "TOTAL_TIME", "value": 91_244.118},
+            {"statistic": "MAX", "value": 3.902},
+        ]
+        available = [
+            {"tag": "exception", "values": ["None", "IOException"]},
+            {"tag": "method", "values": ["GET", "POST"]},
+            {"tag": "status", "values": ["200", "401", "500"]},
+            {"tag": "uri", "values": ["/api/v1/payments", "/api/v1/accounts",
+                                      "/actuator/health"]},
+        ]
+        base_unit = "seconds"
+    else:
+        measurements = [{"statistic": "VALUE", "value": 4.71859e08}]
+        available = [{"tag": "application", "values": [OBSERVABILITY_APP_NAME]}]
+        base_unit = "bytes"
+
+    payload: dict[str, object] = {
+        "name": name,
+        "description": f"{name} meter",
+        "measurements": measurements,
+        "availableTags": available,
+    }
+    if base_unit:
+        payload["baseUnit"] = base_unit
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def _render_actuator_beans() -> bytes:
+    """`/actuator/beans` — the application context.
+
+    Kept short and specific rather than a realistic thousand-bean dump:
+    the intel value is entirely in the bean names, which say which
+    subsystems exist (a datasource, a config client, a security filter
+    chain) and therefore which of the other endpoints is worth a
+    follow-up.
+    """
+    app = OBSERVABILITY_APP_NAME
+    beans = {
+        "dataSource": {
+            "aliases": [],
+            "scope": "singleton",
+            "type": "com.zaxxer.hikari.HikariDataSource",
+            "resource": "class path resource [org/springframework/boot/autoconfigure/"
+                        "jdbc/DataSourceConfiguration$Hikari.class]",
+            "dependencies": ["spring.datasource-org.springframework.boot.autoconfigure"
+                             ".jdbc.DataSourceProperties"],
+        },
+        "configServerPropertySourceLocator": {
+            "aliases": [], "scope": "singleton",
+            "type": "org.springframework.cloud.config.client."
+                    "ConfigServicePropertySourceLocator",
+            "resource": "class path resource [config-client.xml]",
+            "dependencies": [],
+        },
+        "springSecurityFilterChain": {
+            "aliases": [], "scope": "singleton",
+            "type": "org.springframework.security.web.FilterChainProxy",
+            "resource": "class path resource [SecurityConfig.class]",
+            "dependencies": ["securityConfig"],
+        },
+        f"{app}Controller": {
+            "aliases": [], "scope": "singleton",
+            "type": f"com.internal.platform.{app.replace('-', '')}.web.ApiController",
+            "resource": f"file [/opt/{app}/classes/ApiController.class]",
+            "dependencies": ["dataSource", f"{app}Service"],
+        },
+    }
+    return json.dumps({
+        "contexts": {
+            "application": {"beans": beans, "parentId": None},
+        },
+    }, indent=2).encode("utf-8")
+
+
+def _render_actuator_loggers() -> bytes:
+    """`/actuator/loggers` — configured levels.
+
+    The endpoint an operator POSTs to when raising verbosity, which is
+    why it is worth having: a client that reads it and then POSTs a level
+    change is manipulating the target rather than cataloguing it.
+    """
+    levels = ["OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
+    def entry(configured: str | None, effective: str) -> dict[str, object]:
+        return {"configuredLevel": configured, "effectiveLevel": effective}
+    return json.dumps({
+        "levels": levels,
+        "loggers": {
+            "ROOT": entry("INFO", "INFO"),
+            "com.internal.platform": entry("DEBUG", "DEBUG"),
+            "org.springframework": entry(None, "INFO"),
+            "org.springframework.security": entry(None, "INFO"),
+            "org.springframework.web": entry(None, "INFO"),
+            "com.zaxxer.hikari": entry(None, "INFO"),
+            "org.hibernate.SQL": entry(None, "INFO"),
+        },
+        "groups": {
+            "web": {"configuredLevel": None, "members": [
+                "org.springframework.core.codec",
+                "org.springframework.http",
+                "org.springframework.web",
+            ]},
+            "sql": {"configuredLevel": None, "members": [
+                "org.springframework.jdbc.core",
+                "org.hibernate.SQL",
+            ]},
+        },
+    }, indent=2).encode("utf-8")
+
+
+def _render_actuator_auditevents() -> bytes:
+    """`/actuator/auditevents` — recent authentication events.
+
+    The disclosure here is the principal names. That is the same chain
+    the WordPress user-enumeration trap runs: names read off a public
+    surface are the input to a credential-stuffing run against the login
+    surface, and the login surface is where the capture happens.
+    """
+    now = int(time.time())
+    def event(offset: int, principal: str, event_type: str,
+              detail: dict[str, object]) -> dict[str, object]:
+        return {
+            "timestamp": _iso_from_epoch(now - offset),
+            "principal": principal,
+            "type": event_type,
+            "data": detail,
+        }
+    return json.dumps({"events": [
+        event(41, _ACTUATOR_PRINCIPALS[0], "AUTHENTICATION_SUCCESS",
+              {"details": {"remoteAddress": "10.20.4.19",
+                           "sessionId": "0F2A9C1E4B7D"}}),
+        event(1_284, _ACTUATOR_PRINCIPALS[2], "AUTHENTICATION_FAILURE",
+              {"type": "org.springframework.security.authentication."
+                       "BadCredentialsException",
+               "message": "Bad credentials"}),
+        event(3_907, _ACTUATOR_PRINCIPALS[1], "AUTHENTICATION_SUCCESS",
+              {"details": {"remoteAddress": "10.20.4.51",
+                           "sessionId": "7C41B0E92AD3"}}),
+        event(9_118, _ACTUATOR_PRINCIPALS[3], "AUTHORIZATION_FAILURE",
+              {"type": "org.springframework.security.access.AccessDeniedException",
+               "message": "Access is denied"}),
+    ]}, indent=2).encode("utf-8")
+
+
+def _render_actuator_sessions() -> bytes:
+    """`/actuator/sessions` — Spring Session store contents.
+
+    Same disclosure as auditevents, one step further along: a principal
+    plus a live session id. Session ids here are per-hit random rather
+    than fixed — they are the credential-shaped field on this body, and a
+    fixed one would be both useless on replay and identical across every
+    host running this code.
+    """
+    now = int(time.time())
+    sessions = []
+    for index, principal in enumerate(_ACTUATOR_PRINCIPALS[:3]):
+        created = now - (3_600 * (index + 1)) - 900
+        accessed = now - (60 * (index + 1))
+        sessions.append({
+            "id": str(uuid.uuid4()),
+            "attributeNames": ["SPRING_SECURITY_CONTEXT"],
+            "creationTime": _iso_from_epoch(created),
+            "lastAccessedTime": _iso_from_epoch(accessed),
+            "maxInactiveInterval": 1800,
+            "expired": False,
+            "principalName": principal,
+        })
+    return json.dumps({"sessions": sessions}, indent=2).encode("utf-8")
 
 
 def _render_prometheus_metrics() -> bytes:
@@ -27017,6 +27339,33 @@ async def _handle_observability(
     elif kind == "metrics":
         body = _render_prometheus_metrics()
         content_type = "text/plain; version=0.0.4; charset=utf-8"
+    elif kind == "actuator-info":
+        body = _render_actuator_info()
+        content_type = "application/vnd.spring-boot.actuator.v3+json"
+    elif kind == "actuator-metrics":
+        body = _render_actuator_metrics_names()
+        content_type = "application/vnd.spring-boot.actuator.v3+json"
+        extra["obsMeterCount"] = len(_ACTUATOR_METER_NAMES)
+    elif kind == "actuator-metric":
+        meter = path.split("?", 1)[0][len("/actuator/metrics/"):]
+        body = _render_actuator_metric(meter)
+        content_type = "application/vnd.spring-boot.actuator.v3+json"
+        # The name a client comes back for is the measurement: it says
+        # whether the meter index was read or the name was guessed.
+        extra["obsMeterName"] = meter[:120]
+        extra["obsMeterKnown"] = meter in _ACTUATOR_METER_NAMES
+    elif kind == "actuator-beans":
+        body = _render_actuator_beans()
+        content_type = "application/vnd.spring-boot.actuator.v3+json"
+    elif kind == "actuator-loggers":
+        body = _render_actuator_loggers()
+        content_type = "application/vnd.spring-boot.actuator.v3+json"
+    elif kind == "actuator-auditevents":
+        body = _render_actuator_auditevents()
+        content_type = "application/vnd.spring-boot.actuator.v3+json"
+    elif kind == "actuator-sessions":
+        body = _render_actuator_sessions()
+        content_type = "application/vnd.spring-boot.actuator.v3+json"
     elif kind == "expvar":
         body = _render_expvar()
         content_type = "application/json; charset=utf-8"

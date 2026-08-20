@@ -11,6 +11,13 @@ profiler index. flux already answered three neighbours in this family
 | --- | --- | --- | --- |
 | GET / HEAD | `/actuator`, `/actuator/` | `200` + HAL `_links` index | `observability-actuator-index` |
 | GET / HEAD | `/metrics`, `/metrics/`, `/prometheus`, `/actuator/prometheus` | `200` + Prometheus text exposition | `observability-metrics` |
+| GET / HEAD | `/actuator/info` | `200` + build / git / app metadata JSON | `observability-actuator-info` |
+| GET / HEAD | `/actuator/metrics` | `200` + JSON meter-name index (**not** the Prometheus text) | `observability-actuator-metrics` |
+| GET / HEAD | `/actuator/metrics/{name}` | `200` + that meter's measurements; unknown names get Spring's own 404-shaped JSON | `observability-actuator-metric` |
+| GET / HEAD | `/actuator/beans` | `200` + application-context bean list | `observability-actuator-beans` |
+| GET / HEAD | `/actuator/loggers` | `200` + configured / effective log levels | `observability-actuator-loggers` |
+| GET / HEAD | `/actuator/auditevents` | `200` + recent authentication events (principal names) | `observability-actuator-auditevents` |
+| GET / HEAD | `/actuator/sessions` | `200` + Spring Session entries; session ids are per-hit random | `observability-actuator-sessions` |
 | GET / HEAD | `/debug/vars` | `200` + Go expvar JSON | `observability-expvar` |
 | GET / HEAD | `/health`, `/healthz`, `/_health`, `/api/health`, `/readyz`, `/livez`, `/health/ready`, `/health/live`, `/api/status` | `200` + Spring-style health JSON | `observability-health` |
 | GET / HEAD | `/server-info`, `/server-info/` | `200` + `mod_info` HTML | `observability-server-info` |
@@ -37,13 +44,39 @@ different and much narrower population, and the follow-up request is the
 measurement.
 
 The actuator index is the clearest case. The canary-trap table already
-answers 18 endpoints beneath `/actuator`, but the index that Spring Boot
-serves at the base path was a 404 — so a client that *discovers* rather
-than guesses reached none of them. Restoring the index reconnects a
+answers a set of endpoints beneath `/actuator`, but the index that Spring
+Boot serves at the base path was a 404 — so a client that *discovers*
+rather than guesses reached none of them. Restoring the index reconnects a
 broken chain into a trap that was already there, and the index advertises
 exactly the endpoints flux really answers: an advertised link that then
 404s is the cheapest possible tell that the document is canned, so a test
-asserts the two sets match.
+asserts the two sets match, following each advertised `href` (and the
+concrete form of each template) rather than rebuilding it from the link
+name.
+
+The endpoints served from this file rather than the canary table are the
+ones with no credential slot worth minting a canary for. `info` is the
+one that had to be here: Spring Boot exposes `health` and `info` by
+default and nothing else, so answering `health` while 404ing `info` was a
+shape no real configuration produces — and it was the same shape on every
+host running this code, which makes it a fleet fingerprint rather than
+just a gap. `beans`, `loggers`, `auditevents`, `sessions` and `metrics`
+are all in the wide-open `exposure.include=*` set that the rest of the
+advertised index implies, and all of them get probed.
+
+Two of those bodies disclose account names. That is the same chain the
+WordPress user-enumeration trap runs: names read off a public surface are
+the input to a credential-stuffing run against the login surface, and the
+login surface is where the capture happens. Account names authenticate
+nothing, so they are fixed filler; the session id on `/actuator/sessions`
+is the one credential-shaped field on this surface and is per-hit random.
+
+`/actuator/metrics` is a JSON meter-name index, not the Prometheus text
+exposition — that is `/actuator/prometheus`. Conflating them is itself a
+tell. The name index is also the surface's one templated lead: a client
+that reads it and comes back for a single named meter is following a
+lead rather than sweeping, and `obsMeterName` / `obsMeterKnown` record
+which.
 
 No branch issues a canary. The credential-bearing things these bodies
 point at — `/actuator/env`, the `.env` named in the expvar `cmdline`, the
