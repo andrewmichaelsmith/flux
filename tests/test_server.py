@@ -694,6 +694,13 @@ def test_all_trap_families_default_on():
     assert tbenv.BACKUP_ARCHIVE_ENABLED
     assert tbenv.WP_LOGIN_ENABLED
     assert tbenv.WP_USER_ENUM_ENABLED
+    assert tbenv.WP_BATCH_API_ENABLED
+    assert tbenv.WP_REST_ROUTE_ALIAS_ENABLED, (
+        "HONEYPOT_WP_REST_ROUTE_ALIAS_ENABLED should default to True — "
+        "WordPress serves every REST route at both `/wp-json/<route>` and "
+        "`?rest_route=/<route>`, so with the alias off every WP-REST trap "
+        "is reachable by one address and bypassable by the other."
+    )
     assert tbenv.GRAPHQL_ENABLED
     assert tbenv.TELESCOPE_ENABLED
     assert tbenv.OIDC_DISCOVERY_ENABLED

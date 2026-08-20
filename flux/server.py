@@ -745,6 +745,113 @@ _WP_USER_ENUM_FAKE_USERS: tuple[dict[str, str], ...] = (
     {"id": "3", "slug": "webmaster", "name": "Webmaster"},
 )
 
+# --- WordPress REST route aliasing (`?rest_route=`) -----------------------
+# Every WordPress REST route has *two* public addresses. The pretty one,
+# `/wp-json/<namespace>/<route>`, only exists when permalinks are enabled
+# and the rewrite rules are live. The always-available one is the query
+# form the REST server falls back to: `/?rest_route=/<namespace>/<route>`,
+# equally valid on `/index.php?rest_route=...`. WordPress resolves both to
+# the same handler.
+#
+# Flux matched only the pretty form, so every WP-REST trap it ships was
+# reachable by one of the two addresses and invisible on the other. That
+# is not a cosmetic gap: rule-based WAFs have the same blind spot, which
+# is exactly why scanners fire the query form. Tooling has been observed
+# spelling a single REST endpoint ten ways in one run — case-swapped
+# namespace, `%2F`-encoded separators, install-subdirectory guesses, and
+# the `index.php?rest_route=` fallback — firing an identical payload at
+# each until one is not blocked.
+#
+# Enumerating those spellings one by one would lose the same race the WAF
+# loses, because the spelling set is generated, not fixed. Normalising the
+# alias back to its canonical `/wp-json/...` form wins it once, for every
+# WP-REST trap present and future, including spellings not yet observed.
+#
+# The rewrite is deliberately narrow. Only a WordPress front controller
+# may carry the alias — `/`, `/index.php`, or either under a common
+# install subdirectory — because that is the only place WordPress itself
+# honours it. The decoded route must be absolute. Anything else is left
+# alone, so an unrelated application that happens to take a `rest_route`
+# query parameter is not silently re-pointed at a trap.
+WP_REST_ROUTE_ALIAS_ENABLED = _env_bool("HONEYPOT_WP_REST_ROUTE_ALIAS_ENABLED")
+
+# WordPress install subdirectories scanners enumerate. Same dictionary the
+# gravity-smtp and env-webroot prefix lists walk, plus the deployment-detritus
+# names (`old`, `test`, `dev`, `backup`, `staging`) observed carrying the
+# alias form in practice.
+_WP_REST_ALIAS_SUBDIRS: tuple[str, ...] = (
+    "blog", "wordpress", "wp", "site", "news", "cms", "press",
+    "old", "test", "dev", "backup", "staging", "new", "web", "main",
+)
+
+# The front controllers WordPress serves `?rest_route=` from: the site root
+# and `index.php`, at the root install or under any of the subdirectories
+# above.
+_WP_REST_ALIAS_FRONT_CONTROLLERS: frozenset[str] = frozenset(
+    ["/", "/index.php"]
+    + [f"/{d}/" for d in _WP_REST_ALIAS_SUBDIRS]
+    + [f"/{d}/index.php" for d in _WP_REST_ALIAS_SUBDIRS]
+)
+
+# WP-REST namespace prefix every alias normalises onto.
+_WP_REST_ALIAS_CANONICAL_PREFIX = "/wp-json"
+
+# --- Fake WordPress REST Batch API ----------------------------------------
+# `/wp-json/batch/v1` is WordPress core's request multiplexer, added in 5.6.
+# One POST carries an array of sub-requests, each with its own method, path,
+# body and headers; the server runs them and returns an array of responses.
+#
+# For an attacker that is rate-limit amplification, and it is why the
+# endpoint shows up in credential tooling: a login brute that gets one
+# attempt per request gets `n` attempts per request through the batch
+# endpoint, and per-request throttles never see the difference.
+#
+# That amplification is what makes the endpoint worth answering rather than
+# 404ing. A 404 costs the operator one request. A plausible batch response
+# costs them their plan: the sub-request array is the entire list of what
+# the tool intended to do, submitted in one body, before any of it has been
+# attempted. Nothing else in the trap set gets an operator to declare intent
+# up front.
+#
+# The handler answers each sub-request individually rather than returning a
+# single canned envelope, which keeps the chain alive: a sub-request
+# enumerating users gets the same fake author roster the standalone
+# user-enum trap serves, and the roster is the input to a brute-force run
+# against `/wp-login.php`, where the wp-login trap captures the credential
+# POST. Enumerate -> brute -> captured, with the batch body telling us in
+# advance which of the three the operator was aiming for.
+WP_BATCH_API_ENABLED = _env_bool("HONEYPOT_WP_BATCH_API_ENABLED")
+
+# WordPress caps a batch at `rest_get_max_batch_size()`, default 25, and
+# rejects the whole request when the array is longer. Mirror the cap so an
+# oversized batch gets the same envelope a real install returns.
+WP_BATCH_MAX_REQUESTS = max(
+    int((os.environ.get("HONEYPOT_WP_BATCH_MAX_REQUESTS") or "25").strip() or "25"), 1
+)
+# How many sub-requests to record in the log line. The response honours the
+# cap above; this only bounds the row width.
+WP_BATCH_LOG_REQUEST_LIMIT = max(
+    int((os.environ.get("HONEYPOT_WP_BATCH_LOG_REQUEST_LIMIT") or "25").strip() or "25"), 1
+)
+WP_BATCH_BODY_PREVIEW_LIMIT = max(
+    int((os.environ.get("HONEYPOT_WP_BATCH_BODY_PREVIEW_LIMIT") or "1024").strip() or "1024"), 64
+)
+
+_WP_BATCH_PATH_PREFIX = "/wp-json/batch/v1"
+
+# Sub-request body keys that carry a username. WordPress core, WooCommerce
+# and the common login plugins disagree on the spelling, and the tooling
+# sprays several at once.
+_WP_BATCH_USERNAME_KEYS: tuple[str, ...] = (
+    "log", "username", "user_login", "user", "email", "user_email", "login",
+)
+# Sub-request body keys that carry a password. Values are never logged in
+# clear — only a hash and a short shape preview, same contract as the other
+# credential-capturing traps.
+_WP_BATCH_PASSWORD_KEYS: tuple[str, ...] = (
+    "pwd", "password", "pass", "user_pass", "passwd",
+)
+
 # --- Fake LLM-API endpoint (Ollama / OpenAI / Anthropic-proxy shape) ---
 # Motivated by scanner fleets observed probing AI-inference endpoints
 # in April 2026 — Ollama-native paths, OpenAI-compatible paths, and
@@ -4052,6 +4159,82 @@ def is_wp_user_enum_path(path: str) -> bool:
     if _WP_USER_ENUM_YOAST_RE.match(lp):
         return True
     return False
+
+
+def wp_rest_route_alias(path: str, query_string: str) -> str | None:
+    """Resolve a `?rest_route=` WP-REST alias to its canonical
+    `/wp-json/<namespace>/<route>` path.
+
+    Returns None when the request is not an alias — wrong front
+    controller, no `rest_route` parameter, or a relative route — which
+    leaves the caller's path untouched.
+
+    `%2F`-encoded separators decode first, so `?rest_route=%2Fwp%2Fv2%2Fusers`
+    and `?rest_route=/wp/v2/users` both resolve. Duplicate parameters take
+    the first value, matching PHP's `$_GET` semantics rather than
+    last-wins, so a tool that appends a second decoy `rest_route` does not
+    steer the rewrite.
+    """
+    if not WP_REST_ROUTE_ALIAS_ENABLED or not query_string:
+        return None
+    if "rest_route" not in query_string.lower():
+        return None
+    lp = (path or "").lower()
+    if lp not in _WP_REST_ALIAS_FRONT_CONTROLLERS:
+        return None
+
+    route = ""
+    for pair in query_string.split("&"):
+        if not pair:
+            continue
+        name, _, raw_value = pair.partition("=")
+        # `+` is a space in a query string, not a literal plus; unquote_plus
+        # is what PHP's parse_str does to the name as well as the value.
+        if unquote_plus(name).strip().lower() != "rest_route":
+            continue
+        route = unquote_plus(raw_value).strip()
+        break
+
+    if not route.startswith("/"):
+        return None
+    # `?rest_route=/` is the REST index, not a route; it advertises the
+    # namespace list and has no trap behind it.
+    if route == "/":
+        return None
+    # Collapse the doubled separator a generated spelling can produce
+    # (`//wp/v2/users`) without touching anything else in the route.
+    while route.startswith("//"):
+        route = route[1:]
+    # A route may not climb out of the REST namespace.
+    if ".." in route:
+        return None
+    return normalize_path(_WP_REST_ALIAS_CANONICAL_PREFIX + route)
+
+
+def _wp_batch_strip_subdir(lp: str) -> str:
+    """Return `lp` with a WordPress install subdirectory stripped, so
+    `/blog/wp-json/batch/v1` and `/wp-json/batch/v1` reach the same
+    dispatch. Unchanged when no subdirectory prefix matched."""
+    for prefix in _WP_REST_ALIAS_SUBDIRS:
+        head = f"/{prefix}{_WP_BATCH_PATH_PREFIX}"
+        if lp == head or lp.startswith(head + "/"):
+            return _WP_BATCH_PATH_PREFIX + lp[len(head):]
+    return lp
+
+
+def is_wp_batch_path(path: str) -> bool:
+    """Match WordPress core's REST Batch API at `/wp-json/batch/v1`,
+    with or without a trailing slash, at the root install or under a
+    common install subdirectory.
+
+    Nothing is registered *below* `batch/v1` in core, so only the
+    endpoint itself and its trailing-slash form match; a deeper path is
+    left to fall through rather than answered on a guess.
+    """
+    if not WP_BATCH_API_ENABLED:
+        return False
+    lp = _wp_batch_strip_subdir(path.lower().split("?", 1)[0])
+    return lp in {_WP_BATCH_PATH_PREFIX, _WP_BATCH_PATH_PREFIX + "/"}
 
 
 def is_wp_xmlrpc_path(path: str) -> bool:
@@ -23893,6 +24076,277 @@ async def _handle_wp_user_enum(
     )
 
 
+def _wp_batch_normalise_subroute(raw: object) -> str:
+    """Canonicalise a sub-request `path` to the bare REST route.
+
+    Sub-request paths arrive in both spellings tooling uses — the bare
+    route (`/wp/v2/users`) and the fully-qualified one
+    (`/wp-json/wp/v2/users`) — plus an optional query string. Returns ""
+    when the value is not a usable string.
+    """
+    if not isinstance(raw, str) or not raw:
+        return ""
+    route = normalize_path(raw.split("?", 1)[0]).lower()
+    if route.startswith(_WP_REST_ALIAS_CANONICAL_PREFIX + "/"):
+        route = route[len(_WP_REST_ALIAS_CANONICAL_PREFIX):]
+    return route
+
+
+def _wp_batch_scan_credentials(body: object) -> tuple[str, str]:
+    """Pull a (username, password) pair out of one sub-request body.
+
+    Returns ("", "") when the body carries neither. Only the top level is
+    scanned: the login payloads this endpoint amplifies are flat, and
+    walking arbitrary nesting would let a crafted body drive the scan.
+    """
+    if not isinstance(body, dict):
+        return "", ""
+    username = ""
+    password = ""
+    for key, value in body.items():
+        if not isinstance(key, str) or not isinstance(value, str) or not value:
+            continue
+        lkey = key.lower()
+        if not username and lkey in _WP_BATCH_USERNAME_KEYS:
+            username = value
+        elif not password and lkey in _WP_BATCH_PASSWORD_KEYS:
+            password = value
+    return username, password
+
+
+def extract_wp_batch_requests(request_body: bytes) -> dict[str, object]:
+    """Parse a batch POST body into its sub-request list.
+
+    Returns a dict with `ok`, and on success `validation` plus `requests`
+    (the raw sub-request dicts). On failure `error` names which envelope
+    the handler should return: "invalid-json" when the body does not
+    parse, "missing-requests" when the `requests` array is absent or
+    empty, "too-large" when it exceeds the batch cap.
+    """
+    if not request_body:
+        return {"ok": False, "error": "invalid-json"}
+    try:
+        parsed = json.loads(request_body.decode("utf-8", errors="replace"))
+    except (ValueError, UnicodeDecodeError):
+        return {"ok": False, "error": "invalid-json"}
+    if not isinstance(parsed, dict):
+        return {"ok": False, "error": "invalid-json"}
+
+    requests_raw = parsed.get("requests")
+    if not isinstance(requests_raw, list) or not requests_raw:
+        return {"ok": False, "error": "missing-requests"}
+    if len(requests_raw) > WP_BATCH_MAX_REQUESTS:
+        return {"ok": False, "error": "too-large", "count": len(requests_raw)}
+
+    validation = parsed.get("validation")
+    return {
+        "ok": True,
+        "validation": validation if isinstance(validation, str) else "",
+        "requests": [r for r in requests_raw if isinstance(r, dict)],
+    }
+
+
+def _wp_batch_subresponse(route: str, host: str) -> dict[str, object]:
+    """Build one entry of the batch `responses` array.
+
+    User-enumeration routes are answered from the same fake author roster
+    the standalone user-enum trap serves, so an operator who enumerates
+    through the batch endpoint gets the usernames that make a follow-up
+    brute-force run against the login trap worth their time. Everything
+    else gets WordPress's stock `rest_no_route` envelope, which is what a
+    real install returns for a route it does not register.
+    """
+    if route in {"/wp/v2/users", "/wp/v2/users/"}:
+        return {
+            "body": json.loads(render_wp_user_enum_rest_list(host)),
+            "status": 200,
+            "headers": {},
+        }
+    if route.startswith("/wp/v2/users/"):
+        tail = route[len("/wp/v2/users/"):].rstrip("/")
+        if tail.isdigit():
+            body = json.loads(render_wp_user_enum_rest_single(host, int(tail)))
+            status = 200 if "code" not in body else 404
+            return {"body": body, "status": status, "headers": {}}
+    return {
+        "body": {
+            "code": "rest_no_route",
+            "message": "No route was found matching the URL and request method.",
+            "data": {"status": 404},
+        },
+        "status": 404,
+        "headers": {},
+    }
+
+
+async def _handle_wp_batch(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Answer WordPress core's REST Batch API.
+
+    GET/HEAD get the `rest_no_route` envelope core returns for a
+    POST-only route — which still confirms a live WP-REST server, the
+    thing the probe was checking, without inventing a surface.
+
+    POST is where the value is. The sub-request array is logged before
+    anything is answered: it is the operator's full intended action list,
+    handed over in one body, and it is available even when every
+    individual sub-request would have failed.
+    """
+    method = request.method
+    host = str(log_context.get("host", "") or "")
+
+    if method != "POST":
+        body = json.dumps({
+            "code": "rest_no_route",
+            "message": "No route was found matching the URL and request method.",
+            "data": {"status": 404},
+        }, separators=(",", ":")).encode("utf-8")
+        append_log({
+            **log_context,
+            "result": "wp-batch-probe",
+            "status": 404,
+            "wpBatchMethod": method,
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=404, body=b"" if method == "HEAD" else body,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": "no-store",
+                "Content-Length": str(len(body)),
+            },
+        )
+
+    parsed = extract_wp_batch_requests(request_body)
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:WP_BATCH_BODY_PREVIEW_LIMIT].decode(
+            "utf-8", errors="replace")
+
+    if not parsed.get("ok"):
+        error = str(parsed.get("error", "invalid-json"))
+        if error == "too-large":
+            status = 400
+            envelope = {
+                "code": "rest_invalid_param",
+                "message": "Invalid parameter(s): requests",
+                "data": {
+                    "status": 400,
+                    "params": {
+                        "requests": f"requests must contain at most "
+                                    f"{WP_BATCH_MAX_REQUESTS} items.",
+                    },
+                },
+            }
+        elif error == "missing-requests":
+            status = 400
+            envelope = {
+                "code": "rest_missing_callback_param",
+                "message": "Missing parameter(s): requests",
+                "data": {"status": 400, "params": ["requests"]},
+            }
+        else:
+            status = 400
+            envelope = {
+                "code": "rest_invalid_json",
+                "message": "Invalid JSON body passed.",
+                "data": {"status": 400, "json_error_code": 4,
+                         "json_error_message": "Syntax error"},
+            }
+        body = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+        log_entry: dict[str, object] = {
+            **log_context,
+            "result": "wp-batch-rejected",
+            "status": status,
+            "wpBatchMethod": method,
+            "wpBatchError": error,
+            "bytes": len(body),
+        }
+        if "count" in parsed:
+            log_entry["wpBatchRequestCount"] = parsed["count"]
+        if body_preview:
+            log_entry["bodyPreview"] = body_preview
+        append_log(log_entry)
+        return web.Response(
+            status=status, body=body,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": "no-store",
+                "Content-Length": str(len(body)),
+            },
+        )
+
+    sub_requests = list(parsed.get("requests") or [])
+    routes: list[str] = []
+    methods: list[str] = []
+    usernames: list[str] = []
+    passwords: list[str] = []
+    responses: list[dict[str, object]] = []
+
+    for sub in sub_requests:
+        route = _wp_batch_normalise_subroute(sub.get("path"))
+        sub_method = sub.get("method")
+        sub_method = sub_method.upper()[:10] if isinstance(sub_method, str) else "GET"
+        username, password = _wp_batch_scan_credentials(sub.get("body"))
+        if len(routes) < WP_BATCH_LOG_REQUEST_LIMIT:
+            routes.append(route[:200])
+            methods.append(sub_method)
+        if username and username not in usernames:
+            usernames.append(username[:256])
+        if password:
+            passwords.append(password)
+        responses.append(_wp_batch_subresponse(route, host))
+
+    body = json.dumps(
+        {"failed": False, "responses": responses}, separators=(",", ":"),
+    ).encode("utf-8")
+
+    log_entry = {
+        **log_context,
+        "result": "wp-batch-multiplex",
+        "status": 207,
+        "wpBatchMethod": method,
+        "wpBatchValidation": str(parsed.get("validation", ""))[:64],
+        "wpBatchRequestCount": len(sub_requests),
+        "wpBatchRoutes": routes,
+        "wpBatchMethods": methods,
+        # The point of the trap: a batch carrying credentials is a
+        # rate-limit-amplified brute-force run, not enumeration, and the
+        # distinction is visible here before a single attempt lands.
+        "wpBatchCredentialCount": len(passwords),
+        "bytes": len(body),
+    }
+    if usernames:
+        log_entry["wpBatchUsernames"] = usernames
+    if passwords:
+        # Hash plus length, the same shape the docker-daemon auth capture
+        # uses. The hash is what makes a dictionary correlatable across
+        # rows, IPs and sensors without re-parsing every body; the body
+        # preview below still carries the attempt verbatim, exactly as the
+        # login trap retains its credential POST.
+        log_entry["wpBatchPasswordSha256"] = [
+            hashlib.sha256(p.encode("utf-8")).hexdigest() for p in passwords
+        ]
+        log_entry["wpBatchPasswordLens"] = [len(p) for p in passwords]
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview
+    append_log(log_entry)
+
+    # WordPress answers a multiplexed batch with 207 Multi-Status.
+    return web.Response(
+        status=207, body=body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
 async def _handle_wp_xmlrpc(
     request: web.Request,
     log_context: dict[str, object],
@@ -30558,6 +31012,20 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 request, log_context, raw_target, request_body,
             )
 
+    # WordPress serves every REST route at two addresses, and only one of
+    # them is a path. Resolving the `?rest_route=` form back to its
+    # canonical `/wp-json/...` shape here — ahead of every path matcher —
+    # is what makes the WP-REST traps reachable by both, rather than each
+    # trap having to learn the alias separately. `log_context` keeps the
+    # request as it arrived; only dispatch sees the rewrite, and the
+    # rewrite itself is logged so alias use stays countable.
+    if WP_REST_ROUTE_ALIAS_ENABLED:
+        aliased = wp_rest_route_alias(path, query_string)
+        if aliased is not None and aliased != path:
+            log_context["wpRestRouteAliasFrom"] = path[:200]
+            log_context["wpRestRoutePath"] = aliased[:200]
+            path = aliased
+
     if is_webshell_path(path):
         return await _handle_webshell(request, log_context, path, query_string, request_body)
 
@@ -30753,6 +31221,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_wp_user_enum_path(path):
         return await _handle_wp_user_enum(request, log_context, path)
+
+    if is_wp_batch_path(path):
+        return await _handle_wp_batch(request, log_context, path, request_body)
 
     if is_wp_xmlrpc_path(path):
         return await _handle_wp_xmlrpc(request, log_context, path, request_body)
