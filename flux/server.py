@@ -1309,6 +1309,8 @@ _IVANTI_VPN_DEFAULT_PATHS = ",".join([
     # sequence the trap was built around answered 404.
     "/dana-na",
     "/dana-na/",
+    # Stylesheet the welcome page names for itself.
+    "/dana-na/css/ds.css",
 ])
 IVANTI_VPN_PATHS = {
     value.strip().lower()
@@ -1346,6 +1348,10 @@ _ASPERA_FASPEX_DEFAULT_PATHS = ",".join([
     "/aspera/faspex",
     "/aspera/faspex/account/logout",
     "/aspera/faspex/package_relay/relay_package",
+    # Submit target named by the landing page's own <form action>. The
+    # login form rendered, and anything posted to it hit a 404 — so the
+    # one credential this surface exists to collect was dropped.
+    "/aspera/faspex/session",
 ])
 ASPERA_FASPEX_PATHS = {
     value.strip().lower()
@@ -1382,6 +1388,11 @@ _FORTIGATE_VPN_DEFAULT_PATHS = ",".join([
     "/remote/logincheck",
     "/remote/fgt_lang",
     "/remote/error",
+    # Assets the login page names. A FortiOS portal whose own favicon and
+    # logo 404 is a shape no real appliance produces; scanners that
+    # confirm the vendor before shipping an exploit check for them.
+    "/remote/fgt_favicon",
+    "/remote/fortinet.png",
     "/api/v2/cmdb/system/admin",
     "/api/v2/cmdb/system/status",
     "/api/v2/cmdb/system/global",
@@ -1422,6 +1433,8 @@ _CITRIX_GATEWAY_DEFAULT_PATHS = ",".join([
     "/logon/logonpoint/tmindex.html",
     # Language pack stub fetched by the Gateway login JS
     "/vpn/js/rdx/core/lang/rdx_en.json.gz",
+    # Favicon the Gateway index names for itself.
+    "/vpn/images/accessgateway.ico",
     # Credential POST endpoints (real Citrix Gateway paths)
     "/cgi/login",
     "/p/u/doauthentication.do",
@@ -1463,6 +1476,8 @@ _RDWEB_DEFAULT_PATHS = ",".join([
     "/rdweb/webclient",
     "/rdweb/webclient/",
     "/rdweb/webclient/index.html",
+    # Stylesheet the login page names for itself.
+    "/rdweb/pages/site.css",
 ])
 RDWEB_PATHS = {
     value.strip().lower()
@@ -2317,6 +2332,13 @@ _CONFLUENCE_DEFAULT_PATHS = ",".join([
     "/login.action",
     "/confluence/login.action",
     "/wiki/login.action",
+    # Submit target named by the login page's own <form action>. Until
+    # this was matched, the login form rendered correctly and the
+    # credentials posted to it fell through to a 404 — the trap captured
+    # nothing from anyone who actually filled it in.
+    "/dologin.action",
+    "/confluence/dologin.action",
+    "/wiki/dologin.action",
     # Bare Struts entry points. Multi-target scanners ship Struts S2-053
     # / S2-066 OGNL `redirect:${...ProcessBuilder...}` against `/index.action`
     # and `/login.action` regardless of the underlying webapp; the OGNL
@@ -3580,6 +3602,12 @@ _WEBLOGIC_CONSOLE_DEFAULT_PATHS = ",".join([
     # after fetching the login form. Also observed as a direct
     # first-request target from credential-stuffing dictionaries.
     "/console/j_security_check",
+    # Skin assets the login page names for itself. Listed as exact
+    # paths rather than by prefix on purpose — a `/console/` prefix
+    # match would swallow the encoded-traversal payload targets that
+    # belong to other handlers (see is_weblogic_console_path).
+    "/console/framework/skins/wlsconsole/css/master.css",
+    "/console/framework/skins/wlsconsole/images/login_weblogic_branding.png",
 ])
 WEBLOGIC_CONSOLE_PATHS = frozenset(
     value.strip().lower()
@@ -4625,6 +4653,16 @@ def is_gravity_smtp_path(path: str) -> bool:
     return lp.startswith(GRAVITY_SMTP_PATH_PREFIX + "/")
 
 
+# Published Telescope package assets, keyed by the content type each is
+# served with. `vendor:publish` places these at the webroot, not under
+# the `/telescope` mount, which is why they need their own table.
+_TELESCOPE_VENDOR_ASSETS: dict[str, tuple[str, str]] = {
+    "/vendor/telescope/app.js": ("telescope-asset-js", "application/javascript; charset=utf-8"),
+    "/vendor/telescope/app-dark.css": ("telescope-asset-css", "text/css; charset=utf-8"),
+    "/vendor/telescope/favicon.svg": ("telescope-asset-svg", "image/svg+xml"),
+}
+
+
 def _telescope_strip_prefix(lp: str) -> str:
     """Return the path with an optional webroot prefix
     (`/admin/`, `/dashboard/`, …) stripped off so the predicate
@@ -4648,6 +4686,12 @@ def is_telescope_path(path: str) -> bool:
     if not TELESCOPE_ENABLED:
         return False
     lp = path.lower().split("?", 1)[0]
+    # Published package assets. Telescope's `vendor:publish` drops these
+    # under the webroot at `/vendor/telescope/...`, outside the
+    # `/telescope` mount point, and the SPA shell names all three. They
+    # are matched here so the shell's own references resolve.
+    if lp in _TELESCOPE_VENDOR_ASSETS:
+        return True
     lp = _telescope_strip_prefix(lp)
     if lp in {"/telescope", "/telescope/"}:
         return True
@@ -5911,6 +5955,174 @@ def render_cisco_webvpn_logon_forms_js() -> bytes:
 
 def render_cisco_webvpn_jar_stub(name: str) -> bytes:
     return f"PK\x03\x04{name}-placeholder".encode("utf-8")
+
+
+# --- Self-referenced appliance assets -----------------------------------
+# Each vendor login page below is rendered from a template that names its
+# own stylesheet, logo, favicon or form action. Those URLs answered 404
+# until they were served here, which is wrong in two different ways.
+#
+# A login page whose own stylesheet and logo are missing is a shape no
+# real appliance produces, and it was the *same* shape on every host
+# running this code — a fleet fingerprint, not a coverage gap. It is the
+# same defect the operational-endpoint index guard was written for
+# (an index advertising links nothing served), except that guard only
+# walked a JSON index and never looked at rendered HTML.
+#
+# Worse, two of the unresolved references were `<form action=...>`
+# targets rather than assets. Those surfaces rendered a login form whose
+# submission went to a 404, so the credential the trap exists to capture
+# was dropped on arrival. Both now answer and log like every other
+# credential-POST surface.
+#
+# The bodies are deliberately small and generic: they exist so the
+# reference resolves and the vendor-confirmation fetch a gated scanner
+# performs before shipping an exploit succeeds. None carries anything
+# credential-shaped, so none spends a canary.
+
+def _png_solid(rgb: tuple[int, int, int], size: int = 16) -> bytes:
+    """A valid single-colour PNG of `size`x`size`.
+
+    Built rather than embedded so the bytes stay reviewable and no
+    base64 blob has to be trusted. Real appliance logos are larger, but
+    scanners fingerprinting a vendor check that the asset exists and
+    decodes — not what it depicts.
+    """
+    red, green, blue = (max(0, min(255, int(c))) for c in rgb)
+    row = b"\x00" + bytes((red, green, blue)) * size
+    raw = row * size
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            len(payload).to_bytes(4, "big")
+            + kind
+            + payload
+            + (zlib.crc32(kind + payload) & 0xFFFFFFFF).to_bytes(4, "big")
+        )
+
+    header = (
+        size.to_bytes(4, "big")
+        + size.to_bytes(4, "big")
+        + bytes((8, 2, 0, 0, 0))  # 8-bit depth, truecolour RGB
+    )
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _ico_from_png(png: bytes, size: int = 16) -> bytes:
+    """Wrap a PNG in an ICO container.
+
+    The PNG-inside-ICO form is what modern toolchains emit and every
+    browser and image library since Vista accepts, so a scanner that
+    actually decodes the favicon gets a real image.
+    """
+    dimension = 0 if size >= 256 else size
+    entry = (
+        bytes((dimension, dimension, 0, 0))
+        + (1).to_bytes(2, "little")       # colour planes
+        + (32).to_bytes(2, "little")      # bits per pixel
+        + len(png).to_bytes(4, "little")
+        + (22).to_bytes(4, "little")      # offset past header + entry
+    )
+    header = (0).to_bytes(2, "little") + (1).to_bytes(2, "little") + (1).to_bytes(2, "little")
+    return header + entry + png
+
+
+def render_fortigate_favicon() -> bytes:
+    """Referenced by the FortiOS login page as `/remote/fgt_favicon`."""
+    return _ico_from_png(_png_solid((218, 41, 40)))
+
+
+def render_fortigate_logo_png() -> bytes:
+    """Referenced by the FortiOS login page as `/remote/fortinet.png`."""
+    return _png_solid((218, 41, 40), size=32)
+
+
+def render_citrix_gateway_favicon() -> bytes:
+    """Referenced by the Gateway index as `/vpn/images/AccessGateway.ico`."""
+    return _ico_from_png(_png_solid((69, 43, 133)))
+
+
+def render_ivanti_ds_css() -> bytes:
+    """Referenced by the Ivanti/Pulse welcome page as `/dana-na/css/ds.css`."""
+    return (
+        b"body{font-family:Arial,Helvetica,sans-serif;font-size:12px;"
+        b"background:#f2f2f2;color:#333;margin:0}\n"
+        b"#container{width:480px;margin:64px auto;background:#fff;"
+        b"border:1px solid #d5d5d5}\n"
+        b".signin{padding:24px}\n"
+        b".btnSignIn{background:#7c3aed;color:#fff;border:0;padding:6px 18px}\n"
+        b"table.tblLogin td{padding:4px 6px}\n"
+    )
+
+
+def render_rdweb_site_css() -> bytes:
+    """Referenced by the RDWeb login page as `/RDWeb/Pages/Site.css`."""
+    return (
+        b"body{font-family:'Segoe UI',Tahoma,sans-serif;font-size:12px;"
+        b"background-color:#e6e6e6;margin:0}\n"
+        b".form{width:420px;margin:80px auto;background:#fff;padding:24px;"
+        b"border:1px solid #c8c8c8}\n"
+        b"#header{background:#2672ec;color:#fff;padding:12px 24px}\n"
+        b".txtbox{width:240px;padding:3px}\n"
+        b".button{padding:4px 24px}\n"
+    )
+
+
+def render_weblogic_console_css() -> bytes:
+    """Referenced by the Admin Console login page as the wlsconsole skin."""
+    return (
+        b"body{font-family:Tahoma,Arial,sans-serif;font-size:11px;"
+        b"background-color:#ffffff;margin:0}\n"
+        b"table.loginTable{margin:60px auto;border:1px solid #b0b0b0}\n"
+        b".loginHeader{background-color:#c00000;color:#ffffff;padding:6px}\n"
+        b".formLabel{text-align:right;padding:4px 8px}\n"
+        b"input.buttonSmall{padding:2px 12px}\n"
+    )
+
+
+def render_weblogic_console_branding_png() -> bytes:
+    """Referenced by the Admin Console login page as the branding image."""
+    return _png_solid((192, 0, 0), size=32)
+
+
+def render_telescope_app_js() -> bytes:
+    """Referenced by the Telescope shell as `/vendor/telescope/app.js`.
+
+    Telescope's real bundle is a Vue SPA. A scanner that fetches it is
+    checking the package is installed, so a small module that defines the
+    globals the shell names is enough for the reference to resolve.
+    """
+    return (
+        b"/*! Laravel Telescope */\n"
+        b"window.Telescope=window.Telescope||{};\n"
+        b"window.Telescope.basePath='/telescope';\n"
+        b"window.Telescope.recording=true;\n"
+    )
+
+
+def render_telescope_app_css() -> bytes:
+    """Referenced by the Telescope shell as `/vendor/telescope/app-dark.css`."""
+    return (
+        b":root{--telescope-bg:#1a202c;--telescope-fg:#e2e8f0}\n"
+        b"body{background:var(--telescope-bg);color:var(--telescope-fg);"
+        b"font-family:'Nunito',sans-serif;margin:0}\n"
+        b"#telescope{min-height:100vh}\n"
+    )
+
+
+def render_telescope_favicon_svg() -> bytes:
+    """Referenced by the Telescope shell as `/vendor/telescope/favicon.svg`."""
+    return (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+        b'<rect width="32" height="32" rx="6" fill="#1a202c"/>'
+        b'<circle cx="16" cy="16" r="7" fill="#e2e8f0"/>'
+        b"</svg>\n"
+    )
 
 
 def render_cisco_anyconnect_config_auth(host: str) -> bytes:
@@ -7400,6 +7612,34 @@ def extract_rdweb_form(body: bytes, content_type: str) -> tuple[str, bool]:
     return username, has_password
 
 
+def extract_aspera_faspex_creds(body: bytes, content_type: str) -> dict[str, str]:
+    """Pull the sign-in pair off an `/aspera/faspex/session` POST body.
+
+    Faspex is a Rails app, so its form fields are the bracketed
+    `user[email]` / `user[password]` names the landing page renders.
+    Unbracketed spellings are accepted too — credential-stuffing kits
+    frequently submit a generic `username`/`password` pair regardless of
+    what the form actually asked for, and that difference is itself worth
+    recording. The password bytes are not copied into a dedicated field;
+    the raw body stays in `bodyPreview`, as on every other
+    credential-POST surface here.
+    """
+    parsed = parse_form_body(body, content_type)
+    result: dict[str, str] = {}
+    for key in ("user[email]", "user[username]", "username", "email", "user"):
+        values = parsed.get(key)
+        if values and values[0]:
+            result["username"] = values[0][:200]
+            break
+    for key in ("user[password]", "password", "pass"):
+        values = parsed.get(key)
+        if values and values[0]:
+            result["hasPwd"] = "true"
+            result["pwdLen"] = str(len(values[0]))[:6]
+            break
+    return result
+
+
 def render_aspera_faspex_landing(host: str, version: str) -> bytes:
     safe_host = host or "faspex-gateway"
     body = f"""<!doctype html>
@@ -7465,6 +7705,45 @@ _IVANTI_CMD_INJECTION_INDICATORS = (
 def _ivanti_has_cmd_injection(body_preview: str, query: str) -> bool:
     haystack = f"{query} {body_preview}".lower()
     return any(needle in haystack for needle in _IVANTI_CMD_INJECTION_INDICATORS)
+
+
+def extract_geoserver_login_creds(content_type: str, body: bytes) -> dict[str, str]:
+    """Pull the admin pair off a `/geoserver/j_spring_security_check` POST.
+
+    The landing form posts plain `username` / `password`; the
+    `j_username` / `j_password` spellings are Spring Security's own
+    defaults and are accepted too, because scanners targeting the
+    framework rather than this page use them. Password bytes are not
+    copied into a dedicated field; the raw body stays in `bodyPreview`,
+    as on every other credential-POST surface here.
+    """
+    parsed = parse_form_body(body, content_type)
+    result: dict[str, str] = {}
+    for key in ("username", "j_username", "user"):
+        values = parsed.get(key)
+        if values and values[0]:
+            result["username"] = values[0][:200]
+            break
+    for key in ("password", "j_password", "pass"):
+        values = parsed.get(key)
+        if values and values[0]:
+            result["hasPwd"] = "true"
+            result["pwdLen"] = str(len(values[0]))[:6]
+            break
+    return result
+
+
+def render_geoserver_screen_css() -> bytes:
+    """The Wicket-served Blueprint stylesheet the landing page names."""
+    return (
+        b"body{font-family:Verdana,Arial,sans-serif;font-size:12px;"
+        b"background:#fff;color:#333;margin:0}\n"
+        b"#header{background:#0076a1;color:#fff;padding:8px 16px}\n"
+        b"#loginform{float:right;padding:12px}\n"
+        b"#loginform fieldset{border:1px solid #ccc;padding:8px}\n"
+        b"#demos ul{list-style:none;padding-left:0}\n"
+        b".container{width:960px;margin:0 auto}\n"
+    )
 
 
 def render_geoserver_landing(host: str, version: str) -> bytes:
@@ -9226,14 +9505,50 @@ def render_coldfusion_adminapi(method_name: str, version: str) -> bytes:
     return body.encode("utf-8")
 
 
-def render_confluence_login_html(host: str, version: str) -> bytes:
+def extract_confluence_login_creds(body: bytes, content_type: str) -> dict[str, str]:
+    """Pull the Confluence login pair off a `/dologin.action` POST body.
+
+    Records the submitted `os_username`, whether `os_password` was
+    present and how long it was, and whether the client echoed the
+    per-render `atl_token` CSRF nonce. The password bytes are not copied
+    into a dedicated field; the raw body stays in `bodyPreview`, matching
+    every other credential-POST surface here.
+    """
+    parsed = parse_form_body(body, content_type)
+    result: dict[str, str] = {}
+    for key in ("os_username", "username", "j_username", "user"):
+        values = parsed.get(key)
+        if values and values[0]:
+            result["username"] = values[0][:200]
+            break
+    for key in ("os_password", "password", "j_password", "pass"):
+        values = parsed.get(key)
+        if values and values[0]:
+            result["hasPwd"] = "true"
+            result["pwdLen"] = str(len(values[0]))[:6]
+            break
+    token = parsed.get("atl_token")
+    if token and token[0]:
+        result["hasToken"] = "true"
+    return result
+
+
+def render_confluence_login_html(host: str, version: str, error: str = "") -> bytes:
     """Confluence 7.x login page shell. Wicket-aware scanners follow into
     `pages/createpage-entervariables.action` from the page links rendered
     here, so the trap doesn't have to advertise those paths in the body —
     the version banner alone is enough for the canonical CVE-2022-26134
-    follow-on probe."""
+    follow-on probe.
+
+    `error` renders the auth-failure notice real Confluence shows after a
+    rejected `/dologin.action` submission."""
     safe_host = host or "confluence.internal"
     atl_token = uuid.uuid4().hex
+    error_html = (
+        f'<div class="aui-message aui-message-error">'
+        f"<p>{html.escape(error)}</p></div>\n      "
+        if error else ""
+    )
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -9249,7 +9564,7 @@ def render_confluence_login_html(host: str, version: str) -> bytes:
       <h1 id="title-text">Log In</h1>
     </header>
     <section id="main" role="main">
-      <form name="loginform" id="loginform" method="post" action="/dologin.action" class="aui">
+      {error_html}<form name="loginform" id="loginform" method="post" action="/dologin.action" class="aui">
         <input type="hidden" name="atl_token" value="{atl_token}" />
         <input type="hidden" name="os_destination" value="" />
         <input type="hidden" name="login" value="Log in" />
@@ -24817,6 +25132,10 @@ async def _handle_ivanti_vpn(
         result_tag = "ivanti-index"
         body = render_ivanti_welcome_html(host)
         content_type = "text/html; charset=utf-8"
+    elif lpath == "/dana-na/css/ds.css":
+        result_tag = "ivanti-ds-css"
+        body = render_ivanti_ds_css()
+        content_type = "text/css; charset=utf-8"
     elif lpath == "/dana-na/auth/url_default/login.cgi" or (
         realm_match is not None and realm_match.group("page") == "login"
     ):
@@ -24895,6 +25214,7 @@ async def _handle_aspera_faspex(
     lpath = path.lower()
     method = request.method
     host = str(log_context.get("host", ""))
+    extra_credential_fields: dict[str, object] = {}
 
     if lpath in {"/aspera/faspex", "/aspera/faspex/"}:
         result_tag = "aspera-faspex-landing"
@@ -24908,6 +25228,29 @@ async def _handle_aspera_faspex(
         result_tag = "aspera-faspex-relay-package"
         body = b"relay package accepted\n"
         content_type = "text/plain; charset=utf-8"
+    elif lpath == "/aspera/faspex/session" and method != "POST":
+        # Faspex exposes no GET route on the session endpoint; a non-POST
+        # probe gets the landing page, and stays out of the
+        # credential-post counts.
+        result_tag = "aspera-faspex-landing"
+        body = render_aspera_faspex_landing(host, ASPERA_FASPEX_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/aspera/faspex/session":
+        # The landing page's own submit target. Faspex is a Rails app, so
+        # a rejected sign-in re-renders the landing page; that is both what
+        # is plausible and all we can honestly return.
+        creds = extract_aspera_faspex_creds(
+            request_body, request.headers.get("Content-Type", ""),
+        )
+        result_tag = "aspera-faspex-credential-post"
+        extra_credential_fields = {
+            "asperaFaspexUsername": creds.get("username", ""),
+            "asperaFaspexHasPwd": creds.get("hasPwd", "") == "true",
+        }
+        if creds.get("pwdLen"):
+            extra_credential_fields["asperaFaspexPwdLen"] = creds["pwdLen"]
+        body = render_aspera_faspex_landing(host, ASPERA_FASPEX_VERSION)
+        content_type = "text/html; charset=utf-8"
     else:
         append_log({**log_context, "status": 404, "result": "aspera-faspex-miss"})
         return web.Response(
@@ -24921,6 +25264,7 @@ async def _handle_aspera_faspex(
         "result": result_tag,
         "asperaFaspexPath": path,
         "asperaFaspexMethod": method,
+        **extra_credential_fields,
         "bytes": len(body),
     }
     if request_body:
@@ -25001,6 +25345,14 @@ async def _handle_fortigate_vpn(
         result_tag = "fortigate-monitor-router-policy"
         body = render_fortigate_router_policy_json()
         content_type = "application/json; charset=utf-8"
+    elif lpath == "/remote/fgt_favicon":
+        result_tag = "fortigate-favicon"
+        body = render_fortigate_favicon()
+        content_type = "image/x-icon"
+    elif lpath == "/remote/fortinet.png":
+        result_tag = "fortigate-logo"
+        body = render_fortigate_logo_png()
+        content_type = "image/png"
     else:
         append_log({**log_context, "status": 404, "result": "fortigate-vpn-miss"})
         return web.Response(
@@ -25618,6 +25970,10 @@ async def _handle_citrix_gateway(
         result_tag = "citrix-rdx-lang"
         body = render_citrix_rdx_lang_stub()
         content_type = "application/json; charset=utf-8"
+    elif lpath == "/vpn/images/accessgateway.ico":
+        result_tag = "citrix-favicon"
+        body = render_citrix_gateway_favicon()
+        content_type = "image/x-icon"
     elif lpath == "/citrix/xenapp/auth/login.aspx":
         result_tag = "citrix-xenapp-login"
         body = render_citrix_xenapp_login_html(host)
@@ -25709,6 +26065,18 @@ async def _handle_rdweb(
     is_default_page = lpath == "/rdweb/pages/en-us/default.aspx" or (
         locale_match is not None and locale_match.group(1) == "default"
     )
+    # Stylesheet the login page names. Answered ahead of the login flow
+    # so an asset fetch is not logged as a portal visit.
+    if lpath == "/rdweb/pages/site.css":
+        css = render_rdweb_site_css()
+        append_log({
+            **log_context, "status": 200,
+            "result": "rdweb-asset", "rdwebPath": path, "bytes": len(css),
+        })
+        return web.Response(
+            status=200, body=css,
+            headers={"Content-Type": "text/css; charset=utf-8"},
+        )
     # Landing variants that scanners POST credentials against — the short
     # `/RDWeb` path plus every localized login form. Also treat the two
     # HTML5 webclient landing paths as login-form GETs so scanners walking
@@ -25833,6 +26201,22 @@ async def _handle_exchange(
     extra_headers: dict[str, str] = {}
     status = 200
     set_cookie_value: str | None = None
+
+    # ---- static assets the OWA login page names --------------------------
+    # The `/owa/` prefix match is broad enough to swallow the themed asset
+    # URLs the login page references, which meant the favicon it asks for
+    # came back as the login page's own HTML. A favicon that answers
+    # `text/html` is a tell on its own, so these are split out ahead of
+    # the surface routing.
+    if lpath.startswith("/owa/auth/") and lpath.endswith(".ico"):
+        ico = _ico_from_png(_png_solid((0, 114, 198)))
+        append_log({
+            **log_context, "status": 200,
+            "result": "exchange-owa-asset", "bytes": len(ico),
+        })
+        return web.Response(
+            status=200, body=ico, headers={"Content-Type": "image/x-icon"},
+        )
 
     # ---- autodiscover ---------------------------------------------------
     if lpath.startswith("/autodiscover"):
@@ -27479,6 +27863,63 @@ async def _handle_geoserver(
             },
         )
 
+    # The landing page's own Spring Security submit target. Until it was
+    # answered, the admin login form rendered and everything posted to it
+    # fell through to a 404 — GeoServer's default `admin` account is a
+    # standing credential-stuffing target, so that was the submission
+    # most worth having.
+    if lpath == "/geoserver/j_spring_security_check" and request.method != "POST":
+        # Spring Security registers this filter for POST only; a non-POST
+        # probe gets the admin shell rather than a credential-post row.
+        body = render_geoserver_landing(host, GEOSERVER_VERSION)
+        append_log({
+            **log_context, "status": 200, "result": "geoserver-web-landing",
+            **log_extra, "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "text/html; charset=utf-8",
+                     "Cache-Control": "no-store"},
+        )
+
+    if lpath == "/geoserver/j_spring_security_check":
+        creds = extract_geoserver_login_creds(
+            request.headers.get("Content-Type", ""), request_body,
+        )
+        body = render_geoserver_landing(host, GEOSERVER_VERSION)
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "geoserver-credential-post",
+            **log_extra,
+            "geoserverUsername": creds.get("username", ""),
+            "geoserverHasPwd": creds.get("hasPwd", "") == "true",
+            **({"geoserverPwdLen": creds["pwdLen"]} if creds.get("pwdLen") else {}),
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={
+                "Content-Type": "text/html; charset=utf-8",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    # Wicket-served stylesheet the landing page names for itself.
+    if lpath.startswith("/geoserver/wicket/resource/") and lpath.endswith(".css"):
+        css = render_geoserver_screen_css()
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "geoserver-asset",
+            **log_extra,
+            "bytes": len(css),
+        })
+        return web.Response(
+            status=200, body=css,
+            headers={"Content-Type": "text/css; charset=utf-8"},
+        )
+
     # OGC service endpoints — same surface as the wicket page for CVE-2024-36401.
     for svc_path, svc in (
         ("/geoserver/ows", "wfs"),
@@ -27906,6 +28347,29 @@ async def _handle_telescope(
     `telescopePanel`, `telescopeMethod`, `result`, `canaryTypes`,
     and `bytes`."""
     lpath = path.lower().split("?", 1)[0]
+
+    # Published package assets the SPA shell names. Answered before the
+    # panel routing so an asset fetch is not counted as a panel visit,
+    # and none of them mints a canary.
+    vendor_asset = _TELESCOPE_VENDOR_ASSETS.get(lpath)
+    if vendor_asset is not None:
+        asset_tag, asset_content_type = vendor_asset
+        if lpath.endswith(".js"):
+            asset_body = render_telescope_app_js()
+        elif lpath.endswith(".css"):
+            asset_body = render_telescope_app_css()
+        else:
+            asset_body = render_telescope_favicon_svg()
+        append_log({
+            **log_context, "status": 200, "result": asset_tag,
+            "telescopePath": path, "telescopeMethod": request.method,
+            "bytes": len(asset_body),
+        })
+        return web.Response(
+            status=200, body=asset_body,
+            headers={"Content-Type": asset_content_type},
+        )
+
     canonical = _telescope_strip_prefix(lpath)
     method = request.method
     host = str(log_context.get("host", ""))
@@ -28342,6 +28806,34 @@ async def _handle_weblogic_console(
     cookie_header = request.headers.get("Cookie", "")
     cookies = parse_cookies(cookie_header)
     submitted_session = cookies.get("ADMINCONSOLESESSION") or cookies.get("JSESSIONID") or ""
+
+    # Skin assets the login page names. Answered before the login flow so
+    # a stylesheet fetch is never mistaken for a console visit, and served
+    # without a session cookie because a real static asset does not mint
+    # one.
+    lpath_console = path.lower().split("?", 1)[0]
+    if lpath_console == "/console/framework/skins/wlsconsole/css/master.css":
+        css = render_weblogic_console_css()
+        append_log({
+            **log_context, "status": 200,
+            "result": "weblogic-console-asset",
+            "weblogicConsolePath": path, "bytes": len(css),
+        })
+        return web.Response(
+            status=200, body=css,
+            headers={"Content-Type": "text/css; charset=utf-8"},
+        )
+    if lpath_console == "/console/framework/skins/wlsconsole/images/login_weblogic_branding.png":
+        png = render_weblogic_console_branding_png()
+        append_log({
+            **log_context, "status": 200,
+            "result": "weblogic-console-asset",
+            "weblogicConsolePath": path, "bytes": len(png),
+        })
+        return web.Response(
+            status=200, body=png,
+            headers={"Content-Type": "image/png"},
+        )
 
     host = str(log_context.get("host", ""))
     # Real WebLogic mints `ADMINCONSOLESESSION=<uppercased-alnum>` with
@@ -28798,6 +29290,35 @@ async def _handle_confluence(
     elif lpath.endswith("/templates/editor-preload-container"):
         result_tag = "confluence-editor-preload"
         body = render_confluence_editor_preload_html(CONFLUENCE_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif method != "POST" and lpath.endswith("/dologin.action"):
+        # Real Confluence has no GET route here -- a browser landing on it
+        # is bounced back to the login page. Serving that keeps non-POST
+        # probes out of the credential-post counts, which only mean
+        # something if every row in them is an actual submission.
+        result_tag = "confluence-login"
+        body = render_confluence_login_html(host, CONFLUENCE_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath.endswith("/dologin.action"):
+        # The login page's own submit target. Real Confluence re-renders
+        # the login page with an error notice on a bad credential, which
+        # is also the only honest thing we can do — so the response is the
+        # same page, and the value is in what gets logged off the body.
+        creds = extract_confluence_login_creds(request_body, request.headers.get("Content-Type", ""))
+        result_tag = "confluence-credential-post"
+        log_extra["confluenceUsername"] = creds.get("username", "")
+        log_extra["confluenceHasPwd"] = creds.get("hasPwd", "") == "true"
+        if creds.get("pwdLen"):
+            log_extra["confluencePwdLen"] = creds["pwdLen"]
+        # `atl_token` is the per-render CSRF nonce the login page handed
+        # out. A client that echoes it parsed our HTML and submitted the
+        # real form; one that posts without it is replaying a canned
+        # credential-stuffing request. That is the same follow-the-chain
+        # distinction the metadata and debug-panel traps are built on.
+        log_extra["confluenceAtlTokenPresent"] = creds.get("hasToken", "") == "true"
+        body = render_confluence_login_html(
+            host, CONFLUENCE_VERSION, error="Sorry, your username and password are incorrect.",
+        )
         content_type = "text/html; charset=utf-8"
     elif lpath.endswith("/login.action") or lpath in CONFLUENCE_PATHS:
         result_tag = "confluence-login"
