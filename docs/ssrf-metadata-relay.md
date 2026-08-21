@@ -14,9 +14,25 @@ them falls through to the router's 404.
 
 | Method | Entry path | Fires when | Log tag |
 | --- | --- | --- | --- |
-| GET / HEAD | `/fetch`, `/api/fetch`, `/v1/fetch`, `/proxy`, `/api/proxy`, `/v1/proxy`, `/render`, `/api/render`, `/preview`, `/api/preview`, `/screenshot`, `/thumbnail`, `/url`, `/api/url`, `/import`, `/api/import`, `/webhook/test`, `/api/webhook/test` (± trailing slash) | a parameter value resolves to an EC2-layout metadata host | `ssrf-relay-aws-<imdsKind>` |
+| GET / HEAD | `/fetch`, `/api/fetch`, `/v1/fetch`, `/api/v1/fetch`, `/proxy`, `/api/proxy`, `/v1/proxy`, `/render`, `/api/render`, `/preview`, `/api/preview`, `/screenshot`, `/thumbnail`, `/url`, `/api/url`, `/import`, `/api/import`, `/download`, `/api/download`, `/image`, `/api/image`, `/webhook`, `/api/webhook`, `/webhook/test`, `/api/webhook/test` (± trailing slash) | a parameter value resolves to an EC2-layout metadata host | `ssrf-relay-aws-<imdsKind>` |
 | GET / HEAD | same | a parameter value resolves to a GCP metadata host | `ssrf-relay-gcp-<index\|sa-index\|email\|token>` |
 | GET / HEAD | same | metadata host, document we do not emulate | `ssrf-relay-unmatched` (404) |
+
+### On which spellings are listed
+
+The entry path is matched exactly, so an unlisted spelling is a silent
+miss that no amount of parameter-name generality recovers — the
+parameter sweep only helps once the path already matched. Sweeps
+observed against this surface use `/api/v1/fetch` alongside `/v1/fetch`,
+and a bare `/api/webhook` alongside `/api/webhook/test`; both
+`/api`-prefixed forms were missing. `/download` and `/image` are the
+same bet as `/preview`: the client is guessing the application
+dereferences a URL server-side.
+
+`/redirect` is deliberately **not** an entry path. A redirect endpoint
+answers with a 302 rather than dereferencing the target, so returning
+metadata document content from one would be a shape no real application
+produces. A test pins that it stays unmatched.
 
 Metadata hosts recognised: `169.254.169.254`, `169.254.170.2`,
 `100.100.100.200` (Alibaba mirrors the EC2 layout), `instance-data`,

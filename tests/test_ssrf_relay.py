@@ -356,3 +356,35 @@ async def test_head_returns_no_body_but_keeps_the_length(flux_client, monkeypatc
     assert resp.status == 200
     assert await resp.read() == b""
     assert int(resp.headers["Content-Length"]) > 0
+
+
+@pytest.mark.parametrize("entry", [
+    "/fetch", "/api/fetch", "/api/v1/fetch",
+    "/api/proxy", "/api/preview",
+    "/api/webhook", "/api/download", "/api/image",
+])
+def test_observed_entry_spellings_resolve(entry):
+    """Entry spellings seen in real credential-harvester sweeps.
+
+    The relay matches the entry path exactly and only sniffs the
+    parameters for a metadata URL, so an unlisted spelling is a silent
+    miss no parameter-name generality can recover. Four of these
+    (`/api/v1/fetch`, `/api/webhook`, `/api/download`, `/api/image`)
+    were misses: the list had `/v1/fetch` but not the `/api`-prefixed
+    form, and `/api/webhook/test` but not the bare endpoint.
+
+    Pinned by spelling rather than by iterating the set so that trimming
+    the set is a visible test failure with a reason attached.
+    """
+    resolved = tbenv.resolve_ssrf_relay(entry, f"url={AWS_ROOT}")
+    assert resolved is not None, f"{entry} is a spelling scanners actually send"
+    assert resolved.cloud == "aws"
+
+
+@pytest.mark.parametrize("entry", ["/redirect", "/api/redirect"])
+def test_redirect_is_deliberately_not_an_entry_path(entry):
+    """A redirect endpoint answers with a 302; it does not dereference
+    the target server-side. Returning metadata document *content* from
+    one would be a shape no real application produces, so it stays
+    unmatched rather than being added for surface area."""
+    assert tbenv.resolve_ssrf_relay(entry, f"url={AWS_ROOT}") is None

@@ -1094,14 +1094,22 @@ SSRF_RELAY_ENABLED = _env_bool("HONEYPOT_SSRF_RELAY_ENABLED")
 # with a trailing slash tolerated. None belongs to another trap — the
 # SSRF non-collision test keeps it that way.
 _SSRF_RELAY_ENTRY_PATHS: frozenset[str] = frozenset({
-    "/fetch", "/api/fetch", "/v1/fetch",
+    "/fetch", "/api/fetch", "/v1/fetch", "/api/v1/fetch",
     "/proxy", "/api/proxy", "/v1/proxy",
     "/render", "/api/render",
     "/preview", "/api/preview",
     "/screenshot", "/thumbnail",
     "/webhook/test", "/api/webhook/test",
+    # Bare `/api/webhook` as well as the `/test` sub-path: harvester
+    # sweeps ask for both, and only the sub-path was listed.
+    "/webhook", "/api/webhook",
     "/url", "/api/url",
     "/import", "/api/import",
+    # A media/download fetcher is the same bet as a preview renderer --
+    # the client is guessing the app dereferences a URL server-side, and
+    # these two spellings turn up in the same sweeps as the ones above.
+    "/download", "/api/download",
+    "/image", "/api/image",
 })
 # Hosts whose metadata tree uses the EC2 `/latest/meta-data/...` layout.
 # Alibaba Cloud mirrors that layout at its own link-local address, so it
