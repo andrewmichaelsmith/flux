@@ -656,6 +656,11 @@ def test_all_trap_families_default_on():
     )
     assert tbenv.FILE_UPLOAD_ENABLED
     assert tbenv.LLM_ENDPOINT_ENABLED
+    assert tbenv.WP_REST_INDEX_ENABLED, (
+        "HONEYPOT_WP_REST_INDEX_ENABLED should default to True — the REST "
+        "index is the discovery document the WordPress traps behind it are "
+        "reached through, so an install with it off hides them."
+    )
     assert tbenv.MCP_SERVER_ENABLED
     assert tbenv.SONICWALL_ENABLED
     assert tbenv.CISCO_WEBVPN_ENABLED

@@ -40,6 +40,11 @@ from flux import server as tbenv
      "/wp-json/gravitysmtp/v1/config"),
     # A generated doubled separator still resolves.
     ("/", "rest_route=//wp/v2/users", "/wp-json/wp/v2/users"),
+    # `rest_route=/` is the REST index's query-form address — the one a
+    # client uses when permalinks are off. It used to resolve to nothing
+    # because nothing was served there; the index trap changed that.
+    ("/", "rest_route=/", "/wp-json/"),
+    ("/index.php", "rest_route=%2F", "/wp-json/"),
 ])
 def test_alias_resolves_to_the_canonical_rest_path(path, query, expected):
     assert tbenv.wp_rest_route_alias(path, query) == expected
@@ -49,8 +54,6 @@ def test_alias_resolves_to_the_canonical_rest_path(path, query, expected):
     # No alias present at all.
     ("/", "per_page=100"),
     ("/", ""),
-    # The REST index is not a route — nothing is trapped behind it.
-    ("/", "rest_route=/"),
     # Relative routes are not what WordPress accepts.
     ("/", "rest_route=wp/v2/users"),
     # Wrong front controller: an unrelated app that happens to take a

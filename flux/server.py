@@ -852,6 +852,87 @@ _WP_BATCH_PASSWORD_KEYS: tuple[str, ...] = (
     "pwd", "password", "pass", "user_pass", "passwd",
 )
 
+# --- WordPress REST API index ---------------------------------------------
+# `/wp-json/` is the discovery document for every WordPress REST route: it
+# names the registered namespaces and returns a `routes` map with a self
+# link for each one. It is the *first* request a REST-aware WordPress tool
+# makes, because it is how the tool learns whether REST is reachable and
+# which routes exist before spending a request on any of them.
+#
+# Flux shipped traps behind several of those routes — user enumeration on
+# `/wp/v2/users`, the request multiplexer on `/batch/v1` — while the index
+# that advertises them returned the generic 404. A client that asks the
+# index first and gets nothing concludes REST is disabled and never sends
+# the follow-up, so those traps were reachable only by a tool that already
+# had the route hardcoded. Same defect the observability trap fixed for the
+# Spring actuator index, in the same shape, and it is fixed the same way:
+# the index is served, and everything the index advertises is served too.
+#
+# The routes map is deliberately *not* WordPress's full ~130-entry listing.
+# It advertises what this server actually answers, so following the index
+# never produces a dead link — a vendor index whose own routes 404 is a
+# shape no real install produces, and a guard test walks every advertised
+# href to keep it that way.
+WP_REST_INDEX_ENABLED = _env_bool("HONEYPOT_WP_REST_INDEX_ENABLED")
+
+# Namespace prefix under `/wp-json`. Routes below are spelled relative to
+# it, exactly as WordPress spells the keys of the `routes` object.
+_WP_REST_NAMESPACE = "wp/v2"
+
+# Collections served, each with the count `X-WP-Total` should report. The
+# empty ones are honest: a small site really does have no tags, no media
+# and no approved comments, and an empty JSON array is a valid collection
+# response rather than an error.
+_WP_REST_COLLECTIONS: dict[str, int] = {
+    "posts": 2,
+    "pages": 1,
+    "categories": 1,
+    "comments": 0,
+    "media": 0,
+    "tags": 0,
+    "users": 3,
+}
+
+# Routes that exist but refuse an anonymous caller, with the error code
+# WordPress core returns for each. Answering 401 here is not a weaker
+# response than 200 — it is the response that proves the route is
+# registered, which is what the scanner is testing for.
+_WP_REST_AUTH_REQUIRED: dict[str, tuple[str, str]] = {
+    "settings": ("rest_forbidden", "Sorry, you are not allowed to do that."),
+    "plugins": (
+        "rest_cannot_view_plugins",
+        "Sorry, you are not allowed to manage plugins for this site.",
+    ),
+    "themes": ("rest_cannot_view_themes", "Sorry, you are not allowed to view themes."),
+    "users/me": ("rest_not_logged_in", "You are not currently logged in."),
+}
+
+# Read-only descriptor routes. WordPress serves these to anyone; they are
+# what a fingerprinting client reads to confirm the install is real.
+_WP_REST_DESCRIPTORS: tuple[str, ...] = ("types", "taxonomies", "statuses")
+
+# Fake published content. Non-credential filler, so it may be fixed across
+# hosts (see the design principle in the README) — nothing here is
+# secret-shaped, and the per-host halves (site name, links) are derived
+# from the request Host below.
+_WP_REST_FAKE_POSTS: tuple[dict[str, str], ...] = (
+    {"id": "1", "slug": "hello-world", "title": "Hello world!",
+     "date": "2026-01-14T09:12:44", "author": "1", "excerpt":
+     "Welcome to the site. This is the first post; edit or delete it, "
+     "then start writing."},
+    {"id": "8", "slug": "scheduled-maintenance-window",
+     "title": "Scheduled maintenance window",
+     "date": "2026-05-02T16:31:07", "author": "3", "excerpt":
+     "The staging environment will be unavailable on Saturday morning "
+     "while the database is migrated."},
+)
+_WP_REST_FAKE_PAGES: tuple[dict[str, str], ...] = (
+    {"id": "2", "slug": "sample-page", "title": "Sample Page",
+     "date": "2026-01-14T09:12:44", "author": "1", "excerpt":
+     "This is an example page. It differs from a blog post because it "
+     "stays in one place."},
+)
+
 # --- Fake LLM-API endpoint (Ollama / OpenAI / Anthropic-proxy shape) ---
 # Motivated by scanner fleets observed probing AI-inference endpoints
 # in April 2026 — Ollama-native paths, OpenAI-compatible paths, and
@@ -4249,10 +4330,11 @@ def wp_rest_route_alias(path: str, query_string: str) -> str | None:
 
     if not route.startswith("/"):
         return None
-    # `?rest_route=/` is the REST index, not a route; it advertises the
-    # namespace list and has no trap behind it.
+    # `?rest_route=/` is the REST index — the query-form address of
+    # `/wp-json/`, and the one a client uses when permalinks are off.
+    # It resolves to the index like any other route.
     if route == "/":
-        return None
+        return _WP_REST_ALIAS_CANONICAL_PREFIX + "/"
     # Collapse the doubled separator a generated spelling can produce
     # (`//wp/v2/users`) without touching anything else in the route.
     while route.startswith("//"):
@@ -4287,6 +4369,77 @@ def is_wp_batch_path(path: str) -> bool:
         return False
     lp = _wp_batch_strip_subdir(path.lower().split("?", 1)[0])
     return lp in {_WP_BATCH_PATH_PREFIX, _WP_BATCH_PATH_PREFIX + "/"}
+
+
+def _wp_rest_strip_subdir(lp: str) -> str:
+    """Return `lp` with a WordPress install subdirectory stripped, so
+    `/blog/wp-json/wp/v2/posts` and `/wp-json/wp/v2/posts` reach the same
+    dispatch. Unchanged when no subdirectory prefix matched."""
+    for prefix in _WP_REST_ALIAS_SUBDIRS:
+        head = f"/{prefix}{_WP_REST_ALIAS_CANONICAL_PREFIX}"
+        if lp == head or lp.startswith(head + "/"):
+            return lp[len(prefix) + 1:]
+    return lp
+
+
+def wp_rest_route_of(path: str) -> str | None:
+    """Return the bare REST route a `/wp-json` address names — `/` for
+    the index, `/wp/v2/posts` for a collection — or None when the path
+    is not a REST address at all.
+
+    Trailing slashes are dropped because WordPress's router treats
+    `/wp-json/wp/v2/posts/` and `/wp-json/wp/v2/posts` as one route."""
+    lp = _wp_rest_strip_subdir(path.lower().split("?", 1)[0])
+    if lp in {_WP_REST_ALIAS_CANONICAL_PREFIX, _WP_REST_ALIAS_CANONICAL_PREFIX + "/"}:
+        return "/"
+    if not lp.startswith(_WP_REST_ALIAS_CANONICAL_PREFIX + "/"):
+        return None
+    route = lp[len(_WP_REST_ALIAS_CANONICAL_PREFIX):].rstrip("/")
+    return route or "/"
+
+
+def _wp_rest_split_indexed(route: str) -> tuple[str, int] | None:
+    """Split `/wp/v2/posts/8` into `("posts", 8)`. Returns None unless
+    the tail is a bare integer, so `/wp/v2/users/me` — a different
+    surface with a different response — is left alone."""
+    prefix = f"/{_WP_REST_NAMESPACE}/"
+    if not route.startswith(prefix):
+        return None
+    tail = route[len(prefix):]
+    name, _, item = tail.partition("/")
+    if not item or not item.isdigit():
+        return None
+    return name, int(item)
+
+
+def is_wp_rest_index_path(path: str) -> bool:
+    """Match the REST discovery document and the routes it advertises.
+
+    `users` and `batch/v1` are deliberately excluded: they have their
+    own handlers, dispatched ahead of this one. Anything the index does
+    not advertise stays unmatched, so a route WordPress does not
+    register (`/wp/v2/custom-css`, `/wp/v2/attachments`) keeps the 404 a
+    real install returns for it."""
+    if not WP_REST_INDEX_ENABLED:
+        return False
+    route = wp_rest_route_of(path)
+    if route is None:
+        return False
+    if route in {"/", f"/{_WP_REST_NAMESPACE}"}:
+        return True
+    indexed = _wp_rest_split_indexed(route)
+    if indexed is not None:
+        name, _ = indexed
+        return name in _WP_REST_COLLECTIONS and name != "users"
+    tail = route[len(f"/{_WP_REST_NAMESPACE}/"):] if route.startswith(
+        f"/{_WP_REST_NAMESPACE}/") else ""
+    if not tail:
+        return False
+    if tail in _WP_REST_AUTH_REQUIRED:
+        return True
+    if tail in _WP_REST_DESCRIPTORS or tail == "search":
+        return True
+    return tail in _WP_REST_COLLECTIONS and tail != "users"
 
 
 def is_wp_xmlrpc_path(path: str) -> bool:
@@ -10808,6 +10961,276 @@ def render_wp_user_enum_yoast_xml(host: str) -> bytes:
         )
     lines.append(b"</urlset>")
     return b"\n".join(lines)
+
+
+# --- WordPress REST index renderers ---------------------------------------
+
+def _wp_rest_site_name(host: str) -> str:
+    """Derive a plausible site title from the request Host so the index
+    is not the same document on every sensor. `shop.example.co.uk` ->
+    `Shop`. Falls back to a generic title when the Host is unusable."""
+    h = _wp_user_enum_host_url(host)
+    label = h.split("://", 1)[-1].split(".", 1)[0]
+    label = re.sub(r"[^A-Za-z0-9-]", "", label).replace("-", " ").strip()
+    return label.title() if label else "My Site"
+
+
+def _wp_rest_route_entry(
+    base: str, route: str, methods: tuple[str, ...],
+) -> dict[str, object]:
+    """One `routes` map value in WordPress's index shape. The self link
+    is what a client follows, so it is always the canonical
+    `/wp-json/<route>` spelling of a route this server answers."""
+    namespace = "" if route == "/" else _WP_REST_NAMESPACE
+    if route.startswith("/batch/"):
+        namespace = "batch/v1"
+    return {
+        "namespace": namespace,
+        "methods": list(methods),
+        "endpoints": [{"methods": list(methods), "args": {}}],
+        "_links": {"self": [{"href": f"{base}/wp-json{'' if route == '/' else route}"}]},
+    }
+
+
+def _wp_rest_advertised_routes() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Every route the index advertises, in WordPress's own ordering.
+
+    This is the single source of truth the index renderer and the
+    dispatcher both read, so an advertised route cannot drift away from
+    a served one — the failure mode this trap exists to fix."""
+    routes: list[tuple[str, tuple[str, ...]]] = [
+        ("/", ("GET",)),
+        (f"/{_WP_REST_NAMESPACE}", ("GET",)),
+    ]
+    for name in _WP_REST_COLLECTIONS:
+        routes.append((f"/{_WP_REST_NAMESPACE}/{name}", ("GET", "POST")))
+    for name in _WP_REST_DESCRIPTORS:
+        routes.append((f"/{_WP_REST_NAMESPACE}/{name}", ("GET",)))
+    routes.append((f"/{_WP_REST_NAMESPACE}/search", ("GET",)))
+    for name in _WP_REST_AUTH_REQUIRED:
+        routes.append((f"/{_WP_REST_NAMESPACE}/{name}", ("GET",)))
+    routes.append(("/batch/v1", ("POST",)))
+    return tuple(routes)
+
+
+def render_wp_rest_index(host: str) -> bytes:
+    """`/wp-json/` — the REST discovery document.
+
+    Shaped like WordPress core's index: site identity, the registered
+    namespaces, and a `routes` map whose self links are the addresses a
+    client is expected to follow next. Only routes this server answers
+    are listed."""
+    base = _wp_user_enum_host_url(host)
+    routes = {
+        route: _wp_rest_route_entry(base, route, methods)
+        for route, methods in _wp_rest_advertised_routes()
+    }
+    doc = {
+        "name": _wp_rest_site_name(host),
+        "description": "Just another WordPress site",
+        "url": f"{base}/",
+        "home": f"{base}/",
+        "gmt_offset": 0,
+        "timezone_string": "",
+        "namespaces": ["oembed/1.0", "batch/v1", _WP_REST_NAMESPACE],
+        "authentication": {},
+        "routes": routes,
+        "site_logo": 0,
+        "site_icon": 0,
+        "site_icon_url": "",
+        "_links": {"help": [{"href": "https://developer.wordpress.org/rest-api/"}]},
+    }
+    return json.dumps(doc, separators=(",", ":")).encode("utf-8")
+
+
+def render_wp_rest_namespace_index(host: str) -> bytes:
+    """`/wp-json/wp/v2` — the namespace index. Same document shape as
+    the root index, filtered to one namespace, which is exactly what
+    WordPress returns for a namespace request."""
+    base = _wp_user_enum_host_url(host)
+    prefix = f"/{_WP_REST_NAMESPACE}"
+    routes = {
+        route: _wp_rest_route_entry(base, route, methods)
+        for route, methods in _wp_rest_advertised_routes()
+        if route == prefix or route.startswith(prefix + "/")
+    }
+    doc = {
+        "namespace": _WP_REST_NAMESPACE,
+        "methods": ["GET"],
+        "endpoints": [{"methods": ["GET"], "args": {}}],
+        "routes": routes,
+        "_links": {"up": [{"href": f"{base}/wp-json/"}]},
+    }
+    return json.dumps(doc, separators=(",", ":")).encode("utf-8")
+
+
+def _wp_rest_rendered(text: str) -> dict[str, object]:
+    return {"rendered": text, "protected": False}
+
+
+def _wp_rest_post_object(
+    base: str, slot: dict[str, str], kind: str,
+) -> dict[str, object]:
+    """A `wp/v2/posts` or `wp/v2/pages` item. Content is ordinary site
+    copy — no credential-shaped field appears anywhere in it."""
+    rest_base = "posts" if kind == "post" else "pages"
+    link_path = f"{base}/{slot['slug']}/" if kind == "page" else f"{base}/2026/{slot['slug']}/"
+    obj: dict[str, object] = {
+        "id": int(slot["id"]),
+        "date": slot["date"],
+        "date_gmt": slot["date"],
+        "guid": {"rendered": f"{base}/?p={slot['id']}"},
+        "modified": slot["date"],
+        "modified_gmt": slot["date"],
+        "slug": slot["slug"],
+        "status": "publish",
+        "type": kind,
+        "link": link_path,
+        "title": {"rendered": slot["title"]},
+        "content": {"rendered": f"<p>{slot['excerpt']}</p>", "protected": False},
+        "excerpt": _wp_rest_rendered(f"<p>{slot['excerpt']}</p>"),
+        "author": int(slot["author"]),
+        "featured_media": 0,
+        "comment_status": "open" if kind == "post" else "closed",
+        "ping_status": "open" if kind == "post" else "closed",
+        "template": "",
+        "meta": [],
+        "_links": {
+            "self": [{"href": f"{base}/wp-json/wp/v2/{rest_base}/{slot['id']}"}],
+            "collection": [{"href": f"{base}/wp-json/wp/v2/{rest_base}"}],
+            "author": [{"href": f"{base}/wp-json/wp/v2/users/{slot['author']}"}],
+        },
+    }
+    if kind == "post":
+        obj["sticky"] = False
+        obj["format"] = "standard"
+        obj["categories"] = [1]
+        obj["tags"] = []
+    else:
+        obj["parent"] = 0
+        obj["menu_order"] = 0
+    return obj
+
+
+def render_wp_rest_collection(host: str, name: str) -> bytes:
+    """A `wp/v2/<collection>` listing. Empty collections return `[]`,
+    which is what a real small install returns — an error envelope
+    would be the lie."""
+    base = _wp_user_enum_host_url(host)
+    if name == "posts":
+        items: list[object] = [
+            _wp_rest_post_object(base, s, "post") for s in _WP_REST_FAKE_POSTS
+        ]
+    elif name == "pages":
+        items = [_wp_rest_post_object(base, s, "page") for s in _WP_REST_FAKE_PAGES]
+    elif name == "categories":
+        items = [{
+            "id": 1, "count": len(_WP_REST_FAKE_POSTS), "description": "",
+            "link": f"{base}/category/uncategorized/", "name": "Uncategorized",
+            "slug": "uncategorized", "taxonomy": "category", "parent": 0, "meta": [],
+            "_links": {
+                "self": [{"href": f"{base}/wp-json/wp/v2/categories/1"}],
+                "collection": [{"href": f"{base}/wp-json/wp/v2/categories"}],
+            },
+        }]
+    else:
+        items = []
+    return json.dumps(items, separators=(",", ":")).encode("utf-8")
+
+
+def render_wp_rest_single(host: str, name: str, item_id: int) -> tuple[bytes, int]:
+    """A `wp/v2/<collection>/<id>` item, or WordPress's own not-found
+    envelope. Returns `(body, status)`.
+
+    Answering the miss correctly is the point: a scanner walking ids
+    reads `rest_post_invalid_id` as 'REST is live, that id is not', and
+    a bare 404 page as 'REST is off'. The two produce different next
+    requests."""
+    base = _wp_user_enum_host_url(host)
+    slots = _WP_REST_FAKE_POSTS if name == "posts" else (
+        _WP_REST_FAKE_PAGES if name == "pages" else ()
+    )
+    kind = "post" if name == "posts" else "page"
+    for slot in slots:
+        if int(slot["id"]) == item_id:
+            return (
+                json.dumps(
+                    _wp_rest_post_object(base, slot, kind), separators=(",", ":"),
+                ).encode("utf-8"),
+                200,
+            )
+    code = {
+        "posts": "rest_post_invalid_id",
+        "pages": "rest_post_invalid_id",
+        "media": "rest_post_invalid_id",
+        "categories": "rest_term_invalid",
+        "tags": "rest_term_invalid",
+        "comments": "rest_comment_invalid_id",
+    }.get(name, "rest_post_invalid_id")
+    message = "Invalid term ID." if code == "rest_term_invalid" else (
+        "Invalid comment ID." if code == "rest_comment_invalid_id" else "Invalid post ID."
+    )
+    body = {"code": code, "message": message, "data": {"status": 404}}
+    return json.dumps(body, separators=(",", ":")).encode("utf-8"), 404
+
+
+def render_wp_rest_descriptor(host: str, name: str) -> bytes:
+    """`types` / `taxonomies` / `statuses` — the read-only descriptor
+    objects a fingerprinting client reads to confirm the install."""
+    base = _wp_user_enum_host_url(host)
+    if name == "types":
+        doc: dict[str, object] = {
+            key: {
+                "description": "",
+                "hierarchical": key == "page",
+                "name": label,
+                "slug": key,
+                "taxonomies": ["category", "post_tag"] if key == "post" else [],
+                "rest_base": rest_base,
+                "rest_namespace": _WP_REST_NAMESPACE,
+                "_links": {
+                    "collection": [{"href": f"{base}/wp-json/wp/v2/{rest_base}"}],
+                },
+            }
+            for key, label, rest_base in (
+                ("post", "Posts", "posts"),
+                ("page", "Pages", "pages"),
+                ("attachment", "Media", "media"),
+            )
+        }
+    elif name == "taxonomies":
+        doc = {
+            key: {
+                "name": label, "slug": key, "hierarchical": key == "category",
+                "rest_base": rest_base, "rest_namespace": _WP_REST_NAMESPACE,
+                "types": ["post"],
+                "_links": {
+                    "collection": [{"href": f"{base}/wp-json/wp/v2/{rest_base}"}],
+                },
+            }
+            for key, label, rest_base in (
+                ("category", "Categories", "categories"),
+                ("post_tag", "Tags", "tags"),
+            )
+        }
+    else:  # statuses
+        doc = {
+            "publish": {
+                "name": "Published", "public": True, "queryable": True,
+                "slug": "publish", "date_floating": False,
+                "_links": {
+                    "archives": [{"href": f"{base}/wp-json/wp/v2/posts"}],
+                },
+            },
+        }
+    return json.dumps(doc, separators=(",", ":")).encode("utf-8")
+
+
+def render_wp_rest_auth_error(code: str, message: str) -> bytes:
+    """WordPress's stock permission envelope. Status 401 accompanies it;
+    the envelope is what proves the route is registered."""
+    body = {"code": code, "message": message, "data": {"status": 401}}
+    return json.dumps(body, separators=(",", ":")).encode("utf-8")
 
 
 # Multipart Content-Disposition header tokens used by file-upload trap.
@@ -24434,6 +24857,90 @@ async def _handle_wp_user_enum(
     )
 
 
+async def _handle_wp_rest_index(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    """Serve the REST discovery document and the routes it advertises.
+
+    The measurement this exists to produce: a client that fetches the
+    index and then fetches a route it could only have learned there is
+    implementing the REST protocol, not replaying a path dictionary.
+    Distinct result tags per shape keep the two populations apart."""
+    host = str(log_context.get("host", "") or "")
+    method = request.method
+    route = wp_rest_route_of(path) or "/"
+
+    status = 200
+    headers: dict[str, str] = {}
+
+    if route == "/":
+        body = render_wp_rest_index(host)
+        result_tag, variant = "wp-rest-index", "index"
+    elif route == f"/{_WP_REST_NAMESPACE}":
+        body = render_wp_rest_namespace_index(host)
+        result_tag, variant = "wp-rest-namespace-index", "namespace-index"
+    else:
+        tail = route[len(f"/{_WP_REST_NAMESPACE}/"):]
+        indexed = _wp_rest_split_indexed(route)
+        if indexed is not None:
+            name, item_id = indexed
+            body, status = render_wp_rest_single(host, name, item_id)
+            result_tag, variant = "wp-rest-single", f"single-{name}"
+        elif tail in _WP_REST_AUTH_REQUIRED:
+            code, message = _WP_REST_AUTH_REQUIRED[tail]
+            body = render_wp_rest_auth_error(code, message)
+            status = 401
+            result_tag, variant = "wp-rest-auth-required", f"auth-{tail.replace('/', '-')}"
+        elif tail in _WP_REST_DESCRIPTORS:
+            body = render_wp_rest_descriptor(host, tail)
+            result_tag, variant = "wp-rest-descriptor", f"descriptor-{tail}"
+        elif tail == "search":
+            body = b"[]"
+            result_tag, variant = "wp-rest-search", "search"
+            headers["X-WP-Total"] = "0"
+            headers["X-WP-TotalPages"] = "0"
+        else:
+            # A collection. Writing to one needs a logged-in user, and
+            # saying so is what a real install does — the attempted body
+            # is already captured by the shared log context.
+            if method in {"GET", "HEAD"}:
+                body = render_wp_rest_collection(host, tail)
+                total = _WP_REST_COLLECTIONS.get(tail, 0)
+                headers["X-WP-Total"] = str(total)
+                headers["X-WP-TotalPages"] = "1" if total else "0"
+                result_tag, variant = "wp-rest-collection", f"collection-{tail}"
+            else:
+                body = render_wp_rest_auth_error(
+                    "rest_cannot_create",
+                    "Sorry, you are not allowed to create posts as this user.",
+                )
+                status = 401
+                result_tag, variant = "wp-rest-collection-write", f"write-{tail}"
+
+    response_body = b"" if method == "HEAD" else body
+    append_log({
+        **log_context,
+        "result": result_tag,
+        "status": status,
+        "wpRestRoute": route[:200],
+        "wpRestVariant": variant,
+        "wpRestMethod": method,
+        "bytes": len(body),
+    })
+    headers.update({
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Content-Length": str(len(body)),
+        # WordPress advertises the REST root on every response; a client
+        # that discovered us by path can still find the index from here.
+        "Link": f'<{_wp_user_enum_host_url(host)}/wp-json/>; rel="https://api.w.org/"',
+        "X-Robots-Tag": "noindex",
+    })
+    return web.Response(status=status, body=response_body, headers=headers)
+
+
 def _wp_batch_normalise_subroute(raw: object) -> str:
     """Canonicalise a sub-request `path` to the bare REST route.
 
@@ -32103,6 +32610,11 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_wp_batch_path(path):
         return await _handle_wp_batch(request, log_context, path, request_body)
 
+    # After user-enum and batch: those two own their routes, and the
+    # index only fills in what nothing else answers.
+    if is_wp_rest_index_path(path):
+        return await _handle_wp_rest_index(request, log_context, path)
+
     if is_wp_xmlrpc_path(path):
         return await _handle_wp_xmlrpc(request, log_context, path, request_body)
 
@@ -32372,6 +32884,8 @@ def main() -> int:
         active.append("wp-login")
     if WP_USER_ENUM_ENABLED:
         active.append("wp-user-enum")
+    if WP_REST_INDEX_ENABLED:
+        active.append("wp-rest-index")
     if WP_XMLRPC_ENABLED:
         active.append("wp-xmlrpc")
     if WP_WLW_MANIFEST_ENABLED:
