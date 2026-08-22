@@ -122,3 +122,60 @@ async def test_dispatch_serves_firebase_init(flux_client, monkeypatch):
     assert resp.status == 200
     assert json.loads(await resp.read())["apiKey"] == "AKIAFAKEEXAMPLE01"
     assert _log_entries(flux_client.log_path)[-1]["result"] == "firebase-init-json"
+
+
+# --- CI-runner home directory ------------------------------------------
+#
+# The read primitive on the dev-server trap already served
+# `/@fs/home/runner/.aws/credentials`, because it resolves an arbitrary
+# absolute path. The same file asked for directly — which is what a
+# harvester walking home-dir spellings sends — fell through to a 404.
+# One trap answering a path and its sibling 404ing it is the split this
+# closes; `runner` is the CI-runner home, alongside the `ubuntu` /
+# `deploy` / `node` spellings already in the table.
+
+@pytest.mark.parametrize("path", [
+    "/home/runner/.aws/credentials",
+    "/home/runner/.aws/config",
+    "/home/runner/.bashrc",
+    "/home/runner/.profile",
+    "/home/runner/.ssh/id_rsa",
+    "/home/runner/.bash_history",
+    "/home/runner/.kube/config",
+])
+def test_ci_runner_home_paths_are_in_the_trap_table(path):
+    assert path in tbenv._TRAP_BY_PATH, f"{path} has no trap"
+
+
+def test_ci_runner_gitconfig_is_in_the_git_dotfile_family():
+    """`.gitconfig` lives in its own path set rather than the canary
+    trap table, so it needs its own assertion or the addition goes
+    unchecked."""
+    assert tbenv.is_git_dotfile_path("/home/runner/.gitconfig")
+
+
+def test_ci_runner_home_matches_its_ubuntu_sibling_trap():
+    """Every `runner` spelling must land on the same trap as the
+    `ubuntu` one it was derived from — otherwise the two home-dir
+    spellings of one file return different documents."""
+    for path, trap in tbenv._TRAP_BY_PATH.items():
+        if "/home/runner/" not in path:
+            continue
+        sibling = path.replace("/home/runner/", "/home/ubuntu/")
+        assert sibling in tbenv._TRAP_BY_PATH, sibling
+        assert tbenv._TRAP_BY_PATH[sibling] is trap, path
+
+
+async def test_dispatch_serves_the_ci_runner_credentials_file(
+        flux_client, monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", True)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
+
+    resp = await flux_client.get(
+        "/home/runner/.aws/credentials",
+        headers={"X-Forwarded-For": "203.0.113.34"},
+    )
+    assert resp.status == 200
+    assert FAKE_TRACEBIT["aws"]["awsAccessKeyId"].encode() in await resp.read()
+    assert _log_entries(flux_client.log_path)[-1]["result"] == "aws-credentials-file"
