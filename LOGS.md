@@ -180,6 +180,35 @@ Extras on every `llm-endpoint-*` line:
 | `bytes` | int | Size of the response body returned (sum across streaming chunks). |
 | `llmPromptPreview` | string | Prefix of the extracted prompt, truncated to `HONEYPOT_LLM_BODY_DECODE_LIMIT`. Omitted if empty. |
 
+### Fake AI-gateway proxy admin API
+
+One log line per hit on the gateway control plane. See
+[`docs/litellm-admin.md`](./docs/litellm-admin.md).
+
+| `result` | Status | Meaning |
+| --- | --- | --- |
+| `litellm-admin-unauthenticated` | 401 | No token presented; the proxy's `auth_error` envelope was returned. |
+| `litellm-model-info` | 200 | Model registry read — the branch that spends a canary. |
+| `litellm-model-info-tracebit-error` | 401 | Registry read while canary issuance was unavailable; no empty credential slots are served. |
+| `litellm-key-info` | 200 | Key metadata read. |
+| `litellm-key-generate` | 200 | `POST` mint of a virtual key. |
+| `litellm-key-generate-probe` | 405 | Non-POST on the mint route; the route is POST-only upstream. |
+| `litellm-spend-logs` | 200 | Spend-report read. |
+
+Extras on every `litellm-*` line:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `litellmPath` | string | The path that matched. |
+| `litellmMethod` | string | Request method. |
+| `litellmAction` | string | One of `auth-missing`, `model-info`, `key-info`, `key-generate`, `key-generate-probe`, `spend-logs`. |
+| `litellmHasAuth` | bool | Whether any token was presented. |
+| `litellmAuthScheme` | string | Lowercased first token of `Authorization`; `""` for `x-api-key`. |
+| `litellmAuthTokenSha256` | string | sha256 of the presented token. The guessed or stolen master key, groupable across IPs. Omitted when no token was sent. |
+| `litellmAuthTokenPreview` | string | First 12 + last 4 chars with a `...` elision. Omitted when no token was sent. |
+| `litellmRequestedModels` | list | Models a key-mint request asked the new key to reach. |
+| `litellmRequestedBudget` / `litellmRequestedDuration` / `litellmRequestedAlias` / `litellmRequestedTeam` / `litellmRequestedUser` | string | Remaining key-mint request fields, when present. |
+
 ### Fake MCP (Model Context Protocol) server endpoint
 
 One log line per hit. Covers the runtime dispatch surface (`/mcp`,

@@ -79,3 +79,7 @@ See [`../LOGS.md`](../LOGS.md) for the `llm-endpoint-*` result tags
 and the `llmModel` / `llmPromptPreview` / `llmHasAuth` /
 `llmAuthTokenSha256` / `llmAuthTokenPreview` /
 `llmStreamRequested` / `llmStreamChunks` fields.
+
+The gateway's *control* plane — model registry, key minting, spend
+reporting — is a separate trap with a separate population walking it:
+see [`litellm-admin.md`](./litellm-admin.md).

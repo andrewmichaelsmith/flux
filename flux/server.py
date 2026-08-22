@@ -975,6 +975,62 @@ LLM_ENDPOINT_PATHS = {
 # bloating the log file.
 LLM_BODY_DECODE_LIMIT = max(int((os.environ.get("HONEYPOT_LLM_BODY_DECODE_LIMIT") or "4096").strip() or "4096"), 512)
 
+# --- Fake AI-gateway proxy admin API --------------------------------------
+# The inference paths above are the *data* plane of an AI gateway. This is
+# the control plane: the key-management, model-registry and spend-reporting
+# routes an OpenAI-compatible proxy exposes to whoever holds its master
+# key. Scanners walk them as a set — the model registry, the key routes and
+# the spend log in one pass — which is a different intent from probing
+# `/v1/chat/completions`: they are not looking for free inference, they are
+# looking for a proxy they can mint their own keys on.
+#
+# Two things make this worth answering rather than 404ing.
+#
+# First, the master key. These routes are the ones a deployment guide tells
+# you to protect with a bearer token, and the widely-copied example value
+# is a short placeholder that plenty of deployments never change. A 404
+# tells us nothing; accepting any token and logging its hash and prefix
+# tells us exactly which keys the sweep is guessing, and groups the same
+# guessed key across IPs.
+#
+# Second, the model registry. On a real proxy the registry entry for a
+# model carries the upstream provider credential the proxy dials out with —
+# which is a credential belonging to the *operator's* cloud account, not to
+# the proxy. That is the highest-value slot on the whole surface and the
+# one worth backing with a canary, because a client that takes it and uses
+# it is doing so against the provider, where a replay is visible.
+#
+# Canary-backed, so dispatch requires an issuing key on top of the switch.
+LITELLM_ADMIN_ENABLED = _env_bool("HONEYPOT_LITELLM_ADMIN_ENABLED")
+_LITELLM_ADMIN_DEFAULT_PATHS = ",".join([
+    # Model registry — the credential-bearing route.
+    "/model/info",
+    "/v1/model/info",
+    # Key management. Both prefixes: the observed sweeps spray the bare
+    # and `/v1/`-prefixed spelling of the same route rather than picking.
+    "/key/info",
+    "/v1/key/info",
+    "/key/generate",
+    "/v1/key/generate",
+    # Spend reporting.
+    "/global/spend/logs",
+])
+LITELLM_ADMIN_PATHS = {
+    value.strip().lower()
+    for value in (
+        os.environ.get("HONEYPOT_LITELLM_ADMIN_PATHS_CSV")
+        or _LITELLM_ADMIN_DEFAULT_PATHS
+    ).split(",")
+    if value.strip()
+}
+# Bound the request body decoded into the log line, same reasoning as the
+# inference-side limit above.
+LITELLM_ADMIN_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_LITELLM_ADMIN_BODY_DECODE_LIMIT") or "2048").strip()
+        or "2048"),
+    256,
+)
+
 # --- Fake MCP (Model Context Protocol) server endpoint ------------------
 # MCP servers speak a JSON-RPC 2.0 protocol over HTTP + SSE. Scanners are
 # now enumerating the runtime endpoints (`/mcp`, `/mcp/messages`, `/sse`)
@@ -4160,6 +4216,16 @@ def is_llm_endpoint_path(path: str) -> bool:
     if not LLM_ENDPOINT_ENABLED:
         return False
     return path.lower() in LLM_ENDPOINT_PATHS
+
+
+def is_litellm_admin_path(path: str) -> bool:
+    """Exact match on the gateway control-plane routes, query string
+    stripped. Exact rather than prefixed: `/key/` and `/model/` are
+    short enough that a prefix rule would claim unrelated application
+    paths, and the observed sweeps send exact spellings anyway."""
+    if not LITELLM_ADMIN_ENABLED:
+        return False
+    return path.lower().split("?", 1)[0].rstrip("/") in LITELLM_ADMIN_PATHS
 
 
 def is_mcp_server_endpoint_path(path: str) -> bool:
@@ -11224,6 +11290,168 @@ def render_wp_rest_descriptor(host: str, name: str) -> bytes:
             },
         }
     return json.dumps(doc, separators=(",", ":")).encode("utf-8")
+
+
+def _litellm_virtual_key() -> str:
+    """A per-hit virtual key in the proxy's own `sk-` shape. Random, never
+    a literal: a fixed one would be the same string on every host and
+    would detect nothing if it came back."""
+    return "sk-" + secrets.token_urlsafe(24).replace("-", "").replace("_", "")[:32]
+
+
+def _litellm_token_hash() -> str:
+    """Per-hit token hash, the form the proxy stores instead of the key."""
+    return secrets.token_hex(32)
+
+
+def render_litellm_model_info(r: dict[str, object]) -> bytes:
+    """`/model/info` — the model registry.
+
+    The registry entry for a managed-cloud model carries the provider
+    credential the proxy dials out with. That is the credential worth
+    backing with a canary: it belongs to the operator's cloud account
+    rather than to the proxy, so a client that takes it and uses it does
+    so somewhere a replay is visible. The remaining provider slots take
+    per-hit synthetic values in each vendor's published key shape, so the
+    registry looks populated without shipping a fixed literal."""
+    aws = _aws(r)
+    data = [
+        {
+            "model_name": "gpt-4o",
+            "litellm_params": {
+                "model": "azure/gpt-4o",
+                "api_base": "https://ai-gateway-prod.openai.azure.com/",
+                "api_version": "2024-10-21",
+                "api_key": "sk-" + secrets.token_urlsafe(28)[:28],
+            },
+            "model_info": {
+                "id": secrets.token_hex(16),
+                "mode": "chat",
+                "max_tokens": 4096,
+                "input_cost_per_token": 2.5e-06,
+                "output_cost_per_token": 1e-05,
+                "supports_function_calling": True,
+            },
+        },
+        {
+            "model_name": "claude-3-5-sonnet",
+            "litellm_params": {
+                "model": "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
+                "aws_region_name": "us-east-1",
+                "aws_access_key_id": aws.get("awsAccessKeyId", ""),
+                "aws_secret_access_key": aws.get("awsSecretAccessKey", ""),
+                "aws_session_token": aws.get("awsSessionToken", ""),
+            },
+            "model_info": {
+                "id": secrets.token_hex(16),
+                "mode": "chat",
+                "max_tokens": 8192,
+                "input_cost_per_token": 3e-06,
+                "output_cost_per_token": 1.5e-05,
+                "supports_vision": True,
+            },
+        },
+        {
+            "model_name": "text-embedding-3-small",
+            "litellm_params": {
+                "model": "openai/text-embedding-3-small",
+                "api_key": "sk-proj-" + secrets.token_urlsafe(36)[:36],
+            },
+            "model_info": {
+                "id": secrets.token_hex(16),
+                "mode": "embedding",
+                "input_cost_per_token": 2e-08,
+            },
+        },
+    ]
+    return json.dumps({"data": data}, separators=(",", ":")).encode("utf-8")
+
+
+def render_litellm_key_info() -> bytes:
+    """`/key/info` — metadata for the key that authenticated the call.
+    No key material: the proxy stores a hash, so returning one is what
+    the real route does."""
+    doc = {
+        "key": _litellm_token_hash(),
+        "info": {
+            "token": _litellm_token_hash(),
+            "key_name": "sk-...prod",
+            "key_alias": "platform-prod",
+            "spend": 418.7231,
+            "max_budget": 2000.0,
+            "expires": None,
+            "models": ["gpt-4o", "claude-3-5-sonnet", "text-embedding-3-small"],
+            "tpm_limit": 400000,
+            "rpm_limit": 2000,
+            "team_id": "platform",
+            "user_id": "svc-platform",
+            "metadata": {"environment": "production"},
+        },
+    }
+    return json.dumps(doc, separators=(",", ":")).encode("utf-8")
+
+
+def render_litellm_key_generate(requested_models: list[str]) -> bytes:
+    """`POST /key/generate` — mint a virtual key.
+
+    Echoing the requested model list back is what the real route does,
+    and it means the log keeps what the caller asked to be able to reach,
+    not just that it asked."""
+    return json.dumps({
+        "key": _litellm_virtual_key(),
+        "expires": None,
+        "key_name": "sk-...auto",
+        "token_id": _litellm_token_hash(),
+        "models": requested_models,
+        "spend": 0.0,
+        "max_budget": None,
+        "user_id": "default_user_id",
+        "team_id": None,
+    }, separators=(",", ":")).encode("utf-8")
+
+
+def render_litellm_spend_logs() -> bytes:
+    """`/global/spend/logs` — recent spend rows. Establishes that the
+    proxy is in real use, which is the difference between a target worth
+    minting a key on and an empty test deployment. Keys appear as the
+    stored hash, never as key material."""
+    rows = [
+        {
+            "request_id": "chatcmpl-" + secrets.token_hex(12),
+            "api_key": _litellm_token_hash(),
+            "model": model,
+            "call_type": "acompletion",
+            "spend": spend,
+            "total_tokens": tokens,
+            "startTime": start,
+            "endTime": end,
+            "user": user,
+            "metadata": {"user_api_key_alias": alias},
+        }
+        for model, spend, tokens, start, end, user, alias in (
+            ("claude-3-5-sonnet", 0.4182, 21_907,
+             "2026-08-21T22:14:03", "2026-08-21T22:14:09", "svc-platform", "platform-prod"),
+            ("gpt-4o", 0.1937, 8_402,
+             "2026-08-21T22:16:41", "2026-08-21T22:16:44", "svc-batch", "batch-jobs"),
+            ("text-embedding-3-small", 0.0021, 104_558,
+             "2026-08-21T22:19:58", "2026-08-21T22:20:12", "svc-index", "search-index"),
+        )
+    ]
+    return json.dumps(rows, separators=(",", ":")).encode("utf-8")
+
+
+def render_litellm_auth_error() -> bytes:
+    """The proxy's own unauthenticated envelope. Returning it rather than
+    a 404 is what tells a client the route exists and is worth a key
+    guess — which is the guess we want to record."""
+    return json.dumps({
+        "error": {
+            "message": "Authentication Error, No api key passed in.",
+            "type": "auth_error",
+            "param": "None",
+            "code": "401",
+        },
+    }, separators=(",", ":")).encode("utf-8")
 
 
 def render_wp_rest_auth_error(code: str, message: str) -> bytes:
@@ -23582,6 +23810,143 @@ def _log_context_from_request(request: web.Request, request_id: str, body_bytes_
     }
 
 
+def _litellm_key_request_fields(request_body: bytes) -> dict[str, object]:
+    """Pull the interesting fields out of a key-mint request. What the
+    caller asks for — which models, what budget, how long — is the
+    statement of intent, and it arrives before anything is spent."""
+    fields: dict[str, object] = {}
+    try:
+        doc = json.loads(request_body[:LITELLM_ADMIN_BODY_DECODE_LIMIT] or b"{}")
+    except (ValueError, UnicodeDecodeError):
+        return fields
+    if not isinstance(doc, dict):
+        return fields
+    models = doc.get("models")
+    if isinstance(models, list):
+        fields["models"] = [str(m)[:80] for m in models[:20]]
+    for key, name in (
+        ("max_budget", "budget"),
+        ("duration", "duration"),
+        ("key_alias", "alias"),
+        ("team_id", "team"),
+        ("user_id", "user"),
+    ):
+        value = doc.get(key)
+        if isinstance(value, (str, int, float)):
+            fields[name] = str(value)[:80]
+    return fields
+
+
+async def _handle_litellm_admin(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Serve the AI-gateway control plane.
+
+    Any presented token is accepted, and its hash + prefix preview are
+    what the trap is for: the sweep's guessed master keys, groupable
+    across IPs. A request with no token at all gets the proxy's own 401
+    envelope, which is the answer that tells the client the route is
+    real and worth a guess."""
+    lpath = path.lower().split("?", 1)[0].rstrip("/")
+    method = request.method
+    auth_header = request.headers.get("Authorization", "")
+    api_key_header = (
+        request.headers.get("x-api-key", "")
+        or request.headers.get("X-Api-Key", "")
+        or request.headers.get("x-litellm-api-key", "")
+    )
+    token_sha, token_preview = capture_llm_auth_token(auth_header, api_key_header)
+    has_auth = bool(token_sha)
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "litellmPath": path[:200],
+        "litellmMethod": method,
+        "litellmHasAuth": has_auth,
+        "litellmAuthScheme": auth_header.split(" ", 1)[0].lower() if auth_header else "",
+    }
+    if token_sha:
+        log_entry["litellmAuthTokenSha256"] = token_sha
+        log_entry["litellmAuthTokenPreview"] = token_preview
+
+    def _respond(body: bytes, status: int, tag: str, action: str) -> web.Response:
+        log_entry.update({
+            "status": status,
+            "result": tag,
+            "litellmAction": action,
+            "bytes": len(body),
+        })
+        append_log(log_entry)
+        return web.Response(
+            status=status, body=b"" if method == "HEAD" else body,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": "no-store",
+                "Content-Length": str(len(body)),
+                # The proxy fronts an OpenAI-compatible API and advertises
+                # itself in the same header a real deployment does.
+                "Server": "uvicorn",
+                "x-litellm-version": "1.63.11",
+            },
+        )
+
+    if not has_auth:
+        return _respond(
+            render_litellm_auth_error(), 401,
+            "litellm-admin-unauthenticated", "auth-missing",
+        )
+
+    if lpath.endswith("/key/generate"):
+        if method != "POST":
+            # The route is POST-only; the framework's own answer to
+            # anything else is a 405, and it still confirms the route.
+            body = json.dumps(
+                {"detail": "Method Not Allowed"}, separators=(",", ":"),
+            ).encode("utf-8")
+            return _respond(body, 405, "litellm-key-generate-probe", "key-generate-probe")
+        fields = _litellm_key_request_fields(request_body)
+        requested = fields.get("models")
+        for name, value in fields.items():
+            log_entry["litellmRequested" + name.title()] = value
+        return _respond(
+            render_litellm_key_generate(
+                requested if isinstance(requested, list) else [],
+            ),
+            200, "litellm-key-generate", "key-generate",
+        )
+
+    if lpath.endswith("/key/info"):
+        return _respond(render_litellm_key_info(), 200, "litellm-key-info", "key-info")
+
+    if lpath == "/global/spend/logs":
+        return _respond(
+            render_litellm_spend_logs(), 200, "litellm-spend-logs", "spend-logs",
+        )
+
+    # Model registry — the only branch that spends a canary.
+    tracebit_response = await _get_or_issue_canary(
+        ("aws",),
+        str(log_context.get("clientIp", "")),
+        str(log_context.get("requestId", "")),
+        str(log_context.get("host", "")),
+        str(log_context.get("userAgent", "")),
+        path,
+        str(log_context.get("proto", "")),
+    )
+    if tracebit_response is None:
+        return _respond(
+            render_litellm_auth_error(), 401,
+            "litellm-model-info-tracebit-error", "model-info",
+        )
+    return _respond(
+        render_litellm_model_info(tracebit_response), 200,
+        "litellm-model-info", "model-info",
+    )
+
+
 async def _handle_llm_endpoint(
     request: web.Request,
     log_context: dict[str, object],
@@ -32420,6 +32785,11 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_llm_endpoint_path(path):
         return await _handle_llm_endpoint(request, log_context, path, request_body)
 
+    # Canary-backed, so a keyless deployment keeps the 404 rather than
+    # serving a registry with empty credential slots.
+    if API_KEY and is_litellm_admin_path(path):
+        return await _handle_litellm_admin(request, log_context, path, request_body)
+
     if is_mcp_server_endpoint_path(path):
         return await _handle_mcp_server_endpoint(
             request, log_context, request_id, path,
@@ -32816,6 +33186,8 @@ def main() -> int:
             active.append("webshell-sweep")
     if FILE_UPLOAD_ENABLED:
         active.append("file-upload")
+    if LITELLM_ADMIN_ENABLED and API_KEY:
+        active.append("litellm-admin")
     if LLM_ENDPOINT_ENABLED:
         active.append("llm-endpoint")
     if MCP_SERVER_ENABLED:

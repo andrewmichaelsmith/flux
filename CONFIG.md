@@ -204,6 +204,19 @@ No Tracebit key required.
 | `HONEYPOT_LLM_ENDPOINT_PATHS_CSV` | *(built-in — `/v1/models`, `/anthropic/v1/models`, `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages`, `/anthropic/v1/messages`)* | Exact, case-insensitive. Override to add/remove without a code change. |
 | `HONEYPOT_LLM_BODY_DECODE_LIMIT` | `4096` | Max chars of the extracted `llmPromptPreview` written to the log. The raw body is still capped by `HONEYPOT_WEBSHELL_BODY_READ_LIMIT` (shared cap, default 64 KiB off the wire). |
 
+## Fake AI-gateway proxy admin API
+
+The control plane beside the inference paths above: model registry, key
+management and spend reporting. Canary-backed — dispatch also requires
+`TRACEBIT_API_KEY`, so a keyless deployment 404s the whole family rather
+than serving a registry with empty credential slots.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_LITELLM_ADMIN_ENABLED` | on | Master switch. |
+| `HONEYPOT_LITELLM_ADMIN_PATHS_CSV` | *(built-in — `/model/info`, `/v1/model/info`, `/key/info`, `/v1/key/info`, `/key/generate`, `/v1/key/generate`, `/global/spend/logs`)* | Exact, case-insensitive, trailing slash tolerated. Override to add/remove without a code change. |
+| `HONEYPOT_LITELLM_ADMIN_BODY_DECODE_LIMIT` | `2048` | Max bytes of a key-mint request body decoded to extract the requested models / budget / duration. |
+
 ## Fake MCP server endpoint
 
 `TRACEBIT_API_KEY` required for the `tools/call` / `resources/read`

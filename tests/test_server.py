@@ -656,6 +656,11 @@ def test_all_trap_families_default_on():
     )
     assert tbenv.FILE_UPLOAD_ENABLED
     assert tbenv.LLM_ENDPOINT_ENABLED
+    assert tbenv.LITELLM_ADMIN_ENABLED, (
+        "HONEYPOT_LITELLM_ADMIN_ENABLED should default to True — dispatch "
+        "already requires an issuing key on top of this switch, so a "
+        "keyless deployment 404s the family without needing it off."
+    )
     assert tbenv.WP_REST_INDEX_ENABLED, (
         "HONEYPOT_WP_REST_INDEX_ENABLED should default to True — the REST "
         "index is the discovery document the WordPress traps behind it are "
