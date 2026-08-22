@@ -20,6 +20,7 @@ canaries at hit time.
 | `TRACEBIT_ENV_CANARY_SOURCE` | `flux` | `source` label on issued canaries. |
 | `TRACEBIT_ENV_CANARY_SOURCE_TYPE` | `endpoint` | `sourceType` label. |
 | `SENSOR_ID` | *(empty)* | Optional free-text sensor id, included in canary labels and request names. |
+| `HONEYPOT_SITE_HOST` | *(falls back to `SENSOR_PRIMARY_DOMAIN`, then unset)* | This site's own public hostname, used for the absolute links traps render when the request cannot supply a usable one — which is the normal case behind a reverse proxy that rewrites `Host` to its upstream address. Must look externally reachable (not an address literal, not loopback, at least two labels) or it is ignored. See [`docs/wp-rest-index.md`](./docs/wp-rest-index.md). |
 
 ## Logging
 

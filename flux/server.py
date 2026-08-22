@@ -10926,6 +10926,41 @@ def extract_wp_login_creds(body: bytes, content_type: str) -> dict[str, str]:
 
 _WP_HOST_FALLBACK = "example.com"
 
+# The site's own public hostname, for the case below where the request
+# cannot supply one. `HONEYPOT_SITE_HOST` is the explicit setting;
+# `SENSOR_PRIMARY_DOMAIN` is read as a fallback because a deployment
+# that terminates TLS for a known name already has it in the
+# environment, and requiring it to be restated would leave the common
+# case unconfigured.
+#
+# Preferring this over the request host would be *more* faithful to
+# WordPress, which serves its stored `siteurl` regardless of which alias
+# was used to reach it. It is deliberately second anyway: an
+# externally-plausible request host is the one the client actually
+# chose, and existing traps are documented as pointing back at it.
+SITE_HOST = (
+    os.environ.get("HONEYPOT_SITE_HOST")
+    or os.environ.get("SENSOR_PRIMARY_DOMAIN")
+    or ""
+).strip().lower()
+
+
+def _wp_host_is_externally_plausible(h: str) -> bool:
+    """Whether `h` can appear in a link a client is expected to follow.
+
+    Rejects what a reverse proxy substitutes for a real name — address
+    literals and loopback — plus anything unroutable off-box or
+    syntactically unusable in a URL."""
+    if not h or any(c in h for c in (" ", "\n", "\r", '"', "<", ">", "/")):
+        return False
+    if h in ("localhost", "localhost.localdomain") or h.endswith(".local"):
+        return False
+    # Address literals: IPv6 (bracketed or colon-bearing) and dotted quads.
+    if h.startswith("[") or ":" in h:
+        return False
+    labels = h.split(".")
+    return len(labels) >= 2 and not all(label.isdigit() for label in labels)
+
 
 def _wp_user_enum_host_url(host: str) -> str:
     """Construct an `https://<host>` base URL for the absolute links the
@@ -10942,23 +10977,19 @@ def _wp_user_enum_host_url(host: str) -> str:
     fleet-wide constant, identical from every host behind such a proxy.
 
     Same reasoning, and the same test, as `_plausible_deploy_host`.
-    The fallback is deliberately an IANA reserved-for-documentation
-    name: it cannot be mistaken for a real target, and it cannot point a
-    scanner at somebody else's domain.
+
+    When the request cannot supply a usable name, `SITE_HOST` does —
+    which is what makes the links followable rather than merely safe.
+    The last resort is an IANA reserved-for-documentation name: it
+    cannot be mistaken for a real target, and it cannot point a scanner
+    at somebody else's domain, which an invented plausible one could.
     """
     h = (host or "").strip().lower().split(":", 1)[0]
-    # Obviously bogus characters that would corrupt the URL/JSON.
-    if not h or any(c in h for c in (" ", "\n", "\r", '"', "<", ">", "/")):
-        return f"https://{_WP_HOST_FALLBACK}"
-    if h in ("localhost", "localhost.localdomain") or h.endswith(".local"):
-        return f"https://{_WP_HOST_FALLBACK}"
-    # Address literals: IPv6 (bracketed or colon-bearing) and dotted quads.
-    if h.startswith("[") or ":" in h:
-        return f"https://{_WP_HOST_FALLBACK}"
-    labels = h.split(".")
-    if len(labels) < 2 or all(label.isdigit() for label in labels):
-        return f"https://{_WP_HOST_FALLBACK}"
-    return f"https://{h}"
+    if _wp_host_is_externally_plausible(h):
+        return f"https://{h}"
+    if _wp_host_is_externally_plausible(SITE_HOST):
+        return f"https://{SITE_HOST}"
+    return f"https://{_WP_HOST_FALLBACK}"
 
 
 def _wp_user_enum_fake_user(slot: dict[str, str], host_url: str) -> dict[str, object]:

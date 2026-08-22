@@ -89,9 +89,22 @@ follow — and it is a fleet-wide constant, identical from every host
 behind such a proxy. So the host is checked for external plausibility
 (not an address literal, not loopback, not `localhost`/`.local`, at
 least two labels) before it is used, the same test the deploy-config
-trap applies, and an unusable one falls back to an IANA
-reserved-for-documentation name that cannot be mistaken for a real
+trap applies.
+
+Rejecting the loopback value makes the links safe, but not followable —
+a documentation-domain link is still a dead end. So when the request
+cannot supply a usable name, the site's own public hostname does:
+`HONEYPOT_SITE_HOST`, or `SENSOR_PRIMARY_DOMAIN` where the deployment
+already has it in the environment because it terminates TLS for that
+name. It goes through the same plausibility test rather than being
+trusted. Only if that is missing too do the links fall back to an IANA
+reserved-for-documentation name, which cannot be mistaken for a real
 target or point a scanner at somebody else's domain.
+
+Serving a configured canonical hostname is what WordPress itself does —
+it renders its stored `siteurl` regardless of which alias was used to
+reach it — so this is closer to the real behaviour, not a workaround
+around it.
 
 This was found by probing a running instance, not by the unit tests:
 the tests pass a host string in directly, so they never exercised the

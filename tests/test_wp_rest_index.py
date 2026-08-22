@@ -434,3 +434,46 @@ def test_site_name_survives_an_unusable_host():
     doc = json.loads(tbenv.render_wp_rest_index("127.0.0.1"))
     assert doc["name"] == "Example"
     assert doc["url"] == "https://example.com/"
+
+
+# --- the configured site host ------------------------------------------
+#
+# Rejecting a loopback host makes the links safe; it does not make them
+# followable, and a documentation-domain link is still a dead end. The
+# deployment does know its own public name — it terminates TLS for it —
+# so that is what fills the gap when the request cannot.
+
+def test_configured_site_host_is_used_when_the_request_cannot_supply_one(
+        monkeypatch):
+    monkeypatch.setattr(tbenv, "SITE_HOST", "sensor.example.net")
+    assert tbenv._wp_user_enum_host_url("127.0.0.1") == "https://sensor.example.net"
+    assert tbenv._wp_user_enum_host_url("") == "https://sensor.example.net"
+    assert tbenv._wp_user_enum_host_url("localhost") == "https://sensor.example.net"
+
+
+def test_a_usable_request_host_still_wins(monkeypatch):
+    """The client chose that name; existing traps are documented as
+    pointing back at the host the request arrived for."""
+    monkeypatch.setattr(tbenv, "SITE_HOST", "sensor.example.net")
+    assert tbenv._wp_user_enum_host_url("shop.example.com") == "https://shop.example.com"
+
+
+def test_an_unusable_site_host_does_not_leak_into_links(monkeypatch):
+    """`SENSOR_PRIMARY_DOMAIN` is read opportunistically, so it can be
+    empty or junk. It goes through the same plausibility test as the
+    request host rather than being trusted."""
+    for bad in ("", "localhost", "127.0.0.1", "sensor", "has space", "::1"):
+        monkeypatch.setattr(tbenv, "SITE_HOST", bad)
+        assert tbenv._wp_user_enum_host_url("127.0.0.1") == "https://example.com", bad
+
+
+def test_site_host_reaches_every_wordpress_surface(monkeypatch):
+    monkeypatch.setattr(tbenv, "SITE_HOST", "sensor.example.net")
+    doc = json.loads(tbenv.render_wp_rest_index("127.0.0.1"))
+    assert doc["url"] == "https://sensor.example.net/"
+    assert doc["name"] == "Sensor"
+    assert doc["routes"]["/wp/v2/posts"]["_links"]["self"][0]["href"] == (
+        "https://sensor.example.net/wp-json/wp/v2/posts")
+    users = json.loads(tbenv.render_wp_user_enum_rest_list("127.0.0.1"))
+    assert users[0]["link"] == "https://sensor.example.net/author/admin/"
+    assert b"sensor.example.net" in tbenv.render_wp_user_enum_sitemap_xml("127.0.0.1")
