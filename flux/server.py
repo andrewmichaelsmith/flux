@@ -4340,11 +4340,14 @@ def is_wp_user_enum_path(path: str) -> bool:
     shards, and the Yoast/RankMath `author-sitemap[N].xml` variants.
 
     Strips the query string before comparing so `?per_page=100` and
-    `?context=embed` variants both dispatch.
+    `?context=embed` variants both dispatch, and strips an install
+    subdirectory the way the batch and index traps do — otherwise the
+    roster is served at `/blog/wp-json/wp/v2/posts` but not at
+    `/blog/wp-json/wp/v2/users`, a split no real install produces.
     """
     if not WP_USER_ENUM_ENABLED:
         return False
-    lp = path.lower().split("?", 1)[0]
+    lp = _wp_rest_strip_subdir(path.lower().split("?", 1)[0])
     if lp in _WP_USER_ENUM_REST_PATHS:
         return True
     # Indexed REST: `/wp-json/wp/v2/users/<id>` — accept numeric id only,
@@ -25180,7 +25183,10 @@ async def _handle_wp_user_enum(
     later attribution against `wp-login` POST follow-ups."""
     host = str(log_context.get("host", "") or "")
     method = request.method
-    lp = path.lower().split("?", 1)[0]
+    # Same normalisation the matcher applies, or a subdirectory-prefixed
+    # REST path would miss both REST branches here and fall through to
+    # the sitemap renderer — XML in answer to a JSON route.
+    lp = _wp_rest_strip_subdir(path.lower().split("?", 1)[0])
 
     indexed_id: int | None = None
     if lp.startswith("/wp-json/wp/v2/users/"):

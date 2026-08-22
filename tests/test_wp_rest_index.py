@@ -334,3 +334,45 @@ async def test_user_enum_still_owns_its_routes(flux_client):
     resp = await flux_client.get("/wp-json/wp/v2/users")
     assert resp.status == 200
     assert _last_entry(flux_client.log_path)["result"] == "wp-user-enum-rest-list"
+
+
+# --- install subdirectory consistency ----------------------------------
+#
+# The index serves subdirectory-prefixed routes, so the user roster has
+# to as well: `/blog/wp-json/wp/v2/posts` answering while
+# `/blog/wp-json/wp/v2/users` 404s under the same prefix is a split no
+# real install produces, and it is a split this trap would have
+# introduced.
+
+@pytest.mark.parametrize("prefix", ["", "/blog", "/wordpress", "/staging"])
+async def test_one_install_prefix_answers_consistently(flux_client, prefix):
+    posts = await flux_client.get(f"{prefix}/wp-json/wp/v2/posts")
+    users = await flux_client.get(f"{prefix}/wp-json/wp/v2/users")
+    index = await flux_client.get(f"{prefix}/wp-json/")
+    assert (posts.status, users.status, index.status) == (200, 200, 200), prefix
+
+
+@pytest.mark.parametrize("prefix", ["/blog", "/wordpress"])
+async def test_subdirectory_indexed_user_is_json_not_a_sitemap(
+        flux_client, prefix):
+    """The failure this guards: a subdirectory-prefixed REST path that
+    misses both REST branches of the user-enum handler falls through to
+    the sitemap renderer, answering a JSON route with XML."""
+    resp = await flux_client.get(f"{prefix}/wp-json/wp/v2/users/1")
+    assert resp.status == 200
+    assert json.loads(await resp.read())["slug"] == "admin"
+    assert _last_entry(flux_client.log_path)["result"] == "wp-user-enum-rest-single"
+
+    resp = await flux_client.get(f"{prefix}/wp-json/wp/v2/users/99")
+    assert resp.status == 404
+    assert json.loads(await resp.read())["code"] == "rest_user_invalid_id"
+
+
+async def test_sitemap_variants_are_untouched_by_subdirectory_stripping(
+        flux_client):
+    """Regression: the strip must only fire on a `/wp-json` address, or
+    it would start eating prefixes off unrelated paths."""
+    assert tbenv.is_wp_user_enum_path("/wp-sitemap-users-1.xml")
+    assert not tbenv.is_wp_user_enum_path("/blog/wp-sitemap-users-1.xml")
+    assert tbenv._wp_rest_strip_subdir("/blog/anything/else") == "/blog/anything/else"
+    assert tbenv._wp_rest_strip_subdir("/blogger/wp-json/") == "/blogger/wp-json/"
