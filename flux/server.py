@@ -10924,15 +10924,40 @@ def extract_wp_login_creds(body: bytes, content_type: str) -> dict[str, str]:
 # A single fake user object renderer is shared between the array and
 # indexed-id REST handlers so the shape is identical.
 
+_WP_HOST_FALLBACK = "example.com"
+
+
 def _wp_user_enum_host_url(host: str) -> str:
-    """Construct an `https://<host>` base URL for embedding fake author
-    archive links. Strips any explicit port and trims whitespace; falls
-    back to `example.com` when host is empty/unparseable so the JSON
-    payload still validates."""
-    h = (host or "").strip().split(":", 1)[0]
-    # Reject obviously bogus characters that would corrupt the URL/JSON.
-    if not h or any(c in h for c in (" ", "\n", "\r", '"', "<", ">")):
-        h = "example.com"
+    """Construct an `https://<host>` base URL for the absolute links the
+    WordPress surfaces embed — author archives, REST `_links` self
+    hrefs, the wlwmanifest admin URL.
+
+    The host has to look like an externally-reachable name before it is
+    used. Where a reverse proxy in front of this server rewrites `Host`
+    (and `X-Forwarded-Host` with it) to its upstream address, what
+    arrives is a loopback literal — and building links out of that is
+    worse than the 404 they replaced: every URL the document advertises
+    points the client at its own machine, so the discovery chain these
+    surfaces exist to start dead-ends on the first follow. It is also a
+    fleet-wide constant, identical from every host behind such a proxy.
+
+    Same reasoning, and the same test, as `_plausible_deploy_host`.
+    The fallback is deliberately an IANA reserved-for-documentation
+    name: it cannot be mistaken for a real target, and it cannot point a
+    scanner at somebody else's domain.
+    """
+    h = (host or "").strip().lower().split(":", 1)[0]
+    # Obviously bogus characters that would corrupt the URL/JSON.
+    if not h or any(c in h for c in (" ", "\n", "\r", '"', "<", ">", "/")):
+        return f"https://{_WP_HOST_FALLBACK}"
+    if h in ("localhost", "localhost.localdomain") or h.endswith(".local"):
+        return f"https://{_WP_HOST_FALLBACK}"
+    # Address literals: IPv6 (bracketed or colon-bearing) and dotted quads.
+    if h.startswith("[") or ":" in h:
+        return f"https://{_WP_HOST_FALLBACK}"
+    labels = h.split(".")
+    if len(labels) < 2 or all(label.isdigit() for label in labels):
+        return f"https://{_WP_HOST_FALLBACK}"
     return f"https://{h}"
 
 

@@ -72,3 +72,27 @@ The measurement this produces: a client that fetches the index and then
 fetches a route it could only have learned there is implementing the
 REST protocol rather than replaying a path dictionary, and the per-shape
 result tags keep those two populations apart in the log.
+
+## Absolute links and the proxy that hides the Host
+
+Every link these surfaces render — the index's `routes[].{_links}.self`
+hrefs, `url` / `home`, author archives, item `_links` — is absolute,
+because that is what WordPress emits. The host for them comes from
+`X-Forwarded-Host` / `Host`, and where a reverse proxy in front of this
+server rewrites both to its upstream address, that arrives as a loopback
+literal.
+
+Building links out of that is worse than the 404 they replaced: every
+URL the document advertises points the client back at its own machine,
+so the discovery chain the index exists to start dead-ends on the first
+follow — and it is a fleet-wide constant, identical from every host
+behind such a proxy. So the host is checked for external plausibility
+(not an address literal, not loopback, not `localhost`/`.local`, at
+least two labels) before it is used, the same test the deploy-config
+trap applies, and an unusable one falls back to an IANA
+reserved-for-documentation name that cannot be mistaken for a real
+target or point a scanner at somebody else's domain.
+
+This was found by probing a running instance, not by the unit tests:
+the tests pass a host string in directly, so they never exercised the
+value the deployment actually supplies.

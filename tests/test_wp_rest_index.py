@@ -376,3 +376,61 @@ async def test_sitemap_variants_are_untouched_by_subdirectory_stripping(
     assert not tbenv.is_wp_user_enum_path("/blog/wp-sitemap-users-1.xml")
     assert tbenv._wp_rest_strip_subdir("/blog/anything/else") == "/blog/anything/else"
     assert tbenv._wp_rest_strip_subdir("/blogger/wp-json/") == "/blogger/wp-json/"
+
+
+# --- host usability ----------------------------------------------------
+#
+# Found by live probe, not by the unit tests above: the tests pass a host
+# string in directly, while in production a reverse proxy rewrites both
+# `Host` and `X-Forwarded-Host` to its upstream address, so every
+# document these surfaces render was advertising `https://127.0.0.1/...`.
+# That is worse than the 404 it replaced — the discovery chain the index
+# exists to start dead-ends on the first follow — and it is identical
+# from every host behind such a proxy.
+
+@pytest.mark.parametrize("host", [
+    "127.0.0.1", "127.0.0.1:8080", "10.0.0.5", "0.0.0.0", "192.168.1.1",
+    "localhost", "localhost:80", "localhost.localdomain", "sensor.local",
+    "::1", "[::1]", "[2001:db8::1]:443",
+    "sensor",            # single label, not externally resolvable
+    "", "   ", 'bad"host', "has space",
+])
+def test_unusable_hosts_never_reach_a_rendered_link(host):
+    assert tbenv._wp_user_enum_host_url(host) == "https://example.com"
+
+
+@pytest.mark.parametrize("host", [
+    "shop.example.com", "intranet.example.net", "a.b.c.example.org",
+    "SHOP.EXAMPLE.COM", "shop.example.com:443",
+])
+def test_usable_hosts_are_used(host):
+    url = tbenv._wp_user_enum_host_url(host)
+    assert url.startswith("https://")
+    assert "example.com" in url or "example.net" in url or "example.org" in url
+    assert ":" not in url[len("https://"):]
+
+
+def test_loopback_never_appears_in_any_rendered_wordpress_document():
+    """The regression in one assertion: no document any of these
+    surfaces renders may contain a loopback address, whatever the
+    request host was."""
+    blobs = [
+        tbenv.render_wp_rest_index("127.0.0.1"),
+        tbenv.render_wp_rest_namespace_index("127.0.0.1"),
+        tbenv.render_wp_rest_descriptor("127.0.0.1", "types"),
+        tbenv.render_wp_rest_collection("127.0.0.1", "posts"),
+        tbenv.render_wp_user_enum_rest_list("127.0.0.1"),
+        tbenv.render_wp_user_enum_sitemap_xml("127.0.0.1"),
+        tbenv.render_wp_user_enum_yoast_xml("127.0.0.1"),
+    ]
+    single, _ = tbenv.render_wp_rest_single("127.0.0.1", "posts", 1)
+    blobs.append(single)
+    for blob in blobs:
+        assert b"127.0.0.1" not in blob
+        assert b"localhost" not in blob
+
+
+def test_site_name_survives_an_unusable_host():
+    doc = json.loads(tbenv.render_wp_rest_index("127.0.0.1"))
+    assert doc["name"] == "Example"
+    assert doc["url"] == "https://example.com/"
