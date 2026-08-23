@@ -30531,11 +30531,9 @@ def _oidc_collect_fields(
         elif key in _OIDC_PLAIN_FIELDS:
             plain.setdefault(key, value[:256])
 
-    for source in (query_string, ""):
-        if not source:
-            continue
+    if query_string:
         try:
-            for key, value in parse_qsl(source, keep_blank_values=True):
+            for key, value in parse_qsl(query_string, keep_blank_values=True):
                 _take(key, value)
         except Exception:  # noqa: BLE001
             pass
@@ -30720,7 +30718,7 @@ async def _handle_oidc_endpoint(
         if method in {"GET", "HEAD"}:
             status, body, headers = _oidc_json_error(
                 405, "invalid_request",
-                f"RESTEASY003065: Cannot consume content type",
+                "RESTEASY003065: Cannot consume content type",
             )
         else:
             status, body, headers = _oidc_json_error(

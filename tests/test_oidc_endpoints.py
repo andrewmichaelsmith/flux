@@ -140,32 +140,35 @@ async def test_following_every_advertised_endpoint_reaches_a_trap(
     ]
 
 
-async def test_an_advertised_route_without_a_handler_fails_the_guard(
+async def test_a_new_table_entry_is_advertised_and_served_together(
     flux_client, oidc_on, monkeypatch,
 ):
-    """Mutation check on the guard above.
+    """Mutation check: the table is genuinely the single source.
 
-    Add an endpoint to the shared table without teaching the handler
-    about it and the document starts advertising an address that 404s.
-    If this test ever passes silently, the guard has stopped guarding.
+    Adding an entry must move *both* sides at once — the document starts
+    advertising the address and the matcher starts accepting it. That is
+    the property that makes an advertised-but-404ing endpoint
+    unrepresentable, which is the defect this trap was built to remove.
+
+    If a future refactor gave the renderer and the matcher separate
+    lists, this test would fail: the document would advertise the new
+    address and following it would 404.
     """
     monkeypatch.setitem(
-        tbenv._OIDC_ENDPOINT_KINDS, "never-implemented", ("bogus_endpoint", False),
+        tbenv._OIDC_ENDPOINT_KINDS, "never-listed-elsewhere", ("bogus_endpoint", False),
     )
     resp = await flux_client.get(
         "/.well-known/openid-configuration", headers=HEADERS,
     )
     doc = json.loads(await resp.text())
-    assert "bogus_endpoint" in doc
+    assert "bogus_endpoint" in doc, "renderer does not read the table"
 
-    # The matcher does know the new suffix (both read the same table),
-    # so the failure this reproduces is the handler's, not the route's.
     path = doc["bogus_endpoint"][len("https://idp.example.com"):]
+    assert tbenv.is_oidc_endpoint_path(path) is not None, (
+        "matcher does not read the table — the two sides have drifted apart"
+    )
     followed = await flux_client.get(path, headers=HEADERS)
-    # It reaches the handler's fallback branch rather than 404ing, which
-    # is the safe direction: the table is the single source of truth, so
-    # a new suffix is served before it is described.
-    assert followed.status != 404
+    assert followed.status != 404, "advertised address 404s"
 
 
 def test_oauth_sibling_document_omits_the_oidc_only_endpoints():
