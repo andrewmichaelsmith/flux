@@ -714,6 +714,11 @@ def test_all_trap_families_default_on():
     assert tbenv.GRAPHQL_ENABLED
     assert tbenv.TELESCOPE_ENABLED
     assert tbenv.OIDC_DISCOVERY_ENABLED
+    assert tbenv.OIDC_ENDPOINTS_ENABLED, (
+        "HONEYPOT_OIDC_ENDPOINTS_ENABLED should default to True — the "
+        "discovery document advertises these addresses, so leaving them "
+        "off means publishing a document whose every link 404s."
+    )
     assert tbenv.PHPMYADMIN_ENABLED
     assert tbenv.ADMINER_ENABLED
     assert tbenv.WHM_ENABLED

@@ -3338,6 +3338,68 @@ _OIDC_DISCOVERY_NOISE_SUFFIXES = (
     "%00", "%20", ".txt", "~",
 )
 
+# --- The endpoints the discovery document advertises --------------------
+# The discovery document exists to tell a client where to send its next
+# request. Until this block, every address it published 404'd: a client
+# that read the document and followed `jwks_uri` — the cheapest and most
+# common second step — learned the issuer was fake, and the one surface
+# built to invite a follow-up instead proved there was nothing behind it.
+# Credential-bearing POSTs (`token`, `token/introspect`, `userinfo`) fell
+# through to the generic 404 and were never captured.
+#
+# `_OIDC_ENDPOINT_KINDS` is the single source both sides read: the
+# renderer builds the advertised URLs from it, and the matcher accepts
+# exactly the same suffixes. An advertised endpoint therefore cannot
+# drift away from a served one — the guard test walks the published
+# document and follows every URL in it.
+#
+# Suffix → (metadata key, OIDC-only). OIDC-only entries are omitted from
+# the RFC-8414 OAuth sibling document, which carries no userinfo or
+# session management.
+_OIDC_ENDPOINT_KINDS: dict[str, tuple[str, bool]] = {
+    "auth": ("authorization_endpoint", False),
+    "token": ("token_endpoint", False),
+    "token/introspect": ("introspection_endpoint", False),
+    "revoke": ("revocation_endpoint", False),
+    "certs": ("jwks_uri", False),
+    "clients-registrations/openid-connect": ("registration_endpoint", False),
+    "userinfo": ("userinfo_endpoint", True),
+    "logout": ("end_session_endpoint", True),
+}
+# Named by the login page's own <form action>, not by the discovery
+# document. Same class of miss as a login form whose submit target
+# 404s: the page renders, the credentials post, and nothing records
+# them. Served for that reason, excluded from the advertised-URL map.
+_OIDC_LOGIN_ACTION_SUFFIX = "login-actions/authenticate"
+
+OIDC_ENDPOINTS_ENABLED = _env_bool("HONEYPOT_OIDC_ENDPOINTS_ENABLED")
+# Keycloak ships these clients in every realm. A scanner that supplies
+# one knows the product; a scanner fuzzing `client_id` does not. Real
+# Keycloak splits on exactly this — a known client renders the login
+# page, an unknown one renders the `invalid_parameter: client_id` error
+# — so mirroring it costs no plausibility and separates the two
+# populations at the authorization endpoint.
+_OIDC_BUILTIN_CLIENT_IDS = frozenset({
+    "account", "account-console", "admin-cli", "broker",
+    "realm-management", "security-admin-console",
+})
+# Standalone JWKS spellings. A client that never reads the discovery
+# document still guesses these directly, so they answer the same
+# renderer rather than depending on the advertised address.
+_OIDC_STANDALONE_JWKS_PATHS = frozenset({
+    "/.well-known/jwks.json",
+    "/jwks.json",
+    "/oauth2/certs",
+    "/oauth/discovery/keys",
+})
+# Deployment prefixes the endpoints answer under, mirroring the
+# prefixes the discovery matcher already accepts.
+_OIDC_ENDPOINT_PREFIXES = ("/oauth/", "/oauth2/", "/idp/", "/oauth/idp/")
+OIDC_ENDPOINT_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_OIDC_ENDPOINT_BODY_DECODE_LIMIT") or "8192").strip() or "8192"),
+    256,
+)
+
 
 # --- Fake phpMyAdmin login page ----------------------------------------
 # Scanner dictionaries fan out across the classic phpMyAdmin install-
@@ -4984,6 +5046,94 @@ def _oidc_discovery_realm(path: str) -> str:
     if len(segs) >= 2 and segs[-2] == "realms":
         return segs[-1][:64]
     return ""
+
+
+def _oidc_endpoint_urls(base: str, is_oauth_sibling: bool) -> dict[str, str]:
+    """The advertised address of every endpoint, keyed by its metadata
+    field name. The discovery renderer publishes these and the matcher
+    accepts the same suffixes, so the two cannot drift apart."""
+    return {
+        key: f"{base}/{suffix}"
+        for suffix, (key, oidc_only) in _OIDC_ENDPOINT_KINDS.items()
+        if not (is_oauth_sibling and oidc_only)
+    }
+
+
+def _oidc_endpoint_base(host: str, realm: str) -> str:
+    """The prefix every advertised endpoint hangs off. Mirrors the
+    issuer shape the discovery renderer picked for the same realm."""
+    safe_host = host or "idp.internal"
+    if realm:
+        return f"https://{safe_host}/realms/{realm}/protocol/openid-connect"
+    return f"https://{safe_host}/oauth"
+
+
+@dataclass(frozen=True)
+class OidcEndpointMatch:
+    """A request that landed on one of the advertised endpoints.
+
+    `kind` is the endpoint suffix (`token`, `certs`, …) or
+    `login-actions/authenticate` for the login form's submit target.
+    `realm` is the Keycloak realm the path carried, empty for the
+    `/oauth/` placements.
+    """
+    kind: str
+    realm: str
+
+
+def _oidc_realm_from_endpoint_path(segs: list[str]) -> tuple[str, list[str]]:
+    """Split a Keycloak-style endpoint path into its realm and the
+    remaining suffix segments.
+
+    Accepts both the modern `/realms/<realm>/protocol/openid-connect/…`
+    and the legacy `/auth/realms/<realm>/…` layouts, plus the
+    `/realms/<realm>/login-actions/…` shape, which sits beside
+    `protocol/` rather than under it.
+    """
+    if segs and segs[0] == "auth":
+        segs = segs[1:]
+    if len(segs) < 3 or segs[0] != "realms":
+        return "", []
+    realm = segs[1][:64]
+    rest = segs[2:]
+    if rest[:2] == ["protocol", "openid-connect"]:
+        return realm, rest[2:]
+    if rest[:1] == ["login-actions"]:
+        return realm, rest
+    return "", []
+
+
+def is_oidc_endpoint_path(path: str) -> OidcEndpointMatch | None:
+    """Match the endpoints the discovery document advertises, plus the
+    login form's submit target and the standalone JWKS spellings.
+
+    Returns the matched endpoint kind and realm, or None. Reuses the
+    discovery normaliser so the same URL-encoded-slash and suffix-noise
+    tolerance applies here — a scanner that reaches the document through
+    `/%2F…` follows its links the same way.
+    """
+    if not OIDC_ENDPOINTS_ENABLED:
+        return None
+    p = _oidc_discovery_normalise(path).split("?", 1)[0]
+    if p in _OIDC_STANDALONE_JWKS_PATHS:
+        return OidcEndpointMatch("certs", "")
+    p = p.rstrip("/") or "/"
+    segs = [seg for seg in p.split("/") if seg]
+
+    realm, rest = _oidc_realm_from_endpoint_path(segs)
+    if rest:
+        suffix = "/".join(rest)
+        if suffix in _OIDC_ENDPOINT_KINDS or suffix == _OIDC_LOGIN_ACTION_SUFFIX:
+            return OidcEndpointMatch(suffix, realm)
+        return None
+
+    for prefix in _OIDC_ENDPOINT_PREFIXES:
+        if not p.startswith(prefix):
+            continue
+        suffix = p[len(prefix):]
+        if suffix in _OIDC_ENDPOINT_KINDS or suffix == _OIDC_LOGIN_ACTION_SUFFIX:
+            return OidcEndpointMatch(suffix, "")
+    return None
 
 
 def _liferay_has_marshaller(body_bytes: bytes) -> bool:
@@ -9528,20 +9678,18 @@ def render_oidc_discovery_json(
     # on so scanner gating-on-issuer keeps working.
     if realm:
         issuer = f"https://{safe_host}/realms/{realm}"
-        base = f"https://{safe_host}/realms/{realm}/protocol/openid-connect"
     else:
         issuer = f"https://{safe_host}"
-        base = f"https://{safe_host}/oauth"
+    base = _oidc_endpoint_base(safe_host, realm)
 
     aws = _aws(r)
     payload: dict[str, object] = {
         "issuer": issuer,
-        "authorization_endpoint": f"{base}/auth",
-        "token_endpoint": f"{base}/token",
-        "introspection_endpoint": f"{base}/token/introspect",
-        "revocation_endpoint": f"{base}/revoke",
-        "jwks_uri": f"{base}/certs",
-        "registration_endpoint": f"{base}/clients-registrations/openid-connect",
+        # Built from `_OIDC_ENDPOINT_KINDS`, the same table the matcher
+        # reads, so every address published here is an address that
+        # answers. The OIDC-only endpoints are folded in below for the
+        # non-sibling document.
+        **_oidc_endpoint_urls(base, is_oauth_sibling=True),
         "response_types_supported": [
             "code", "none", "id_token", "token", "id_token token",
             "code id_token", "code token", "code id_token token",
@@ -9588,8 +9736,12 @@ def render_oidc_discovery_json(
         # OIDC-only fields. RFC-8414 OAuth metadata documents don't
         # carry id_token signing algs / userinfo / claims.
         payload.update({
-            "userinfo_endpoint": f"{base}/userinfo",
-            "end_session_endpoint": f"{base}/logout",
+            # The two OIDC-only endpoints, from the same shared table.
+            **{
+                key: url
+                for key, url in _oidc_endpoint_urls(base, is_oauth_sibling=False).items()
+                if key not in payload
+            },
             "frontchannel_logout_session_supported": True,
             "frontchannel_logout_supported": True,
             "id_token_signing_alg_values_supported": [
@@ -9617,6 +9769,143 @@ def render_oidc_discovery_json(
             "backchannel_logout_session_supported": True,
         })
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def _b64u(raw: bytes) -> str:
+    """Unpadded base64url, the encoding JWK members use."""
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def render_oidc_jwks_json() -> bytes:
+    """The JWKS a client reaches by following `jwks_uri`.
+
+    Every value is per-hit random. A public key is not a credential, but
+    a *fixed* one would be worse than a fixed credential: it is a stable
+    string in a document scanners routinely archive, so a single shared
+    modulus would fingerprint every host serving this trap as the same
+    deployment. The modulus is random bytes rather than a real RSA key —
+    a client that parses the JWK gets a well-formed key object, and one
+    that tries to verify a signature with it fails, which is also what a
+    rotated-out key looks like.
+    """
+    # Two keys, matching the shape Keycloak serves: RS256 for signing
+    # and RSA-OAEP for encryption, plus an EC key. A client picking a
+    # key by `use`/`alg` finds the one it expects.
+    def _rsa(kid: str, alg: str, use: str) -> dict[str, object]:
+        return {
+            "kid": kid,
+            "kty": "RSA",
+            "alg": alg,
+            "use": use,
+            # 2048-bit modulus. Leading byte forced high so the value
+            # decodes to a full-length integer like a real modulus.
+            "n": _b64u(bytes([0xC0 | secrets.randbelow(0x40)]) + secrets.token_bytes(255)),
+            "e": "AQAB",
+            "x5c": [base64.b64encode(secrets.token_bytes(512)).decode("ascii")],
+            "x5t": _b64u(secrets.token_bytes(20)),
+            "x5t#S256": _b64u(secrets.token_bytes(32)),
+        }
+
+    payload = {
+        "keys": [
+            _rsa(_b64u(secrets.token_bytes(32)), "RS256", "sig"),
+            _rsa(_b64u(secrets.token_bytes(32)), "RSA-OAEP", "enc"),
+            {
+                "kid": _b64u(secrets.token_bytes(32)),
+                "kty": "EC",
+                "alg": "ES256",
+                "use": "sig",
+                "crv": "P-256",
+                "x": _b64u(secrets.token_bytes(32)),
+                "y": _b64u(secrets.token_bytes(32)),
+            },
+        ],
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def render_oidc_login_page(
+    host: str, realm: str, client_id: str, version: str,
+) -> bytes:
+    """Keycloak's realm login form.
+
+    Reached from the authorization endpoint when the request names a
+    client the product actually ships. The form action is the address
+    the credential POST goes to, and it is served — a login page whose
+    submit target 404s captures nothing from anyone who fills it in.
+    """
+    safe_host = host or "idp.internal"
+    safe_realm = realm or "master"
+    action = (
+        f"https://{safe_host}/realms/{_html_escape_attr(safe_realm)}"
+        f"/{_OIDC_LOGIN_ACTION_SUFFIX}"
+        f"?session_code={secrets.token_urlsafe(32)}"
+        f"&execution={uuid.uuid4()}"
+        f"&client_id={_html_escape_attr(client_id or 'account')}"
+        f"&tab_id={_b64u(secrets.token_bytes(8))}"
+    )
+    body = f"""<!DOCTYPE html>
+<html class="login-pf">
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Sign in to {_html_escape_attr(safe_realm)}</title>
+  <link rel="stylesheet" href="/resources/css/login.css">
+  <meta name="generator" content="Keycloak {_html_escape_attr(version)}">
+</head>
+<body class="login-pf-page">
+  <div id="kc-header-wrapper">{_html_escape_attr(safe_realm.upper())}</div>
+  <div id="kc-form">
+    <form id="kc-form-login" action="{action}" method="post">
+      <div class="form-group">
+        <label for="username">Username or email</label>
+        <input tabindex="1" id="username" name="username" type="text"
+               autofocus autocomplete="off" />
+      </div>
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input tabindex="2" id="password" name="password" type="password"
+               autocomplete="off" />
+      </div>
+      <div class="form-group">
+        <input type="hidden" name="credentialId" value="" />
+        <input tabindex="4" name="login" id="kc-login" type="submit" value="Sign In" />
+      </div>
+    </form>
+  </div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def render_oidc_error_page(host: str, realm: str, message: str) -> bytes:
+    """Keycloak's `We are sorry...` page.
+
+    What the authorization endpoint returns for a client it does not
+    recognise. Being the honest answer matters here: a scanner that
+    supplies a real Keycloak client id gets the login form and a scanner
+    fuzzing client ids gets this, which is the split a real install
+    makes.
+    """
+    safe_realm = realm or "master"
+    body = f"""<!DOCTYPE html>
+<html class="login-pf">
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex, nofollow">
+  <title>We are sorry...</title>
+  <link rel="stylesheet" href="/resources/css/login.css">
+</head>
+<body class="login-pf-page">
+  <div id="kc-header-wrapper">{_html_escape_attr(safe_realm.upper())}</div>
+  <div id="kc-error-message">
+    <p class="instruction">{_html_escape_attr(message)}</p>
+  </div>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
 
 
 def render_coldfusion_public_page(path: str, host: str, version: str) -> bytes:
@@ -30092,6 +30381,273 @@ async def _handle_oidc_discovery(
     return web.Response(status=200, body=body, headers=headers)
 
 
+# Fields worth lifting off an OAuth request. `client_secret` and
+# `password` are recorded as a hash plus a short preview rather than in
+# clear: the guess distribution is the intel, and grouping the same
+# guessed secret across source IPs only needs the hash.
+_OIDC_PLAIN_FIELDS = (
+    "client_id", "grant_type", "response_type", "scope", "state",
+    "nonce", "username", "code", "redirect_uri", "audience",
+    "token_type_hint", "code_challenge", "code_challenge_method",
+    "client_name", "device_code", "subject_token",
+)
+_OIDC_SECRET_FIELDS = ("client_secret", "password", "token", "refresh_token", "assertion")
+
+
+# Below this length a first-n/last-n preview is not a fragment of the
+# secret, it *is* the secret — most submitted passwords are shorter than
+# this. The preview exists to make long machine-issued tokens readable in
+# triage, so it is emitted only where it stays a fragment.
+_OIDC_SECRET_PREVIEW_MIN_LENGTH = 32
+
+
+def _oidc_secret_digest(value: str) -> dict[str, object]:
+    """Hash + length for a credential-shaped field, plus a preview only
+    when the value is long enough for the preview to remain a fragment.
+
+    The hash is what groups the same guessed secret across source IPs,
+    which is the measurement; the plaintext is never needed for that and
+    is never recorded.
+    """
+    raw = value.encode("utf-8", "replace")
+    out: dict[str, object] = {
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "length": len(value),
+    }
+    if len(value) >= _OIDC_SECRET_PREVIEW_MIN_LENGTH:
+        out["preview"] = f"{value[:8]}…{value[-4:]}"
+    return out
+
+
+def _oidc_collect_fields(
+    query_string: str, request_body: bytes, content_type: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Pull the OAuth parameters out of the query string and the body.
+
+    Handles both `application/x-www-form-urlencoded` (what every OAuth
+    POST uses) and JSON (what dynamic client registration uses). Returns
+    the plain fields and the digested credential-shaped ones.
+    """
+    plain: dict[str, object] = {}
+    secret: dict[str, object] = {}
+
+    def _take(key: str, value: str) -> None:
+        if not value:
+            return
+        if key in _OIDC_SECRET_FIELDS:
+            secret.setdefault(key, _oidc_secret_digest(value))
+        elif key in _OIDC_PLAIN_FIELDS:
+            plain.setdefault(key, value[:256])
+
+    for source in (query_string, ""):
+        if not source:
+            continue
+        try:
+            for key, value in parse_qsl(source, keep_blank_values=True):
+                _take(key, value)
+        except Exception:  # noqa: BLE001
+            pass
+
+    body = request_body[:OIDC_ENDPOINT_BODY_DECODE_LIMIT]
+    if not body:
+        return plain, secret
+    text = body.decode("utf-8", "replace")
+    if "json" in content_type.lower():
+        try:
+            parsed = json.loads(text)
+        except Exception:  # noqa: BLE001
+            parsed = None
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                if isinstance(value, str):
+                    _take(key, value)
+                elif key == "redirect_uris" and isinstance(value, list):
+                    # Dynamic client registration: the callback the
+                    # caller wants tokens delivered to, i.e. their own
+                    # infrastructure. Same class of signal as an
+                    # out-of-band callback host lifted from an exploit
+                    # body — durable across source-IP rotation.
+                    plain.setdefault(
+                        "redirect_uris",
+                        [str(v)[:256] for v in value[:8]],
+                    )
+    else:
+        try:
+            for key, value in parse_qsl(text, keep_blank_values=True):
+                _take(key, value)
+        except Exception:  # noqa: BLE001
+            pass
+    return plain, secret
+
+
+def _oidc_bearer_token(request: web.Request) -> str:
+    """The presented bearer token, if any. A client reaching userinfo or
+    registration with a token is replaying something it already holds,
+    which is a different population from one probing the endpoint bare."""
+    auth = request.headers.get("Authorization", "")
+    if auth[:7].lower() == "bearer ":
+        return auth[7:].strip()
+    return ""
+
+
+def _oidc_json_error(
+    status: int, error: str, description: str,
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[int, bytes, dict[str, str]]:
+    body = json.dumps(
+        {"error": error, "error_description": description},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "Server": "nginx/1.24.0",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return status, body, headers
+
+
+async def _handle_oidc_endpoint(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+    match: "OidcEndpointMatch",
+) -> web.Response:
+    """The endpoints the discovery document advertises.
+
+    Each answer is the one a real Keycloak gives an unauthenticated
+    caller, because that is what tells the client the endpoint is
+    registered. A 404 says the opposite, and said it for every address
+    the document published until this handler existed.
+
+    The credential-bearing endpoints answer `invalid_client` rather than
+    accepting anything: accepting a guessed secret would mean the log
+    could not distinguish a guess from a real credential, and the guess
+    distribution is the measurement. What each request carried is logged
+    either way.
+
+    No canary is issued here. The discovery document already carries
+    one, and this surface's signal is the submitted credential and the
+    caller's own callback address rather than a replay.
+    """
+    method = request.method
+    kind = match.kind
+    realm = match.realm
+    host = str(log_context.get("host", ""))
+    content_type = request.headers.get("Content-Type", "")
+
+    plain, secret = _oidc_collect_fields(query_string, request_body, content_type)
+    bearer = _oidc_bearer_token(request)
+
+    log_extra: dict[str, object] = {
+        "oidcEndpointPath": path,
+        "oidcEndpointKind": kind,
+        "oidcEndpointMethod": method,
+        "oidcEndpointRealm": realm,
+    }
+    if plain:
+        log_extra["oidcEndpointFields"] = plain
+    if secret:
+        log_extra["oidcEndpointSecrets"] = secret
+    if bearer:
+        log_extra["oidcEndpointBearer"] = _oidc_secret_digest(bearer)
+
+    result = f"oidc-{kind.replace('/', '-')}"
+
+    if kind == "certs":
+        body = render_oidc_jwks_json()
+        status, headers = 200, {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Server": "nginx/1.24.0",
+        }
+    elif kind == "auth":
+        client_id = str(plain.get("client_id", ""))
+        if client_id.lower() in _OIDC_BUILTIN_CLIENT_IDS:
+            body = render_oidc_login_page(
+                host, realm, client_id, OIDC_DISCOVERY_VERSION,
+            )
+            status = 200
+            result = "oidc-auth-login-form"
+        else:
+            body = render_oidc_error_page(
+                host, realm,
+                "We are sorry... Invalid parameter: client_id",
+            )
+            status = 400
+            result = "oidc-auth-unknown-client"
+        headers = {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Server": "nginx/1.24.0",
+        }
+    elif kind == _OIDC_LOGIN_ACTION_SUFFIX:
+        # The login form's submit target. Real Keycloak re-renders the
+        # form with an error notice on a bad password, so the caller
+        # can keep trying — which is the behaviour that keeps a brute
+        # loop submitting rather than moving on after one attempt.
+        body = render_oidc_login_page(
+            host, realm, str(plain.get("client_id", "")), OIDC_DISCOVERY_VERSION,
+        )
+        status, headers = 200, {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Server": "nginx/1.24.0",
+        }
+        result = "oidc-login-credential-post" if secret.get("password") else "oidc-login-form"
+    elif kind == "userinfo":
+        status, body, headers = _oidc_json_error(
+            401, "invalid_token", "Token verification failed",
+            {"WWW-Authenticate": f'Bearer realm="{realm or "master"}", error="invalid_token"'},
+        )
+    elif kind == "clients-registrations/openid-connect":
+        status, body, headers = _oidc_json_error(
+            401, "invalid_token",
+            "Failed to verify token: no initial access token provided",
+        )
+    elif kind == "logout":
+        # Deliberately never redirects to a caller-supplied address.
+        # Honouring `post_logout_redirect_uri` would turn the sensor
+        # into an open redirector pointed wherever the caller likes,
+        # which is a real capability to hand out for no extra signal —
+        # the address is already logged from the query string.
+        body = render_oidc_error_page(
+            host, realm, "Invalid parameter: post_logout_redirect_uri",
+        )
+        status, headers = 400, {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Server": "nginx/1.24.0",
+        }
+    else:
+        # token, token/introspect, revoke — the form-POST endpoints.
+        if method in {"GET", "HEAD"}:
+            status, body, headers = _oidc_json_error(
+                405, "invalid_request",
+                f"RESTEASY003065: Cannot consume content type",
+            )
+        else:
+            status, body, headers = _oidc_json_error(
+                401, "invalid_client",
+                "Invalid client or Invalid client credentials",
+            )
+
+    append_log({
+        **log_context,
+        "status": status,
+        "result": result,
+        **log_extra,
+        "bytes": len(body),
+    })
+    if method == "HEAD":
+        return web.Response(status=status, headers=headers)
+    return web.Response(status=status, body=body, headers=headers)
+
+
 async def _handle_coldfusion(
     request: web.Request,
     log_context: dict[str, object],
@@ -32976,6 +33532,18 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if API_KEY and is_oidc_discovery_path(path):
         return await _handle_oidc_discovery(request, log_context, path)
+
+    # Gated on the same condition as the document that advertises them,
+    # so the IdP surface appears and disappears as a whole. A deployment
+    # that 404s the discovery document must not answer its endpoints —
+    # that inconsistency is exactly what this trap exists to remove.
+    if API_KEY:
+        _oidc_endpoint = is_oidc_endpoint_path(path)
+        if _oidc_endpoint is not None:
+            return await _handle_oidc_endpoint(
+                request, log_context, path, query_string, request_body,
+                _oidc_endpoint,
+            )
 
     if is_phpmyadmin_path(path):
         return await _handle_phpmyadmin(request, log_context, path, request_body)

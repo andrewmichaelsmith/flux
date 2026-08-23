@@ -6,6 +6,12 @@ discovery. The Tracebit AWS canary lands in non-standard extension
 fields that credential harvesters grep for `AKIA…` literals — replay
 against AWS fires the canary.
 
+The endpoints this document advertises are served by the
+[OIDC endpoints trap](./oidc-endpoints.md) — `jwks_uri`, the token /
+introspection / userinfo endpoints and the rest. They returned 404 until
+that trap existed, so a client that read this document and followed any
+link in it learned the issuer was fake.
+
 | Path | Methods | Response |
 | --- | --- | --- |
 | `/.well-known/openid-configuration` | any | RFC-shaped OIDC discovery JSON with embedded canary; `oidc-discovery` |
