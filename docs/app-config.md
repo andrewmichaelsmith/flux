@@ -22,7 +22,7 @@ greps raw bytes for `AKIA`, and the per-format log tags separate them.
 
 | Family | Path(s) | Renderer | Canary slot |
 | --- | --- | --- | --- |
-| `app-config-php` | `/config.php`, `/configuration.php`, `/settings.php`, `/local.config.php`, `/config/config.php`, `/includes/config.php`, `/inc/config.php`, `/include/config.php`, `/application/config/config.php`, plus editor/backup siblings (`.bak`, `.old`, `.save`, `.orig`, `.swp`, `~`, `.txt`) and the `_app_layout_variants` webroot-prefix matrix | `render_php_config` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` `define()` constants |
+| `app-config-php` | `/config.php`, `/configuration.php`, `/settings.php`, `/local.config.php`, `/config/config.php`, `/includes/config.php`, `/inc/config.php`, `/include/config.php`, `/application/config/config.php`, plus the family-wide editor/backup sibling set (`.bak`, `.old`, `.save`, `.orig`, `.swp`, `~`) and `.txt` and the `_app_layout_variants` webroot-prefix matrix | `render_php_config` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` `define()` constants |
 | `app-config-php-database` | `/config/database.php`, `/config/db.php`, `/config/connection.php`, `/application/config/database.php`, plus backup and webroot-prefix variants | `render_php_database_config` | `connections.backups.key` / `secret` / `token` |
 | `app-config-php-mail` | `/config/mail.php`, `/config/mailer.php`, `/config/email.php`, `/config/smtp.php`, plus backup and webroot-prefix variants | `render_php_mail_config` | `mailers.ses.key` / `secret` / `token` |
 | `app-config-php-services` | `/config/services.php`, `/config/api.php`, `/config/keys.php`, `/config/credentials.php`, `/config/app.php`, `/config/secrets.php`, plus backup and webroot-prefix variants | `render_php_services_config` | `aws.key` / `secret` / `token` |
@@ -77,3 +77,32 @@ format-correct body turns each of those requests into a canary issuance
 instead of a 404, and — because the response is parseable rather than a
 stub — gives a downstream signal on whether the harvester consumes what
 it collects.
+
+## Editor / backup leftovers are a rule, not a list
+
+A harvester dictionary walks the `.bak` / `.old` / `~` form of every
+config file it probes, because a webroot that serves the original
+usually serves the backup as plain text even where PHP execution is on.
+
+The sibling set used to be hand-written per path, and had drifted:
+`/config.php` carried six siblings, `/configuration.php` three,
+`/settings.php` two, and `/includes/config.php` none. That split one
+dictionary pass across two outcomes for no reason the caller could see —
+the same sweep asking for `/config.php.swp` and `/settings.php.swp` got a
+config from the first and a 404 from the second.
+
+The set is now filled by a rule over the whole family, so a path added
+later gets its siblings without anyone remembering to. Two properties
+keep it safe, both pinned by tests:
+
+- **It can only add.** The fill uses `setdefault`, so a suffix spelling a
+  framework-specific trap already owns (`/wp-config.php.bak`,
+  `/.env.old`, `/config/database.yml.bak`) keeps its own renderer. The
+  fill can turn a 404 into an answer; it can never move a route.
+- **A sibling renders the same document as its base.** A `.bak` routing
+  to a different renderer than the file it is a backup of would hand one
+  caller two different configs for the same path, which is a tell rather
+  than a trap.
+
+Leftovers are not stacked (`/config.php.bak.old` is not served) — no
+scanner asks for that spelling.

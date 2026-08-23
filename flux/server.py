@@ -23585,6 +23585,44 @@ for _trap in CANARY_TRAPS:
     for _p in _trap.paths:
         _TRAP_BY_PATH[_p.lower()] = _trap
 
+# --- Editor / backup leftovers across the app-config family -------------
+# A harvester dictionary walks the `.bak` / `.old` / `~` form of every
+# config file it probes, because a webroot that serves the original
+# usually serves the backup as plain text even where PHP execution is on.
+# The family is documented as carrying that whole sibling set, but the
+# variants were hand-written per path, so the set drifted: `/config.php`
+# had six siblings, `/configuration.php` three, `/settings.php` two, and
+# `/includes/config.php` none. One dictionary pass therefore split across
+# two outcomes for no reason the caller could see.
+#
+# Filled here rather than in the tables because it is a property of the
+# family, not of each path. `setdefault` is load-bearing: a suffix
+# spelling another trap already owns keeps its owner, so this can only
+# ever add a 404-to-answer and never move an existing route.
+_APP_CONFIG_EDITOR_SUFFIXES = (".bak", ".old", ".save", ".orig", ".swp", "~")
+_APP_CONFIG_SUFFIX_FAMILY = frozenset({
+    "app-config-php",
+    "app-config-php-database",
+    "app-config-php-mail",
+    "app-config-php-services",
+    "app-config-python",
+    "app-config-yaml",
+    "app-config-toml",
+    "app-config-json",
+    "app-config-properties",
+})
+for _trap in CANARY_TRAPS:
+    if _trap.name not in _APP_CONFIG_SUFFIX_FAMILY:
+        continue
+    for _p in _trap.paths:
+        _low = _p.lower()
+        # Don't stack a leftover on a leftover (`/config.php.bak.old`);
+        # no scanner asks for that and it doubles the table for nothing.
+        if _low.endswith(_APP_CONFIG_EDITOR_SUFFIXES):
+            continue
+        for _suffix in _APP_CONFIG_EDITOR_SUFFIXES:
+            _TRAP_BY_PATH.setdefault(_low + _suffix, _trap)
+
 
 # Absolute system paths answered on the filesystem-read surface, mapped to
 # (log-tag suffix, renderer, content type). Matched exactly against the
