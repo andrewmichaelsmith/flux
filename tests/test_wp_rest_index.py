@@ -396,7 +396,7 @@ async def test_sitemap_variants_are_untouched_by_subdirectory_stripping(
     "", "   ", 'bad"host', "has space",
 ])
 def test_unusable_hosts_never_reach_a_rendered_link(host):
-    assert tbenv._wp_user_enum_host_url(host) == "https://example.com"
+    assert tbenv._external_base_url(host) == "https://example.com"
 
 
 @pytest.mark.parametrize("host", [
@@ -404,7 +404,7 @@ def test_unusable_hosts_never_reach_a_rendered_link(host):
     "SHOP.EXAMPLE.COM", "shop.example.com:443",
 ])
 def test_usable_hosts_are_used(host):
-    url = tbenv._wp_user_enum_host_url(host)
+    url = tbenv._external_base_url(host)
     assert url.startswith("https://")
     assert "example.com" in url or "example.net" in url or "example.org" in url
     assert ":" not in url[len("https://"):]
@@ -446,16 +446,16 @@ def test_site_name_survives_an_unusable_host():
 def test_configured_site_host_is_used_when_the_request_cannot_supply_one(
         monkeypatch):
     monkeypatch.setattr(tbenv, "SITE_HOST", "sensor.example.net")
-    assert tbenv._wp_user_enum_host_url("127.0.0.1") == "https://sensor.example.net"
-    assert tbenv._wp_user_enum_host_url("") == "https://sensor.example.net"
-    assert tbenv._wp_user_enum_host_url("localhost") == "https://sensor.example.net"
+    assert tbenv._external_base_url("127.0.0.1") == "https://sensor.example.net"
+    assert tbenv._external_base_url("") == "https://sensor.example.net"
+    assert tbenv._external_base_url("localhost") == "https://sensor.example.net"
 
 
 def test_a_usable_request_host_still_wins(monkeypatch):
     """The client chose that name; existing traps are documented as
     pointing back at the host the request arrived for."""
     monkeypatch.setattr(tbenv, "SITE_HOST", "sensor.example.net")
-    assert tbenv._wp_user_enum_host_url("shop.example.com") == "https://shop.example.com"
+    assert tbenv._external_base_url("shop.example.com") == "https://shop.example.com"
 
 
 def test_an_unusable_site_host_does_not_leak_into_links(monkeypatch):
@@ -464,7 +464,7 @@ def test_an_unusable_site_host_does_not_leak_into_links(monkeypatch):
     request host rather than being trusted."""
     for bad in ("", "localhost", "127.0.0.1", "sensor", "has space", "::1"):
         monkeypatch.setattr(tbenv, "SITE_HOST", bad)
-        assert tbenv._wp_user_enum_host_url("127.0.0.1") == "https://example.com", bad
+        assert tbenv._external_base_url("127.0.0.1") == "https://example.com", bad
 
 
 def test_site_host_reaches_every_wordpress_surface(monkeypatch):

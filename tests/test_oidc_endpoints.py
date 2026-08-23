@@ -171,6 +171,79 @@ async def test_a_new_table_entry_is_advertised_and_served_together(
     assert followed.status != 404, "advertised address 404s"
 
 
+# --- the host the document publishes -----------------------------------
+
+@pytest.mark.parametrize("proxy_host", [
+    "127.0.0.1", "localhost", "::1", "[::1]", "10.0.0.5", "192.168.1.1",
+    "127.0.0.1:18081", "",
+])
+def test_a_proxy_rewritten_host_never_reaches_the_published_urls(proxy_host):
+    """Reproduces the deployment condition, which is what the other
+    tests could not see.
+
+    A reverse proxy in front of this server rewrites `Host` (and
+    `X-Forwarded-Host` with it) to its upstream address. Every test that
+    passes a hostname straight into the renderer is blind to that, and
+    the document shipped `issuer: https://127.0.0.1` with all nine of its
+    endpoints under it because of exactly that blind spot. Found by
+    probing a deployment, not by reading the code.
+    """
+    doc = json.loads(
+        tbenv.render_oidc_discovery_json(
+            FAKE_TRACEBIT, proxy_host, "", False, "24.0.5",
+        )
+    )
+    published = [
+        v for k, v in doc.items()
+        if (k == "issuer" or k.endswith(("_endpoint", "_uri"))) and isinstance(v, str)
+    ]
+    assert len(published) >= 9
+    for url in published:
+        assert "127.0.0.1" not in url, url
+        assert "localhost" not in url, url
+        assert "::1" not in url, url
+        assert "10.0.0.5" not in url and "192.168.1.1" not in url, url
+        assert url.startswith("https://"), url
+        # And it must still be a followable name, not an empty authority.
+        authority = url[len("https://"):].split("/", 1)[0]
+        assert tbenv._host_is_externally_plausible(authority), url
+
+
+def test_the_login_form_action_is_not_loopback_either():
+    """The action is an absolute URL the browser posts to. A loopback
+    one posts the credentials to the client's own machine."""
+    body = tbenv.render_oidc_login_page("127.0.0.1", "master", "account", "24.0.5").decode()
+    action = body.split('action="', 1)[1].split('"', 1)[0]
+    assert "127.0.0.1" not in action
+    assert action.startswith("https://")
+
+
+async def test_over_the_wire_a_rewritten_host_still_publishes_followable_urls(
+    flux_client, oidc_on, monkeypatch,
+):
+    """End to end through the real dispatch, with the header a proxy
+    actually sends."""
+    resp = await flux_client.get(
+        "/.well-known/openid-configuration",
+        headers={
+            "X-Forwarded-Host": "127.0.0.1",
+            "X-Forwarded-For": "203.0.113.7",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+    doc = json.loads(await resp.text())
+    assert "127.0.0.1" not in json.dumps(doc)
+
+    # Every advertised path still resolves when followed relative to the
+    # server, which is what makes the fix a fix rather than a mask.
+    for key, url in doc.items():
+        if not (key.endswith(("_endpoint", "_uri")) and isinstance(url, str)):
+            continue
+        path = "/" + url.split("/", 3)[3] if url.count("/") >= 3 else "/"
+        followed = await flux_client.get(path, headers=HEADERS)
+        assert followed.status != 404, f"{key} -> {path}"
+
+
 def test_oauth_sibling_document_omits_the_oidc_only_endpoints():
     oauth = json.loads(
         tbenv.render_oidc_discovery_json(FAKE_TRACEBIT, "idp.example.com", "", True, "24.0.5")

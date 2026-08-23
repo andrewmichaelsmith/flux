@@ -5061,11 +5061,18 @@ def _oidc_endpoint_urls(base: str, is_oauth_sibling: bool) -> dict[str, str]:
 
 def _oidc_endpoint_base(host: str, realm: str) -> str:
     """The prefix every advertised endpoint hangs off. Mirrors the
-    issuer shape the discovery renderer picked for the same realm."""
-    safe_host = host or "idp.internal"
+    issuer shape the discovery renderer picked for the same realm.
+
+    Goes through `_external_base_url` because these strings are
+    published as absolute URLs a client is expected to follow. Behind a
+    reverse proxy that rewrites `Host`, the raw value is a loopback
+    literal, and a document advertising nine endpoints on `127.0.0.1`
+    points every client at its own machine.
+    """
+    base_url = _external_base_url(host)
     if realm:
-        return f"https://{safe_host}/realms/{realm}/protocol/openid-connect"
-    return f"https://{safe_host}/oauth"
+        return f"{base_url}/realms/{realm}/protocol/openid-connect"
+    return f"{base_url}/oauth"
 
 
 @dataclass(frozen=True)
@@ -9673,14 +9680,14 @@ def render_oidc_discovery_json(
     whether the surrounding schema is RFC-shape; on replay against AWS
     those creds fire the canary.
     """
-    safe_host = host or "idp.internal"
     # Build the issuer to match the deployment shape the request landed
-    # on so scanner gating-on-issuer keeps working.
-    if realm:
-        issuer = f"https://{safe_host}/realms/{realm}"
-    else:
-        issuer = f"https://{safe_host}"
-    base = _oidc_endpoint_base(safe_host, realm)
+    # on so scanner gating-on-issuer keeps working. The host goes through
+    # the external-plausibility test first — `issuer` and every endpoint
+    # below it are absolute URLs a client follows, and a proxy that
+    # rewrites `Host` otherwise turns all of them into loopback.
+    site = _external_base_url(host)
+    issuer = f"{site}/realms/{realm}" if realm else site
+    base = _oidc_endpoint_base(host, realm)
 
     aws = _aws(r)
     payload: dict[str, object] = {
@@ -9834,10 +9841,14 @@ def render_oidc_login_page(
     the credential POST goes to, and it is served — a login page whose
     submit target 404s captures nothing from anyone who fills it in.
     """
-    safe_host = host or "idp.internal"
+    # The form action is an absolute URL the browser posts to, so it
+    # gets the same external-plausibility treatment as the discovery
+    # document's endpoints. A loopback action posts the credentials to
+    # the client's own machine and we capture nothing.
+    site = _external_base_url(host)
     safe_realm = realm or "master"
     action = (
-        f"https://{safe_host}/realms/{_html_escape_attr(safe_realm)}"
+        f"{site}/realms/{_html_escape_attr(safe_realm)}"
         f"/{_OIDC_LOGIN_ACTION_SUFFIX}"
         f"?session_code={secrets.token_urlsafe(32)}"
         f"&execution={uuid.uuid4()}"
@@ -11075,7 +11086,7 @@ def render_wp_wlwmanifest_xml(host: str) -> bytes:
     versions; we point the imageUrl / adminUrl at the request host so
     a scanner that follows the embedded URLs lands back on the sensor's
     wp-admin / wp-login traps."""
-    base = _wp_user_enum_host_url(host)
+    base = _external_base_url(host)
     body = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<manifest xmlns="http://schemas.microsoft.com/wlw/manifest/weblog">\n'
@@ -11213,7 +11224,7 @@ def extract_wp_login_creds(body: bytes, content_type: str) -> dict[str, str]:
 # A single fake user object renderer is shared between the array and
 # indexed-id REST handlers so the shape is identical.
 
-_WP_HOST_FALLBACK = "example.com"
+_EXTERNAL_HOST_FALLBACK = "example.com"
 
 # The site's own public hostname, for the case below where the request
 # cannot supply one. `HONEYPOT_SITE_HOST` is the explicit setting;
@@ -11234,7 +11245,7 @@ SITE_HOST = (
 ).strip().lower()
 
 
-def _wp_host_is_externally_plausible(h: str) -> bool:
+def _host_is_externally_plausible(h: str) -> bool:
     """Whether `h` can appear in a link a client is expected to follow.
 
     Rejects what a reverse proxy substitutes for a real name — address
@@ -11251,10 +11262,11 @@ def _wp_host_is_externally_plausible(h: str) -> bool:
     return len(labels) >= 2 and not all(label.isdigit() for label in labels)
 
 
-def _wp_user_enum_host_url(host: str) -> str:
-    """Construct an `https://<host>` base URL for the absolute links the
-    WordPress surfaces embed — author archives, REST `_links` self
-    hrefs, the wlwmanifest admin URL.
+def _external_base_url(host: str) -> str:
+    """Construct an `https://<host>` base URL for the absolute links any
+    surface embeds — the WordPress author archives and REST `_links`
+    self hrefs, the OIDC issuer and every endpoint the discovery
+    document advertises.
 
     The host has to look like an externally-reachable name before it is
     used. Where a reverse proxy in front of this server rewrites `Host`
@@ -11267,6 +11279,14 @@ def _wp_user_enum_host_url(host: str) -> str:
 
     Same reasoning, and the same test, as `_plausible_deploy_host`.
 
+    Every renderer that publishes an absolute URL has to call this. The
+    OIDC discovery document did not, and shipped
+    `issuer: https://127.0.0.1` with all nine of its endpoints under it
+    for as long as it existed — the same defect this helper was written
+    for, in a second family, found by probing a deployment rather than
+    by reading the code. Unit tests pass a hostname straight into the
+    renderer, so they cannot see it.
+
     When the request cannot supply a usable name, `SITE_HOST` does —
     which is what makes the links followable rather than merely safe.
     The last resort is an IANA reserved-for-documentation name: it
@@ -11274,11 +11294,11 @@ def _wp_user_enum_host_url(host: str) -> str:
     at somebody else's domain, which an invented plausible one could.
     """
     h = (host or "").strip().lower().split(":", 1)[0]
-    if _wp_host_is_externally_plausible(h):
+    if _host_is_externally_plausible(h):
         return f"https://{h}"
-    if _wp_host_is_externally_plausible(SITE_HOST):
+    if _host_is_externally_plausible(SITE_HOST):
         return f"https://{SITE_HOST}"
-    return f"https://{_WP_HOST_FALLBACK}"
+    return f"https://{_EXTERNAL_HOST_FALLBACK}"
 
 
 def _wp_user_enum_fake_user(slot: dict[str, str], host_url: str) -> dict[str, object]:
@@ -11313,7 +11333,7 @@ def _wp_user_enum_fake_user(slot: dict[str, str], host_url: str) -> dict[str, ob
 
 def render_wp_user_enum_rest_list(host: str) -> bytes:
     """`/wp-json/wp/v2/users` — JSON array of every fake user."""
-    base = _wp_user_enum_host_url(host)
+    base = _external_base_url(host)
     users = [_wp_user_enum_fake_user(slot, base) for slot in _WP_USER_ENUM_FAKE_USERS]
     return json.dumps(users, separators=(",", ":")).encode("utf-8")
 
@@ -11324,7 +11344,7 @@ def render_wp_user_enum_rest_single(host: str, user_id: int) -> bytes:
     `rest_user_invalid_id` payload for unknown ids; we mirror that so a
     scanner walking ids `1..50` sees the expected envelope and stops at
     the first miss, instead of hammering until rate-limited."""
-    base = _wp_user_enum_host_url(host)
+    base = _external_base_url(host)
     for slot in _WP_USER_ENUM_FAKE_USERS:
         if int(slot["id"]) == user_id:
             return json.dumps(
@@ -11344,7 +11364,7 @@ def render_wp_user_enum_sitemap_xml(host: str) -> bytes:
     """`/wp-sitemap-users-N.xml` — WordPress 5.5+ core sitemap shape.
     Includes the XSL stylesheet PI that real WP emits so curl/wget
     captures + browser views both look authentic."""
-    base = _wp_user_enum_host_url(host)
+    base = _external_base_url(host)
     lines = [
         b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
         f"<?xml-stylesheet type=\"text/xsl\" href=\"{base}/wp-sitemap.xsl\" ?>".encode("utf-8"),
@@ -11361,7 +11381,7 @@ def render_wp_user_enum_sitemap_xml(host: str) -> bytes:
 def render_wp_user_enum_yoast_xml(host: str) -> bytes:
     """`/author-sitemap.xml` — Yoast SEO author sitemap. Same shape as
     the core sitemap but with the Yoast XSL stylesheet."""
-    base = _wp_user_enum_host_url(host)
+    base = _external_base_url(host)
     lines = [
         b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
         f"<?xml-stylesheet type=\"text/xsl\" href=\"{base}/main-sitemap.xsl\" ?>".encode("utf-8"),
@@ -11384,7 +11404,7 @@ def _wp_rest_site_name(host: str) -> str:
     """Derive a plausible site title from the request Host so the index
     is not the same document on every sensor. `shop.example.co.uk` ->
     `Shop`. Falls back to a generic title when the Host is unusable."""
-    h = _wp_user_enum_host_url(host)
+    h = _external_base_url(host)
     label = h.split("://", 1)[-1].split(".", 1)[0]
     label = re.sub(r"[^A-Za-z0-9-]", "", label).replace("-", " ").strip()
     return label.title() if label else "My Site"
@@ -11435,7 +11455,7 @@ def render_wp_rest_index(host: str) -> bytes:
     namespaces, and a `routes` map whose self links are the addresses a
     client is expected to follow next. Only routes this server answers
     are listed."""
-    base = _wp_user_enum_host_url(host)
+    base = _external_base_url(host)
     routes = {
         route: _wp_rest_route_entry(base, route, methods)
         for route, methods in _wp_rest_advertised_routes()
@@ -11462,7 +11482,7 @@ def render_wp_rest_namespace_index(host: str) -> bytes:
     """`/wp-json/wp/v2` — the namespace index. Same document shape as
     the root index, filtered to one namespace, which is exactly what
     WordPress returns for a namespace request."""
-    base = _wp_user_enum_host_url(host)
+    base = _external_base_url(host)
     prefix = f"/{_WP_REST_NAMESPACE}"
     routes = {
         route: _wp_rest_route_entry(base, route, methods)
@@ -11531,7 +11551,7 @@ def render_wp_rest_collection(host: str, name: str) -> bytes:
     """A `wp/v2/<collection>` listing. Empty collections return `[]`,
     which is what a real small install returns — an error envelope
     would be the lie."""
-    base = _wp_user_enum_host_url(host)
+    base = _external_base_url(host)
     if name == "posts":
         items: list[object] = [
             _wp_rest_post_object(base, s, "post") for s in _WP_REST_FAKE_POSTS
@@ -11561,7 +11581,7 @@ def render_wp_rest_single(host: str, name: str, item_id: int) -> tuple[bytes, in
     reads `rest_post_invalid_id` as 'REST is live, that id is not', and
     a bare 404 page as 'REST is off'. The two produce different next
     requests."""
-    base = _wp_user_enum_host_url(host)
+    base = _external_base_url(host)
     slots = _WP_REST_FAKE_POSTS if name == "posts" else (
         _WP_REST_FAKE_PAGES if name == "pages" else ()
     )
@@ -11592,7 +11612,7 @@ def render_wp_rest_single(host: str, name: str, item_id: int) -> tuple[bytes, in
 def render_wp_rest_descriptor(host: str, name: str) -> bytes:
     """`types` / `taxonomies` / `statuses` — the read-only descriptor
     objects a fingerprinting client reads to confirm the install."""
-    base = _wp_user_enum_host_url(host)
+    base = _external_base_url(host)
     if name == "types":
         doc: dict[str, object] = {
             key: {
@@ -25757,7 +25777,7 @@ async def _handle_wp_rest_index(
         "Content-Length": str(len(body)),
         # WordPress advertises the REST root on every response; a client
         # that discovered us by path can still find the index from here.
-        "Link": f'<{_wp_user_enum_host_url(host)}/wp-json/>; rel="https://api.w.org/"',
+        "Link": f'<{_external_base_url(host)}/wp-json/>; rel="https://api.w.org/"',
         "X-Robots-Tag": "noindex",
     })
     return web.Response(status=status, body=response_body, headers=headers)
