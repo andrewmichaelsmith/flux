@@ -13,7 +13,7 @@ directory instead of `public/`) leak all four in one shot.
 
 | Family | Path(s) | Renderer | Canary slot |
 | --- | --- | --- | --- |
-| `rails-database-yml` | `/config/database.yml` plus editor/backup variants (`.example`, `.sample`, `.dist`, `.default`, `.bak`, `.old`, `.save`, `.orig`, `.swp`, `~`), dialect variants (`.pgsql`, `.postgres`, `.postgresql`, `.mysql`, `.sqlite`, `.sqlite3`), leading-dot vim swap (`/.config/database.yml.swp`), and app-layout webroot-prefix variants (`/app/`, `/storage/`, `/backend/`, `/backup/`, `/public/`, `/public_html/`, `/www/`, `/htdocs/`) | `render_rails_database_yml` | `production.s3_bucket_key_id` / `s3_bucket_secret` / `s3_bucket_session_token` |
+| `rails-database-yml` | `/config/database.yml` plus editor/backup variants (`.example`, `.sample`, `.dist`, `.default`, `.bak`, `.old`, `.save`, `.orig`, `.swp`, `~`), dialect variants (`.pgsql`, `.postgres`, `.postgresql`, `.mysql`, `.sqlite`, `.sqlite3`), leading-dot vim swap (`/.config/database.yml.swp`), app-layout webroot-prefix variants (`/app/`, `/storage/`, `/backend/`, `/backup/`, `/public/`, `/public_html/`, `/www/`, `/htdocs/`), the webroot-dropped leaf (`/database.yml`, `/database.yaml`, `/db.yml`, `/db.yaml` + `.bak` / `.old` / `~`), and the application-prefixed spellings where the prefix replaces `config/` (`/{api,app,backend,server,services,src,db,conf}/database.yml`) | `render_rails_database_yml` | `production.s3_bucket_key_id` / `s3_bucket_secret` / `s3_bucket_session_token` |
 | `rails-secrets-yml` | `/config/secrets.yml` plus the same editor/backup/webroot-prefix matrix | `render_rails_secrets_yml` | `production.aws.access_key_id` / `secret_access_key` / `session_token` |
 | `rails-master-key` | `/config/master.key` plus backup variants and Rails 6+ multi-environment `/config/credentials/{production,staging,development,test}.key` | `render_rails_master_key` | (no canary slot — bare AES key) |
 | `rails-credentials-enc` | `/config/credentials.yml.enc` plus backup variants and Rails 6+ multi-environment `/config/credentials/{production,staging,development,test}.yml.enc` | `render_rails_credentials_enc` | (no canary slot — encrypted GCM blob) |
@@ -96,3 +96,22 @@ the `_app_layout_variants` helper with `.aws/credentials`,
 dictionaries walk the same prefix matrix regardless of the specific
 target file, so anything not covered by that matrix falls through to
 404.
+
+## Webroot-dropped and application-prefixed spellings
+
+`/config/database.yml` is the canonical path, but it is not the one
+dictionaries ask for most. Two other shapes arrive more often and both
+used to 404:
+
+- **The bare leaf** — `/database.yml`, `/db.yml` and their `.yaml`
+  spellings. A deploy that serves the `config/` directory contents at the
+  docroot puts the file there, and the dictionary reflects that. This is
+  the same asymmetry the bare `/credentials` entry closes for the AWS
+  credentials family.
+- **The prefix replacing `config/`** — `/api/database.yml`,
+  `/backend/database.yml`, `/src/database.yml`. Distinct from the
+  `_app_layout_variants` matrix, which yields `/api/config/database.yml`:
+  there the prefix precedes `config/`, here it stands in for it. Both
+  shapes are now served, and both render the same document, because they
+  are the same file seen from two docroots — serving two different
+  configs for them would be a tell rather than a trap.

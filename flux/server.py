@@ -22738,6 +22738,33 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             *_app_layout_variants("config/database.yml.example"),
             *_app_layout_variants("config/database.yml.bak"),
             *_app_layout_variants("config/database.yml~"),
+            # Webroot-dropped spellings. The whole `config/` directory
+            # ends up served at the docroot often enough that dictionaries
+            # ask for the leaf on its own, and they ask for it more than
+            # they ask for the canonical path. Same asymmetry the bare
+            # `/credentials` entry closes for the AWS family.
+            "/database.yml",
+            "/database.yaml",
+            "/database.yml.bak",
+            "/database.yml.old",
+            "/database.yml~",
+            "/db.yml",
+            "/db.yaml",
+            # Application-prefixed spellings where the prefix *replaces*
+            # `config/` rather than preceding it — the layout a scanner
+            # assumes when the app is mounted at a sub-path. Distinct from
+            # `_app_layout_variants`, which yields `/api/config/…`.
+            *(
+                f"/{prefix}/{leaf}"
+                # `config` is deliberately absent — the canonical
+                # `/config/database.yml` is listed explicitly above, and
+                # regenerating it here would claim the same path twice.
+                for prefix in (
+                    "api", "app", "backend", "server", "services", "src",
+                    "db", "conf",
+                )
+                for leaf in ("database.yml", "database.yaml", "db.yml")
+            ),
         ),
         ("aws",),
         render_rails_database_yml,
@@ -23438,6 +23465,33 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # `config.yaml` in the same sweep.
             "/.hermes/config.yaml",
             "/.hermes/config.yml",
+            # Helm chart values. The renderer already names this shape as
+            # one it covers — a chart's values file is where the registry
+            # pull secret, the database password and the object-store key
+            # end up when they are not moved into a sealed secret — but
+            # the paths were never listed, so the whole family 404'd.
+            "/values.yaml",
+            "/values.yml",
+            "/helm/values.yaml",
+            "/helm/values.yml",
+            "/chart/values.yaml",
+            "/charts/values.yaml",
+            "/deploy/values.yaml",
+            "/k8s/values.yaml",
+            # Per-environment chart overlays, which is where the
+            # production credentials actually live.
+            "/values-prod.yaml",
+            "/values.prod.yaml",
+            "/values-production.yaml",
+            "/values.production.yaml",
+            "/values-staging.yaml",
+            "/values.staging.yaml",
+            "/helm/values-prod.yaml",
+            "/helm/values.production.yaml",
+            # YAML sibling of `/credentials.json`, which the `config-json`
+            # trap owns. Same sweep, same dictionary, different extension.
+            "/credentials.yml",
+            "/credentials.yaml",
             *_app_layout_variants("config.yml"),
             *_app_layout_variants("config.yaml"),
         ),
