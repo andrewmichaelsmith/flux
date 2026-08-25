@@ -16001,7 +16001,9 @@ def test_app_config_paths_do_not_match_tarpit(path):
 
 
 def test_app_config_family_covers_expected_formats():
-    """Nine format-keyed families, all carrying the AWS canary type."""
+    """The format- and file-keyed families. All carry the AWS canary type
+    except the structural Laravel members, which hold no credentials in a
+    real install and must not invent any."""
     families = {
         t.name: t for t in tbenv.CANARY_TRAPS if t.name.startswith("app-config")
     }
@@ -16010,14 +16012,25 @@ def test_app_config_family_covers_expected_formats():
         "app-config-php-database",
         "app-config-php-mail",
         "app-config-php-services",
+        "app-config-php-filesystems",
+        "app-config-php-queue",
+        "app-config-php-broadcasting",
+        "app-config-php-structural",
         "app-config-python",
         "app-config-yaml",
         "app-config-toml",
         "app-config-json",
         "app-config-properties",
     }
+    canary_less = {"app-config-php-structural"}
     for name, trap in families.items():
-        assert trap.canary_types == ("aws",), f"{name} lost its AWS canary type"
+        if name in canary_less:
+            assert trap.canary_types == (), (
+                f"{name} holds no credentials in a real install and must "
+                f"not spend a canary"
+            )
+        else:
+            assert trap.canary_types == ("aws",), f"{name} lost its AWS canary type"
         assert trap.paths, f"{name} has no paths"
 
 
@@ -16026,6 +16039,15 @@ def test_app_config_family_covers_expected_formats():
     "render_php_database_config",
     "render_php_mail_config",
     "render_php_services_config",
+    # `render_php_filesystems_config` is deliberately absent: a real
+    # `config/filesystems.php` holds the object-store key pair and
+    # nothing else, so the canary is its only credential and there is no
+    # second secret to vary. Adding a synthetic purely to satisfy this
+    # assertion would put a credential in a file that does not have one.
+    # `test_filesystems_config_has_no_non_canary_secret` guards it
+    # instead, by asserting that every secret-shaped slot is canary-fed.
+    "render_php_queue_config",
+    "render_php_broadcasting_config",
     "render_python_settings",
     "render_generic_config_yaml",
     "render_generic_config_toml",

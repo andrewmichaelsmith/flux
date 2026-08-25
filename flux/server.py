@@ -623,6 +623,16 @@ WEBAPP_FORM_BODY_PREVIEW_LIMIT = max(int((os.environ.get("HONEYPOT_WEBAPP_FORM_B
 # No branch issues a canary — every response is public framework metadata
 # or a rejection — so the surface costs nothing upstream and runs without
 # an API key.
+# Spring profile names, for the `application-<profile>.<ext>` and
+# `bootstrap-<profile>.<ext>` spellings. Deliberately the conventional
+# set rather than a wildcard: a host that answers every profile name ever
+# guessed is not a host, and the bare spellings stay with their own
+# entries so the vocabulary here is only the suffix.
+_SPRING_PROFILES = (
+    "prod", "production", "dev", "development", "staging", "stage",
+    "test", "local", "qa", "uat", "default",
+)
+
 NEXTAUTH_ENABLED = _env_bool("HONEYPOT_NEXTAUTH_ENABLED")
 NEXTAUTH_BODY_PREVIEW_LIMIT = max(
     int((os.environ.get("HONEYPOT_NEXTAUTH_BODY_PREVIEW_LIMIT") or "400").strip() or "400"), 64,
@@ -20314,6 +20324,193 @@ def render_php_database_config(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_php_filesystems_config(r: dict[str, object]) -> bytes:
+    """`config/filesystems.php` — the object-store disk map. In a stock
+    Laravel install this is where `AWS_ACCESS_KEY_ID` and
+    `AWS_SECRET_ACCESS_KEY` actually land, which makes it a first-class
+    credential file rather than a structural one, and puts it in the same
+    dredging dictionary as `config/database.php`."""
+    aws = _aws(r)
+    return (
+        "<?php\n"
+        "\n"
+        "return [\n"
+        "    'default' => env('FILESYSTEM_DISK', 's3'),\n"
+        "\n"
+        "    'disks' => [\n"
+        "        'local' => [\n"
+        "            'driver' => 'local',\n"
+        "            'root' => storage_path('app'),\n"
+        "            'throw' => false,\n"
+        "        ],\n"
+        "\n"
+        "        's3' => [\n"
+        "            'driver' => 's3',\n"
+        f"            'key' => '{aws.get('awsAccessKeyId', '')}',\n"
+        f"            'secret' => '{aws.get('awsSecretAccessKey', '')}',\n"
+        f"            'token' => '{aws.get('awsSessionToken', '')}',\n"
+        "            'region' => 'us-east-1',\n"
+        "            'bucket' => 'internal-tools-uploads',\n"
+        "            'url' => null,\n"
+        "            'endpoint' => null,\n"
+        "            'use_path_style_endpoint' => false,\n"
+        "            'throw' => false,\n"
+        "        ],\n"
+        "\n"
+        "        'backups' => [\n"
+        "            'driver' => 's3',\n"
+        f"            'key' => '{aws.get('awsAccessKeyId', '')}',\n"
+        f"            'secret' => '{aws.get('awsSecretAccessKey', '')}',\n"
+        "            'region' => 'us-east-1',\n"
+        "            'bucket' => 'internal-tools-backups',\n"
+        "        ],\n"
+        "    ],\n"
+        "\n"
+        "    'links' => [\n"
+        "        public_path('storage') => storage_path('app/public'),\n"
+        "    ],\n"
+        "];\n"
+    ).encode("utf-8")
+
+
+def render_php_queue_config(r: dict[str, object]) -> bytes:
+    """`config/queue.php` — the worker-queue connection map. The SQS
+    connection carries the same AWS pair as the object store, and the
+    Redis connection carries its own password, so this file is a
+    credential file in two directions at once."""
+    aws = _aws(r)
+    redis_password = _fake_db_password()
+    return (
+        "<?php\n"
+        "\n"
+        "return [\n"
+        "    'default' => env('QUEUE_CONNECTION', 'redis'),\n"
+        "\n"
+        "    'connections' => [\n"
+        "        'sync' => [\n"
+        "            'driver' => 'sync',\n"
+        "        ],\n"
+        "\n"
+        "        'database' => [\n"
+        "            'driver' => 'database',\n"
+        "            'table' => 'jobs',\n"
+        "            'queue' => 'default',\n"
+        "            'retry_after' => 90,\n"
+        "        ],\n"
+        "\n"
+        "        'redis' => [\n"
+        "            'driver' => 'redis',\n"
+        "            'connection' => 'default',\n"
+        "            'host' => 'redis.internal',\n"
+        "            'port' => 6379,\n"
+        f"            'password' => '{redis_password}',\n"
+        "            'queue' => 'default',\n"
+        "            'retry_after' => 90,\n"
+        "            'block_for' => null,\n"
+        "        ],\n"
+        "\n"
+        "        'sqs' => [\n"
+        "            'driver' => 'sqs',\n"
+        f"            'key' => '{aws.get('awsAccessKeyId', '')}',\n"
+        f"            'secret' => '{aws.get('awsSecretAccessKey', '')}',\n"
+        f"            'token' => '{aws.get('awsSessionToken', '')}',\n"
+        "            'prefix' => 'https://sqs.us-east-1.amazonaws.com/'\n"
+        "            . '481516234209',\n"
+        "            'queue' => 'internal-tools-jobs',\n"
+        "            'suffix' => null,\n"
+        "            'region' => 'us-east-1',\n"
+        "        ],\n"
+        "    ],\n"
+        "\n"
+        "    'failed' => [\n"
+        "        'driver' => 'database-uuids',\n"
+        "        'database' => 'mysql',\n"
+        "        'table' => 'failed_jobs',\n"
+        "    ],\n"
+        "];\n"
+    ).encode("utf-8")
+
+
+def render_php_broadcasting_config(r: dict[str, object]) -> bytes:
+    """`config/broadcasting.php` — the realtime-channel driver map. The
+    Pusher/Ably app secrets here are their own resale target; they are
+    per-hit synthetics rather than canaries because no canary provider
+    issues that credential shape."""
+    aws = _aws(r)
+    pusher_secret = _fake_db_password()
+    ably_key = f"{secrets.token_hex(4)}.{secrets.token_urlsafe(16)}"
+    return (
+        "<?php\n"
+        "\n"
+        "return [\n"
+        "    'default' => env('BROADCAST_DRIVER', 'pusher'),\n"
+        "\n"
+        "    'connections' => [\n"
+        "        'pusher' => [\n"
+        "            'driver' => 'pusher',\n"
+        f"            'key' => '{secrets.token_hex(10)}',\n"
+        f"            'secret' => '{pusher_secret}',\n"
+        "            'app_id' => '1784412',\n"
+        "            'options' => [\n"
+        "                'cluster' => 'eu',\n"
+        "                'useTLS' => true,\n"
+        "            ],\n"
+        "        ],\n"
+        "\n"
+        "        'ably' => [\n"
+        "            'driver' => 'ably',\n"
+        f"            'key' => '{ably_key}',\n"
+        "        ],\n"
+        "\n"
+        "        'sns' => [\n"
+        "            'driver' => 'sns',\n"
+        f"            'key' => '{aws.get('awsAccessKeyId', '')}',\n"
+        f"            'secret' => '{aws.get('awsSecretAccessKey', '')}',\n"
+        "            'region' => 'us-east-1',\n"
+        "        ],\n"
+        "\n"
+        "        'log' => [\n"
+        "            'driver' => 'log',\n"
+        "        ],\n"
+        "    ],\n"
+        "];\n"
+    ).encode("utf-8")
+
+
+def render_php_session_config(r: dict[str, object]) -> bytes:
+    """`config/session.php` and the other structural files in a Laravel
+    `config/` directory — `logging.php`, `view.php`, `hashing.php`,
+    `auth.php`.
+
+    These hold no credentials in a real install, and this renderer does
+    not invent any. They are served anyway because they are what makes
+    the install *coherent*: a dredger walking `config/` gets a plausible
+    file from `database.php` and a 404 from `session.php`, which is a
+    tell about the files that did answer. Answering the whole directory
+    is what keeps the credential-bearing members believable."""
+    return (
+        "<?php\n"
+        "\n"
+        "return [\n"
+        "    'driver' => env('SESSION_DRIVER', 'redis'),\n"
+        "    'lifetime' => 120,\n"
+        "    'expire_on_close' => false,\n"
+        "    'encrypt' => false,\n"
+        "    'files' => storage_path('framework/sessions'),\n"
+        "    'connection' => env('SESSION_CONNECTION'),\n"
+        "    'table' => 'sessions',\n"
+        "    'store' => env('SESSION_STORE'),\n"
+        "    'lottery' => [2, 100],\n"
+        "    'cookie' => env('SESSION_COOKIE', 'internal_tools_session'),\n"
+        "    'path' => '/',\n"
+        "    'domain' => env('SESSION_DOMAIN'),\n"
+        "    'secure' => env('SESSION_SECURE_COOKIE', true),\n"
+        "    'http_only' => true,\n"
+        "    'same_site' => 'lax',\n"
+        "];\n"
+    ).encode("utf-8")
+
+
 def render_php_mail_config(r: dict[str, object]) -> bytes:
     """`config/mail.php` / `mailer.php` / `email.php` / `smtp.php` — the
     SMTP-relay block. Mail credentials are their own harvest target
@@ -21508,16 +21705,38 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         "text/html; charset=utf-8",
         _trace_axd_extra_headers,
     ),
+    # Spring's own convention is that `application.<ext>` holds the
+    # defaults and `application-<profile>.<ext>` holds what actually
+    # differs per environment — which is exactly where the credentials
+    # are. Answering only the bare spelling meant serving the file whose
+    # real-world copy is the least interesting and 404ing every profile
+    # variant in the same sweep. `bootstrap-<profile>` is the Spring
+    # Cloud equivalent, ahead of the config-server fetch.
     CanaryTrap(
         "application-properties",
-        ("/application.properties",),
+        (
+            "/application.properties",
+            *(
+                f"/{stem}-{profile}.properties"
+                for stem in ("application", "bootstrap")
+                for profile in _SPRING_PROFILES
+            ),
+        ),
         ("aws",),
         render_application_properties,
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(
         "application-yml",
-        ("/application.yml", "/application.yaml"),
+        (
+            "/application.yml", "/application.yaml",
+            *(
+                f"/{stem}-{profile}.{ext}"
+                for stem in ("application", "bootstrap")
+                for profile in _SPRING_PROFILES
+                for ext in ("yml", "yaml")
+            ),
+        ),
         ("aws",),
         render_application_yml,
         "application/yaml; charset=utf-8",
@@ -23691,6 +23910,68 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ),
         ("aws",),
         render_php_services_config,
+        "text/plain; charset=utf-8",
+    ),
+    # The rest of a stock Laravel `config/` directory. `database.php`,
+    # `mail.php`, `services.php` and `app.php` already answered; the
+    # remaining members were 404ing in the same sweep, which is a tell
+    # about the ones that did answer — a real install has the whole
+    # directory. Two of them are credential files in their own right:
+    # `filesystems.php` is where the object-store key pair actually
+    # lands, and `queue.php` carries both the SQS pair and the Redis
+    # password.
+    CanaryTrap(
+        "app-config-php-filesystems",
+        (
+            "/config/filesystems.php",
+            "/config/filesystem.php",
+            "/config/filesystems.php.bak",
+            *_app_layout_variants("config/filesystems.php"),
+        ),
+        ("aws",),
+        render_php_filesystems_config,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "app-config-php-queue",
+        (
+            "/config/queue.php",
+            "/config/horizon.php",
+            "/config/queue.php.bak",
+            *_app_layout_variants("config/queue.php"),
+        ),
+        ("aws",),
+        render_php_queue_config,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "app-config-php-broadcasting",
+        (
+            "/config/broadcasting.php",
+            "/config/websockets.php",
+            *_app_layout_variants("config/broadcasting.php"),
+        ),
+        ("aws",),
+        render_php_broadcasting_config,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "app-config-php-structural",
+        (
+            # No credentials in any of these, and the renderer invents
+            # none. They are here so the directory reads as a whole
+            # install rather than as four files that happen to exist.
+            "/config/session.php",
+            "/config/logging.php",
+            "/config/view.php",
+            "/config/hashing.php",
+            "/config/auth.php",
+            "/config/cors.php",
+            "/config/sanctum.php",
+            *_app_layout_variants("config/session.php"),
+        ),
+        (),
+        render_php_session_config,
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(

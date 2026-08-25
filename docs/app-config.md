@@ -26,6 +26,10 @@ greps raw bytes for `AKIA`, and the per-format log tags separate them.
 | `app-config-php-database` | `/config/database.php`, `/config/db.php`, `/config/connection.php`, `/application/config/database.php`, plus backup and webroot-prefix variants | `render_php_database_config` | `connections.backups.key` / `secret` / `token` |
 | `app-config-php-mail` | `/config/mail.php`, `/config/mailer.php`, `/config/email.php`, `/config/smtp.php`, plus backup and webroot-prefix variants | `render_php_mail_config` | `mailers.ses.key` / `secret` / `token` |
 | `app-config-php-services` | `/config/services.php`, `/config/api.php`, `/config/keys.php`, `/config/credentials.php`, `/config/app.php`, `/config/secrets.php`, plus backup and webroot-prefix variants | `render_php_services_config` | `aws.key` / `secret` / `token` |
+| `app-config-php-filesystems` | `/config/filesystems.php`, `/config/filesystem.php`, plus backup and webroot-prefix variants | `render_php_filesystems_config` | `disks.s3.key` / `secret` / `token`, repeated in the `backups` disk |
+| `app-config-php-queue` | `/config/queue.php`, `/config/horizon.php`, plus backup and webroot-prefix variants | `render_php_queue_config` | `connections.sqs.key` / `secret` / `token` (the Redis password is a per-hit synthetic) |
+| `app-config-php-broadcasting` | `/config/broadcasting.php`, `/config/websockets.php`, plus webroot-prefix variants | `render_php_broadcasting_config` | `connections.sns.key` / `secret` (Pusher and Ably keys are per-hit synthetics) |
+| `app-config-php-structural` | `/config/session.php`, `/config/logging.php`, `/config/view.php`, `/config/hashing.php`, `/config/auth.php`, `/config/cors.php`, `/config/sanctum.php`, plus webroot-prefix variants | `render_php_session_config` | **none** — these hold no credentials in a real install and the renderer invents none |
 | `app-config-python` | `/settings.py`, `/config.py`, `/app/settings.py`, `/app/config.py`, `/config/settings.py`, `/instance/config.py`, `/project/settings.py`, `/core/settings.py`, `/core/config.py`, `/backend/settings.py`, `/backend/config.py`, `/src/settings.py`, `/src/config.py`, `/local_settings.py`, `/production_settings.py`, plus backup variants | `render_python_settings` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` module constants |
 | `app-config-yaml` | `/config.yaml`, `/config.yml`, `/secrets.yml`, `/secrets.yaml`, `/bootstrap.yml`, `/bootstrap.yaml`, `/config/storage.yml`, `/config/config.yml`, `/config/config.yaml`, `/.hermes/config.yaml`, `/.hermes/config.yml`, plus backup and webroot-prefix variants | `render_generic_config_yaml` | `storage.accessKeyId` / `secretAccessKey` / `sessionToken` |
 | `app-config-toml` | `/config.toml`, `/settings.toml`, `/config/config.toml`, plus backup and webroot-prefix variants | `render_generic_config_toml` | `[s3] access_key_id` / `secret_access_key` / `session_token` |
@@ -45,8 +49,30 @@ re-home the framework-specific traps. Pinned by
 - `/config/database.yml`, `/config/secrets.yml`, `/config/master.key` →
   the `rails-*` traps.
 - `/env.php` → `env-production`.
-- `/application.yml`, `/application.yaml` → `application-yml`.
+- `/application.yml`, `/application.yaml` and every
+  `application-<profile>` / `bootstrap-<profile>` spelling →
+  `application-yml`; the `.properties` spellings of the same →
+  `application-properties`. The bare `/bootstrap.yml` and
+  `/bootstrap.properties` stay with the framework-agnostic families
+  above — only the profile-suffixed forms move.
 - `/settings.json` → `config-json`.
+
+## Why the whole `config/` directory answers
+
+Four members of a Laravel `config/` directory used to answer and the rest
+404'd. That is a tell about the four that answered: a real install has
+the whole directory, so a dredger walking it learns more from the misses
+than from the hits. Two of the added members are credential files in
+their own right — `filesystems.php` is where the object-store key pair
+actually lands, and `queue.php` carries both the SQS pair and the queue
+Redis password. The rest hold no secrets, are served for coherence, and
+spend no canary.
+
+The same reasoning drives the Spring profile suffixes. Spring publishes
+defaults in `application.<ext>` and the values that differ per
+environment in `application-<profile>.<ext>` — so answering only the bare
+spelling meant serving the one file whose real-world copy is least likely
+to hold a credential, while 404ing every variant in the same sweep.
 
 ## Logged fields
 
