@@ -591,6 +591,67 @@ WEBAPP_FORM_BODY_PREVIEW_LIMIT = max(int((os.environ.get("HONEYPOT_WEBAPP_FORM_B
 # Returning a realistic login form with a per-hit unique _wpnonce lets us
 # attribute the follow-up POST by whether it echoes the nonce (sophisticated
 # tool that parses the GET) or blind-POSTs without it (naive tool).
+# --- Auth.js / NextAuth credential-provider surface -----------------------
+# Credential-stuffing sweeps that used to walk `/wp-login.php` and `/login`
+# now carry the JavaScript-framework auth namespace in the same dictionary:
+# `/api/auth/signin`, `/api/auth/callback/credentials`, `/auth/callback`.
+# That namespace is not one page, it is a small protocol, and the protocol
+# is the reason it is worth serving rather than aliasing onto the generic
+# login form.
+#
+# A credentials sign-in is a two-step exchange. The client must first GET
+# `/api/auth/csrf`, read `csrfToken` out of the JSON, and POST that exact
+# token back alongside the credentials; a POST without it is rejected by
+# the real framework before any credential check happens. So the token
+# doubles as a probe of the client: we mint one per source, remember it,
+# and record on the POST whether what came back is a token we issued.
+#
+# That splits the population in a way request volume cannot. A stuffer
+# replaying a path list POSTs credentials with no token or an invented
+# one. A client that fetched `/api/auth/csrf` first and echoed our value
+# parsed our response and implemented the flow — a materially different
+# level of effort, and the signal this trap exists to produce. Same
+# parse-versus-replay discrimination the stored-request trap gets from
+# asking whether the id came from our own listing.
+#
+# The second capture is inverted, like the install-wizard trap: NextAuth
+# takes a `callbackUrl` and redirects to it after sign-in, which makes it
+# a standing open-redirect target. A `callbackUrl` pointing off-host is
+# not a guess about our credentials, it is a piece of the attacker's own
+# infrastructure, so it is logged as its own field.
+#
+# No branch issues a canary — every response is public framework metadata
+# or a rejection — so the surface costs nothing upstream and runs without
+# an API key.
+NEXTAUTH_ENABLED = _env_bool("HONEYPOT_NEXTAUTH_ENABLED")
+NEXTAUTH_BODY_PREVIEW_LIMIT = max(
+    int((os.environ.get("HONEYPOT_NEXTAUTH_BODY_PREVIEW_LIMIT") or "400").strip() or "400"), 64,
+)
+NEXTAUTH_CSRF_CACHE_TTL = max(
+    int((os.environ.get("HONEYPOT_NEXTAUTH_CSRF_CACHE_TTL") or "3600").strip() or "3600"), 60,
+)
+NEXTAUTH_CSRF_CACHE_MAX = max(
+    int((os.environ.get("HONEYPOT_NEXTAUTH_CSRF_CACHE_MAX") or "1024").strip() or "1024"), 16,
+)
+
+# Both mount points. `/api/auth` is the framework default; `/auth` is the
+# basePath override common enough that sweeps carry both spellings, and the
+# bare `/auth/callback` probe arrives with no provider segment at all.
+_NEXTAUTH_PREFIXES = ("/api/auth", "/auth")
+
+# The routes Auth.js exposes. `signin`, `signout` and `callback` take an
+# optional trailing `/<provider>` segment; the rest are exact leaves.
+_NEXTAUTH_LEAF_OPS = frozenset({
+    "providers", "csrf", "session", "signin", "signout", "error", "callback",
+})
+_NEXTAUTH_PROVIDER_OPS = frozenset({"signin", "signout", "callback"})
+
+# Provider ids advertised by `/api/auth/providers` and accepted on the
+# `/<provider>` routes. `credentials` is the one that takes a password;
+# the OAuth pair is there because a real deployment almost always has at
+# least one, and their absence would itself be a tell.
+_NEXTAUTH_PROVIDERS = ("credentials", "google", "github")
+
 WP_LOGIN_ENABLED = _env_bool("HONEYPOT_WP_LOGIN_ENABLED")
 WP_LOGIN_BODY_PREVIEW_LIMIT = max(int((os.environ.get("HONEYPOT_WP_LOGIN_BODY_PREVIEW_LIMIT") or "400").strip() or "400"), 64)
 WP_LOGIN_NONCE_CACHE_TTL = max(int((os.environ.get("HONEYPOT_WP_LOGIN_NONCE_CACHE_TTL") or "3600").strip() or "3600"), 60)
@@ -4381,6 +4442,73 @@ def is_threecx_ui_path(path: str) -> bool:
     if not THREECX_ENABLED:
         return False
     return path.lower().split("?", 1)[0] in THREECX_UI_PATHS
+
+
+def nextauth_route(path: str) -> tuple[str, str] | None:
+    """Resolve a path to an `(op, provider)` pair, or None if it is not on
+    the Auth.js surface. `provider` is `""` for the leaf routes.
+
+    Matched case-insensitively and with a trailing slash tolerated, because
+    both spellings show up in sweeps and the framework's own router treats
+    them alike."""
+    lowered = path.lower().split("?", 1)[0].rstrip("/")
+    for prefix in _NEXTAUTH_PREFIXES:
+        if not lowered.startswith(prefix + "/"):
+            continue
+        rest = lowered[len(prefix) + 1:]
+        if not rest:
+            return None
+        parts = rest.split("/")
+        op = parts[0]
+        if op not in _NEXTAUTH_LEAF_OPS:
+            return None
+        if len(parts) == 1:
+            return (op, "")
+        # One optional provider segment, and only on the routes that take
+        # one. Anything deeper is not a route the framework serves, so it
+        # falls through to 404 rather than being flattened onto the leaf.
+        if len(parts) == 2 and op in _NEXTAUTH_PROVIDER_OPS:
+            return (op, parts[1][:64])
+        return None
+    return None
+
+
+def is_nextauth_path(path: str) -> bool:
+    if not NEXTAUTH_ENABLED:
+        return False
+    return nextauth_route(path) is not None
+
+
+_NEXTAUTH_CSRF_CACHE: dict[str, tuple[float, set[str]]] = {}
+
+
+def _nextauth_csrf_store(client_ip: str, token: str) -> None:
+    """Remember a token we handed this source, so the POST can be scored
+    on whether it echoed one of ours. Same bounded per-IP shape as the
+    login-nonce cache: a set per source, TTL'd, with the whole map capped
+    so a spray across many sources cannot grow it without limit."""
+    now = time.monotonic()
+    entry = _NEXTAUTH_CSRF_CACHE.get(client_ip)
+    if entry and entry[0] > now:
+        entry[1].add(token)
+        if len(entry[1]) > 32:
+            entry[1].pop()
+    else:
+        _NEXTAUTH_CSRF_CACHE[client_ip] = (now + NEXTAUTH_CSRF_CACHE_TTL, {token})
+    if len(_NEXTAUTH_CSRF_CACHE) > NEXTAUTH_CSRF_CACHE_MAX:
+        for key in [k for k, v in _NEXTAUTH_CSRF_CACHE.items() if v[0] <= now]:
+            del _NEXTAUTH_CSRF_CACHE[key]
+        if len(_NEXTAUTH_CSRF_CACHE) > NEXTAUTH_CSRF_CACHE_MAX:
+            oldest = min(_NEXTAUTH_CSRF_CACHE, key=lambda k: _NEXTAUTH_CSRF_CACHE[k][0])
+            del _NEXTAUTH_CSRF_CACHE[oldest]
+
+
+def _nextauth_csrf_known(client_ip: str, token: str) -> bool:
+    now = time.monotonic()
+    entry = _NEXTAUTH_CSRF_CACHE.get(client_ip)
+    if not entry or entry[0] <= now:
+        return False
+    return token in entry[1]
 
 
 def is_wp_login_path(path: str) -> bool:
@@ -10818,6 +10946,145 @@ def _wp_login_nonce_check(client_ip: str, nonce: str) -> bool:
     if not entry or entry[0] <= now:
         return False
     return nonce in entry[1]
+
+
+# --- Auth.js / NextAuth renderers -----------------------------------------
+
+
+def _nextauth_html_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+def extract_nextauth_fields(body: bytes, content_type: str) -> dict[str, str]:
+    """Pull the credential-submission fields out of a sign-in POST.
+
+    Auth.js accepts both `application/x-www-form-urlencoded` (what its own
+    HTML form posts) and JSON (what a hand-written client sends), and
+    stuffer tooling uses both, so a form-only reader would silently drop
+    half the captures. Usernames arrive under several spellings depending
+    on how the credentials provider was declared; the password value is
+    never recorded, only whether one was present."""
+    fields: dict[str, str] = {}
+    flat: dict[str, str] = {}
+
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct == "application/json" or (body[:1] in (b"{",) and not ct):
+        try:
+            parsed = json.loads(body.decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                if isinstance(value, (str, int, float, bool)):
+                    flat[str(key)] = str(value)
+    else:
+        for key, values in parse_form_body(body, content_type).items():
+            if values:
+                flat[key] = values[0]
+
+    for key in ("username", "email", "user", "login", "identifier"):
+        value = flat.get(key)
+        if value:
+            fields["username"] = value[:200]
+            fields["usernameKey"] = key
+            break
+    for key in ("password", "passwd", "pass"):
+        if flat.get(key):
+            fields["hasPwd"] = "true"
+            break
+    for key in ("csrfToken", "csrftoken", "_csrf"):
+        value = flat.get(key)
+        if value:
+            fields["csrfToken"] = value[:200]
+            break
+    for key in ("callbackUrl", "callbackurl", "redirect_uri", "redirectTo"):
+        value = flat.get(key)
+        if value:
+            fields["callbackUrl"] = value[:300]
+            break
+    return fields
+
+
+def render_nextauth_providers(providers: tuple[str, ...], base: str) -> bytes:
+    """`/api/auth/providers` — the public provider map. Real Auth.js
+    serves this unauthenticated; it is how a client discovers which
+    sign-in flows exist, and it is the response a scanner reads to learn
+    that a credentials provider (i.e. a password to guess) is configured."""
+    body: dict[str, object] = {}
+    for provider in providers:
+        label = {"credentials": "Credentials", "google": "Google",
+                 "github": "GitHub"}.get(provider, provider.title())
+        body[provider] = {
+            "id": provider,
+            "name": label,
+            "type": "credentials" if provider == "credentials" else "oauth",
+            "signinUrl": f"{base}/signin/{provider}",
+            "callbackUrl": f"{base}/callback/{provider}",
+        }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
+def render_nextauth_csrf(token: str) -> bytes:
+    return (json.dumps({"csrfToken": token}, indent=2) + "\n").encode("utf-8")
+
+
+def render_nextauth_session() -> bytes:
+    """An unauthenticated session. Real Auth.js answers `{}` with a 200
+    here rather than a 401 — the empty object *is* the "not signed in"
+    answer, and returning anything else would be the tell."""
+    return b"{}\n"
+
+
+def render_nextauth_signin_html(
+    *, token: str, providers: tuple[str, ...], base: str, callback_url: str,
+) -> bytes:
+    """The framework's built-in sign-in page. The CSRF token is embedded
+    in the form exactly as Auth.js embeds it, which is what makes the
+    two-step flow completable by a client that bothers to parse it."""
+    safe_token = _nextauth_html_escape(token)
+    safe_callback = _nextauth_html_escape(callback_url)
+    oauth_buttons = "".join(
+        f'<form action="{base}/signin/{p}" method="POST">'
+        f'<input type="hidden" name="csrfToken" value="{safe_token}"/>'
+        f'<button type="submit">Sign in with {p.title()}</button></form>\n'
+        for p in providers if p != "credentials"
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<title>Sign In</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="robots" content="noindex"/>
+</head>
+<body class="__next-auth-theme-auto">
+<div class="signin"><div class="card">
+<form action="{base}/callback/credentials" method="POST">
+<input type="hidden" name="csrfToken" value="{safe_token}"/>
+<input type="hidden" name="callbackUrl" value="{safe_callback}"/>
+<label for="input-username">Username</label>
+<input type="text" id="input-username" name="username" required autocomplete="username"/>
+<label for="input-password">Password</label>
+<input type="password" id="input-password" name="password" required autocomplete="current-password"/>
+<button type="submit">Sign in with Credentials</button>
+</form>
+<hr/>
+{oauth_buttons}</div></div>
+</body></html>
+""".encode("utf-8")
+
+
+def render_nextauth_error_html(error: str) -> bytes:
+    safe = _nextauth_html_escape(error or "Configuration")
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/><title>Sign In Error</title>
+<meta name="robots" content="noindex"/></head>
+<body class="__next-auth-theme-auto">
+<div class="error"><div class="card"><h1>Sign in failed</h1>
+<div class="message"><p>{safe}</p></div></div></div>
+</body></html>
+""".encode("utf-8")
 
 
 def render_wp_login_html(*, nonce: str, redirect_to: str) -> bytes:
@@ -25540,6 +25807,166 @@ async def _handle_threecx(
     )
 
 
+async def _handle_nextauth(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Serve the Auth.js route table and score the credentials POST on
+    whether the client completed the two-step CSRF exchange."""
+    route = nextauth_route(path)
+    if route is None:  # pragma: no cover - dispatch guards this
+        raise web.HTTPNotFound()
+    op, provider = route
+    method = request.method
+    client_ip = str(log_context.get("clientIp", "") or "")
+    # Answer under whichever mount point the client used, so every URL we
+    # hand back stays on the path family they already chose.
+    lowered = path.lower().rstrip("/")
+    base = "/api/auth" if lowered.startswith("/api/auth") else "/auth"
+    query = parse_qs(query_string or "", keep_blank_values=True)
+
+    def _finish(
+        body: bytes, status: int, result: str, content_type: str,
+        extra: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> web.Response:
+        append_log({
+            **log_context,
+            "result": result,
+            "status": status,
+            "nextauthOp": op,
+            "nextauthProvider": provider,
+            "bytes": len(body),
+            **(extra or {}),
+        })
+        payload = b"" if method == "HEAD" else body
+        return web.Response(
+            status=status, body=payload,
+            headers={
+                "Content-Type": content_type,
+                "Cache-Control": "no-store",
+                **(headers or {}),
+            },
+        )
+
+    # --- credential submission ---------------------------------------
+    # `signin` and `callback` both take the POST in the wild: the form
+    # this trap renders points at `callback/credentials`, and blind
+    # stuffers post straight at `signin`. Scoring them identically is
+    # what keeps the parse-vs-replay comparison honest.
+    if method == "POST" and op in {"signin", "callback"}:
+        fields = extract_nextauth_fields(
+            request_body, request.headers.get("Content-Type", ""),
+        )
+        submitted = fields.get("csrfToken", "")
+        known = _nextauth_csrf_known(client_ip, submitted) if submitted else False
+        callback_url = fields.get("callbackUrl", "") or (
+            query.get("callbackUrl", [""])[0][:300]
+        )
+        extra: dict[str, object] = {
+            "nextauthUsername": fields.get("username", ""),
+            "nextauthUsernameKey": fields.get("usernameKey", ""),
+            "nextauthHasPwd": fields.get("hasPwd", "") == "true",
+            "nextauthCsrfSubmitted": submitted[:64],
+            "nextauthCsrfKnown": known,
+            "nextauthCallbackUrl": callback_url,
+            "contentType": request.headers.get("Content-Type", "")[:120],
+        }
+        if request_body:
+            extra["bodyPreview"] = request_body[
+                :NEXTAUTH_BODY_PREVIEW_LIMIT
+            ].decode("utf-8", errors="replace")
+        # Auth.js rejects a credentials sign-in by bouncing back to its own
+        # error page. Rejecting every attempt is both what an app with
+        # working credentials does to a guess and what keeps this trap from
+        # having to invent a session token.
+        location = f"{base}/error?error=CredentialsSignin"
+        append_log({
+            **log_context,
+            "result": "nextauth-credentials",
+            "status": 302,
+            "nextauthOp": op,
+            "nextauthProvider": provider,
+            "bytes": 0,
+            **extra,
+        })
+        return web.Response(
+            status=302, body=b"",
+            headers={"Location": location, "Cache-Control": "no-store"},
+        )
+
+    json_ct = "application/json; charset=utf-8"
+    html_ct = "text/html; charset=utf-8"
+
+    if op == "providers":
+        return _finish(
+            render_nextauth_providers(_NEXTAUTH_PROVIDERS, base),
+            200, "nextauth-providers", json_ct,
+        )
+
+    if op == "csrf":
+        token = secrets.token_hex(32)
+        _nextauth_csrf_store(client_ip, token)
+        # The framework sets the token as a cookie as well as returning it,
+        # and its double-submit value is `<token>|<hash>`.
+        cookie = (
+            f"next-auth.csrf-token={token}%7C{secrets.token_hex(32)}; "
+            "Path=/; HttpOnly; SameSite=Lax"
+        )
+        return _finish(
+            render_nextauth_csrf(token), 200, "nextauth-csrf", json_ct,
+            {"nextauthCsrfIssued": token[:64]}, {"Set-Cookie": cookie},
+        )
+
+    if op == "session":
+        return _finish(
+            render_nextauth_session(), 200, "nextauth-session", json_ct,
+        )
+
+    if op == "signout":
+        return _finish(
+            render_nextauth_signin_html(
+                token=_nextauth_issue_token(client_ip),
+                providers=(), base=base, callback_url="/",
+            ),
+            200, "nextauth-signout", html_ct,
+        )
+
+    if op == "error":
+        return _finish(
+            render_nextauth_error_html(query.get("error", [""])[0][:120]),
+            200, "nextauth-error", html_ct,
+        )
+
+    # `signin` on GET renders the built-in page; a bare `callback` probe
+    # with no submission gets the same page, which is where the framework
+    # sends a callback it cannot complete.
+    token = _nextauth_issue_token(client_ip)
+    callback_url = query.get("callbackUrl", [""])[0][:300]
+    body = render_nextauth_signin_html(
+        token=token, providers=_NEXTAUTH_PROVIDERS, base=base,
+        callback_url=callback_url or "/",
+    )
+    result = "nextauth-signin-page" if op == "signin" else "nextauth-callback-probe"
+    extra = {"nextauthCsrfIssued": token[:64]}
+    if callback_url:
+        extra["nextauthCallbackUrl"] = callback_url
+    return _finish(body, 200, result, html_ct, extra)
+
+
+def _nextauth_issue_token(client_ip: str) -> str:
+    """Mint a CSRF token and remember it for this source. Every page that
+    embeds a token has to register it, or a client that reads the token
+    out of the sign-in HTML rather than the JSON endpoint would be scored
+    as a replayer for doing more work, not less."""
+    token = secrets.token_hex(32)
+    _nextauth_csrf_store(client_ip, token)
+    return token
+
+
 async def _handle_wp_login(
     request: web.Request,
     log_context: dict[str, object],
@@ -33722,6 +34149,15 @@ async def handle(request: web.Request) -> web.StreamResponse:
             request, log_context, path, query_string, request_body,
         )
 
+    # Ahead of the generic web-app form trap: `/auth/callback` and
+    # `/api/auth/signin` would otherwise be swallowed by its login-path
+    # list and answered with a generic form, losing the CSRF exchange
+    # that is the whole point of this surface.
+    if is_nextauth_path(path):
+        return await _handle_nextauth(
+            request, log_context, path, query_string, request_body,
+        )
+
     if is_wp_login_path(path):
         return await _handle_wp_login(request, log_context, path, request_body)
 
@@ -34006,6 +34442,8 @@ def main() -> int:
         active.append("php-cgi-liveness")
     if WEBAPP_FORM_ENABLED:
         active.append("webapp-form")
+    if NEXTAUTH_ENABLED:
+        active.append("nextauth")
     if WP_LOGIN_ENABLED:
         active.append("wp-login")
     if WP_USER_ENUM_ENABLED:

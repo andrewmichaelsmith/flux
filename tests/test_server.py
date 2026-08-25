@@ -702,6 +702,10 @@ def test_all_trap_families_default_on():
     assert tbenv.TOMCAT_PATH_BYPASS_ENABLED
     assert tbenv.SPRING_GATEWAY_ENABLED
     assert tbenv.BACKUP_ARCHIVE_ENABLED
+    assert tbenv.NEXTAUTH_ENABLED, (
+        "HONEYPOT_NEXTAUTH_ENABLED should default to True — no branch on "
+        "the auth surface issues a canary, so it costs nothing upstream."
+    )
     assert tbenv.WP_LOGIN_ENABLED
     assert tbenv.WP_USER_ENUM_ENABLED
     assert tbenv.WP_BATCH_API_ENABLED

@@ -373,6 +373,33 @@ than replaying a path. See [docs](./docs/laravel-debugbar.md).
 | `laravel-debugbar-clockwork` | 200 | `bytes: int` | Unconfigured Clockwork shim (`{}`). No canary issued. |
 | `laravel-debugbar-open-get-error` | 404 | — | Canary issuance failed. Only `open-get` can produce this. |
 
+### Auth.js / NextAuth credential-provider surface
+
+Every line carries `nextauthOp` (which route) and `nextauthProvider` (the
+`/<provider>` segment, or `""`). A `nextauth-csrf` — or a
+`nextauth-signin-page` — followed by a `nextauth-credentials` with
+`nextauthCsrfKnown=true` from the same source is the completed two-step
+exchange: a client that read our token and echoed it, rather than
+blind-POSTing a path list. Tokens are scoped per source, so a value
+harvested from one source does not score as known for another. See
+[docs](./docs/nextauth.md).
+
+| `result` | `status` | Extras | Meaning |
+| --- | --- | --- | --- |
+| `nextauth-providers` | 200 | `bytes: int` | Provider map. Public framework metadata; no canary. |
+| `nextauth-csrf` | 200 | `nextauthCsrfIssued: str<=64`, `bytes: int` | Token minted and remembered for this source. |
+| `nextauth-session` | 200 | `bytes: int` | Unauthenticated session (`{}`), which is the framework's own answer. |
+| `nextauth-signin-page` | 200 | `nextauthCsrfIssued: str<=64`, `nextauthCallbackUrl: str<=300`, `bytes: int` | Built-in sign-in page. The embedded token is registered, so scraping the HTML also scores as known. |
+| `nextauth-callback-probe` | 200 | as above | A `callback` route fetched with no submission — a different behaviour from a sign-in page fetch, so it gets its own tag. |
+| `nextauth-credentials` | 302 | `nextauthUsername`, `nextauthUsernameKey`, `nextauthHasPwd: bool`, `nextauthCsrfSubmitted: str<=64`, `nextauthCsrfKnown: bool`, `nextauthCallbackUrl: str<=300`, `contentType`, `bodyPreview` | Credential submission. Always rejected to `…/error?error=CredentialsSignin`; no session is ever granted. The password value is never recorded — only `nextauthHasPwd`. |
+| `nextauth-signout` | 200 | `bytes: int` | Sign-out page. |
+| `nextauth-error` | 200 | `bytes: int` | Error page; the reflected `error` value is HTML-escaped. |
+
+`nextauthCallbackUrl` is the attacker-supplied post-sign-in redirect
+target, taken from the body or the query string. An off-host value names
+their infrastructure rather than guessing at ours, which is why it is
+lifted out of `bodyPreview` into its own field.
+
 ### SSRF relay onto the metadata tree
 
 The same documents, reached through a URL-taking parameter on a
