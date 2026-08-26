@@ -266,14 +266,21 @@ No Tracebit key required.
 | Var | Default | Notes |
 | --- | --- | --- |
 | `HONEYPOT_FORTIGATE_VPN_ENABLED` | on | Master switch. |
-| `HONEYPOT_FORTIGATE_VPN_PATHS_CSV` | *(built-in — `/remote/login`, `/remote/logincheck`, `/remote/fgt_lang`, `/remote/error`, `/api/v2/cmdb/system/admin`, `/api/v2/cmdb/system/status`, `/api/v2/cmdb/system/global`, `/api/v2/monitor/router/policy`)* | Exact, case-insensitive. Override to add/remove without a code change. |
+| `HONEYPOT_FORTIGATE_VPN_PATHS_CSV` | *(built-in — `/remote/login`, `/remote/logincheck`, `/remote/portal`, `/sslvpn/portal.html`, `/remote/portal.css`, `/remote/network`, `/remote/logout`, `/remote/fgt_lang`, `/remote/error`, `/api/v2/cmdb/system/admin`, `/api/v2/cmdb/system/status`, `/api/v2/cmdb/system/global`, `/api/v2/monitor/router/policy`)* | Exact, case-insensitive. Override to add/remove without a code change. |
 | `HONEYPOT_FORTIGATE_VPN_VERSION` | `7.4.4` | FortiOS version banner shown in the HTML comment + REST envelopes. Pinned to a build inside the CVE-2024-21762 / CVE-2023-27997 vulnerable window so banner-grab scrapers ship the exploit body. |
 | `HONEYPOT_FORTIGATE_VPN_BUILD` | `2662` | FortiOS build number paired with the version string. |
+| `HONEYPOT_FORTIGATE_VPN_ACCEPT_ENABLED` | on | Credential-sink conversion gate. Lets a source find exactly one working credential after enough attempts, so post-authentication behaviour becomes observable. Off ⇒ every guess is rejected. See [docs](./docs/fake-fortigate-vpn.md#the-conversion-gate). |
+| `HONEYPOT_FORTIGATE_VPN_ACCEPT_MIN_ATTEMPTS` | `40` | Lower bound of the per-source acceptance threshold band. |
+| `HONEYPOT_FORTIGATE_VPN_ACCEPT_MAX_ATTEMPTS` | `160` | Upper bound of the band. The threshold is derived from the client address so it is not a fleet-wide constant. |
+| `HONEYPOT_FORTIGATE_VPN_BRUTE_STATE_TTL_SECONDS` | `86400` | How long per-source attempt/acceptance state survives. |
+| `HONEYPOT_FORTIGATE_VPN_BRUTE_STATE_MAX_ENTRIES` | `4096` | Bound on the in-process per-source state table. |
 
-The `SVPNCOOKIE` minted on `/remote/logincheck` and the `FGVM…` serial
-in the `/api/v2/cmdb/system/{status,global}` and
+The `SVPNCOOKIE` minted on an accepted `/remote/logincheck` and the
+`FGVM…` serial in the `/api/v2/cmdb/system/{status,global}` and
 `/api/v2/monitor/router/policy` envelopes are per-request unique
-(`uuid4().hex`). No fixed credential / serial literals.
+(`uuid4().hex`). No fixed credential / serial literals. The SSL VPN
+portal served after acceptance carries host and service names only — no
+credential-shaped material of any kind.
 
 ## Fake Citrix NetScaler / Gateway portal (CVE-2019-19781 / CVE-2023-3519 / CVE-2023-4966 / CVE-2022-27510 bait)
 

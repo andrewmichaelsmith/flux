@@ -1614,6 +1614,16 @@ _FORTIGATE_VPN_DEFAULT_PATHS = ",".join([
     "/api/v2/cmdb/system/status",
     "/api/v2/cmdb/system/global",
     "/api/v2/monitor/router/policy",
+    # Post-authentication surface. A credential sink that can succeed has
+    # to have somewhere to send the client next: FortiOS lands a
+    # successful SSL VPN login on the web portal. Without these, an
+    # accepted login redirects straight into a 404 and the session ends
+    # at the moment it becomes interesting.
+    "/remote/portal",
+    "/sslvpn/portal.html",
+    "/remote/logout",
+    "/remote/network",
+    "/remote/portal.css",
 ])
 FORTIGATE_VPN_PATHS = {
     value.strip().lower()
@@ -1624,6 +1634,47 @@ FORTIGATE_VPN_PATHS = {
 # CVE-2024-21762 / CVE-2023-27997 vulnerable window.
 FORTIGATE_VPN_VERSION = (os.environ.get("HONEYPOT_FORTIGATE_VPN_VERSION") or "7.4.4").strip()
 FORTIGATE_VPN_BUILD = (os.environ.get("HONEYPOT_FORTIGATE_VPN_BUILD") or "2662").strip()
+
+# Credential-sink conversion gate.
+#
+# `/remote/logincheck` is the highest-volume credential POST surface this
+# honeypot exposes — a small number of sources account for tens of
+# thousands of guesses, and every one of them has historically received
+# byte-identical auth failure. That records the dictionary and nothing
+# else: what the operator does *after* a successful VPN authentication is
+# unobservable, because authentication never succeeds.
+#
+# The sibling remote-access traps already convert (the RD Web Access sink
+# mints a session and serves a portal page on POST; the SonicWall auth
+# endpoint returns an outright success envelope). This brings the FortiOS
+# sink in line, but on a gate rather than unconditionally: a portal that
+# accepts the *first* guess is not a portal any brute-force operator
+# believes. Instead the source has to work for it — after a per-source
+# attempt threshold, exactly one credential pair is accepted, and only
+# that pair keeps working afterwards.
+#
+# The threshold is derived from the client address (see
+# `_fortigate_accept_threshold`) so it varies per source and per
+# deployment rather than every host in a fleet converting on the same
+# attempt number, which would itself be a fingerprint.
+FORTIGATE_VPN_ACCEPT_ENABLED = _env_bool("HONEYPOT_FORTIGATE_VPN_ACCEPT_ENABLED")
+FORTIGATE_VPN_ACCEPT_MIN_ATTEMPTS = max(
+    int((os.environ.get("HONEYPOT_FORTIGATE_VPN_ACCEPT_MIN_ATTEMPTS") or "40").strip() or "40"), 1,
+)
+FORTIGATE_VPN_ACCEPT_MAX_ATTEMPTS = max(
+    int((os.environ.get("HONEYPOT_FORTIGATE_VPN_ACCEPT_MAX_ATTEMPTS") or "160").strip() or "160"),
+    FORTIGATE_VPN_ACCEPT_MIN_ATTEMPTS,
+)
+# Per-source brute state is memory held on a long-lived process; bound it
+# the same way the canary cache is bounded.
+FORTIGATE_VPN_BRUTE_STATE_TTL_SECONDS = max(
+    int((os.environ.get("HONEYPOT_FORTIGATE_VPN_BRUTE_STATE_TTL_SECONDS") or "86400").strip() or "86400"),
+    60,
+)
+FORTIGATE_VPN_BRUTE_STATE_MAX_ENTRIES = max(
+    int((os.environ.get("HONEYPOT_FORTIGATE_VPN_BRUTE_STATE_MAX_ENTRIES") or "4096").strip() or "4096"),
+    16,
+)
 
 # --- Fake Citrix NetScaler / Gateway portal -----------------------------
 # Multi-target VPN scanners pair `/vpn/index.html` and
@@ -6787,15 +6838,218 @@ def render_fortigate_login_html(host: str, version: str, build: str) -> bytes:
 
 
 def render_fortigate_logincheck() -> bytes:
-    """Body returned for /remote/logincheck.
+    """Auth-failure body for /remote/logincheck.
 
     Real FortiOS replies with a short `ret=N,redir=...` text/plain blob
-    after evaluating the credential. We always emit auth-failure so the
-    scanner moves on (and ships any follow-on auth-bypass body); the
-    session cookie is set in the handler — minted per-request, never a
-    fixed literal.
+    after evaluating the credential. This is the rejection shape: the
+    redirect target is the login page and the error flag is set. No
+    session cookie accompanies it — see `_handle_fortigate`.
     """
     return b"ret=1,redir=/remote/login&error=1\r\n"
+
+
+def render_fortigate_logincheck_success() -> bytes:
+    """Auth-success body for /remote/logincheck.
+
+    Discriminated from the rejection shape by the redirect target — the
+    SSL VPN web portal rather than back to the login form — and by the
+    absence of the error flag. The `SVPNCOOKIE` that carries the session
+    is set by the handler alongside this body, and only alongside this
+    body.
+    """
+    return b"ret=1,redir=/remote/portal\r\n"
+
+
+def _fortigate_accept_threshold(client_ip: str, host: str = "") -> int:
+    """How many guesses this source must burn before one is accepted.
+
+    Derived from the client address *and* the host being served, so the
+    number differs both per source and per deployment. Keying on the
+    address alone would give one operator the same threshold on every
+    host they hit — which is the fleet-wide constant this is trying to
+    avoid, just measured across hosts instead of across sources.
+    """
+    span = FORTIGATE_VPN_ACCEPT_MAX_ATTEMPTS - FORTIGATE_VPN_ACCEPT_MIN_ATTEMPTS + 1
+    seed = f"{client_ip or ''}\x00{host or ''}".encode("utf-8", errors="replace")
+    digest = hashlib.sha256(seed).digest()
+    return FORTIGATE_VPN_ACCEPT_MIN_ATTEMPTS + (int.from_bytes(digest[:4], "big") % span)
+
+
+def fortigate_credential_id(username: str, password: str) -> str:
+    """Stable join key for a submitted credential pair.
+
+    No structured log field carries the secret value — this hash stands
+    in for it, and gives analysis a way to ask whether the credential
+    this trap accepted from one source later shows up from a *different*
+    source: the remote-access equivalent of watching a planted cloud
+    credential move between the host that harvests it and the host that
+    spends it. (The raw request body still reaches `bodyPreview`, the
+    payload-capture field every trap shares; the point here is that the
+    join key is usable without reading it back out of the body.)
+    """
+    digest = hashlib.sha256(
+        username.encode("utf-8", errors="replace")
+        + b"\x00"
+        + password.encode("utf-8", errors="replace")
+    )
+    return digest.hexdigest()[:32]
+
+
+# Per-source credential-sink state: attempts seen, and which credential
+# (if any) this source has been allowed to "find".
+_FORTIGATE_BRUTE_STATE: dict[str, dict[str, object]] = {}
+
+
+def _fortigate_prune_brute_state(now: float) -> None:
+    expired = [
+        key for key, entry in _FORTIGATE_BRUTE_STATE.items()
+        if float(entry.get("expiry", 0.0)) <= now
+    ]
+    for key in expired:
+        del _FORTIGATE_BRUTE_STATE[key]
+    while len(_FORTIGATE_BRUTE_STATE) >= FORTIGATE_VPN_BRUTE_STATE_MAX_ENTRIES:
+        oldest = min(
+            _FORTIGATE_BRUTE_STATE,
+            key=lambda k: float(_FORTIGATE_BRUTE_STATE[k].get("expiry", 0.0)),
+        )
+        del _FORTIGATE_BRUTE_STATE[oldest]
+
+
+def fortigate_evaluate_credential(
+    client_ip: str, username: str, password: str, host: str = "",
+) -> tuple[bool, bool, int]:
+    """Decide whether this credential POST authenticates.
+
+    Returns `(accepted, newly_accepted, attempts)`.
+
+    A source accumulates attempts until it crosses its threshold; the
+    credential it happens to be trying at that point becomes the one
+    that works, and keeps working on replay. Every other pair from that
+    source continues to fail, so the operator sees exactly what a real
+    successful brute-force looks like — one hit in a long run — rather
+    than a portal that waves everything through.
+    """
+    now = time.time()
+    _fortigate_prune_brute_state(now)
+
+    # Keyed on (source, host) to match the threshold derivation: one
+    # process can serve several hostnames, and a source working through
+    # them is running a separate brute against each.
+    state_key = f"{client_ip}\x00{host}"
+    entry = _FORTIGATE_BRUTE_STATE.get(state_key)
+    if entry is None:
+        entry = {"attempts": 0, "accepted_id": None}
+        _FORTIGATE_BRUTE_STATE[state_key] = entry
+    entry["expiry"] = now + FORTIGATE_VPN_BRUTE_STATE_TTL_SECONDS
+    entry["attempts"] = int(entry.get("attempts", 0)) + 1
+    attempts = int(entry["attempts"])
+
+    # A pair we can't identify (no username, or no password) can never be
+    # the credential that "works" — accepting one would hand the operator
+    # a session they cannot reproduce.
+    if not username or not password:
+        return False, False, attempts
+
+    cred_id = fortigate_credential_id(username, password)
+    accepted_id = entry.get("accepted_id")
+
+    if accepted_id is not None:
+        # Already converted: only the found credential keeps working.
+        return cred_id == accepted_id, False, attempts
+
+    if attempts >= _fortigate_accept_threshold(client_ip, host):
+        entry["accepted_id"] = cred_id
+        return True, True, attempts
+
+    return False, False, attempts
+
+
+def render_fortigate_portal_html(host: str, version: str) -> bytes:
+    """SSL VPN web portal — where a successful login lands.
+
+    Deliberately carries no credential-shaped material: the portal's job
+    is to be a plausible next step, and what we want to measure is
+    whether the client follows the redirect and what it reaches for once
+    it does. Bookmark entries name hosts and services only.
+    """
+    safe_host = html.escape(host or "fortigate")
+    safe_version = html.escape(version)
+    rows = "\n".join(
+        f'<li><a href="/remote/portal?bookmark={slug}">'
+        f"{html.escape(label)}</a></li>"
+        for slug, label in _FORTIGATE_PORTAL_BOOKMARKS
+    )
+    body = f"""<!doctype html>
+<html><head><title>SSL-VPN Portal</title>
+<link rel="stylesheet" href="/remote/portal.css">
+</head>
+<body class="sslvpn">
+<div id="header"><span id="hostname">{safe_host}</span>
+<a href="/remote/logout" id="logout">Logout</a></div>
+<div id="tunnel"><a href="/remote/network">Network Access (tunnel mode)</a></div>
+<div id="bookmarks">
+<h2>Bookmarks</h2>
+<ul>
+{rows}
+</ul>
+</div>
+<!-- FortiGate-VM64 v{safe_version} -->
+</body></html>
+"""
+    return body.encode("utf-8")
+
+
+# Bookmark tiles the portal lists. Host and service names only — no
+# credential-shaped material anywhere in the portal. Every target stays
+# under the FortiOS-owned `/remote/` prefix so the portal's own links
+# resolve; which slug a client reaches for is the measurement.
+_FORTIGATE_PORTAL_BOOKMARKS: tuple[tuple[str, str], ...] = (
+    ("rdp-fs01", "fs01.corp.local — RDP"),
+    ("smb-fs01-share", "fs01.corp.local — SMB share"),
+    ("ssh-build01", "build01.corp.local — SSH"),
+    ("http-intranet", "intranet.corp.local — Web"),
+)
+
+
+def render_fortigate_portal_css() -> bytes:
+    """Stylesheet the portal names for itself.
+
+    A portal whose own stylesheet 404s is a shape no appliance produces,
+    and the asset fetch is a cheap signal that a client rendered the page
+    rather than only recording its status code.
+    """
+    return (
+        b"body.sslvpn{font-family:Helvetica,Arial,sans-serif;margin:0;"
+        b"background:#f5f5f5;color:#333}\n"
+        b"#header{background:#c8102e;color:#fff;padding:8px 16px}\n"
+        b"#bookmarks{padding:16px}\n"
+        b"#bookmarks ul{list-style:none;padding:0}\n"
+        b"#bookmarks li{padding:6px 0;border-bottom:1px solid #ddd}\n"
+    )
+
+
+def render_fortigate_network_html(host: str) -> bytes:
+    """Tunnel-mode landing page.
+
+    Real FortiOS serves the SSL VPN client provisioning step here. The
+    page exists so the portal's most prominent link resolves, and so a
+    client that goes looking for tunnel configuration after
+    authenticating lands somewhere rather than on a 404.
+    """
+    safe_host = html.escape(host or "fortigate")
+    body = f"""<!doctype html>
+<html><head><title>Network Access</title>
+<link rel="stylesheet" href="/remote/portal.css">
+</head>
+<body class="sslvpn">
+<div id="header"><span id="hostname">{safe_host}</span></div>
+<div id="tunnel-status">
+<p>SSL-VPN tunnel mode requires the FortiClient application.</p>
+<p><a href="/remote/portal">Return to portal</a></p>
+</div>
+</body></html>
+"""
+    return body.encode("utf-8")
 
 
 def render_fortigate_lang_stub() -> bytes:
@@ -6903,6 +7157,30 @@ def extract_fortigate_logincheck_form(body: bytes, content_type: str) -> tuple[s
         for key in ("credential", "password", "pass", "passwd")
     )
     return username, has_password
+
+
+def extract_fortigate_credentials(body: bytes, content_type: str) -> tuple[str, str]:
+    """Pull the submitted `(username, password)` pair.
+
+    Same field names as `extract_fortigate_logincheck_form`, but returns
+    the secret value rather than only its presence. The value is used to
+    derive the conversion-gate join key and is discarded immediately
+    afterwards — it is never logged and never stored.
+    """
+    form = parse_form_body(body, content_type)
+    username = ""
+    for key in ("username", "user", "login"):
+        values = form.get(key) or form.get(key.upper())
+        if values and values[0]:
+            username = values[0][:120]
+            break
+    password = ""
+    for key in ("credential", "password", "pass", "passwd"):
+        values = form.get(key) or form.get(key.upper())
+        if values and values[0]:
+            password = values[0][:256]
+            break
+    return username, password
 
 
 _FORTIGATE_CMD_INJECTION_INDICATORS = (
@@ -27373,19 +27651,73 @@ async def _handle_fortigate_vpn(
     )
 
     set_cookie_value: str | None = None
+    # Conversion-gate bookkeeping, folded into the log entry below.
+    fortigate_credential_id_value = ""
+    fortigate_attempts = 0
+    fortigate_accepted = False
+    fortigate_newly_accepted = False
 
     if lpath == "/remote/login":
         result_tag = "fortigate-login"
         body = render_fortigate_login_html(host, FORTIGATE_VPN_VERSION, FORTIGATE_VPN_BUILD)
         content_type = "text/html; charset=utf-8"
     elif lpath == "/remote/logincheck":
-        result_tag = "fortigate-logincheck"
+        content_type = "text/plain; charset=utf-8"
+        username_submitted, password_submitted = (
+            extract_fortigate_credentials(request_body, content_type_req)
+            if request_body else ("", "")
+        )
+        if username_submitted and password_submitted:
+            fortigate_credential_id_value = fortigate_credential_id(
+                username_submitted, password_submitted,
+            )
+        if FORTIGATE_VPN_ACCEPT_ENABLED:
+            (
+                fortigate_accepted,
+                fortigate_newly_accepted,
+                fortigate_attempts,
+            ) = fortigate_evaluate_credential(
+                str(log_context.get("clientIp", "")),
+                username_submitted,
+                password_submitted,
+                host,
+            )
+        if fortigate_accepted:
+            result_tag = "fortigate-logincheck-accepted"
+            body = render_fortigate_logincheck_success()
+            # SVPNCOOKIE is the cookie name FortiOS sets for an
+            # authenticated SSL VPN session, so it is issued only where
+            # a session actually exists. Per-request hex value — no fixed
+            # literal across the fleet.
+            set_cookie_value = f"SVPNCOOKIE={uuid.uuid4().hex}; Path=/; Secure; HttpOnly"
+        else:
+            result_tag = "fortigate-logincheck"
+            body = render_fortigate_logincheck()
+            # No session cookie on a rejected credential. Shipping one
+            # alongside an error body told a client keying on the cookie
+            # that every guess had succeeded, while a client keying on
+            # the body read every guess as failed — neither is a shape a
+            # real appliance produces.
+    elif lpath in ("/remote/portal", "/sslvpn/portal.html"):
+        result_tag = "fortigate-portal"
+        body = render_fortigate_portal_html(host, FORTIGATE_VPN_VERSION)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/remote/portal.css":
+        result_tag = "fortigate-portal-asset"
+        body = render_fortigate_portal_css()
+        content_type = "text/css; charset=utf-8"
+    elif lpath == "/remote/network":
+        result_tag = "fortigate-network"
+        body = render_fortigate_network_html(host)
+        content_type = "text/html; charset=utf-8"
+    elif lpath == "/remote/logout":
+        result_tag = "fortigate-logout"
         body = render_fortigate_logincheck()
         content_type = "text/plain; charset=utf-8"
-        # SVPNCOOKIE is the cookie name FortiOS sets for an authenticated
-        # SSL VPN session. We mint a fresh per-request hex value so every
-        # hit ships a distinct cookie — no fixed literal across the fleet.
-        set_cookie_value = f"SVPNCOOKIE={uuid.uuid4().hex}; Path=/; Secure; HttpOnly"
+        # Clearing the session is the one other place FortiOS touches
+        # SVPNCOOKIE; mirror the expiry so a client that logs out sees a
+        # coherent session lifecycle.
+        set_cookie_value = "SVPNCOOKIE=; Path=/; Secure; HttpOnly; Max-Age=0"
     elif lpath == "/remote/fgt_lang":
         result_tag = "fortigate-fgt-lang"
         body = render_fortigate_lang_stub()
@@ -27434,11 +27766,37 @@ async def _handle_fortigate_vpn(
         "fortigateHasCmdInjection": has_cmd_injection,
         "bytes": len(body),
     }
-    if request_body and result_tag == "fortigate-logincheck":
+    if request_body and result_tag in ("fortigate-logincheck", "fortigate-logincheck-accepted"):
         username, has_password = extract_fortigate_logincheck_form(request_body, content_type_req)
         if username:
             log_entry["fortigateUsername"] = username
         log_entry["fortigateHasPassword"] = has_password
+        # Hash of the submitted pair, never the pair itself. Logged on
+        # every attempt so analysis can ask whether the credential this
+        # source was allowed to find later turns up from a different
+        # source — i.e. whether the host that runs the brute is also the
+        # host that spends what it finds.
+        if fortigate_credential_id_value:
+            log_entry["fortigateCredentialId"] = fortigate_credential_id_value
+        if FORTIGATE_VPN_ACCEPT_ENABLED:
+            log_entry["fortigateAttempt"] = fortigate_attempts
+            log_entry["fortigateAccepted"] = fortigate_accepted
+            if fortigate_newly_accepted:
+                log_entry["fortigateFirstAccept"] = True
+    if result_tag == "fortigate-portal":
+        # Did the client actually carry the session it was handed, or is
+        # it walking the portal path blind? The difference separates a
+        # scanner following the redirect from one that only ever
+        # enumerates paths.
+        log_entry["fortigatePortalHasSession"] = "svpncookie" in (
+            request.headers.get("Cookie", "").lower()
+        )
+        bookmark = parse_qs(query).get("bookmark", [""])[0][:64]
+        if bookmark:
+            # Which internal resource the operator reached for first is
+            # the most direct read we get on intent after a successful
+            # remote-access authentication.
+            log_entry["fortigateBookmark"] = bookmark
     if body_preview:
         log_entry["bodyPreview"] = body_preview[:400]
     append_log(log_entry)

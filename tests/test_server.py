@@ -626,6 +626,12 @@ def test_all_trap_families_default_on():
         "layout-vocabulary walk cannot cover."
     )
     assert tbenv.CLOUD_IMDS_ENABLED
+    assert tbenv.FORTIGATE_VPN_ACCEPT_ENABLED, (
+        "HONEYPOT_FORTIGATE_VPN_ACCEPT_ENABLED should default to True — a "
+        "credential sink that can never succeed records the dictionary and "
+        "nothing about what the operator does with a working credential, "
+        "and the gate spends no upstream quota."
+    )
     assert tbenv.LARAVEL_DEBUGBAR_ENABLED, (
         "HONEYPOT_LARAVEL_DEBUGBAR_ENABLED should default to True — only "
         "the op=get step spends a canary, so the listing steps cost "
@@ -4931,7 +4937,7 @@ async def test_dispatch_fortigate_login_landing(flux_client):
     assert entry["fortigatePath"] == "/remote/login"
 
 
-async def test_dispatch_fortigate_logincheck_logs_username_and_sets_svpn_cookie(flux_client):
+async def test_dispatch_fortigate_logincheck_logs_username_and_rejects_first_guess(flux_client):
     resp = await flux_client.post(
         "/remote/logincheck",
         data="username=admin&credential=h%26unter2&ajax=1",
@@ -4943,32 +4949,17 @@ async def test_dispatch_fortigate_logincheck_logs_username_and_sets_svpn_cookie(
     assert resp.status == 200
     text = await resp.text()
     assert "ret=1" in text
-    set_cookie = resp.headers.get("Set-Cookie", "")
-    assert "SVPNCOOKIE=" in set_cookie
+    assert "error=1" in text
+    # A rejected credential carries no session. Shipping SVPNCOOKIE on a
+    # failure told a cookie-keyed client every guess had worked.
+    assert "SVPNCOOKIE=" not in resp.headers.get("Set-Cookie", "")
 
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "fortigate-logincheck"
     assert entry["fortigateUsername"] == "admin"
     assert entry["fortigateHasPassword"] is True
-    assert "credential" not in entry  # secret value never logged
-
-
-async def test_dispatch_fortigate_logincheck_cookie_per_request_unique(flux_client):
-    cookies = []
-    for i in range(2):
-        resp = await flux_client.post(
-            "/remote/logincheck",
-            data=f"username=u{i}&credential=p",
-            headers={
-                "X-Forwarded-For": f"203.0.113.{93 + i}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-        )
-        assert resp.status == 200
-        cookies.append(resp.headers.get("Set-Cookie", ""))
-    assert cookies[0] != cookies[1]
-    assert "SVPNCOOKIE=" in cookies[0]
-    assert "SVPNCOOKIE=" in cookies[1]
+    assert entry["fortigateAccepted"] is False
+    assert "credential" not in entry  # no dedicated secret field
 
 
 async def test_dispatch_fortigate_admin_returns_permission_denied(flux_client):
