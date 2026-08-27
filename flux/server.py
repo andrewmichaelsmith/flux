@@ -766,6 +766,10 @@ GIT_DOTFILE_PATHS: set[str] = {
     "/home/.gitconfig",
     "/home/ubuntu/.gitconfig",
     "/home/runner/.gitconfig",
+    # Same CI-runner-home spellings the trap table carries; this set is
+    # separate from it, so it has to be kept in step by hand.
+    "/home/gitlab-runner/.gitconfig",
+    "/home/circleci/.gitconfig",
     "/home/ec2-user/.gitconfig",
     "/.gitignore",
     "/root/.gitignore",
@@ -16752,6 +16756,137 @@ def render_jenkinsfile(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def _jenkins_secret_blob(length: int = 44) -> str:
+    """A `{…}` value in the shape Jenkins writes for an encrypted secret.
+
+    Per hit, because it is a secret-shaped field: a constant would be one
+    string shared by every host running this software. It decrypts to
+    nothing — that is the point of the entries that carry it. The one
+    credential in the file that a harvester can actually use is issued
+    upstream and is replay-detectable; see `render_jenkins_credentials_xml`.
+    """
+    raw = secrets.token_bytes(length)
+    return "{" + base64.b64encode(raw).decode("ascii")[:length] + "=}"
+
+
+def render_jenkins_credentials_xml(r: dict[str, object]) -> bytes:
+    """Jenkins' `credentials.xml` — the global credential store.
+
+    Mixed on purpose. The username/password and SSH entries carry
+    `{…}` ciphertext, which is what a correctly-configured instance
+    writes and what makes the document read as real. The AWS entry
+    carries the canary in the clear: its `accessKey` field genuinely is
+    plaintext in a real file, and rendering the secret half as ciphertext
+    too would leave the whole trap decorative — nothing in it could be
+    replayed, so a harvest would produce no signal at all. An instance
+    whose store was restored from a plaintext backup looks exactly like
+    this, and it is the shape the harvesters that grep these files for
+    `AKIA` are looking for.
+    """
+    aws = _aws(r)
+    return (
+        "<?xml version='1.1' encoding='UTF-8'?>\n"
+        '<com.cloudbees.plugins.credentials.SystemCredentialsProvider plugin="credentials@1319.v7eb_51b_3a_c97b_">\n'
+        '  <domainCredentialsMap class="hudson.util.CopyOnWriteMap$Hash">\n'
+        "    <entry>\n"
+        "      <com.cloudbees.plugins.credentials.domains.Domain>\n"
+        "        <specifications/>\n"
+        "      </com.cloudbees.plugins.credentials.domains.Domain>\n"
+        "      <java.util.concurrent.CopyOnWriteArrayList>\n"
+        "        <com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl>\n"
+        "          <scope>GLOBAL</scope>\n"
+        "          <id>deploy-registry</id>\n"
+        "          <description>internal registry push</description>\n"
+        "          <username>svc_deploy</username>\n"
+        f"          <password>{_jenkins_secret_blob()}</password>\n"
+        "        </com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl>\n"
+        '        <com.cloudbees.jenkins.plugins.awscredentials.AWSCredentialsImpl plugin="aws-credentials@231.v08a_59f17d742">\n'
+        "          <scope>GLOBAL</scope>\n"
+        "          <id>aws-prod-deploy</id>\n"
+        "          <description>prod deploy role</description>\n"
+        f"          <accessKey>{aws.get('awsAccessKeyId', '')}</accessKey>\n"
+        f"          <secretKey>{aws.get('awsSecretAccessKey', '')}</secretKey>\n"
+        f"          <iamRoleArn>arn:aws:iam::{_CLOUD_IMDS_FILLER_ACCOUNT}:role/jenkins-deploy</iamRoleArn>\n"
+        "          <iamMfaSerialNumber></iamMfaSerialNumber>\n"
+        "        </com.cloudbees.jenkins.plugins.awscredentials.AWSCredentialsImpl>\n"
+        '        <com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey plugin="ssh-credentials@349.vb_8b_6b_9709f5b_">\n'
+        "          <scope>GLOBAL</scope>\n"
+        "          <id>deploy-ssh</id>\n"
+        "          <username>deploy</username>\n"
+        f"          <passphrase>{_jenkins_secret_blob(32)}</passphrase>\n"
+        '          <privateKeySource class="com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey$DirectEntryPrivateKeySource">\n'
+        f"            <privateKey>{_jenkins_secret_blob(88)}</privateKey>\n"
+        "          </privateKeySource>\n"
+        "        </com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey>\n"
+        "      </java.util.concurrent.CopyOnWriteArrayList>\n"
+        "    </entry>\n"
+        "  </domainCredentialsMap>\n"
+        "</com.cloudbees.plugins.credentials.SystemCredentialsProvider>\n"
+    ).encode("utf-8")
+
+
+def render_jenkins_master_key(_r: dict[str, object]) -> bytes:
+    """`$JENKINS_HOME/secrets/master.key`.
+
+    Key material, so it is minted per hit — a constant here would be the
+    same key on every host, which is both a fingerprint and a gift. It
+    unlocks nothing: the ciphertext in `credentials.xml` is random, not
+    encrypted under this. What the file measures is whether a source that
+    took the credential store comes back for the means to decrypt it,
+    which is the difference between a scraper and an operator.
+    """
+    return (secrets.token_hex(128) + "\n").encode("utf-8")
+
+
+def render_jenkins_config_xml(_r: dict[str, object]) -> bytes:
+    """Jenkins' root `config.xml`.
+
+    Carries no credential — its job is to be the file that makes the
+    credential store the obvious next request, and to say which Jenkins
+    this is claiming to be. Version and plugin strings are inside the
+    window the script-console and credential-store probes assume.
+    """
+    return (
+        "<?xml version='1.1' encoding='UTF-8'?>\n"
+        "<hudson>\n"
+        "  <disabledAdministrativeMonitors/>\n"
+        "  <version>2.426.3</version>\n"
+        "  <numExecutors>4</numExecutors>\n"
+        "  <mode>NORMAL</mode>\n"
+        "  <useSecurity>true</useSecurity>\n"
+        '  <authorizationStrategy class="hudson.security.FullControlOnceLoggedInAuthorizationStrategy">\n'
+        "    <denyAnonymousReadAccess>false</denyAnonymousReadAccess>\n"
+        "  </authorizationStrategy>\n"
+        '  <securityRealm class="hudson.security.HudsonPrivateSecurityRealm">\n'
+        "    <disableSignup>true</disableSignup>\n"
+        "    <enableCaptcha>false</enableCaptcha>\n"
+        "  </securityRealm>\n"
+        "  <disableRememberMe>false</disableRememberMe>\n"
+        "  <projectNamingStrategy class=\"jenkins.model.ProjectNamingStrategy$DefaultProjectNamingStrategy\"/>\n"
+        "  <workspaceDir>${JENKINS_HOME}/workspace/${ITEM_FULL_NAME}</workspaceDir>\n"
+        "  <buildsDir>${ITEM_ROOTDIR}/builds</buildsDir>\n"
+        "  <jdks/>\n"
+        "  <viewsTabBar class=\"hudson.views.DefaultViewsTabBar\"/>\n"
+        "  <myViewsTabBar class=\"hudson.views.DefaultMyViewsTabBar\"/>\n"
+        "  <clouds/>\n"
+        "  <quietPeriod>5</quietPeriod>\n"
+        "  <scmCheckoutRetryCount>0</scmCheckoutRetryCount>\n"
+        "  <views>\n"
+        '    <hudson.model.AllView>\n'
+        "      <owner class=\"hudson\" reference=\"../../..\"/>\n"
+        "      <name>all</name>\n"
+        "      <filterExecutors>false</filterExecutors>\n"
+        "      <filterQueue>false</filterQueue>\n"
+        "      <properties class=\"hudson.model.View$PropertyList\"/>\n"
+        "    </hudson.model.AllView>\n"
+        "  </views>\n"
+        '  <primaryView>all</primaryView>\n'
+        "  <slaveAgentPort>-1</slaveAgentPort>\n"
+        "  <label></label>\n"
+        "</hudson>\n"
+    ).encode("utf-8")
+
+
 def render_bitbucket_pipelines_yml(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     deploy_password = _fake_db_password()
@@ -22165,6 +22300,56 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_jenkinsfile,
         "text/plain; charset=utf-8",
     ),
+    # The build server's own state, not a file a pipeline publishes. The
+    # dictionaries that walk `/Jenkinsfile` walk these in the same sweep,
+    # under both the webroot spellings (`/jenkins/…`, `/.jenkins/…`) and
+    # the absolute `$JENKINS_HOME` ones — and the absolute forms arrive
+    # through the dev-server read primitive too, which is why they belong
+    # in this table rather than in a handler: one entry answers every
+    # route into the same file.
+    CanaryTrap(
+        "jenkins-credentials-xml",
+        (
+            "/credentials.xml",
+            "/jenkins/credentials.xml",
+            "/.jenkins/credentials.xml",
+            "/jenkins_home/credentials.xml",
+            "/var/jenkins_home/credentials.xml",
+            "/var/lib/jenkins/credentials.xml",
+        ),
+        ("aws",),
+        render_jenkins_credentials_xml,
+        "application/xml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "jenkins-master-key",
+        (
+            "/secrets/master.key",
+            "/jenkins/secrets/master.key",
+            "/.jenkins/secrets/master.key",
+            "/jenkins_home/secrets/master.key",
+            "/var/jenkins_home/secrets/master.key",
+            "/var/lib/jenkins/secrets/master.key",
+        ),
+        (),
+        render_jenkins_master_key,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "jenkins-config-xml",
+        (
+            "/jenkins/config.xml",
+            "/jenkins/config.xml.bak",
+            "/.jenkins/config.xml",
+            "/config/jenkins.xml",
+            "/jenkins_home/config.xml",
+            "/var/jenkins_home/config.xml",
+            "/var/lib/jenkins/config.xml",
+        ),
+        (),
+        render_jenkins_config_xml,
+        "application/xml; charset=utf-8",
+    ),
     CanaryTrap(
         "bitbucket-pipelines",
         ("/bitbucket-pipelines.yml", "/bitbucket-pipelines.yaml"),
@@ -24752,6 +24937,22 @@ for _trap in CANARY_TRAPS:
             continue
         for _suffix in _APP_CONFIG_EDITOR_SUFFIXES:
             _TRAP_BY_PATH.setdefault(_low + _suffix, _trap)
+
+
+# CI providers other than GitHub Actions name the build agent's home
+# after themselves. The dictionaries that walk `/home/runner/<file>` walk
+# these spellings in the same sweep, so answering one and 404ing the rest
+# is the same split that adding `/home/runner` closed for `/home/ubuntu`
+# — a shape no real host produces. Derived rather than hand-listed so a
+# file added to one home cannot be missing from the others.
+_CI_RUNNER_HOME = "/home/runner/"
+_CI_RUNNER_HOME_ALIASES: tuple[str, ...] = ("gitlab-runner", "circleci")
+for _p, _trap in list(_TRAP_BY_PATH.items()):
+    if not _p.startswith(_CI_RUNNER_HOME):
+        continue
+    _leaf = _p[len(_CI_RUNNER_HOME):]
+    for _alias in _CI_RUNNER_HOME_ALIASES:
+        _TRAP_BY_PATH.setdefault(f"/home/{_alias}/{_leaf}", _trap)
 
 
 # Absolute system paths answered on the filesystem-read surface, mapped to

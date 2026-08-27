@@ -218,6 +218,9 @@ case-insensitive exact matches.
 | GitHub Actions workflows | `/.github/workflows/{deploy,main,ci,build,test,docker,release,cd}.yml` plus `.yaml` variants | `aws` | `github-actions-workflow` |
 | GitLab CI config | `/.gitlab-ci.yml`, `/.gitlab-ci.yaml`, `/.gitlab/.gitlab-ci.yml` | `aws` | `gitlab-ci` |
 | Jenkins Pipeline | `/Jenkinsfile`, `/Jenkinsfile.bak` | `aws` | `jenkinsfile` |
+| Jenkins credential store — [docs](./docs/jenkins-store.md) | `/credentials.xml`, `/jenkins/credentials.xml`, `/.jenkins/credentials.xml`, `/jenkins_home/credentials.xml`, `/var/jenkins_home/credentials.xml`, `/var/lib/jenkins/credentials.xml` — the global credential store, with `{…}` ciphertext on the entries a real instance encrypts and the canary in the clear on the AWS entry (whose `accessKey` is plaintext in a real file) | `aws` | `jenkins-credentials-xml` |
+| Jenkins `master.key` — [docs](./docs/jenkins-store.md) | `/secrets/master.key`, `/jenkins/secrets/master.key`, `/.jenkins/secrets/master.key`, `/jenkins_home/secrets/master.key`, `/var/jenkins_home/secrets/master.key`, `/var/lib/jenkins/secrets/master.key` — per-hit key material, no canary; coming back for it after taking the store is what separates a scraper from an operator | — | `jenkins-master-key` |
+| Jenkins root config — [docs](./docs/jenkins-store.md) | `/jenkins/config.xml`, `/jenkins/config.xml.bak`, `/.jenkins/config.xml`, `/config/jenkins.xml`, `/jenkins_home/config.xml`, `/var/jenkins_home/config.xml`, `/var/lib/jenkins/config.xml` — no credential, no upstream call; the file that makes the credential store the obvious next request | — | `jenkins-config-xml` |
 | Bitbucket Pipelines | `/bitbucket-pipelines.yml`, `/bitbucket-pipelines.yaml` | `aws` | `bitbucket-pipelines` |
 | Generic CI deploy config | `/appveyor.yml`, `/.circleci/config.yml`, `/azure-pipelines.yml`, `/deployment.yml`, `/deploy.yml`, `/drone.yml`, `/.drone.yml` plus `.yaml` variants where applicable | `aws` | `generic-ci-config` |
 | Spring properties | `/application.properties` | `aws` | `application-properties` |
@@ -365,6 +368,7 @@ under [`docs/`](./docs/):
 - [Fake Sophos XG SSL VPN](./docs/fake-sophos-vpn.md)
 - [Fake Barracuda SSL VPN](./docs/fake-barracuda-vpn.md)
 - [Fake Check Point Mobile Access / Gaia](./docs/fake-checkpoint.md)
+- [Jenkins build-server state files](./docs/jenkins-store.md)
 - [Fake F5 BIG-IP APM / TMUI](./docs/fake-f5-bigip.md)
 - [Fake Citrix NetScaler / Gateway portal](./docs/fake-citrix-gateway.md)
 - [Fake Microsoft RDWeb (RD Web Access) trap](./docs/fake-rdweb.md)
