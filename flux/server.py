@@ -6603,6 +6603,7 @@ def capture_llm_auth_token(auth_header: str, api_key_header: str) -> tuple[str, 
 
 
 def render_cisco_webvpn_logon_html(host: str) -> bytes:
+    host = _appliance_display_host(host, "cisco-webvpn")
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -6802,6 +6803,7 @@ def render_telescope_favicon_svg() -> bytes:
 
 
 def render_cisco_anyconnect_config_auth(host: str) -> bytes:
+    host = _appliance_display_host(host, "cisco-anyconnect")
     gateway = host or "vpn-gateway"
     body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
@@ -6821,7 +6823,7 @@ def render_cisco_anyconnect_config_auth(host: str) -> bytes:
 
 
 def render_ivanti_welcome_html(host: str) -> bytes:
-    safe_host = host or "ivanti-vpn"
+    safe_host = _appliance_display_host(host, "ivanti-vpn")
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -6900,7 +6902,7 @@ def render_fortigate_login_html(host: str, version: str, build: str) -> bytes:
     number, not bytewise diff against a real device) move on to the
     second-stage probe.
     """
-    safe_host = host or "fortigate"
+    safe_host = _appliance_display_host(host, "fortigate")
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -7071,6 +7073,7 @@ def render_fortigate_portal_html(host: str, version: str) -> bytes:
     whether the client follows the redirect and what it reaches for once
     it does. Bookmark entries name hosts and services only.
     """
+    host = _appliance_display_host(host, "fortigate")
     safe_host = html.escape(host or "fortigate")
     safe_version = html.escape(version)
     rows = "\n".join(
@@ -7135,6 +7138,7 @@ def render_fortigate_network_html(host: str) -> bytes:
     client that goes looking for tunnel configuration after
     authenticating lands somewhere rather than on a 404.
     """
+    host = _appliance_display_host(host, "fortigate")
     safe_host = html.escape(host or "fortigate")
     body = f"""<!doctype html>
 <html><head><title>Network Access</title>
@@ -7158,7 +7162,7 @@ def render_fortigate_lang_stub() -> bytes:
 
 
 def render_fortigate_error_html(host: str) -> bytes:
-    safe_host = host or "fortigate"
+    safe_host = _appliance_display_host(host, "fortigate")
     body = f"""<!doctype html>
 <html><head><title>Error</title></head>
 <body><div id="err">An error occurred. <a href="/remote/login?lang=en">Return to login</a></div>
@@ -7197,7 +7201,7 @@ def render_fortigate_status_json(host: str, version: str, build: str) -> bytes:
     Public on real FortiOS pre-auth in some configs; banner-grab probes
     sometimes skip the login HTML and go straight here.
     """
-    safe_host = host or "fortigate"
+    safe_host = _appliance_display_host(host, "fortigate")
     payload = {
         "http_method": "GET",
         "results": {
@@ -7327,7 +7331,7 @@ def render_globalprotect_prelogin_xml(version: str) -> bytes:
 
 
 def render_globalprotect_login_html(host: str) -> bytes:
-    safe_host = host or "globalprotect"
+    safe_host = _appliance_display_host(host, "globalprotect")
     return (
         "<!DOCTYPE html>\n<html><head>\n"
         f"<title>GlobalProtect Portal - {safe_host}</title>\n"
@@ -7344,7 +7348,7 @@ def render_globalprotect_login_html(host: str) -> bytes:
 
 
 def render_globalprotect_getconfig_xml(host: str, version: str) -> bytes:
-    safe_host = host or "globalprotect"
+    safe_host = _appliance_display_host(host, "globalprotect")
     return (
         '<?xml version="1.0" encoding="UTF-8" ?>\n'
         "<response>\n"
@@ -7386,7 +7390,7 @@ def extract_globalprotect_form(body: bytes, content_type: str) -> tuple[str, boo
 # ---- Sophos SSL VPN renderers -----------------------------------------------
 
 def render_sophos_vpn_login_html(host: str) -> bytes:
-    safe_host = host or "sophos-xg"
+    safe_host = _appliance_display_host(host, "sophos-xg")
     return (
         "<!DOCTYPE html>\n<html><head>\n"
         f"<title>Sophos Firewall - {safe_host}</title>\n"
@@ -7439,7 +7443,7 @@ def render_barracuda_vpn_negotiation() -> bytes:
 
 
 def render_barracuda_login_html(host: str) -> bytes:
-    safe_host = host or "barracuda"
+    safe_host = _appliance_display_host(host, "barracuda")
     return (
         "<!DOCTYPE html>\n<html><head>\n"
         f"<title>Barracuda SSL VPN - {safe_host}</title>\n"
@@ -7464,7 +7468,7 @@ def render_checkpoint_portal_html(host: str, error: str = "") -> bytes:
     credential arrives at this handler rather than at the router's 404 —
     the failure mode the self-referenced-asset guard exists to catch.
     """
-    safe_host = host or "gateway"
+    safe_host = _appliance_display_host(host, "gateway")
     banner = (
         f'<div id="errorMessage">{error}</div>\n' if error else ""
     )
@@ -7494,7 +7498,7 @@ def render_checkpoint_gaia_html(host: str) -> bytes:
     separate products on the same box, and which one a source asks for
     is the measurement this trap exists to take.
     """
-    safe_host = host or "gateway"
+    safe_host = _appliance_display_host(host, "gateway")
     return (
         "<!DOCTYPE html>\n<html><head>\n"
         f"<title>Gaia Portal - {safe_host}</title>\n"
@@ -7593,7 +7597,7 @@ def extract_checkpoint_read_target(body: bytes) -> str:
 # ---- F5 BIG-IP APM renderers ------------------------------------------------
 
 def render_f5_my_policy_html(host: str, version: str) -> bytes:
-    safe_host = host or "bigip"
+    safe_host = _appliance_display_host(host, "bigip")
     return (
         "<!DOCTYPE html>\n<html><head>\n"
         f"<title>BIG-IP - {safe_host}</title>\n"
@@ -7612,7 +7616,7 @@ def render_f5_my_policy_html(host: str, version: str) -> bytes:
 
 
 def render_f5_tmui_login_html(host: str, version: str) -> bytes:
-    safe_host = host or "bigip"
+    safe_host = _appliance_display_host(host, "bigip")
     return (
         "<!DOCTYPE html>\n<html><head>\n"
         f"<title>BIG-IP&reg; Configuration Utility</title>\n"
@@ -8142,7 +8146,7 @@ def render_citrix_gateway_index_html(host: str, version: str) -> bytes:
     / `NS<version>` rather than diff bytes) to move on to the credential
     POST or the CVE-2019-19781 path-traversal probe.
     """
-    safe_host = host or "citrix-gateway"
+    safe_host = _appliance_display_host(host, "citrix-gateway")
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -8179,7 +8183,7 @@ def render_citrix_logonpoint_html(host: str, version: str) -> bytes:
 
     Differs from `/vpn/index.html` only in framing — same form contract.
     """
-    safe_host = host or "citrix-gateway"
+    safe_host = _appliance_display_host(host, "citrix-gateway")
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -8213,7 +8217,7 @@ def render_citrix_xenapp_login_html(host: str) -> bytes:
     deployments; we accept both the GET landing here and any POST that
     lands on `/cgi/login` or this same path.
     """
-    safe_host = host or "citrix-storefront"
+    safe_host = _appliance_display_host(host, "citrix-storefront")
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -8325,7 +8329,7 @@ def render_rdweb_login_html(host: str, server_build: str) -> bytes:
     parse the HTML and submit. The `Server: Microsoft-IIS/10.0` header
     is set by the handler.
     """
-    safe_host = host or "rdweb"
+    safe_host = _appliance_display_host(host, "rdweb")
     viewstate = uuid.uuid4().hex
     body = f"""<!doctype html>
 <html lang="en">
@@ -8375,7 +8379,7 @@ def render_rdweb_default_html(host: str, tb: dict[str, object] | None = None) ->
     falls back to the empty `No resources are currently available.`
     shape so keyless deployments still emit a plausible response.
     """
-    safe_host = host or "rdweb"
+    safe_host = _appliance_display_host(host, "rdweb")
     aws = _aws(tb) if tb else {}
     access_key = aws.get("awsAccessKeyId", "")
     secret_key = aws.get("awsSecretAccessKey", "")
@@ -8418,7 +8422,7 @@ def render_exchange_owa_login_html(host: str, build: str) -> bytes:
     `flags`, `forcedownlevel`, `trusted` hidden inputs that scanners
     parse to pick a credential-stuffing payload shape.
     """
-    safe_host = host or "owa"
+    safe_host = _appliance_display_host(host, "owa")
     canary = uuid.uuid4().hex
     body = f"""<!doctype html>
 <html lang="en">
@@ -8459,7 +8463,7 @@ def render_exchange_owa_default_html(host: str) -> bytes:
     302s to `/owa/auth/logon.aspx?url=…` when there's no cadata cookie.
     We return the redirect HTML so any scanner-side follow chain
     lands on the logon page next."""
-    safe_host = host or "owa"
+    safe_host = _appliance_display_host(host, "owa")
     body = f"""<!doctype html>
 <html><head><title>Outlook</title>
 <meta http-equiv="Refresh" content="0;URL=/owa/auth/logon.aspx?url=https%3A%2F%2F{safe_host}%2Fowa%2F&reason=0" />
@@ -8471,7 +8475,7 @@ def render_exchange_owa_default_html(host: str) -> bytes:
 def render_exchange_owa_error_html(host: str, http_code: str) -> bytes:
     """OWA error landing — `/owa/auth/errorFE.aspx?httpCode=NNN` is the
     real path Exchange redirects to when forms-based auth fails."""
-    safe_host = host or "owa"
+    safe_host = _appliance_display_host(host, "owa")
     code = http_code if http_code.isdigit() else "500"
     body = f"""<!doctype html>
 <html><head><title>Outlook Web App</title></head>
@@ -8495,7 +8499,7 @@ def render_exchange_ecp_logon_html(host: str, build: str) -> bytes:
     """Exchange Control Panel login page (`/ecp/`). Real ECP shares the
     OWA forms-auth landing but with an `isEcpLogon=1` hidden input.
     We log the POST as a credential submission against ECP."""
-    safe_host = host or "ecp"
+    safe_host = _appliance_display_host(host, "ecp")
     body = f"""<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8" /><title>Exchange Admin Center</title></head>
@@ -8525,7 +8529,7 @@ def render_exchange_exporttool_application(host: str, build: str) -> bytes:
     picking a CVE chain (the version range determines which of
     ProxyLogon / ProxyShell / ProxyNotShell branches are in scope).
     Returning a plausible XML keeps the fingerprint pass alive."""
-    safe_host = host or "exchange"
+    safe_host = _appliance_display_host(host, "exchange")
     body = f"""<?xml version="1.0" encoding="utf-8"?>
 <asmv1:assembly xsi:schemaLocation="urn:schemas-microsoft-com:asm.v1 assembly.adaptive.xsd"
   manifestVersion="1.0"
@@ -8558,7 +8562,7 @@ def render_exchange_autodiscover_json(host: str, target_email: str, bearer: str)
     `Token`. We embed a per-request bearer literal in `Token` plus
     echo the spoof target back into the `Url` so the canary placement
     is plausible to anyone scraping the JSON for secrets."""
-    safe_host = host or "exchange"
+    safe_host = _appliance_display_host(host, "exchange")
     safe_email = (target_email or "user@" + safe_host)[:120].replace('"', "")
     body = (
         "{"
@@ -8578,7 +8582,7 @@ def render_exchange_powershell_401(host: str) -> bytes:
     401 + `WWW-Authenticate: Negotiate, Kerberos, NTLM` on an
     unauthenticated probe. The header is set by the handler; the
     body just describes the error."""
-    safe_host = host or "exchange"
+    safe_host = _appliance_display_host(host, "exchange")
     body = (
         b"<html><body><h1>HTTP/1.1 401 Unauthorized</h1>"
         b"<p>Authentication required for /PowerShell/.</p>"
@@ -8679,7 +8683,7 @@ def extract_aspera_faspex_creds(body: bytes, content_type: str) -> dict[str, str
 
 
 def render_aspera_faspex_landing(host: str, version: str) -> bytes:
-    safe_host = host or "faspex-gateway"
+    safe_host = _appliance_display_host(host, "faspex-gateway")
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -8789,7 +8793,7 @@ def render_geoserver_landing(host: str, version: str) -> bytes:
 
     Apache Wicket markup is intentionally close to the upstream login.html
     so wicket-aware scanners follow into AboutGeoServerPage / Demos."""
-    safe_host = host or "geoserver.internal"
+    safe_host = _appliance_display_host(host, "geoserver.internal")
     body = f"""<!doctype html>
 <html lang="en" xml:lang="en" xmlns="http://www.w3.org/1999/xhtml">
 <head>
@@ -8843,7 +8847,7 @@ def render_geoserver_about(host: str, version: str) -> bytes:
     """About page — visited as the CVE-2024-36401 trigger surface. Server
     responds with a plausible Wicket-rendered AboutGeoServerPage so scanners
     that fingerprint on the response body proceed to ship the exploit."""
-    safe_host = host or "geoserver.internal"
+    safe_host = _appliance_display_host(host, "geoserver.internal")
     body = f"""<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8" /><title>About GeoServer</title></head>
@@ -9457,6 +9461,7 @@ def render_weblogic_console_login_html(
     submitted username so form-scraping bots think the failed-login
     branch was reached (real WebLogic re-populates the username
     field on failure)."""
+    host = _appliance_display_host(host, "weblogic")
     safe_host = (host or "console.example").replace("<", "&lt;").replace(">", "&gt;")
     safe_user = (submitted_user or "").replace("<", "&lt;").replace(">", "&gt;")[:200]
     safe_error = error.replace("<", "&lt;").replace(">", "&gt;")[:200]
@@ -9545,6 +9550,7 @@ def render_liferay_jsonws_landing(host: str, aws: dict, version: str, build: str
     grep the table for service names and AKIA/secret pairs that
     deployments sometimes leave in service-description text after copying
     portal-ext.properties values into documentation."""
+    host = _appliance_display_host(host, "example.com")
     key = aws.get("awsAccessKeyId", "") if isinstance(aws, dict) else ""
     secret = aws.get("awsSecretAccessKey", "") if isinstance(aws, dict) else ""
     safe_host = (host or "portal.example").replace("<", "&lt;").replace(">", "&gt;")
@@ -9705,6 +9711,7 @@ def render_gravity_smtp_settings(host: str) -> bytes:
     they pivot to `/config` and `/connector/<name>` for the credential
     grabs. `from_email` is derived from the request `Host` so each
     sensor advertises its own apex (no fleet-wide fixed literal)."""
+    host = _appliance_display_host(host, "example.com")
     safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
     safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
     payload = {
@@ -9847,6 +9854,7 @@ def render_gravity_smtp_mock_data(host: str) -> bytes:
     that the plugin's settings-page test button uses to render a
     sample outbound email. No credentials in the payload; useful as
     a fingerprint slot that keeps the scanner walking the namespace."""
+    host = _appliance_display_host(host, "example.com")
     safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
     safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
     payload = {
@@ -9875,6 +9883,7 @@ def render_gravity_smtp_debug(host: str) -> bytes:
     `sent` rows with redacted recipients so scanners see the slot
     populated, plus the active connector (`amazonses`) so the chain
     matches `/settings` and `/config`."""
+    host = _appliance_display_host(host, "example.com")
     safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
     safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
     payload = {
@@ -9939,6 +9948,7 @@ def render_telescope_shell_html(host: str) -> bytes:
     `/telescope/requests`, `/telescope/queries`, etc. land here as the
     fingerprint marker; the credential harvest happens via the
     `telescope-api/<panel>` JSON endpoints the SPA then calls."""
+    host = _appliance_display_host(host, "example.com")
     safe_host = (host or "example.com").split(":", 1)[0] or "example.com"
     safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "example.com"
     csrf = secrets.token_hex(20)
@@ -10575,7 +10585,7 @@ def render_coldfusion_public_page(path: str, host: str, version: str) -> bytes:
         "/menu.cfm": "Application Menu",
         "/base.cfm": "Application Base",
     }.get(path.lower(), "ColdFusion Application")
-    safe_host = host or "cfusion.internal"
+    safe_host = _appliance_display_host(host, "cfusion.internal")
     body = f"""<!doctype html>
 <html>
 <head>
@@ -10597,7 +10607,7 @@ def render_coldfusion_public_page(path: str, host: str, version: str) -> bytes:
 
 
 def render_coldfusion_componentutils(host: str, version: str) -> bytes:
-    safe_host = host or "cfusion.internal"
+    safe_host = _appliance_display_host(host, "cfusion.internal")
     body = f"""<!doctype html>
 <html>
 <head>
@@ -10624,7 +10634,7 @@ def render_coldfusion_componentutils(host: str, version: str) -> bytes:
 
 
 def render_coldfusion_admin_login(host: str, version: str) -> bytes:
-    safe_host = host or "cfusion.internal"
+    safe_host = _appliance_display_host(host, "cfusion.internal")
     body = f"""<!doctype html>
 <html>
 <head>
@@ -10647,7 +10657,7 @@ def render_coldfusion_admin_login(host: str, version: str) -> bytes:
 
 
 def render_coldfusion_admin_dashboard(host: str, version: str) -> bytes:
-    safe_host = host or "cfusion.internal"
+    safe_host = _appliance_display_host(host, "cfusion.internal")
     body = f"""<!doctype html>
 <html>
 <head><meta charset="utf-8" /><title>ColdFusion Administrator</title></head>
@@ -10723,7 +10733,7 @@ def render_confluence_login_html(host: str, version: str, error: str = "") -> by
 
     `error` renders the auth-failure notice real Confluence shows after a
     rejected `/dologin.action` submission."""
-    safe_host = host or "confluence.internal"
+    safe_host = _appliance_display_host(host, "confluence.internal")
     atl_token = uuid.uuid4().hex
     error_html = (
         f'<div class="aui-message aui-message-error">'
@@ -11294,6 +11304,7 @@ def render_sonicwall_portal_html(host: str) -> bytes:
     directly in the existing CVE-2024-53704 bait chain instead of having to
     know the API route up front.
     """
+    host = _appliance_display_host(host, "sonicwall")
     safe_host = html.escape(host or "sonicwall")
     return (
         "<!DOCTYPE html>\n<html><head>\n"
@@ -12049,6 +12060,34 @@ def _host_is_externally_plausible(h: str) -> bool:
         return False
     labels = h.split(".")
     return len(labels) >= 2 and not all(label.isdigit() for label in labels)
+
+
+def _appliance_display_host(host: str, fallback: str) -> str:
+    """The hostname an appliance page may print as its own name.
+
+    Every vendor portal here renders the requested host into its title
+    and page furniture, guarded by `host or "<vendor default>"`. That
+    guard only fires on an *empty* host — and the value that actually
+    arrives behind a reverse proxy which rewrites `Host` is not empty,
+    it is `127.0.0.1`. So the pages shipped
+    `<title>… - 127.0.0.1</title>`: not a name any appliance would
+    print, and identical from every host running this software, which
+    makes it a fleet fingerprint rather than a cosmetic slip. Found by
+    probing a deployment — unit tests pass a hostname straight into the
+    renderer, so they cannot see it. Same way the OIDC issuer defect was
+    found, and the same defect.
+
+    Same test and fallback order as `_external_base_url`, minus the URL
+    scheme: the requested host when it could be a real external name,
+    else the configured site host, else the vendor placeholder the
+    caller supplied.
+    """
+    h = (host or "").strip().lower().split(":", 1)[0]
+    if _host_is_externally_plausible(h):
+        return h
+    if _host_is_externally_plausible(SITE_HOST):
+        return SITE_HOST
+    return fallback
 
 
 def _external_base_url(host: str) -> str:
@@ -15009,6 +15048,7 @@ def render_swagger_ui_html(host: str, spec_url: str = "/swagger.json") -> bytes:
     """Stock Swagger UI bootstrap. References /swagger.json so a scanner
     that fetches the UI then follows the spec lands on `_handle_openapi_swagger`
     again with `spec-json` and receives the canary-bearing document."""
+    host = _appliance_display_host(host, "example.com")
     safe_host = (host or "").split(":", 1)[0]
     safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host)
     title_host = safe_host or "API"
@@ -15043,6 +15083,7 @@ def render_swagger_ui_html(host: str, spec_url: str = "/swagger.json") -> bytes:
 def render_redoc_html(host: str, spec_url: str = "/openapi.json") -> bytes:
     """ReDoc bootstrap variant — same role as Swagger UI but the alternative
     renderer scanners check when Swagger UI 404s. Points at /openapi.json."""
+    host = _appliance_display_host(host, "example.com")
     safe_host = (host or "").split(":", 1)[0]
     safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host)
     title_host = safe_host or "API"
@@ -15072,6 +15113,7 @@ def render_graphiql_html(host: str, endpoint: str) -> bytes:
     same path the scanner hit) so a multi-variant fanout sees
     consistent state.
     """
+    host = _appliance_display_host(host, "example.com")
     safe_host = (host or "").split(":", 1)[0]
     safe_host = re.sub(r"[^a-zA-Z0-9._-]", "", safe_host) or "graphql"
     safe_endpoint = re.sub(r"[^a-zA-Z0-9/_\-.]", "", endpoint or "/graphql") or "/graphql"
