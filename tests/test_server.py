@@ -695,6 +695,12 @@ def test_all_trap_families_default_on():
     assert tbenv.GLOBALPROTECT_ENABLED
     assert tbenv.SOPHOS_VPN_ENABLED
     assert tbenv.BARRACUDA_VPN_ENABLED
+    assert tbenv.CHECKPOINT_ENABLED, (
+        "HONEYPOT_CHECKPOINT_ENABLED should default to True — the "
+        "multi-vendor edge sweep gets a portal from every other vendor "
+        "trap here, and being the one vendor that 404s is a property of "
+        "this software rather than of the deployment."
+    )
     assert tbenv.F5_BIGIP_ENABLED
     assert tbenv.DOCKER_REGISTRY_ENABLED
     assert tbenv.DOCKER_DAEMON_ENABLED

@@ -116,9 +116,9 @@ def test_suffix_walk_is_bounded(monkeypatch):
 def test_unknown_file_misses_rather_than_inventing_a_body():
     """A real dev server 404s a file that isn't there. Answering 200 for
     anything at all would be an obvious tell."""
-    resolution = tbenv.resolve_vite_fs("/@fs/etc/shadow")
+    resolution = tbenv.resolve_vite_fs("/@fs/etc/hosts")
     assert resolution.trap is None
-    assert resolution.requested_path == "/etc/shadow"
+    assert resolution.requested_path == "/etc/hosts"
 
 
 def test_resolution_still_reports_the_path_on_a_miss():
@@ -185,14 +185,14 @@ async def test_dispatch_serves_the_canary_for_a_resolved_read(flux_client):
 
 async def test_dispatch_logs_the_requested_path_on_a_miss(flux_client):
     resp = await flux_client.get(
-        "/@fs/etc/shadow",
+        "/@fs/etc/hosts",
         headers={"X-Forwarded-For": "203.0.113.10"},
     )
     assert resp.status == 404
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "vite-fs-miss"
-    assert entry["viteFsRequestedPath"] == "/etc/shadow"
-    assert entry["viteFsRawSuffix"] == "etc/shadow"
+    assert entry["viteFsRequestedPath"] == "/etc/hosts"
+    assert entry["viteFsRawSuffix"] == "etc/hosts"
 
 
 async def test_env_variant_takes_the_canary_not_the_tarpit(flux_client):
@@ -300,7 +300,7 @@ def test_system_file_match_is_exact_not_walked():
         "/@fs/var/www/etc/passwd",
         "/@fs/passwd",
         "/@fs/etc/passwd.bak",
-        "/@fs/etc/shadow",
+        "/@fs/etc/hosts",
         "/@fs/etc/nginx/sites-enabled/default",
     ):
         assert tbenv.resolve_vite_fs(path).system_file == ""
@@ -372,10 +372,10 @@ async def test_unlisted_system_path_still_misses(flux_client):
     """Scope guard: this is a fixed list, not an answer-everything
     switch. An unlisted system file must still 404 and log the miss."""
     resp = await flux_client.get(
-        "/@fs/etc/shadow",
+        "/@fs/etc/hosts",
         headers={"X-Forwarded-For": "203.0.113.33"},
     )
     assert resp.status == 404
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "vite-fs-miss"
-    assert entry["viteFsRequestedPath"] == "/etc/shadow"
+    assert entry["viteFsRequestedPath"] == "/etc/hosts"

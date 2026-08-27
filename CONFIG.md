@@ -282,6 +282,26 @@ The `SVPNCOOKIE` minted on an accepted `/remote/logincheck` and the
 portal served after acceptance carries host and service names only — no
 credential-shaped material of any kind.
 
+## Fake Check Point Mobile Access / Gaia (CVE-2024-24919 bait)
+
+No Tracebit key required for the portal surfaces. The read primitive
+resolves through the canary file table, so on a keyless deployment it
+finds nothing to hand out and answers empty.
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_CHECKPOINT_ENABLED` | on | Master switch for all three surfaces. |
+| `HONEYPOT_CHECKPOINT_PORTAL_PATHS_CSV` | *(built-in — `/sslvpn/login/login`, `/sslvpn/login`, `/sslvpn/portal/main`, `/sslvpn/`, `/sslvpn`, `/login/login`)* | Mobile Access blade portal. Exact, case-insensitive, query string stripped. |
+| `HONEYPOT_CHECKPOINT_GAIA_PATHS_CSV` | *(built-in — `/cgi-bin/home.tcl`)* | Gaia appliance-management UI. Kept separate from the portal list so the two surfaces stay separable in the log. |
+| `HONEYPOT_CHECKPOINT_READ_PATHS_CSV` | *(built-in — `/clients/mycrl`)* | CVE-2024-24919 CRL-client endpoint. |
+| `HONEYPOT_CHECKPOINT_BODY_DECODE_LIMIT` | `8192` | Bytes of request body decoded for traversal extraction and credential parsing. Floor 256. |
+| `HONEYPOT_CHECKPOINT_SERVER_HEADER` | `CPWS` | `Server:` header on every response from these surfaces. |
+
+The `CPCVPN_SESSION_ID` cookie is per-request unique (`uuid4().hex`) and
+the `/etc/shadow` body the read primitive serves is minted per hit. No
+fixed credential literals on any branch. See
+[docs](./docs/fake-checkpoint.md).
+
 ## Fake Citrix NetScaler / Gateway portal (CVE-2019-19781 / CVE-2023-3519 / CVE-2023-4966 / CVE-2022-27510 bait)
 
 No Tracebit key required.

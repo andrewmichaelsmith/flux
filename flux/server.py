@@ -1852,6 +1852,76 @@ BARRACUDA_VPN_PATHS = {
     if value.strip()
 }
 
+# --- Fake Check Point Mobile Access / Gaia portal -----------------------
+# The multi-vendor edge-appliance sweep walks one login path per vendor
+# and keeps whichever answers. Every other vendor in that dictionary has
+# a trap here — FortiOS, SonicWall, Citrix, Ivanti, GlobalProtect,
+# Sophos, Barracuda, F5 — so a source running the sweep gets a portal
+# from all of them and a 404 from exactly one. That asymmetry is a
+# property of this software rather than of any deployment, which is what
+# makes the gap worth closing instead of just a missing vendor.
+#
+# Two distinct surfaces, deliberately tagged apart:
+#   - the Mobile Access blade portal (`/sslvpn/Login/Login`,
+#     `/Login/Login`) — remote access for users, where a credential
+#     sweep lands;
+#   - the Gaia management UI (`/cgi-bin/home.tcl`) — appliance
+#     administration, where a source after the box itself lands.
+# A source that asks for one and not the other is saying which of the two
+# it came for.
+CHECKPOINT_ENABLED = _env_bool("HONEYPOT_CHECKPOINT_ENABLED")
+_CHECKPOINT_PORTAL_DEFAULT_PATHS = ",".join([
+    "/sslvpn/login/login",
+    "/sslvpn/login",
+    "/sslvpn/portal/main",
+    "/sslvpn/",
+    "/sslvpn",
+    "/login/login",
+])
+CHECKPOINT_PORTAL_PATHS = {
+    value.strip().lower()
+    for value in (
+        os.environ.get("HONEYPOT_CHECKPOINT_PORTAL_PATHS_CSV")
+        or _CHECKPOINT_PORTAL_DEFAULT_PATHS
+    ).split(",")
+    if value.strip()
+}
+CHECKPOINT_GAIA_PATHS = {
+    value.strip().lower()
+    for value in (
+        os.environ.get("HONEYPOT_CHECKPOINT_GAIA_PATHS_CSV") or "/cgi-bin/home.tcl"
+    ).split(",")
+    if value.strip()
+}
+# CVE-2024-24919 (CISA KEV): an unauthenticated POST to the CRL client
+# endpoint whose body carries a traversal reads an arbitrary file off the
+# gateway. The traversal rides in the *body*, not the request target, so
+# `normalize_path` never sees it and none of the existing traversal
+# handling applies — the body is the only place the signature exists.
+#
+# This is the reason the portal is worth serving at all. The portal tells
+# a scanner which vendor it is looking at; the read primitive is the step
+# that identification unlocks. Answering it out of the canary table makes
+# the file a source chooses to read both a behavioural signal (which
+# secret did it want?) and a replay-detectable credential.
+CHECKPOINT_READ_PATHS = {
+    value.strip().lower()
+    for value in (
+        os.environ.get("HONEYPOT_CHECKPOINT_READ_PATHS_CSV") or "/clients/mycrl"
+    ).split(",")
+    if value.strip()
+}
+CHECKPOINT_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_CHECKPOINT_BODY_DECODE_LIMIT") or "8192").strip() or "8192"),
+    256,
+)
+# The gateway's own web server identifies itself; a scanner that
+# fingerprints on the response header rather than the body should reach
+# the same conclusion the page does.
+CHECKPOINT_SERVER_HEADER = (
+    os.environ.get("HONEYPOT_CHECKPOINT_SERVER_HEADER") or "CPWS"
+).strip() or "CPWS"
+
 # --- Fake F5 BIG-IP APM (Access Policy Manager) -------------------------
 # `/my.policy` is the F5 BIG-IP APM access policy landing — scanners
 # probe it to fingerprint the BIG-IP web interface before checking for
@@ -4890,6 +4960,31 @@ def is_barracuda_vpn_path(path: str) -> bool:
     return path.lower().split("?")[0] in BARRACUDA_VPN_PATHS
 
 
+def checkpoint_surface(path: str) -> str:
+    """Which Check Point surface `path` names: `portal`, `gaia`, `read`
+    or `""` for none.
+
+    The query string is stripped because the portal carries session and
+    realm parameters (`?RelayState=…`, `?selectedRealm=…`) that vary per
+    probe, and the read endpoint is sometimes reached with a trailing
+    `?` from tooling that appends one unconditionally.
+    """
+    if not CHECKPOINT_ENABLED:
+        return ""
+    p = path.lower().split("?")[0]
+    if p in CHECKPOINT_READ_PATHS:
+        return "read"
+    if p in CHECKPOINT_PORTAL_PATHS:
+        return "portal"
+    if p in CHECKPOINT_GAIA_PATHS:
+        return "gaia"
+    return ""
+
+
+def is_checkpoint_path(path: str) -> bool:
+    return bool(checkpoint_surface(path))
+
+
 def is_f5_bigip_path(path: str) -> bool:
     if not F5_BIGIP_ENABLED:
         return False
@@ -7354,6 +7449,141 @@ def render_barracuda_login_html(host: str) -> bytes:
         "</form>\n</div>\n"
         "</body></html>\n"
     ).encode("utf-8")
+
+
+# ---- Check Point Mobile Access / Gaia renderers -----------------------------
+
+def render_checkpoint_portal_html(host: str, error: str = "") -> bytes:
+    """Mobile Access blade login page.
+
+    The form posts to a path the portal table already owns, so the
+    credential arrives at this handler rather than at the router's 404 —
+    the failure mode the self-referenced-asset guard exists to catch.
+    """
+    safe_host = host or "gateway"
+    banner = (
+        f'<div id="errorMessage">{error}</div>\n' if error else ""
+    )
+    return (
+        "<!DOCTYPE html>\n<html><head>\n"
+        f"<title>Mobile Access Portal - {safe_host}</title>\n"
+        '<meta name="viewport" content="width=device-width, initial-scale=1" />\n'
+        "</head><body>\n"
+        '<div id="loginFrame">\n'
+        "<h2>Please log in</h2>\n"
+        f"{banner}"
+        '<form name="loginForm" method="post" action="/sslvpn/Login/Login">\n'
+        '<input type="text" name="userName" autocomplete="off" />\n'
+        '<input type="password" name="password" autocomplete="off" />\n'
+        '<input type="hidden" name="selectedRealm" value="ldap" />\n'
+        '<input type="hidden" name="loginType" value="Standard" />\n'
+        '<button type="submit">Sign In</button>\n'
+        "</form>\n</div>\n"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
+def render_checkpoint_gaia_html(host: str) -> bytes:
+    """Gaia appliance-management login.
+
+    A separate page from the Mobile Access portal because they are
+    separate products on the same box, and which one a source asks for
+    is the measurement this trap exists to take.
+    """
+    safe_host = host or "gateway"
+    return (
+        "<!DOCTYPE html>\n<html><head>\n"
+        f"<title>Gaia Portal - {safe_host}</title>\n"
+        "</head><body>\n"
+        '<div id="gaiaLogin">\n'
+        "<h2>Gaia Portal</h2>\n"
+        '<form name="gaiaLoginForm" method="post" action="/cgi-bin/home.tcl">\n'
+        '<input type="text" name="user" autocomplete="off" />\n'
+        '<input type="password" name="password" autocomplete="off" />\n'
+        '<button type="submit">Login</button>\n'
+        "</form>\n</div>\n"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
+def render_fake_shadow() -> bytes:
+    """`/etc/shadow`-shape body whose hashes are minted per hit.
+
+    A read primitive that hands out a *fixed* hash ships the same string
+    from every host running this software, which is a fleet fingerprint
+    and — worse — is crackable once, forever. These are random per
+    request: the same salt/hash shape, no reuse, and nothing that can be
+    cracked back to a password because no password was ever used to make
+    them. The account list matches `render_fake_passwd` so a source that
+    reads both files sees one consistent host.
+    """
+    def _crypt() -> str:
+        salt = secrets.token_urlsafe(12)[:16]
+        digest = secrets.token_urlsafe(64)[:86]
+        return f"$6${salt}${digest}"
+
+    lines = []
+    for raw in render_fake_passwd().decode("utf-8").splitlines():
+        if not raw:
+            continue
+        fields = raw.split(":")
+        name, shell = fields[0], fields[-1]
+        # Accounts that cannot log in carry no hash on a real host, and
+        # that asymmetry is part of what makes the file look real.
+        secret = _crypt() if shell not in ("/usr/sbin/nologin", "/bin/false") else "*"
+        lines.append(f"{name}:{secret}:19800:0:99999:7:::")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+# The traversal shape CVE-2024-24919 exploitation uses. The published
+# proof-of-concept prefixes the target with the CShell alias
+# (`aCSHELL/../../../…`), but the gateway resolves any body that walks
+# up out of the alias directory, and the observed spellings vary in how
+# many `../` segments they carry and whether they URL-encode them. Match
+# on "a body that contains a traversal", then take everything after the
+# last traversal segment as the requested file.
+_CHECKPOINT_TRAVERSAL_RE = re.compile(
+    r"(?:\.|%2e){2}(?:/|%2f|\\)",
+    re.IGNORECASE,
+)
+
+
+def extract_checkpoint_read_target(body: bytes) -> str:
+    """Pull the file a CRL-client body is asking to read.
+
+    Returns an absolute path, or `""` when the body carries no traversal
+    (a genuine CRL fetch, or a scanner checking only that the endpoint
+    exists). The return value is not resolved here — resolution is
+    `resolve_fs_read`'s job, and keeping the two apart means the parser
+    can be tested on shapes we have no trap for.
+    """
+    if not body:
+        return ""
+    text = unquote(
+        body[:CHECKPOINT_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+    )
+    # The body is form-encoded in the published exploit, so the target
+    # may sit in a value. Take the longest traversal-bearing token
+    # rather than assuming a parameter name we have not seen.
+    candidates = re.split(r"[&\s\r\n\x00]+", text)
+    best = ""
+    for token in candidates:
+        if "=" in token:
+            token = token.split("=", 1)[1]
+        if not _CHECKPOINT_TRAVERSAL_RE.search(token):
+            continue
+        if len(token) > len(best):
+            best = token
+    if not best:
+        return ""
+    normalised = best.replace("\\", "/")
+    # Everything after the final `../` is the path the client wants; the
+    # segments before it are the alias it started from.
+    tail = re.split(r"(?:\.\./)+", normalised)[-1]
+    tail = tail.strip().lstrip("/")
+    if not tail:
+        return ""
+    return "/" + tail
 
 
 # ---- F5 BIG-IP APM renderers ------------------------------------------------
@@ -24542,6 +24772,16 @@ _VITE_FS_SYSTEM_FILES: "dict[str, tuple[str, Callable[[], bytes], str]]" = {
         render_stock_nginx_conf,
         "text/plain; charset=utf-8",
     ),
+    # Root-only, so it means something different from the two above: a
+    # source that asks for it is testing whether the read primitive runs
+    # privileged, not just whether it works. The hashes are minted per
+    # hit — see `render_fake_shadow` for why a fixed one would be worse
+    # than serving nothing.
+    "/etc/shadow": (
+        "etc-shadow",
+        render_fake_shadow,
+        "text/plain; charset=utf-8",
+    ),
 }
 
 
@@ -24755,10 +24995,52 @@ def resolve_vite_fs(path: str) -> "ViteFsResolution | None":
     if not lowered.startswith(_VITE_FS_PREFIX):
         return None
     raw_suffix = path[len(_VITE_FS_PREFIX):]
-    collapsed = _collapse_fs_path(raw_suffix.split("/"))
+    target = resolve_fs_read(raw_suffix)
+    return ViteFsResolution(
+        target.requested_path, raw_suffix, target.trap,
+        target.match_depth, target.bare_env, target.system_file,
+    )
+
+
+@dataclass(frozen=True)
+class FsReadTarget:
+    """What answers a read of one absolute on-disk path.
+
+    Shared by every trap that hands an attacker an arbitrary-file-read
+    primitive, whichever way the path arrives — in the request target
+    (`/@fs/<path>`) or in a request body (the CRL-client traversal). The
+    resolution is the same question in both cases, and keeping one
+    implementation is what stops the two surfaces from answering the
+    same filename differently.
+    """
+
+    requested_path: str      # absolute FS path after traversal collapse
+    trap: "CanaryTrap | None"
+    match_depth: int         # leading segments dropped to find `trap`
+    bare_env: bool = False   # landed on `/.env`, served by `_send_env`
+    system_file: str = ""    # key into `_VITE_FS_SYSTEM_FILES`
+
+    @property
+    def resolved(self) -> bool:
+        return self.trap is not None or self.bare_env or bool(self.system_file)
+
+
+def resolve_fs_read(raw_path: str) -> FsReadTarget:
+    """Resolve an absolute filesystem path to whatever answers a read.
+
+    Matching walks leading directory segments off the requested absolute
+    path and looks each suffix up in the exact-path trap table, longest
+    first. `/usr/src/app/.env` tries `/usr/src/app/.env`, `/src/app/.env`,
+    `/app/.env`, `/.env` and stops at the first hit, so an absolute prefix
+    we have never seen still lands on the renderer for the file the
+    scanner actually asked for.
+
+    `raw_path` may carry `.`/`..`/`//` segments; they are collapsed here.
+    """
+    collapsed = _collapse_fs_path(raw_path.split("/"))
     if not collapsed:
-        # `/@fs/` alone, or a request that traversed itself back to root.
-        return ViteFsResolution("/", raw_suffix, None, 0)
+        # The root itself, or a request that traversed back up to it.
+        return FsReadTarget("/", None, 0)
     requested = "/" + "/".join(collapsed)
 
     trap = None
@@ -24789,9 +25071,7 @@ def resolve_vite_fs(path: str) -> "ViteFsResolution | None":
         if requested.lower() in _VITE_FS_SYSTEM_FILES:
             system_file = requested.lower()
 
-    return ViteFsResolution(
-        requested, raw_suffix, trap, depth, bare_env, system_file,
-    )
+    return FsReadTarget(requested, trap, depth, bare_env, system_file)
 
 
 _DEBUGBAR_PREFIX = "/_debugbar"
@@ -27974,6 +28254,167 @@ async def _handle_barracuda_vpn(
         "Content-Type": content_type,
         "Cache-Control": "no-store",
     })
+
+
+def extract_checkpoint_login_form(body: bytes) -> tuple[str, bool, str]:
+    """`(username, has_password, realm)` off a Mobile Access login POST.
+
+    The portal's own field names (`userName`, `selectedRealm`) plus the
+    lowercase spellings tooling sends when it has only ever seen the
+    field list second-hand.
+    """
+    if not body:
+        return "", False, ""
+    text = body[:CHECKPOINT_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
+    username = ""
+    has_password = False
+    realm = ""
+    for part in text.split("&"):
+        if "=" not in part:
+            continue
+        key, _, val = part.partition("=")
+        key = unquote(key.strip()).lower()
+        val = unquote(val.strip())
+        if key in ("username", "user", "loginusername") and not username:
+            username = val[:200]
+        elif key in ("password", "loginpassword") and val:
+            has_password = True
+        elif key in ("selectedrealm", "realm") and not realm:
+            realm = val[:80]
+    return username, has_password, realm
+
+
+async def _handle_checkpoint(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+    surface: str,
+    request_id: str,
+    client_ip: str,
+    user_agent: str,
+    proto: str,
+) -> web.Response:
+    """Serve the Check Point surfaces: portal, management UI, read primitive."""
+    method = request.method
+    host = str(log_context.get("host", ""))
+
+    if surface == "read":
+        return await _handle_checkpoint_read(
+            request, log_context, path, request_body,
+            request_id, client_ip, host, user_agent, proto,
+        )
+
+    body_preview = ""
+    if request_body:
+        body_preview = request_body[:CHECKPOINT_BODY_DECODE_LIMIT].decode(
+            "utf-8", errors="replace",
+        )
+
+    if surface == "gaia":
+        result_tag = "checkpoint-gaia-portal"
+        body = render_checkpoint_gaia_html(host)
+    elif method == "POST":
+        # Rejected, and it says so. The credential is the capture; a
+        # portal that accepts anything on the first guess is a shape no
+        # appliance produces, and the sibling remote-access trap already
+        # owns the accept-once experiment.
+        result_tag = "checkpoint-portal-login-post"
+        body = render_checkpoint_portal_html(host, error="Authentication failed.")
+    else:
+        result_tag = "checkpoint-portal"
+        body = render_checkpoint_portal_html(host)
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "checkpointSurface": surface,
+        "checkpointPath": path,
+        "checkpointMethod": method,
+        "bytes": len(body),
+    }
+    if method == "POST" and request_body:
+        username, has_password, realm = extract_checkpoint_login_form(request_body)
+        if username:
+            log_entry["checkpointUsername"] = username
+        log_entry["checkpointHasPassword"] = has_password
+        if realm:
+            log_entry["checkpointRealm"] = realm
+    if body_preview:
+        log_entry["bodyPreview"] = body_preview[:400]
+    append_log(log_entry)
+
+    return web.Response(status=200, body=body, headers={
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Server": CHECKPOINT_SERVER_HEADER,
+        # Per-hit session id. Not a credential and not replay-detectable,
+        # but it must still be unique per request: a constant here would
+        # be one string shared by every host running this software.
+        "Set-Cookie": (
+            f"CPCVPN_SESSION_ID={uuid.uuid4().hex}; Path=/; Secure; HttpOnly"
+        ),
+    })
+
+
+async def _handle_checkpoint_read(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+    request_id: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+) -> web.Response:
+    """CVE-2024-24919: the CRL-client endpoint, with its file read.
+
+    A body with no traversal is the endpoint's ordinary use and the
+    scanner's existence check — answered empty, the way the real one is
+    for a client that asked for nothing in particular. A body that walks
+    out of the alias directory is the exploit, and gets resolved through
+    the same table the webroot and dev-server surfaces read, so one
+    filename means one document everywhere.
+    """
+    requested = extract_checkpoint_read_target(request_body)
+    if not requested:
+        append_log({
+            **log_context,
+            "status": 200,
+            "result": "checkpoint-crl-probe",
+            "checkpointSurface": "read",
+            "checkpointPath": path,
+            "checkpointMethod": request.method,
+            "bytes": 0,
+        })
+        return web.Response(status=200, body=b"", headers={
+            "Content-Type": "application/octet-stream",
+            "Server": CHECKPOINT_SERVER_HEADER,
+        })
+
+    target = resolve_fs_read(requested)
+    extra_log: dict[str, object] = {
+        "checkpointSurface": "read",
+        "checkpointPath": path,
+        "checkpointMethod": request.method,
+        # The absolute path the source asked the gateway to read. On this
+        # surface the choice of file is the whole signal: a source that
+        # goes for the shadow file, one that goes for the cloud profile
+        # and one that goes for the VPN config are three different jobs.
+        "checkpointReadPath": target.requested_path[:512],
+        "checkpointReadMatchDepth": target.match_depth,
+    }
+    return await _send_fs_read(
+        request, target, request_id, path,
+        client_ip, host, user_agent, proto, log_context,
+        result_prefix="checkpoint-read-", extra_log=extra_log,
+        # An appliance whose read primitive found no such file still
+        # answered the request; it does not 404 the endpoint.
+        miss_status=200, miss_body=b"",
+        miss_content_type="application/octet-stream",
+    )
 
 
 async def _handle_f5_bigip(
@@ -33681,41 +34122,78 @@ async def _send_vite_fs(
         # file, i.e. the scanner used a prefix we've never catalogued.
         "viteFsMatchDepth": resolution.match_depth,
     }
-    if not resolution.resolved:
+    return await _send_fs_read(
+        request, resolution, request_id, path,
+        client_ip, host, user_agent, proto, log_context,
+        result_prefix="vite-fs-", extra_log=extra_log,
+    )
+
+
+async def _send_fs_read(
+    request: web.Request,
+    target: "FsReadTarget | ViteFsResolution",
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+    result_prefix: str,
+    extra_log: dict[str, object],
+    miss_status: int = 404,
+    miss_body: bytes = b"not found\n",
+    miss_content_type: str = "text/plain; charset=utf-8",
+) -> web.Response:
+    """Serve one resolved arbitrary-file read, whatever surface asked.
+
+    Hit: delegate to the resolved trap so the body is byte-identical to
+    what a bare probe for the same file would get, tagged
+    `<result_prefix><trap>` so each read surface's population stays
+    separable from the webroot one and from the other surfaces.
+
+    Miss: whatever the surface's own not-found looks like. A dev server
+    404s; an appliance read primitive returns an empty 200, because the
+    file simply was not there and the endpoint still worked. The
+    requested path is logged either way — the dictionary is the point,
+    and the misses describe the parts of the filesystem the scanner
+    expects to find that we have chosen not to furnish.
+    """
+    if not target.resolved:
         append_log({
             **log_context, **extra_log,
-            "status": 404, "result": "vite-fs-miss",
+            "status": miss_status, "result": f"{result_prefix}miss",
         })
         return web.Response(
-            status=404, body=b"not found\n",
-            headers={"Content-Type": "text/plain; charset=utf-8"},
+            status=miss_status, body=miss_body,
+            headers={"Content-Type": miss_content_type},
         )
-    if resolution.system_file:
+    if target.system_file:
         # World-readable system file. Static body, no canary spent — the
         # signal is the request, and the response exists so the read
         # primitive behaves like a real one for the scanner's own
         # confirmation step.
-        tag, render, content_type = _VITE_FS_SYSTEM_FILES[resolution.system_file]
+        tag, render, content_type = _VITE_FS_SYSTEM_FILES[target.system_file]
         body = render()
         append_log({
             **log_context, **extra_log,
-            "status": 200, "result": f"vite-fs-{tag}",
+            "status": 200, "result": f"{result_prefix}{tag}",
         })
         return web.Response(
             status=200, body=body,
             headers={"Content-Type": content_type},
         )
-    if resolution.trap is None:
+    if target.trap is None:
         # Bare `/.env` — served by the original handler, not the table.
         return await _send_env(
             request, request_id, path,
             client_ip, host, user_agent, proto, log_context,
-            result_prefix="vite-fs-", extra_log=extra_log,
+            result_prefix=result_prefix, extra_log=extra_log,
         )
     return await _send_canary_trap(
-        request, resolution.trap, request_id, path,
+        request, target.trap, request_id, path,
         client_ip, host, user_agent, proto, log_context,
-        result_prefix="vite-fs-", extra_log=extra_log,
+        result_prefix=result_prefix, extra_log=extra_log,
     )
 
 
@@ -34636,6 +35114,17 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_barracuda_vpn_path(path):
         return await _handle_barracuda_vpn(request, log_context, path, request_body)
 
+    # Check Point. The portal and management surfaces need no issuing
+    # key; the read primitive resolves through the canary table, which
+    # already 404s itself on a keyless deployment — so the branch runs
+    # either way and the read simply finds nothing to hand out.
+    checkpoint = checkpoint_surface(path)
+    if checkpoint:
+        return await _handle_checkpoint(
+            request, log_context, path, request_body, checkpoint,
+            request_id, client_ip, user_agent, proto,
+        )
+
     # Tomcat `/..;/env.*` path-normalization bypass. Match before F5
     # BIG-IP so the bypass-shape env-file harvest goes to the dedicated
     # handler; `is_tomcat_path_bypass_path` already excludes `/tmui/`
@@ -35037,6 +35526,8 @@ def main() -> int:
         active.append("sophos-vpn")
     if BARRACUDA_VPN_ENABLED:
         active.append("barracuda-vpn")
+    if CHECKPOINT_ENABLED:
+        active.append("checkpoint")
     if F5_BIGIP_ENABLED:
         active.append("f5-bigip")
     if DOCKER_REGISTRY_ENABLED:
