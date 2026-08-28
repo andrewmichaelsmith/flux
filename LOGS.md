@@ -28,6 +28,10 @@ Every line includes these — they're built in `_handle()` before dispatch.
 | `debugbarOp` | string | Laravel Debugbar only: which step of the stored-request protocol was asked for — `index`, `open-list`, `open-get`, `asset-js`, `asset-css`, `clockwork`. |
 | `debugbarStoredId` | string | The stored-request id the client named on `op=get`; `""` on every other step. |
 | `debugbarIdKnown` | bool | True when `debugbarStoredId` is one this host advertises. An `open-list` followed by an `open-get` with `debugbarIdKnown=true` from the same source is a client that parsed our listing rather than replaying a path — see [docs/laravel-debugbar.md](./docs/laravel-debugbar.md). |
+| `canaryEchoKeyIds` | list | Present only when the request carried an AWS access key id. The ids found — in the request target, the logged header subset, or the head of the body — most interesting first, capped by `HONEYPOT_CANARY_ECHO_MAX_REPORTED`. Stamped before dispatch, so these four fields can appear on **any** trap's line, not just `not-handled`. The matching secret is never logged. See [docs/canary-echo.md](./docs/canary-echo.md). |
+| `canaryEchoMatch` | string | `own` (this process served that exact key), `account` (same issuing account, served by a sibling host), or `foreign` (somebody else's). The closest relationship any key on the request has. |
+| `canaryEchoIn` | list | Where the reported ids were found: `target`, `body`, `header:<lowercased name>`. |
+| `canaryEchoCount` | int | Distinct key ids found, before the reporting cap — so a truncated `canaryEchoKeyIds` still has a true total beside it. |
 
 ## Result tags
 
@@ -39,6 +43,7 @@ Every line has a `result` identifying what the handler did, and a
 | `result` | `status` | Extras | Meaning |
 | --- | --- | --- | --- |
 | `not-handled` | 404 | — | Path didn't match any trap; fell through to 404. |
+| `webhook-delivery` | 200 | `webhookToken`, `webhookMethod`, `webhookContentType`, `webhookBodyPreview` | A webhook delivery was acknowledged rather than 404'd, keeping the payload. See [docs/webhook-receiver.md](./docs/webhook-receiver.md). |
 
 **Canary-issuance and renderer failures also answer `404 not found\n`** —
 byte-identical to `not-handled` above. They previously answered

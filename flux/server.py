@@ -174,6 +174,68 @@ ROBOTS_TXT_BODY = (
     or "User-agent: *\nDisallow: /\n"
 ).encode("utf-8")
 
+# --- Canary-echo observer ---------------------------------------------------
+# Credentials this server hands out sometimes come back to it, inside a
+# later request, on a path nothing here serves. The observer exists to
+# make that countable. It is a pure measurement layer: it stamps log
+# fields and never changes a byte of any response, so no client can tell
+# whether the credential it just sent was recognised. That property is
+# the whole design — a server that answered its own canaries differently
+# would be separable from a real one by sending a key and watching what
+# changed.
+CANARY_ECHO_ENABLED = _env_bool("HONEYPOT_CANARY_ECHO_ENABLED")
+
+# How many issued key ids to remember, per process, for exact matching.
+CANARY_ECHO_MAX_KEYS = max(
+    int((os.environ.get("HONEYPOT_CANARY_ECHO_MAX_KEYS") or "4096").strip() or "4096"), 16
+)
+# Bytes of request body scanned. The body is already read and capped
+# upstream; this bounds the regex, not the read.
+CANARY_ECHO_BODY_SCAN_LIMIT = max(
+    int((os.environ.get("HONEYPOT_CANARY_ECHO_BODY_SCAN_LIMIT") or "8192").strip() or "8192"), 256
+)
+# Distinct key ids reported on one line, so a request pasting a whole
+# harvest file cannot produce an unbounded log row.
+CANARY_ECHO_MAX_REPORTED = max(
+    int((os.environ.get("HONEYPOT_CANARY_ECHO_MAX_REPORTED") or "8").strip() or "8"), 1
+)
+
+# AWS access key ids are `AKIA`/`ASIA` plus 16 uppercase alphanumerics.
+# The lookarounds stop a longer token that merely contains the shape from
+# matching, which otherwise mints key ids out of base64 blobs.
+_AWS_KEY_ID_RE = re.compile(r"(?<![A-Za-z0-9])((?:AKIA|ASIA)[A-Z0-9]{16})(?![A-Za-z0-9])")
+
+# Key ids this process has served, insertion-ordered, and the account
+# prefixes they imply. Both are learned at runtime from the issuing
+# API's own responses — nothing about the issuing account is written
+# down here. That is deliberate: this file is public, and an account
+# prefix committed into it would let anyone test a credential for
+# canary-ness offline.
+_CANARY_ECHO_ISSUED: dict[str, None] = {}
+_CANARY_ECHO_ACCOUNT_PREFIXES: set[str] = set()
+# `ASIA` + 8 characters. AWS derives those 8 from the account, so every
+# key one issuing account mints shares them; it is the widest identifier
+# that still means "this came from the account we issue from".
+_CANARY_ECHO_PREFIX_LEN = 12
+
+# --- Inbound webhook receiver ----------------------------------------------
+# Tooling that posts its results to a collector sometimes posts them
+# here instead — same request, wrong host. Those arrive as POSTs to a
+# webhook-shaped path with a token in it, and a 404 ends the exchange
+# with only a body hash to show for it. Answering the delivery keeps the
+# body. Matching is on path shape alone; what the token contains never
+# affects the response.
+WEBHOOK_RECEIVER_ENABLED = _env_bool("HONEYPOT_WEBHOOK_RECEIVER_ENABLED")
+WEBHOOK_RECEIVER_BODY_PREVIEW_LIMIT = max(
+    int((os.environ.get("HONEYPOT_WEBHOOK_RECEIVER_BODY_PREVIEW_LIMIT") or "512").strip() or "512"),
+    64,
+)
+_WEBHOOK_RECEIVER_RE = re.compile(
+    r"^/api/(?:v\d{1,2}/)?webhooks?/(?P<token>[A-Za-z0-9._:-]{4,128})/"
+    r"(?P<verb>event|events|callback|deliveries|delivery)/?$",
+    re.IGNORECASE,
+)
+
 # --- Fake /.git/ tree configuration ---
 # Default-on: flux is a honeypot, and the /.git/ tree is one of the most
 # valuable traps we have. The per-IP cache (FAKE_GIT_CACHE_TTL_SECONDS)
@@ -14582,11 +14644,139 @@ async def _get_or_issue_canary(
         raise
 
 
+# --- Canary-echo observer: remember what we issued, notice it coming back ---
+
+def canary_echo_note_issued(key_id: str) -> None:
+    """Record one access key id this server has served.
+
+    Called from `_aws()`, which every renderer that embeds an AWS canary
+    goes through — so a new renderer is covered the day it is written and
+    cannot forget to register. Keeping the registry keyed on what was
+    actually served, rather than on a configured pattern, is also what
+    keeps the issuing account out of this file.
+    """
+    if not CANARY_ECHO_ENABLED or not key_id:
+        return
+    if not _AWS_KEY_ID_RE.fullmatch(key_id):
+        return
+    # Re-inserting moves a key to the newest position, so a credential
+    # still in active use is not the one evicted.
+    _CANARY_ECHO_ISSUED.pop(key_id, None)
+    _CANARY_ECHO_ISSUED[key_id] = None
+    while len(_CANARY_ECHO_ISSUED) > CANARY_ECHO_MAX_KEYS:
+        # dicts iterate in insertion order, so this drops the oldest.
+        del _CANARY_ECHO_ISSUED[next(iter(_CANARY_ECHO_ISSUED))]
+    # Prefixes are never evicted: there are only ever a handful, and
+    # forgetting one would silently downgrade `account` matches to
+    # `foreign` after a busy day.
+    _CANARY_ECHO_ACCOUNT_PREFIXES.add(key_id[:_CANARY_ECHO_PREFIX_LEN])
+
+
+def _canary_echo_classify(key_id: str) -> str:
+    """`own` when this process served the exact key, `account` when it
+    came from the account we issue from, `foreign` otherwise.
+
+    The three are worth separating. `own` is this host's credential
+    coming home. `account` is a credential from a sibling host, which is
+    the only evidence available that a harvest is being replayed across
+    a fleet rather than at its source. `foreign` is somebody else's
+    stolen key arriving here — not ours to alert on, but it says the
+    sender is carrying loot from elsewhere.
+    """
+    if key_id in _CANARY_ECHO_ISSUED:
+        return "own"
+    if key_id[:_CANARY_ECHO_PREFIX_LEN] in _CANARY_ECHO_ACCOUNT_PREFIXES:
+        return "account"
+    return "foreign"
+
+
+# Strongest first: one request carrying several keys is described by the
+# closest relationship any of them has to us.
+_CANARY_ECHO_RANK = ("own", "account", "foreign")
+
+
+def canary_echo_scan(
+    raw_target: str,
+    headers: dict[str, object] | None,
+    body: bytes,
+) -> dict[str, object]:
+    """Look for access key ids in an inbound request and describe what
+    was found. Returns `{}` when there is nothing to say.
+
+    Scans the request target (path and query together, pre-decode and
+    decoded, because a key can arrive percent-encoded), the logged header
+    subset, and the head of the body. The caller merges the result into
+    the log context *before* dispatch, so whichever trap ends up
+    answering carries the finding on its own line — a key echoed at a
+    path that some other trap owns is exactly as interesting as one
+    echoed at a path nothing serves.
+    """
+    if not CANARY_ECHO_ENABLED:
+        return {}
+
+    found: dict[str, str] = {}
+    where: set[str] = set()
+
+    def scan(text: str, location: str) -> None:
+        for key_id in _AWS_KEY_ID_RE.findall(text):
+            found.setdefault(key_id, location)
+            where.add(location)
+
+    if raw_target:
+        scan(raw_target, "target")
+        # A key in a query value is usually percent-encoded somewhere on
+        # its way here; decode once and look again.
+        try:
+            decoded = unquote(raw_target)
+        except (UnicodeDecodeError, ValueError):
+            decoded = ""
+        if decoded and decoded != raw_target:
+            scan(decoded, "target")
+
+    if headers:
+        for name, value in headers.items():
+            if isinstance(value, str) and value:
+                scan(value, f"header:{name.lower()}")
+
+    if body:
+        scan(body[:CANARY_ECHO_BODY_SCAN_LIMIT].decode("utf-8", "replace"), "body")
+
+    if not found:
+        return {}
+
+    classified = {k: _canary_echo_classify(k) for k in found}
+    match = next(
+        (rank for rank in _CANARY_ECHO_RANK if rank in classified.values()),
+        "foreign",
+    )
+    # Report the most interesting keys first so the cap never truncates
+    # an `own` match in favour of a foreign one.
+    ordered = sorted(found, key=lambda k: (_CANARY_ECHO_RANK.index(classified[k]), k))
+    reported = ordered[:CANARY_ECHO_MAX_REPORTED]
+    return {
+        # The key id is an identifier, not a secret — it is what joins
+        # this line back to the issuance that produced it. The matching
+        # secret is deliberately never logged, and never matched on.
+        "canaryEchoKeyIds": reported,
+        "canaryEchoMatch": match,
+        "canaryEchoIn": sorted({found[k] for k in reported}),
+        "canaryEchoCount": len(found),
+    }
+
+
 # --- Render functions: (tracebit_response) -> bytes ---
 
 def _aws(r: dict[str, object]) -> dict[str, str]:
     aws = r.get("aws") if isinstance(r, dict) else None
-    return aws if isinstance(aws, dict) else {}
+    if not isinstance(aws, dict):
+        return {}
+    # Single chokepoint: every renderer that embeds an AWS canary reads
+    # it through here, so registering the key id at this point covers
+    # them all without each having to remember to.
+    key_id = aws.get("awsAccessKeyId")
+    if isinstance(key_id, str):
+        canary_echo_note_issued(key_id)
+    return aws
 
 
 def _fake_db_password() -> str:
@@ -33122,6 +33312,70 @@ async def _handle_tomcat_path_bypass(
     return web.Response(status=200, body=body, headers=headers)
 
 
+def webhook_receiver_token(path: str) -> str | None:
+    """Return the token out of a webhook-delivery path, or None.
+
+    Deliberately narrow. `/api/v1/webhook/<token>/event` and its close
+    spellings are a delivery address: the token identifies a
+    subscription and the trailing verb says what is being delivered.
+    `/api/v1/webhooks` (the management collection) and
+    `/api/v1/webhook/<token>` (the subscription itself) are different
+    surfaces with different responses, so neither is claimed here.
+    """
+    if not WEBHOOK_RECEIVER_ENABLED:
+        return None
+    m = _WEBHOOK_RECEIVER_RE.match(path)
+    return m.group("token") if m else None
+
+
+def is_webhook_receiver_path(path: str) -> bool:
+    return webhook_receiver_token(path) is not None
+
+
+async def _handle_webhook_receiver(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Accept a webhook delivery and keep what was in it.
+
+    A delivery endpoint that 404s gets one attempt and a body hash. One
+    that acknowledges gets the payload, and — because senders retry and
+    batch against an endpoint that works — usually more than one.
+
+    The acknowledgement carries no credential-shaped field at all: a
+    receiver has no reason to hand the sender a secret, so there is
+    nothing here that could become a fixed literal. `deliveryId` is a
+    per-request uuid4, which is what a real receiver echoes back.
+    """
+    token = webhook_receiver_token(path) or ""
+    preview = request_body[:WEBHOOK_RECEIVER_BODY_PREVIEW_LIMIT].decode("utf-8", "replace")
+    payload = {
+        "ok": True,
+        "deliveryId": str(uuid.uuid4()),
+        "receivedAt": utc_now(),
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": "webhook-delivery",
+        # The token is the sender's own identifier for wherever it
+        # thought it was posting. When it is a credential shape, the
+        # echo observer has already classified it on this same line.
+        "webhookToken": token[:128],
+        "webhookMethod": request.method,
+        "webhookContentType": request.headers.get("Content-Type", "")[:120],
+        "webhookBodyPreview": preview,
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200, body=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+
+
 async def _handle_graphql(
     request: web.Request,
     log_context: dict[str, object],
@@ -35274,6 +35528,21 @@ async def handle(request: web.Request) -> web.StreamResponse:
             body_sha256 = hashlib.sha256(request_body).hexdigest()
 
     log_context = _log_context_from_request(request, request_id, body_bytes_read, body_sha256)
+
+    # Stamped before any dispatch so the finding rides on whichever
+    # trap's line ends up being written, rather than only on the
+    # not-handled ones. Purely additive to the log: no branch below
+    # reads these fields, so a request carrying a credential is answered
+    # exactly as it would have been without one.
+    if CANARY_ECHO_ENABLED:
+        echo = canary_echo_scan(
+            str(log_context["rawTarget"]),
+            log_context.get("headers") if isinstance(log_context.get("headers"), dict) else None,
+            request_body,
+        )
+        if echo:
+            log_context.update(echo)
+
     path = str(log_context["path"])
     query_string = str(log_context["query"])
     client_ip = str(log_context["clientIp"])
@@ -35660,6 +35929,14 @@ async def handle(request: web.Request) -> web.StreamResponse:
                     {"trapWalkDepth": trap_walk_depth} if trap_walk_depth else None
                 ),
             )
+
+    # Webhook deliveries. Late in the chain because the match is a path
+    # shape rather than a known address: anything above that wants
+    # `/api/...` for itself has already taken it. Needs no Tracebit key —
+    # the response contains no credential — so it stays useful on a
+    # keyless deployment, where it is one of the few traps that does.
+    if WEBHOOK_RECEIVER_ENABLED and is_webhook_receiver_path(path):
+        return await _handle_webhook_receiver(request, log_context, path, request_body)
 
     # Backup-archive pattern trap runs after exact-path canary lookup so
     # that explicit entries (e.g. `/backup.sql` -> sql-dump trap) keep

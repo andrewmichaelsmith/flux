@@ -477,6 +477,34 @@ form `token` and the issued `phpMyAdmin=<session>` cookie are
 `uuid4().hex` randomness so no fixed credential-shaped literal is ever
 shipped across the sensor fleet.
 
+## Canary-echo observer
+
+Notices an AWS access key id arriving back in a later request and
+classifies it. Serves no route and never alters a response — see
+[`docs/canary-echo.md`](./docs/canary-echo.md).
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_CANARY_ECHO_ENABLED` | on | Master switch. Issues nothing, spends no upstream quota, and changes no byte of any response — it only adds `canaryEcho*` log fields when a key id is present. |
+| `HONEYPOT_CANARY_ECHO_MAX_KEYS` | `4096` | Issued key ids remembered per process for exact (`own`) matching. Re-serving a key refreshes its position, so a credential still in use is not the one evicted. Account prefixes are never evicted, so `account` matching is unaffected by this bound. |
+| `HONEYPOT_CANARY_ECHO_BODY_SCAN_LIMIT` | `8192` | Bytes of request body scanned. Bounds the regex, not the read — the body is already read and capped upstream. |
+| `HONEYPOT_CANARY_ECHO_MAX_REPORTED` | `8` | Distinct key ids named on one log line, so a request pasting a whole harvest file cannot produce an unbounded row. `canaryEchoCount` still reports the true total, and the most interesting keys are reported first so the cap cannot drop an `own` match. |
+
+There is deliberately **no** var for the issuing account. Recognition is
+learned at runtime from credentials actually served; a configured or
+committed prefix would let anyone test a credential for canary-ness
+offline against this public repository.
+
+## Inbound webhook receiver
+
+Acknowledges webhook deliveries instead of 404ing them, keeping the
+payload — see [`docs/webhook-receiver.md`](./docs/webhook-receiver.md).
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_WEBHOOK_RECEIVER_ENABLED` | on | Master switch. Matches `/api/[vN/]webhook[s]/<token>/{event,events,callback,delivery,deliveries}`. The acknowledgement contains no canary, so this trap needs no `TRACEBIT_API_KEY`. |
+| `HONEYPOT_WEBHOOK_RECEIVER_BODY_PREVIEW_LIMIT` | `512` | Bytes of the delivery body kept in `webhookBodyPreview`. |
+
 ## Bind address / port
 
 Flux listens on `127.0.0.1:18081` (aiohttp). To change, edit

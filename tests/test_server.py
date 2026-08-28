@@ -638,6 +638,17 @@ def test_all_trap_families_default_on():
         "nothing upstream."
     )
     assert tbenv.SSRF_RELAY_ENABLED
+    assert tbenv.CANARY_ECHO_ENABLED, (
+        "HONEYPOT_CANARY_ECHO_ENABLED should default to True — it issues "
+        "nothing, spends no upstream quota and never alters a response, so "
+        "the only thing turning it off buys is not knowing when a credential "
+        "this server handed out comes back to it."
+    )
+    assert tbenv.WEBHOOK_RECEIVER_ENABLED, (
+        "HONEYPOT_WEBHOOK_RECEIVER_ENABLED should default to True — the "
+        "acknowledgement contains no canary, so it needs no upstream key, "
+        "and a delivery that 404s leaves only a body hash behind."
+    )
     assert tbenv.OBSERVABILITY_ENABLED, (
         "HONEYPOT_OBSERVABILITY_ENABLED should default to True — the "
         "surface issues no canary on any branch, so a sweep across it "
