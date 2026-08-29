@@ -228,3 +228,102 @@ async def test_literal_list_still_answers_without_any_sweep(flux_client):
     lines = log_lines(flux_client.log_path)
     assert lines[-1]["result"] == "webshell-probe"
     assert "webshellSweepDistinct" not in lines[-1]
+
+
+# --------------------------------------------------------------------------
+# Nested WordPress asset directories
+#
+# A large share of observed shell-hunting never touches webroot: it walks
+# `.php` names inside WordPress's asset directories. WordPress ships a blank
+# `index.php` in each of those ("silence is golden"), so a `.php` there that
+# does something is somebody's planted shell and a source walking the names
+# is hunting for one. Before the nested shape was recognised this whole
+# family sat on the 404 path no matter how wide a dictionary was walked.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", [
+    "/wp-content/uploads/index.php",
+    "/wp-admin/js/index.php",
+    "/wp-content/plugins/admin.php",
+    "/wp-includes/ID3/about.php",
+    "/wp-admin/css/colors/blue/index.php",
+    "/wp-content/themes/admin.php",
+    "/wp-admin/maint/index.php",
+    "/wp-includes/assets/index.php",
+    "/wp-content/about.php",
+])
+def test_nested_wordpress_names_are_candidates(path):
+    assert tbenv.is_webshell_sweep_candidate(path)
+
+
+@pytest.mark.parametrize("path", [
+    "/wp-content/uploads/logo.png",          # not a .php leaf
+    "/wp-content/plugins/hellopress/wp_filemanager.php",  # literal list's
+    "/assets/js/index.php",                  # outside the fixed vocabulary
+    "/vendor/wp-content/index.php",          # vocabulary must anchor at root
+    "/wp-content/index.php/extra",           # .php must be the leaf
+    "/wp-contentXX/uploads/index.php",       # no partial-segment matching
+])
+def test_nested_non_candidates_are_rejected(path):
+    assert not tbenv.is_webshell_sweep_candidate(path)
+
+
+def test_nested_depth_is_bounded():
+    """Bounded so the widened shape cannot be walked into arbitrary nesting."""
+    deep = "/wp-content" + "/a" * 8 + "/shell.php"
+    assert not tbenv.is_webshell_sweep_candidate(deep)
+
+
+async def test_nested_sweep_is_gated_exactly_like_the_root_sweep(flux_client):
+    """The widened shape must not weaken the behavioural gate: a source
+    still sees the ordinary 404 until it has walked MIN_DISTINCT names."""
+    ip = "203.0.113.31"
+    names = [
+        "/wp-content/uploads/index.php",
+        "/wp-admin/js/index.php",
+        "/wp-content/plugins/admin.php",
+        "/wp-includes/ID3/about.php",
+    ]
+    responses = [
+        await flux_client.get(n, headers={"X-Forwarded-For": ip}) for n in names
+    ]
+    threshold = tbenv.WEBSHELL_SWEEP_MIN_DISTINCT
+    for resp in responses[: threshold - 1]:
+        assert resp.status == 404
+    for resp in responses[threshold - 1:]:
+        assert resp.status == 200
+
+    served = [
+        line for line in log_lines(flux_client.log_path)
+        if line["result"] == "webshell-probe"
+    ]
+    assert served
+    assert served[0]["webshellSweepDistinct"] >= threshold
+
+
+async def test_single_nested_probe_still_looks_like_an_ordinary_404(flux_client):
+    """One probe must stay indistinguishable from a host with nothing there,
+    or the widened shape becomes a fingerprint."""
+    resp = await flux_client.get(
+        "/wp-content/uploads/index.php", headers={"X-Forwarded-For": "203.0.113.32"})
+    assert resp.status == 404
+    assert (await resp.read()) == b"not found\n"
+
+
+async def test_nested_gate_captures_the_follow_up_command(flux_client):
+    """Same payoff as the root-level gate: the `?cmd=` step is the intel."""
+    ip = "203.0.113.33"
+    for n in ["/wp-content/uploads/index.php", "/wp-admin/js/index.php",
+              "/wp-content/plugins/admin.php"]:
+        await flux_client.get(n, headers={"X-Forwarded-For": ip})
+
+    resp = await flux_client.get(
+        "/wp-content/plugins/admin.php?cmd=whoami", headers={"X-Forwarded-For": ip})
+    assert resp.status == 200
+
+    commands = [
+        line for line in log_lines(flux_client.log_path)
+        if line["result"] == "webshell-command"
+    ]
+    assert commands
+    assert commands[-1]["command"] == "whoami"

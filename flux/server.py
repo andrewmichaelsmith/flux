@@ -451,13 +451,42 @@ WEBSHELL_SWEEP_MAX_PATHS_PER_SOURCE = max(
     8,
 )
 # Single-segment root-level `.php` filename. Anchored and length-bounded so it
-# cannot match nested drop paths (those are the literal list's job) or absurd
-# generated names.
+# cannot match absurd generated names.
 _WEBSHELL_SWEEP_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.php$", re.IGNORECASE)
+# The same sweep, one directory in. A large share of observed shell-hunting
+# never touches webroot: it walks `.php` names inside WordPress's asset
+# directories instead — `/wp-content/uploads/index.php`,
+# `/wp-admin/js/index.php`, `/wp-content/plugins/admin.php`,
+# `/wp-includes/ID3/about.php` and so on, across many distinct sources.
+#
+# Those directories are the interesting ones precisely because WordPress
+# ships a *blank* `index.php` in each of them (the "silence is golden"
+# convention). A `.php` under `/wp-content/uploads/` that actually does
+# something is somebody's planted shell, so a scanner walking these names
+# is hunting for a backdoor another actor left behind — the same
+# behaviour the root-level gate exists to observe, one directory deeper.
+# Restricting the gate to root-level names meant this entire family sat
+# on the 404 path no matter how wide a dictionary the source walked.
+#
+# The vocabulary is fixed to the three WordPress asset roots and the
+# depth is bounded, so this widens the *shape* the gate recognises
+# without letting arbitrary nesting through. The behavioural gate is
+# unchanged: a source still has to ask for `WEBSHELL_SWEEP_MIN_DISTINCT`
+# unclaimed names before any of them stops being a 404, which is what
+# keeps a single probe from proving the host fabricates responses.
+_WEBSHELL_SWEEP_NESTED_RE = re.compile(
+    r"^/(?:wp-content|wp-admin|wp-includes)"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,31}){0,4}"
+    r"/[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.php$",
+    re.IGNORECASE,
+)
 # Names that stay 404 no matter how much sweeping a source does. These are
 # ordinary front-controller filenames a crawler or a mistyped link can ask for
 # innocently; serving a shell page there would put trap output in front of
 # non-scanner traffic without telling us anything a real sweep would not.
+# Only webroot spellings belong here: there is no front controller inside
+# `/wp-content/`, so the same filename one directory down is a shell hunt
+# rather than an innocent request.
 _WEBSHELL_SWEEP_NEVER = frozenset({
     "/index.php", "/home.php", "/main.php",
 })
@@ -466,7 +495,11 @@ _WEBSHELL_SWEEP_SEEN: dict[str, tuple[float, set[str]]] = {}
 
 
 def is_webshell_sweep_candidate(path: str) -> bool:
-    """True for a root-level `*.php` name that no other trap claimed.
+    """True for an unclaimed `*.php` name in a shell-drop position.
+
+    Two shapes qualify: a root-level filename, and a filename under one of
+    the WordPress asset directories, which is where a large share of
+    observed shell-hunting actually looks.
 
     Callers must run this only after every exact-path trap has had its turn,
     which is what makes "unclaimed" true: the dispatch reaches here last.
@@ -479,7 +512,9 @@ def is_webshell_sweep_candidate(path: str) -> bool:
     if lowered in WEBSHELL_PATHS:
         # Already served by the literal list; not a gate decision.
         return False
-    return bool(_WEBSHELL_SWEEP_RE.match(path))
+    return bool(
+        _WEBSHELL_SWEEP_RE.match(path) or _WEBSHELL_SWEEP_NESTED_RE.match(path)
+    )
 
 
 def webshell_sweep_observe(src_ip: str, path: str, now: float | None = None) -> int:
