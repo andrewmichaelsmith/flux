@@ -10,13 +10,21 @@ Matches these paths (exact, case-insensitive; configurable via
 | GET with `Accept: text/event-stream` | same as POST set | Streamable-HTTP server-to-client stream — same `event: endpoint` handshake as `/sse` |
 | GET / HEAD / other | same as POST set | `405` + JSON-RPC error envelope |
 
-`/mcp.json`, `/.cursor/mcp.json`, `/.mcp/config.json`, and the other
-on-disk MCP config filenames are covered by the `mcp-config` CanaryTrap
-(they render a fake `mcp.json` with the Tracebit AWS canary in the
-`mcpServers[*].env` block). This trap covers the runtime **wire**
-endpoints instead — the JSON-RPC dispatch surface a real MCP server
-exposes, and the SSE handshake older MCP clients open before the
-JSON-RPC POST.
+`/mcp.json`, `/.cursor/mcp.json`, `/.mcp/config.json`,
+`/claude_desktop_config.json` and the other on-disk MCP config filenames
+are covered by the `mcp-config` CanaryTrap — [docs](./mcp-config.md).
+This trap covers the runtime **wire** endpoints instead: the JSON-RPC
+dispatch surface a real MCP server exposes, and the SSE handshake older
+MCP clients open before the JSON-RPC POST.
+
+The two are wired together in one direction. Every config the
+`mcp-config` trap serves advertises an HTTP-transport server entry whose
+`url` is this host's own JSON-RPC endpoint (`MCP_SELF_ENDPOINT_PATH`,
+derived from the path set below so a rename moves both) and whose bearer
+is the per-hit canary session token. A reader that harvests a config and
+follows it arrives here, and the `mcpAuthTokenSha256` logged on arrival
+joins the two hits back to a single actor — which is how "a config was
+read" becomes "a config was read and then used".
 
 ## JSON-RPC dispatch
 

@@ -272,7 +272,9 @@ case-insensitive exact matches.
 | Claude Code credentials | `/.claude/.credentials.json`, `/.config/claude/.credentials.json`, `/.credentials.json`, `/.config/anthropic/credentials/default.json` | `aws` (†) | `claude-credentials` |
 | Claude Desktop settings | `/.claude/settings.json` | `aws` (†) | `claude-settings` |
 | Cline settings | `/.cline/settings.json` | `aws` (†) | `cline-settings` |
-| Generic MCP server configs | `/.cline/mcp_settings.json`, `/mcp_settings.json`, `/mcp.json`, `/.mcp/mcp.json`, `/.mcp/config.json`, `/.mcp/settings.json`, `/.cursor/mcp_config.json`, `/.mcp.json` | `aws` (†) | `mcp-config` |
+| Generic MCP server configs — [docs](./docs/mcp-config.md) | `/.cline/mcp_settings.json`, `/mcp_settings.json`, `/mcp.json`, `/.mcp/mcp.json`, `/.mcp/config.json`, `/.mcp/settings.json`, `/.cursor/mcp_config.json`, `/.mcp.json`, `/claude_desktop_config.json`. Every rendered config advertises an HTTP-transport server pointing at this host's own `/mcp` endpoint, bearer'd with the per-hit canary, so a reader that follows the config lands on the JSON-RPC trap and the two hits join on the token | `aws` (†) | `mcp-config` |
+| Anthropic dotenv fragment — [docs](./docs/mcp-config.md) | `/.env.anthropic` | `aws` (†) | `anthropic-dotenv` |
+| OpenAI dotenv fragment — [docs](./docs/mcp-config.md) | `/.env.openai` | `aws` (†) | `openai-dotenv` |
 | Continue.dev config | `/.continue/config.json` | `aws` (†) | `continue-config` |
 | Sourcegraph Cody config | `/.sourcegraph/cody.json` | `aws` (†) | `cody-config` |
 | Aider config | `/.aider.conf.yml` | `aws` (†) | `aider-conf` |

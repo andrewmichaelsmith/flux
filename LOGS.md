@@ -218,8 +218,18 @@ Extras on every `litellm-*` line:
 
 One log line per hit. Covers the runtime dispatch surface (`/mcp`,
 `/mcp/`, `/mcp/messages`) and the SSE handshake (`/sse`). The on-disk
-MCP config files (`/mcp.json`, `/.cursor/mcp.json`, …) are the
-`mcp-config` CanaryTrap and log under a different `result` tag.
+MCP config files (`/mcp.json`, `/.cursor/mcp.json`,
+`/claude_desktop_config.json`, …) are the `mcp-config` CanaryTrap and log
+under a different `result` tag; the provider-scoped dotenv fragments
+`/.env.anthropic` and `/.env.openai` log as `anthropic-dotenv` and
+`openai-dotenv`.
+
+Those configs advertise this endpoint as an HTTP-transport server,
+bearer'd with the per-hit canary session token, so `mcpAuthTokenSha256`
+on a hit here joins back to the `mcp-config` line that issued that token.
+That join is the evidence that one actor both harvested a config and
+acted on it — worth checking whenever `mcp-server-*` lines appear after
+an `mcp-config` line, including from a different source address.
 
 | `result` | `status` | Meaning |
 | --- | --- | --- |

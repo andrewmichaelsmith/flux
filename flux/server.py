@@ -1199,6 +1199,18 @@ MCP_SERVER_PATHS = {
     for value in (os.environ.get("HONEYPOT_MCP_SERVER_PATHS_CSV") or _MCP_SERVER_DEFAULT_PATHS).split(",")
     if value.strip()
 }
+# The endpoint the served MCP *config* files advertise as their HTTP
+# transport, so a reader that follows the config lands on the JSON-RPC
+# dispatch above rather than on a 404. Derived from the live path set
+# rather than written out again: if `HONEYPOT_MCP_SERVER_PATHS_CSV`
+# renames the endpoint, the advertised URL follows it instead of
+# silently pointing at a path this server no longer answers. `/mcp` is
+# preferred because it is the canonical Streamable-HTTP spelling; the
+# sorted() fallback keeps the choice deterministic on a custom set.
+MCP_SELF_ENDPOINT_PATH = (
+    "/mcp" if "/mcp" in MCP_SERVER_PATHS
+    else (sorted(p for p in MCP_SERVER_PATHS if p != "/sse") or ["/mcp"])[0]
+)
 # Cap on JSON-RPC argument decode. Scanners that reach `tools/call` may
 # send large tool arguments; we log a bounded preview.
 MCP_SERVER_BODY_DECODE_LIMIT = max(
@@ -19914,6 +19926,73 @@ def render_anthropic_config_json(r: dict[str, object]) -> bytes:
     }, indent=2).encode("utf-8")
 
 
+_MCP_SELF_HOST_FALLBACK = "mcp.internal"
+
+
+def _mcp_self_endpoint(r: dict[str, object]) -> str:
+    """Absolute URL of the MCP endpoint this same server answers on.
+
+    Every server entry in the config we serve was, until now, a *stdio*
+    entry — a `command`/`args` pair naming a binary to spawn on the
+    reader's own machine. A remote harvester cannot follow any of those,
+    so reading the config was a dead end: the walk ended at the file, and
+    whether anyone does something with a harvested MCP config was
+    unmeasurable.
+
+    An HTTP-transport entry pointing back at this host's own `/mcp`
+    JSON-RPC endpoint closes that chain, because the endpoint is already
+    implemented and already mints canaries on `tools/call`. The URL must
+    therefore be one a client can actually resolve, which is the same
+    constraint the OIDC issuer and the appliance page titles hit: behind
+    a reverse proxy that rewrites `Host`, the requested host arrives as a
+    loopback literal. Publishing that would advertise the reader's own
+    machine and, being identical everywhere this runs, would fingerprint
+    the deployment. Same test and fallback order as
+    `_appliance_display_host`.
+    """
+    host = str(r.get("_requestHost") or "").strip().lower().split(":", 1)[0]
+    if not _host_is_externally_plausible(host):
+        host = (
+            SITE_HOST
+            if _host_is_externally_plausible(SITE_HOST)
+            else _MCP_SELF_HOST_FALLBACK
+        )
+    return f"https://{host}{MCP_SELF_ENDPOINT_PATH}"
+
+
+def render_anthropic_dotenv(r: dict[str, object]) -> bytes:
+    """`/.env.anthropic` — a provider-scoped dotenv fragment.
+
+    Splitting `.env` per provider (`.env.anthropic`, `.env.openai`) is a
+    common way to keep one key per file out of a shared `.env`. The
+    canary occupies `ANTHROPIC_API_KEY`; the rest is non-secret shape
+    (base URL, model, timeout) that a real fragment carries, because a
+    file holding nothing but one key reads as bait.
+    """
+    aws = _aws(r)
+    return (
+        f"ANTHROPIC_API_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"ANTHROPIC_AUTH_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "ANTHROPIC_BASE_URL=https://api.anthropic.com\n"
+        "ANTHROPIC_MODEL=claude-3-5-sonnet-20241022\n"
+        "ANTHROPIC_MAX_TOKENS=4096\n"
+        "ANTHROPIC_TIMEOUT_MS=600000\n"
+    ).encode("utf-8")
+
+
+def render_openai_dotenv(r: dict[str, object]) -> bytes:
+    """`/.env.openai` — the OpenAI-scoped sibling of the above."""
+    aws = _aws(r)
+    return (
+        f"OPENAI_API_KEY={aws.get('awsAccessKeyId', '')}\n"
+        f"OPENAI_ORG_ID={aws.get('awsSessionToken', '')}\n"
+        "OPENAI_BASE_URL=https://api.openai.com/v1\n"
+        "OPENAI_MODEL=gpt-4o\n"
+        "OPENAI_MAX_RETRIES=3\n"
+        "OPENAI_TIMEOUT=600\n"
+    ).encode("utf-8")
+
+
 def render_cursor_mcp_json(r: dict[str, object]) -> bytes:
     # Cursor's Model Context Protocol config — can contain API keys and
     # tokens passed as env vars to spawned MCP servers. We embed the canary
@@ -19935,6 +20014,21 @@ def render_cursor_mcp_json(r: dict[str, object]) -> bytes:
                     "API_KEY": aws.get("awsSecretAccessKey", ""),
                     "SESSION_TOKEN": aws.get("awsSessionToken", ""),
                     "BASE_URL": "https://tools.internal.lan",
+                },
+            },
+            # The one entry a remote reader can act on. `type: http` is
+            # the Streamable-HTTP transport spelling MCP clients expect,
+            # and the URL is this server's own JSON-RPC endpoint. The
+            # bearer is the per-hit canary session token, so the
+            # `mcpAuthTokenSha256` logged if anyone connects joins that
+            # connection back to this exact config read — which is what
+            # turns "a config was fetched" into "a config was fetched and
+            # then followed".
+            "internal-gateway": {
+                "type": "http",
+                "url": _mcp_self_endpoint(r),
+                "headers": {
+                    "Authorization": f"Bearer {aws.get('awsSessionToken', '')}",
                 },
             },
         },
@@ -23737,6 +23831,27 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_cursor_mcp_json,
         "application/json; charset=utf-8",
     ),
+    # Provider-scoped dotenv fragments. These need a CanaryTrap entry to
+    # be reachable at all, not merely to be nicer: `is_tarpit_path`
+    # claims every `.env`-prefixed leaf except bare `/.env`, and it
+    # exempts exactly the paths carrying a trap entry. Without one these
+    # two fell through to the generic tarpit — so an AI-credential
+    # harvester got a redirect chain instead of a canary, and the
+    # issuance that gives replay-side telemetry never happened.
+    CanaryTrap(
+        "anthropic-dotenv",
+        ("/.env.anthropic",),
+        ("aws",),
+        render_anthropic_dotenv,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "openai-dotenv",
+        ("/.env.openai",),
+        ("aws",),
+        render_openai_dotenv,
+        "text/plain; charset=utf-8",
+    ),
     CanaryTrap(
         "claude-credentials",
         (
@@ -23797,6 +23912,13 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # Scanner dictionaries add both the directory and the flat-
             # dotfile shape in the same sweep.
             "/.mcp.json",
+            # Claude Desktop's config file. Same `mcpServers` document as
+            # every other name here, but the only one in the family
+            # without a leading dot, so a dotfile-shaped matcher misses
+            # it — which is how it stayed a 404 while the rest of the
+            # family answered. Observed being walked in the same sweeps
+            # as the dotted names.
+            "/claude_desktop_config.json",
         ),
         ("aws",),
         render_cursor_mcp_json,
