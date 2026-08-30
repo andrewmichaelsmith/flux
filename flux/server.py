@@ -1370,6 +1370,12 @@ _CLOUD_IMDS_ECS_PATHS: frozenset[str] = frozenset({
     "/.aws/ecs-task-credentials.json",
     "/k8s/eks/credentials",
 })
+# The non-credential sibling of the set above. Checked first, because
+# `/v2/metadata` must not fall through to the credential branch.
+_CLOUD_IMDS_ECS_METADATA_PATHS: frozenset[str] = frozenset({
+    "/v2/metadata",
+    "/v2/task",
+})
 _CLOUD_IMDS_ECS_PREFIX = "/v2/credentials/"
 # Account number embedded in the container-provider `RoleArn`. Filler, not
 # a secret — an ARN identifies a role, it does not authenticate to it.
@@ -1458,6 +1464,51 @@ SSRF_GCP_SERVICE_ACCOUNT = (
     os.environ.get("HONEYPOT_SSRF_GCP_SERVICE_ACCOUNT")
     or "app-runtime@prod-platform-284915.iam.gserviceaccount.com"
 ).strip() or "app-runtime@prod-platform-284915.iam.gserviceaccount.com"
+
+# Azure's metadata service shares the link-local address with EC2's, so
+# the host cannot discriminate the two — only the layout can. Azure hangs
+# its tree under `/metadata/`, which never collides with the `/latest/`
+# and `/v2/` roots the AWS resolver owns, so the path decides which cloud
+# a client meant.
+_SSRF_AZURE_ROOT = "/metadata"
+# `/metadata/identity/oauth2/token` is the whole reason a sweep carries an
+# Azure leg. On Azure there is no long-lived credential file to steal, so
+# managed identity is the only route to a token, and it is minted on
+# request rather than read off disk — which is why the file-oriented half
+# of the same dictionary has no Azure equivalent.
+_SSRF_AZURE_TOKEN_PATHS: frozenset[str] = frozenset({
+    "/metadata/identity/oauth2/token",
+    # Pre-managed-identity spelling. Older tooling still emits it and
+    # Azure still answers it, so a dictionary carrying it is dated rather
+    # than wrong.
+    "/metadata/oauth2/token",
+})
+# Non-secret identifiers for the managed identity we claim to be. A client
+# id names a principal, it does not authenticate as one — the same reason
+# `CLOUD_IMDS_ROLE_NAME` and `SSRF_GCP_SERVICE_ACCOUNT` are constants.
+SSRF_AZURE_CLIENT_ID = (
+    os.environ.get("HONEYPOT_SSRF_AZURE_CLIENT_ID")
+    or "7695dde9-3a32-4fe1-bb85-a1a50e2203e3"
+).strip() or "7695dde9-3a32-4fe1-bb85-a1a50e2203e3"
+SSRF_AZURE_TENANT_ID = (
+    os.environ.get("HONEYPOT_SSRF_AZURE_TENANT_ID")
+    or "f5884f75-ae9c-42e2-ab14-b9831abcf4f2"
+).strip() or "f5884f75-ae9c-42e2-ab14-b9831abcf4f2"
+# The subscription the VM we claim to be sits in. A separate id from the
+# tenant above — they are different things in Azure, and a document that
+# reuses one for the other is wrong in a way a reader of these documents
+# would notice.
+SSRF_AZURE_SUBSCRIPTION_ID = (
+    os.environ.get("HONEYPOT_SSRF_AZURE_SUBSCRIPTION_ID")
+    or "d5f9e2e1-8a67-444f-8863-b3d1e8912e70"
+).strip() or "d5f9e2e1-8a67-444f-8863-b3d1e8912e70"
+# Parameter spellings that carry the audience the client wants a token
+# for. Recorded because it is the sharpest statement of intent in the
+# whole sweep: a token for `management.azure.com` is for taking over the
+# subscription, one for `vault.azure.net` is for reading the key vault,
+# one for `storage.azure.com` is for the data. Same request, three very
+# different objectives, and only this parameter separates them.
+_SSRF_AZURE_RESOURCE_PARAMS: tuple[str, ...] = ("resource", "audience", "aud")
 
 # Tool names that trigger the AWS canary path when passed to `tools/call`.
 # A real MCP server hosting these tools would return credentials or file
@@ -25754,7 +25805,8 @@ class CloudImdsRequest:
     steps, which is exactly the distinction the trap exists to measure.
     """
 
-    kind: str   # "index" | "iam-index" | "role-list" | "role-credentials" | "ecs-credentials"
+    kind: str   # "index" | "iam-index" | "role-list" | "role-credentials"
+                # | "ecs-credentials" | "ecs-metadata"
     role: str = ""
 
     @property
@@ -25780,6 +25832,8 @@ def resolve_cloud_imds(path: str) -> "CloudImdsRequest | None":
     lowered = path.lower()
     bare = lowered.rstrip("/") or "/"
 
+    if bare in _CLOUD_IMDS_ECS_METADATA_PATHS:
+        return CloudImdsRequest("ecs-metadata")
     if bare in _CLOUD_IMDS_ECS_PATHS:
         return CloudImdsRequest("ecs-credentials")
     if lowered.startswith(_CLOUD_IMDS_ECS_PREFIX):
@@ -25814,6 +25868,38 @@ _CLOUD_IMDS_INDEX_BODY = b"\n".join([
 ]) + b"\n"
 _CLOUD_IMDS_IAM_INDEX_BODY = b"info\nsecurity-credentials/\n"
 
+# ECS task metadata. The sibling of `/v2/credentials/` and swept in the
+# same breath, but it is inventory rather than credential — cluster, task
+# family, container image — so like the other listing steps it spends no
+# canary. It is worth answering because it confirms to the client that it
+# really is talking to a container credential provider, which is the
+# check that decides whether the credential request is worth making.
+def _cloud_imds_ecs_metadata_body() -> bytes:
+    return json.dumps({
+        "Cluster": "prod-platform-ecs",
+        "TaskARN": (
+            f"arn:aws:ecs:us-east-1:{_CLOUD_IMDS_FILLER_ACCOUNT}:task/"
+            f"prod-platform-ecs/{secrets.token_hex(16)}"
+        ),
+        "Family": "prod-app-api",
+        "Revision": "47",
+        "DesiredStatus": "RUNNING",
+        "KnownStatus": "RUNNING",
+        "Containers": [{
+            "DockerId": secrets.token_hex(32),
+            "Name": "app",
+            "Image": (
+                f"{_CLOUD_IMDS_FILLER_ACCOUNT}.dkr.ecr.us-east-1."
+                "amazonaws.com/prod-app-api:1.4.7"
+            ),
+            "DesiredStatus": "RUNNING",
+            "KnownStatus": "RUNNING",
+            "Limits": {"CPU": 512, "Memory": 1024},
+            "Type": "NORMAL",
+        }],
+        "LaunchType": "FARGATE",
+    }).encode("utf-8")
+
 
 @dataclass
 class SsrfRelayRequest:
@@ -25825,18 +25911,34 @@ class SsrfRelayRequest:
     protocol, in which case the relay answers with the very same body the
     direct trap would — the client asked us to fetch metadata, so what
     comes back has to be metadata, not a wrapper.
+
+    `fs` is the same idea for the other half of the sweep. The same
+    parameter is swept with `file://` targets, which is the same primitive
+    aimed at disk instead of the network, so it resolves through the same
+    shared file-read table every other read surface uses.
     """
 
     param: str
     target: str
     host: str
     target_path: str
-    cloud: str                      # "aws" | "gcp" | "unknown"
+    cloud: str                      # "aws" | "gcp" | "azure" | "file" | "unknown"
     imds: "CloudImdsRequest | None" = None
     gcp_kind: str = ""              # "index" | "sa-index" | "email" | "token" | ""
+    azure_kind: str = ""            # "token" | "instance" | "versions" | ""
+    azure_resource: str = ""        # audience named on an Azure token request
+    fs: "FsReadTarget | None" = None
 
     @property
     def issues_canary(self) -> bool:
+        if self.fs is not None:
+            # A resolved read is not automatically a credential: the same
+            # table answers `/proc/self/environ` and a world-readable
+            # system file with no canary in them. The trap's own declared
+            # canary types are what decide it.
+            if self.fs.bare_env:
+                return True
+            return bool(self.fs.trap is not None and self.fs.trap.canary_types)
         return self.imds is not None and self.imds.issues_canary
 
 
@@ -25860,7 +25962,14 @@ def _ssrf_candidate_urls(query_string: str) -> list[tuple[str, str]]:
         if not value:
             continue
         for candidate in (value, unquote(value)):
-            if "://" in candidate or candidate.startswith("//"):
+            # `file:/etc/passwd` carries neither marker but is a URL, and
+            # a fetcher that unquotes before dereferencing resolves it the
+            # same as the three-slash spelling.
+            if (
+                "://" in candidate
+                or candidate.startswith("//")
+                or candidate[:5].lower() == "file:"
+            ):
                 out.append((key[:64], candidate[:512]))
                 break
     return out
@@ -25883,25 +25992,125 @@ def _ssrf_split_url(url: str) -> tuple[str, str]:
     return host, path
 
 
+def _ssrf_file_path(url: str) -> str:
+    """The on-disk path a `file://` target names, or "" if it isn't one.
+
+    Accepts the three spellings that turn up together in one sweep:
+    `file:///etc/passwd` (empty authority), `file://localhost/etc/passwd`
+    (the only authority the scheme allows), and the malformed-but-common
+    `file:/etc/passwd`. Anything with a real remote authority is not a
+    local read and is left for the host table to reject.
+    """
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+        if scheme.strip().lower() != "file":
+            return ""
+        authority, _, tail = rest.partition("/")
+        if authority.strip().lower() not in ("", "localhost", "127.0.0.1"):
+            return ""
+        return "/" + tail.split("?", 1)[0].split("#", 1)[0]
+    scheme, sep, rest = url.partition(":")
+    if sep and scheme.strip().lower() == "file":
+        return "/" + rest.lstrip("/").split("?", 1)[0].split("#", 1)[0]
+    return ""
+
+
+def _ssrf_target_query(url: str) -> str:
+    """The query string carried by the *target* URL, not by our request.
+
+    `_ssrf_split_url` drops it deliberately — it is not part of matching a
+    path onto a document. It is worth recovering separately because the
+    Azure token endpoint puts the audience there, and the audience is the
+    part that says what the token was wanted for.
+    """
+    _, _, query = url.partition("?")
+    return query.split("#", 1)[0]
+
+
+def _resolve_ssrf_azure_kind(lowered_path: str) -> str:
+    """Which step of the Azure metadata tree a path names.
+
+    Mirrors the AWS and GCP splits: the listing steps carry no secret and
+    cost nothing, and only the token endpoint hands back something
+    credential-shaped.
+    """
+    bare = lowered_path.rstrip("/") or "/"
+    if bare in _SSRF_AZURE_TOKEN_PATHS:
+        return "token"
+    if bare == f"{_SSRF_AZURE_ROOT}/versions":
+        return "versions"
+    if bare == _SSRF_AZURE_ROOT or bare.startswith(f"{_SSRF_AZURE_ROOT}/instance"):
+        return "instance"
+    return ""
+
+
+def _ssrf_azure_resource(target_query: str) -> str:
+    """The audience named on an Azure token request, if it named one."""
+    if not target_query:
+        return ""
+    try:
+        pairs = parse_qsl(target_query, keep_blank_values=True)
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    for key, value in pairs[:20]:
+        if key.strip().lower() in _SSRF_AZURE_RESOURCE_PARAMS and value:
+            return value[:256]
+    return ""
+
+
 def resolve_ssrf_relay(path: str, query_string: str) -> "SsrfRelayRequest | None":
-    """Map a fetch-style request onto the metadata document it points at.
+    """Map a fetch-style request onto the document it points at.
 
     Returns None unless the entry path is one we serve *and* some
-    parameter names a cloud metadata host. Requiring the metadata host is
-    what keeps this from behaving like an open proxy: a target we do not
-    emulate is logged and refused, never fetched. flux makes no outbound
-    request on any branch here.
+    parameter names a cloud metadata host or a local file. Requiring one
+    of those is what keeps this from behaving like an open proxy: a target
+    we do not emulate is logged and refused, never fetched. flux makes no
+    outbound request and reads no real file on any branch here.
     """
     bare = (path.lower().rstrip("/") or "/")
     if bare not in _SSRF_RELAY_ENTRY_PATHS:
         return None
 
+    # An unresolved `file://` target is held back rather than returned on
+    # the spot: a request can carry several candidate parameters, and a
+    # file we do not furnish must not shadow a metadata host named by a
+    # later one. A resolved read wins immediately — it is a real answer.
+    file_miss: "SsrfRelayRequest | None" = None
+
     for param, url in _ssrf_candidate_urls(query_string):
+        # `file://` first: it has no authority to match against the host
+        # tables below, and the same parameter carries both kinds in the
+        # same sweep.
+        file_path = _ssrf_file_path(url)
+        if file_path:
+            candidate = SsrfRelayRequest(
+                param=param, target=url, host="", target_path=file_path,
+                cloud="file", fs=resolve_fs_read(file_path),
+            )
+            if candidate.fs is not None and candidate.fs.resolved:
+                return candidate
+            if file_miss is None:
+                file_miss = candidate
+            continue
         host, target_path = _ssrf_split_url(url)
         if not host:
             continue
         lowered = target_path.lower()
         if host in _SSRF_AWS_METADATA_HOSTS:
+            # Azure shares the link-local address, so the layout decides.
+            # Checked first because the Azure root cannot collide with the
+            # `/latest/` and `/v2/` roots the EC2 resolver owns.
+            azure_kind = _resolve_ssrf_azure_kind(lowered)
+            if azure_kind:
+                return SsrfRelayRequest(
+                    param=param, target=url, host=host,
+                    target_path=target_path, cloud="azure",
+                    azure_kind=azure_kind,
+                    azure_resource=(
+                        _ssrf_azure_resource(_ssrf_target_query(url))
+                        if azure_kind == "token" else ""
+                    ),
+                )
             return SsrfRelayRequest(
                 param=param, target=url, host=host, target_path=target_path,
                 cloud="aws", imds=resolve_cloud_imds(target_path),
@@ -25911,7 +26120,7 @@ def resolve_ssrf_relay(path: str, query_string: str) -> "SsrfRelayRequest | None
                 param=param, target=url, host=host, target_path=target_path,
                 cloud="gcp", gcp_kind=_resolve_ssrf_gcp_kind(lowered),
             )
-    return None
+    return file_miss
 
 
 def _resolve_ssrf_gcp_kind(lowered_path: str) -> str:
@@ -25940,6 +26149,104 @@ def _resolve_ssrf_gcp_kind(lowered_path: str) -> str:
 # above: no secret in them, so a sweep across the tree spends no canary.
 _SSRF_GCP_INDEX_BODY = b"instance/\nproject/\n"
 _SSRF_GCP_SA_INDEX_BODY = b"aliases\nemail\nidentity\nscopes\ntoken\n"
+
+# Azure's own listing steps. Same reasoning again: nothing here
+# authenticates as anything, so a sweep across the tree spends no canary.
+# The shape matters more than the values — a client that parses this and
+# comes back for a token has implemented the protocol rather than replayed
+# a list, which is the distinction the trap is built to measure.
+_SSRF_AZURE_VERSIONS_BODY = json.dumps({
+    "apiVersions": [
+        "2017-04-02", "2017-08-01", "2017-12-01", "2018-02-01",
+        "2018-10-01", "2019-06-01", "2020-09-01", "2021-02-01",
+    ],
+}).encode("utf-8")
+
+
+def _ssrf_azure_instance_body() -> bytes:
+    """Instance metadata for the VM we claim to be.
+
+    Ordinary inventory — region, size, image, network — none of which is a
+    credential. It exists so the walk-the-tree step behaves like the real
+    service for a client checking that its SSRF actually landed before it
+    spends a request on the token endpoint.
+    """
+    return json.dumps({
+        "compute": {
+            "azEnvironment": "AzurePublicCloud",
+            "location": "eastus",
+            "name": "prod-app-vmss-000004",
+            "offer": "0001-com-ubuntu-server-jammy",
+            "osType": "Linux",
+            "publisher": "canonical",
+            "resourceGroupName": "rg-prod-platform",
+            "sku": "22_04-lts-gen2",
+            "subscriptionId": SSRF_AZURE_SUBSCRIPTION_ID,
+            "vmId": "2b6c0af4-77e5-4d19-9f42-6ea83b5c17d8",
+            "vmSize": "Standard_D2s_v3",
+            "zone": "1",
+        },
+        "network": {
+            "interface": [{
+                "ipv4": {
+                    "ipAddress": [{
+                        "privateIpAddress": "10.42.3.17",
+                        "publicIpAddress": "",
+                    }],
+                    "subnet": [{"address": "10.42.3.0", "prefix": "24"}],
+                },
+                "macAddress": "000D3AF8C21B",
+            }],
+        },
+    }).encode("utf-8")
+
+
+def _ssrf_azure_token_body(resource: str) -> bytes:
+    """A managed-identity token response.
+
+    Tracebit issues no Azure-shaped credential, so — exactly as in the GCP
+    branch — this is a per-hit synthetic rather than a monitored canary.
+    It must still be unique per hit: a fixed literal would be one string
+    shared across every deployment, which is both a fleet fingerprint and
+    worth nothing on replay. The JWT shape is load-bearing, because a
+    client that actually uses the token will parse it before sending it.
+    """
+    issued = int(time.time())
+    expires = issued + 3599
+    audience = resource or "https://management.azure.com/"
+    # Compact separators: a real JWT carries no whitespace, and the
+    # encoded header of a whitespace-padded one does not match what every
+    # other RS256 token on the internet starts with.
+    header = _b64u(json.dumps(
+        {"typ": "JWT", "alg": "RS256"}, separators=(",", ":"),
+    ).encode("utf-8"))
+    payload = _b64u(json.dumps({
+        "aud": audience,
+        "iss": f"https://sts.windows.net/{SSRF_AZURE_TENANT_ID}/",
+        "iat": issued,
+        "nbf": issued,
+        "exp": expires,
+        "appid": SSRF_AZURE_CLIENT_ID,
+        "tid": SSRF_AZURE_TENANT_ID,
+        "oid": secrets.token_hex(16),
+        "sub": secrets.token_hex(16),
+        "xms_mirid": (
+            f"/subscriptions/{SSRF_AZURE_SUBSCRIPTION_ID}/resourcegroups/"
+            "rg-prod-platform/providers/Microsoft.Compute/"
+            "virtualMachineScaleSets/prod-app-vmss"
+        ),
+    }, separators=(",", ":")).encode("utf-8"))
+    signature = _b64u(secrets.token_bytes(256))
+    return json.dumps({
+        "access_token": f"{header}.{payload}.{signature}",
+        "client_id": SSRF_AZURE_CLIENT_ID,
+        "expires_in": "3599",
+        "expires_on": str(expires),
+        "ext_expires_in": "3599",
+        "not_before": str(issued),
+        "resource": audience,
+        "token_type": "Bearer",
+    }).encode("utf-8")
 
 
 # ============================================================================
@@ -34579,8 +34886,12 @@ async def _send_cloud_imds(
     }
 
     if not imds.issues_canary:
+        # The task-metadata step is the only listing that speaks JSON —
+        # the ECS endpoint serves a document, not a directory — so it
+        # picks its own content type below.
         body = (
-            _CLOUD_IMDS_IAM_INDEX_BODY if imds.kind == "iam-index"
+            _cloud_imds_ecs_metadata_body() if imds.kind == "ecs-metadata"
+            else _CLOUD_IMDS_IAM_INDEX_BODY if imds.kind == "iam-index"
             else _CLOUD_IMDS_INDEX_BODY if imds.kind == "index"
             else (CLOUD_IMDS_ROLE_NAME + "\n").encode("utf-8")
         )
@@ -34592,7 +34903,10 @@ async def _send_cloud_imds(
             status=200,
             body=b"" if request.method == "HEAD" else body,
             headers={
-                "Content-Type": "text/plain",
+                "Content-Type": (
+                    "application/json; charset=utf-8"
+                    if imds.kind == "ecs-metadata" else "text/plain"
+                ),
                 "Cache-Control": "no-store",
                 # Real metadata services advertise the document size even
                 # on HEAD; keeping it consistent avoids a length mismatch
@@ -34644,6 +34958,23 @@ def _ssrf_plain_response(request: web.Request, body: bytes) -> web.Response:
     )
 
 
+def _ssrf_json_response(request: web.Request, body: bytes) -> web.Response:
+    """As above, for the trees that speak JSON rather than plain text.
+
+    Azure answers every step with JSON, including the listing steps, so
+    content type is part of looking like the real service.
+    """
+    return web.Response(
+        status=200,
+        body=b"" if request.method == "HEAD" else body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
 async def _send_ssrf_relay(
     request: web.Request,
     relay: "SsrfRelayRequest",
@@ -34679,6 +35010,45 @@ async def _send_ssrf_relay(
         "ssrfTargetPath": relay.target_path,
         "ssrfCloud": relay.cloud,
     }
+
+    if relay.fs is not None:
+        # The `file://` leg of the same sweep. Resolved through the shared
+        # file-read table, so the body is byte-identical to what a bare
+        # probe for the same file would get, and a credential file answers
+        # with the same monitored canary a direct read would get. The
+        # prefix keeps this population separable from the other read
+        # surfaces.
+        return await _send_fs_read(
+            request, relay.fs, request_id, path,
+            client_ip, host, user_agent, proto, log_context,
+            result_prefix="ssrf-relay-file-",
+            extra_log={
+                "ssrfFsRequestedPath": relay.fs.requested_path[:512],
+                "ssrfFsMatchDepth": relay.fs.match_depth,
+            },
+        )
+
+    if relay.cloud == "azure" and relay.azure_kind in ("instance", "versions"):
+        body = (
+            _SSRF_AZURE_VERSIONS_BODY if relay.azure_kind == "versions"
+            else _ssrf_azure_instance_body()
+        )
+        append_log({
+            **log_context, "status": 200,
+            "result": f"ssrf-relay-azure-{relay.azure_kind}", "bytes": len(body),
+        })
+        return _ssrf_json_response(request, body)
+
+    if relay.cloud == "azure" and relay.azure_kind == "token":
+        body = _ssrf_azure_token_body(relay.azure_resource)
+        append_log({
+            **log_context, "status": 200, "result": "ssrf-relay-azure-token",
+            # The audience is the intent: which Azure service the client
+            # wanted this identity's token for.
+            "azureResource": relay.azure_resource[:256],
+            "syntheticToken": True, "bytes": len(body),
+        })
+        return _ssrf_json_response(request, body)
 
     if relay.imds is not None:
         return await _send_cloud_imds(

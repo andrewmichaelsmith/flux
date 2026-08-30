@@ -141,8 +141,11 @@ dispatched behind it, so it cannot outlive it.
 
 | Var | Default | Notes |
 | --- | --- | --- |
-| `HONEYPOT_SSRF_RELAY_ENABLED` | on | Master switch. Answers fetch-style entry paths (`/fetch`, `/proxy`, `/render`, `/preview`, `/webhook/test`, …) whose parameters name a cloud metadata host. Fires only on a metadata target, so it never behaves like a working open proxy; flux makes no outbound request on any branch. |
+| `HONEYPOT_SSRF_RELAY_ENABLED` | on | Master switch. Answers fetch-style entry paths (`/fetch`, `/proxy`, `/render`, `/preview`, `/webhook/test`, …) whose parameters name a cloud metadata host (AWS/Alibaba, Azure, GCP) or a `file://` path. Fires only on one of those targets, so it never behaves like a working open proxy; flux makes no outbound request and reads no real file on any branch. |
 | `HONEYPOT_SSRF_GCP_SERVICE_ACCOUNT` | `app-runtime@prod-platform-284915.iam.gserviceaccount.com` | Filler service-account address returned by the GCP `…/default/email` step. Non-secret — an address identifies a principal, it does not authenticate as one. |
+| `HONEYPOT_SSRF_AZURE_CLIENT_ID` | `7695dde9-…-a1a50e2203e3` | Client id of the managed identity the Azure branch claims to be. Non-secret, same reasoning as above. |
+| `HONEYPOT_SSRF_AZURE_TENANT_ID` | `f5884f75-…-b9831abcf4f2` | Tenant id used in the token's issuer and `tid` claim. Non-secret. |
+| `HONEYPOT_SSRF_AZURE_SUBSCRIPTION_ID` | `d5f9e2e1-…-b3d1e8912e70` | Subscription id in the instance document and the token's `xms_mirid`. A separate id from the tenant — they are different things in Azure. Non-secret. |
 
 ## Observability / debug surface
 

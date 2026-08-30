@@ -14,6 +14,14 @@ one.
 | GET / HEAD | `<root>/iam/security-credentials` | `200` + the role **name** only, no canary | `cloud-imds-role-list` |
 | GET / HEAD | `<root>/iam/security-credentials/<role>` | `200` + `Code`/`Type`/key/secret/`Token`/`Expiration` envelope | `cloud-imds-role-credentials` |
 | GET / HEAD | `/v2/credentials`, `/v2/credentials/<id>`, `/ecs/task-credentials[.json]`, `/aws/ecs/task-credentials[.json]`, `/aws/iam/ecs-task-credentials.json`, `/.aws/ecs-task-credentials[.json]`, `/k8s/eks/credentials` | `200` + `RoleArn`/key/secret/`Token`/`Expiration` envelope | `cloud-imds-ecs-credentials` |
+| GET / HEAD | `/v2/metadata`, `/v2/task` | `200` + JSON task metadata (cluster, task ARN, container image), no canary | `cloud-imds-ecs-metadata` |
+
+Task metadata is the non-secret sibling of the container credential
+endpoint and is swept in the same breath, so it is checked first and
+answers as a listing — it is inventory, not secret, and spends no canary.
+It is worth answering because it confirms to the client that it really is
+talking to a container credential provider, which is the check that
+decides whether the credential request is worth making.
 
 Both credential envelopes carry a per-request Tracebit `aws` canary and a
 forward-computed `Expiration`. Issuance failure logs
