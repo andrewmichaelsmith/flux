@@ -19,7 +19,7 @@ them falls through to the router's 404.
 
 | Method | Entry path | Fires when | Log tag |
 | --- | --- | --- | --- |
-| GET / HEAD | `/fetch`, `/api/fetch`, `/v1/fetch`, `/api/v1/fetch`, `/proxy`, `/api/proxy`, `/v1/proxy`, `/render`, `/api/render`, `/preview`, `/api/preview`, `/screenshot`, `/thumbnail`, `/url`, `/api/url`, `/import`, `/api/import`, `/download`, `/api/download`, `/image`, `/api/image`, `/webhook`, `/api/webhook`, `/webhook/test`, `/api/webhook/test` (± trailing slash) | a parameter value resolves to an EC2-layout metadata host | `ssrf-relay-aws-<imdsKind>` |
+| GET / HEAD | `/fetch`, `/api/fetch`, `/v1/fetch`, `/api/v1/fetch`, `/proxy`, `/api/proxy`, `/v1/proxy`, `/render`, `/api/render`, `/preview`, `/api/preview`, `/screenshot`, `/thumbnail`, `/url`, `/api/url`, `/import`, `/api/import`, `/download`, `/api/download`, `/image`, `/api/image`, `/read`, `/api/read`, `/file`, `/api/file`, `/webhook`, `/api/webhook`, `/webhook/test`, `/api/webhook/test` (± trailing slash) | a parameter value resolves to an EC2-layout metadata host | `ssrf-relay-aws-<imdsKind>` |
 | GET / HEAD | same | a parameter value resolves to a GCP metadata host | `ssrf-relay-gcp-<index\|sa-index\|email\|token>` |
 | GET / HEAD | same | a parameter value resolves to the Azure `/metadata/…` layout | `ssrf-relay-azure-<token\|instance\|versions>` |
 | GET / HEAD | same | a parameter value names a `file://` path we furnish | `ssrf-relay-file-<trap>` |
@@ -36,6 +36,16 @@ and a bare `/api/webhook` alongside `/api/webhook/test`; both
 `/api`-prefixed forms were missing. `/download` and `/image` are the
 same bet as `/preview`: the client is guessing the application
 dereferences a URL server-side.
+
+`/read` and `/api/file` were added on the same reasoning: both were
+being swept by the very sources that also send `/proxy` and `/fetch`, and
+both were silent misses. `/api/read` and `/file` are their symmetric
+partners under the `/api`-prefix convention the rest of the set follows.
+
+`/resolve` is swept too but stays **out**: its sources are disjoint from
+this surface's — none of them sends `/proxy` or `/fetch` — which makes it
+a different behaviour wearing a similar name rather than another spelling
+of this one.
 
 `/redirect` is deliberately **not** an entry path. A redirect endpoint
 answers with a 302 rather than dereferencing the target, so returning

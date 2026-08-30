@@ -1438,6 +1438,14 @@ _SSRF_RELAY_ENTRY_PATHS: frozenset[str] = frozenset({
     # these two spellings turn up in the same sweeps as the ones above.
     "/download", "/api/download",
     "/image", "/api/image",
+    # A read/file-serving endpoint is the same bet again. `/read` and
+    # `/api/file` were both being swept by the same client population as
+    # the entries above -- every source sending them also sent `/proxy` or
+    # `/fetch` -- and both were silent misses. `/api/read` and `/file` are
+    # their symmetric partners under the same `/api`-prefix convention the
+    # rest of this set already follows.
+    "/read", "/api/read",
+    "/file", "/api/file",
 })
 # Hosts whose metadata tree uses the EC2 `/latest/meta-data/...` layout.
 # Alibaba Cloud mirrors that layout at its own link-local address, so it

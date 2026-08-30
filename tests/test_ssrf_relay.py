@@ -660,3 +660,27 @@ def test_file_miss_is_still_returned_when_nothing_else_matches():
     assert resolved is not None
     assert resolved.cloud == "file"
     assert not resolved.fs.resolved
+
+
+@pytest.mark.parametrize("entry", ["/read", "/api/read", "/file", "/api/file"])
+def test_read_style_entry_spellings_resolve(entry):
+    """Read/file-serving spellings swept by the same client population.
+
+    `/read` and `/api/file` were observed being swept by the very sources
+    that also send `/proxy` and `/fetch`, and both were silent misses —
+    the entry path is matched exactly, so no parameter-name generality
+    recovers an unlisted spelling. `/api/read` and `/file` are their
+    symmetric partners under the `/api`-prefix convention the rest of the
+    set already follows.
+    """
+    resolved = tbenv.resolve_ssrf_relay(entry, f"url={AWS_ROOT}")
+    assert resolved is not None, f"{entry} is a spelling scanners actually send"
+    assert resolved.cloud == "aws"
+
+
+def test_resolve_is_deliberately_not_an_entry_path():
+    """`/resolve` is swept too, but by a disjoint set of sources — none of
+    them sends `/proxy` or `/fetch`. That makes it a different behaviour
+    wearing a similar name rather than another spelling of this one, so it
+    stays out until something ties it to this surface."""
+    assert tbenv.resolve_ssrf_relay("/resolve", f"url={AWS_ROOT}") is None
