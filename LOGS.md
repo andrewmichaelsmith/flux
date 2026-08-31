@@ -435,10 +435,13 @@ above is reconstructable through the relay too. See
 | `ssrf-relay-gcp-email` | 200 | `bytes: int` | Service-account address (non-secret filler). No canary issued. |
 | `ssrf-relay-gcp-token` | 200 | `syntheticToken: true`, `bytes: int` | Per-hit synthetic bearer token — **not** a monitored canary; Tracebit issues no GCP-shaped credential. The token itself is never logged. |
 | `ssrf-relay-unmatched` | 404 | — | Metadata host we serve, document we do not emulate. Logged for the target, which names what the tooling wants next. |
+| `ssrf-relay-file-<trap>` | 200 | as the resolved trap | Local-file read served through the relay, from a `file://` URL or a bare/traversal path (`file=../../.env`). Canary only where the resolved trap carries one. |
+| `ssrf-relay-file-miss` | 404 | — | A local file we do not furnish. `ssrfTarget` records the path the source assumed was on disk. |
 
-A request to an entry path whose parameters name no metadata host is not
-claimed by this trap at all — it falls through to `not-handled`, and
-flux never makes an outbound request on any branch.
+A request to an entry path whose parameters name neither a metadata host
+nor a local file is not claimed by this trap at all — it falls through to
+`not-handled`, and flux never makes an outbound request or reads a real
+file on any branch.
 
 ### Canary-backed file traps
 

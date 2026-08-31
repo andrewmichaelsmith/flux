@@ -6,10 +6,12 @@ documents get asked for: a URL-taking parameter on a fetch-style
 endpoint, pointed at the link-local metadata address. Same documents,
 same canary, different client — and, until now, a flat 404.
 
-The same parameter on the same entry paths is also swept with `file://`
+The same parameter on the same entry paths is also swept with local-file
 targets in the same burst — the same read primitive aimed at disk instead
 of the network — so that leg resolves here too, through the shared
-file-read table rather than a second copy of anything.
+file-read table rather than a second copy of anything. Both spellings
+count: the `file://` URL and the bare path (`file=../../.env`,
+`path=/etc/passwd`) that the same dictionaries send more often.
 
 ## Routed paths
 
@@ -22,8 +24,8 @@ them falls through to the router's 404.
 | GET / HEAD | `/fetch`, `/api/fetch`, `/v1/fetch`, `/api/v1/fetch`, `/proxy`, `/api/proxy`, `/v1/proxy`, `/render`, `/api/render`, `/preview`, `/api/preview`, `/screenshot`, `/thumbnail`, `/url`, `/api/url`, `/import`, `/api/import`, `/download`, `/api/download`, `/image`, `/api/image`, `/read`, `/api/read`, `/file`, `/api/file`, `/webhook`, `/api/webhook`, `/webhook/test`, `/api/webhook/test` (± trailing slash) | a parameter value resolves to an EC2-layout metadata host | `ssrf-relay-aws-<imdsKind>` |
 | GET / HEAD | same | a parameter value resolves to a GCP metadata host | `ssrf-relay-gcp-<index\|sa-index\|email\|token>` |
 | GET / HEAD | same | a parameter value resolves to the Azure `/metadata/…` layout | `ssrf-relay-azure-<token\|instance\|versions>` |
-| GET / HEAD | same | a parameter value names a `file://` path we furnish | `ssrf-relay-file-<trap>` |
-| GET / HEAD | same | a parameter value names a `file://` path we do not | `ssrf-relay-file-miss` (404) |
+| GET / HEAD | same | a parameter value names a local file we furnish, as a `file://` URL or a bare/traversal path | `ssrf-relay-file-<trap>` |
+| GET / HEAD | same | a parameter value names a local file we do not | `ssrf-relay-file-miss` (404) |
 | GET / HEAD | same | metadata host, document we do not emulate | `ssrf-relay-unmatched` (404) |
 
 ### On which spellings are listed
@@ -62,12 +64,42 @@ client meant. The Azure check runs **first** on that shared host, and a
 test pins that it does not steal EC2-layout targets: an over-broad match
 there would silently divert every AWS credential request.
 
-`file://` is checked before either, because a `file://` URL has no
-authority to match against the host tables at all. Three spellings
-resolve — `file:///etc/…` (empty authority), `file://localhost/etc/…`
-(the only authority the scheme allows), and the malformed-but-common
-`file:/etc/…`. A real remote authority is not a local read and stays
-unmatched.
+Local reads are checked before either, because they have no authority to
+match against the host tables at all. Three `file://` spellings resolve —
+`file:///etc/…` (empty authority), `file://localhost/etc/…` (the only
+authority the scheme allows), and the malformed-but-common `file:/etc/…`.
+A real remote authority is not a local read and stays unmatched.
+
+### The scheme-less spelling
+
+Requiring a scheme was itself a gap. The same sweeps that send
+`url=file:///app/.env` send `file=../../.env`, `path=/etc/passwd` and
+`..\..\web.config` — the plain LFI spelling, which is the more common of
+the two — and every one of those fell out of the candidate list before
+anything looked at it, so a document that already had a renderer behind it
+was answered as an unrecognised request.
+
+A parameter value is therefore also treated as a read when it is a bare
+filesystem path: it carries a `..` segment, or it starts with a single
+slash. Backslash separators are normalised and values are decoded twice,
+so `%2e%2e%2f%2e%2e%2f.env` resolves like its plain form. Relative walks
+need no special handling once accepted — `resolve_fs_read` already
+collapses `.` / `..` / empty segments, so `../../.env` lands on exactly
+the document `/app/.env` would.
+
+Two boundaries keep this from widening into an open proxy, both pinned by
+tests:
+
+- A **protocol-relative** value (`//169.254.169.254/latest/…`) names an
+  authority, not a file, and is deliberately excluded — the host tables
+  own it, and claiming it here would mean the metadata resolver never saw
+  it.
+- An **unresolved** read is still held back rather than returned on the
+  spot, so a file we do not furnish cannot shadow a metadata host named by
+  a later parameter in the same request. It is reported as
+  `ssrf-relay-file-miss`, which is a more honest 404 than the
+  unrecognised-request one it replaces: the log now records which path the
+  source assumed was on disk.
 
 Metadata hosts recognised: `169.254.169.254`, `169.254.170.2`,
 `100.100.100.200` (Alibaba mirrors the EC2 layout), `instance-data`,

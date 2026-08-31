@@ -43,7 +43,7 @@ for a file that isn't there. Answering everything would be an obvious
 tell, and the miss is still logged — the paths we decline to furnish are
 as descriptive of the tooling as the ones we serve.
 
-## World-readable system files
+## System files
 
 The suffix walk above only ever consults the credential trap table, which
 is webroot-relative. An absolute system path has no suffix that appears in
@@ -66,17 +66,36 @@ system file only means anything at the path it really lives at
 | --- | --- |
 | `/etc/passwd` | The same account list the command-injection trap prints for `cat /etc/passwd`, so a scanner probing both surfaces sees one consistent host |
 | `/etc/nginx/nginx.conf` | The unmodified packaged config — no vhost, no upstream, nothing that reflects real deployment shape |
+| `/etc/shadow` | Hashes minted per hit, over the same account list as `/etc/passwd`. Root-only, so asking for it is a different question: whether the read runs privileged |
+| `/var/run/secrets/kubernetes.io/serviceaccount/token` (and the `/run` spelling) | A projected service-account JWT, minted per hit |
+| `…/serviceaccount/namespace` | The namespace the token claims, so the volume describes one coherent pod |
+| `…/serviceaccount/ca.crt` | The cluster CA bundle — public material, random per hit so it is not a fleet constant |
 
-These bodies carry no credential, so no canary is spent and no per-IP
-quota applies. Keeping the list fixed is the point: answering every system
-path a scanner can name would be its own obvious tell, and the misses stay
+Most of these bodies carry no credential, so no canary is spent and no
+per-IP quota applies. The service-account token is the exception: it is a
+bearer, so it follows the same rule the rest of the surface does and is
+**unique per hit**. A fixed one would ship the same string from every
+deployment — a fleet fingerprint — and no later use of it could ever be
+traced back to the read that leaked it.
+
+The projected volume is worth answering because it asks a different
+question from the three `/etc` files above: not "does this read work" or
+"does it run privileged", but "is this a container, and can I have its
+cluster identity". A source that pulls `token` and stops has told us less
+than one that also pulls `namespace` and `ca.crt` — the latter is the
+shape of a client assembling a working API-server config, and the three
+tags separate those populations.
+
+Keeping the list fixed is the point: answering every system path a
+scanner can name would be its own obvious tell, and the misses stay
 worth reading.
 
 ## What it logs
 
 Result tag is `vite-fs-<trap>` on a hit, `vite-fs-etc-passwd` /
-`vite-fs-etc-nginx-conf` for a system file, and `vite-fs-miss`
-otherwise. The
+`vite-fs-etc-shadow` / `vite-fs-etc-nginx-conf` /
+`vite-fs-k8s-serviceaccount-{token,namespace,ca-cert}` for a system
+file, and `vite-fs-miss` otherwise. The
 prefix keeps the filesystem-walk population separable from the webroot
 population: the same body served for `/.aws/credentials` and for
 `/@fs/root/.aws/credentials` represents two different scanner behaviours

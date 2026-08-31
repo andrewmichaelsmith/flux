@@ -7711,6 +7711,84 @@ def render_fake_shadow() -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+# The namespace a projected service-account volume claims to belong to.
+# Fixed on purpose: it is not a secret, and holding it constant is what
+# lets the three files in the volume describe one coherent pod when a
+# reader fetches them in separate requests.
+K8S_SA_NAMESPACE = "production"
+
+
+def _b64url(raw: bytes) -> str:
+    """base64url without padding — the encoding every JWT segment uses."""
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def render_fake_k8s_sa_token() -> bytes:
+    """A projected service-account JWT, minted per hit.
+
+    This is the credential a container reads to talk to its own API
+    server, so it is the file worth answering when a read primitive is
+    aimed at the kubelet's projected volume. Everything identifying is
+    random per request: the signature, the key id, and the pod/service
+    account UIDs. A fixed token would be the *same* bearer on every host
+    running this software, so a single observation would fingerprint the
+    whole deployment and no replay could ever be attributed to the read
+    that leaked it.
+
+    The signature is random bytes, not an RS256 signature over the
+    claims: nothing here verifies, and a reader that checked would need
+    our private key to tell the difference from a rotated one.
+    """
+    issued = int(time.time())
+    header = {"alg": "RS256", "kid": _b64url(secrets.token_bytes(32))}
+    claims = {
+        "aud": ["https://kubernetes.default.svc.cluster.local"],
+        "exp": issued + 3607,
+        "iat": issued,
+        "iss": "https://kubernetes.default.svc.cluster.local",
+        "jti": str(uuid.uuid4()),
+        "kubernetes.io": {
+            "namespace": K8S_SA_NAMESPACE,
+            "node": {"name": "ip-10-0-14-82", "uid": str(uuid.uuid4())},
+            "pod": {
+                "name": f"api-worker-{secrets.token_hex(5)}",
+                "uid": str(uuid.uuid4()),
+            },
+            "serviceaccount": {"name": "default", "uid": str(uuid.uuid4())},
+        },
+        "nbf": issued,
+        "sub": f"system:serviceaccount:{K8S_SA_NAMESPACE}:default",
+    }
+    segments = (
+        _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8")),
+        _b64url(json.dumps(claims, separators=(",", ":")).encode("utf-8")),
+        _b64url(secrets.token_bytes(256)),
+    )
+    return (".".join(segments)).encode("ascii")
+
+
+def render_fake_k8s_sa_namespace() -> bytes:
+    """The projected `namespace` file — no trailing newline, as kubelet writes it."""
+    return K8S_SA_NAMESPACE.encode("ascii")
+
+
+def render_fake_k8s_sa_ca_cert() -> bytes:
+    """The cluster CA bundle from the same projected volume.
+
+    Not a secret — it is a public certificate — but a reader that pulls
+    the token and stops there has told us less than one that also pulls
+    the CA, which is the shape of a client preparing to actually connect.
+    The body is random per hit so it is not a fleet-wide constant.
+    """
+    body = _b64url(secrets.token_bytes(760))
+    wrapped = "\n".join(body[i:i + 64] for i in range(0, len(body), 64))
+    return (
+        "-----BEGIN CERTIFICATE-----\n"
+        f"{wrapped}\n"
+        "-----END CERTIFICATE-----\n"
+    ).encode("ascii")
+
+
 # The traversal shape CVE-2024-24919 exploitation uses. The published
 # proof-of-concept prefixes the target with the CShell alias
 # (`aCSHELL/../../../…`), but the gateway resolves any body that walks
@@ -17876,6 +17954,10 @@ _ENV_DOTDIR_PREFIXES: tuple[str, ...] = (
     ".docker",
     ".config",
     ".local",
+    # A repository checked out into the webroot exposes this directory,
+    # and a pipeline that keeps its environment beside its workflows
+    # leaves the credential file inside it.
+    ".github",
 )
 
 
@@ -18009,6 +18091,12 @@ def _env_production_paths() -> tuple[str, ...]:
     for dotdir in _ENV_DOTDIR_PREFIXES:
         for suffix in _ENV_FILE_SUFFIXES:
             paths.append(f"/{dotdir}/.env{suffix}")
+        # Group 8b — the `<name>.env` leaf under a leading-dot dir. Group
+        # 6 builds this cross-product for ordinary webroot prefixes only,
+        # so `/secrets.env` and `/app/secrets.env` answered while the
+        # dot-dir spelling of the same filename fell through.
+        for name in _ENV_LEAF_NAMES:
+            paths.append(f"/{dotdir}/{name}.env")
 
     # Dedupe while preserving order — defensive against future overlap
     # between the bare-dotfile and prefix loops.
@@ -22701,6 +22789,11 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/.github/workflows/release.yaml",
             "/.github/workflows/cd.yml",
             "/.github/workflows/cd.yaml",
+            # The publish/package job is where a release pipeline keeps
+            # its registry and cloud push credentials, so dictionaries
+            # that walk this directory ask for it alongside `release`.
+            "/.github/workflows/publish.yml",
+            "/.github/workflows/publish.yaml",
         ),
         ("aws",),
         render_github_actions_workflow,
@@ -22792,6 +22885,16 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/deploy.yaml",
             "/drone.yml",
             "/.drone.yml",
+            # Travis sat out of this list while its hosted-CI siblings
+            # (appveyor, drone, circleci) were all present, so the same
+            # dictionary pass that landed on those 404'd here.
+            "/.travis.yml",
+            "/.travis.yaml",
+            # Google Cloud Build. The managed-cloud build descriptor has
+            # the same substitution/secret-env shape as the rest of this
+            # family and travels in the same dictionaries.
+            "/cloudbuild.yaml",
+            "/cloudbuild.yml",
         ),
         ("aws",),
         render_generic_ci_yml,
@@ -25431,6 +25534,48 @@ _VITE_FS_SYSTEM_FILES: "dict[str, tuple[str, Callable[[], bytes], str]]" = {
         render_fake_shadow,
         "text/plain; charset=utf-8",
     ),
+    # The kubelet's projected service-account volume. A read primitive
+    # aimed here is asking a different question from the three files
+    # above: not "does this read work" or "does it run privileged", but
+    # "is this a container, and can I have its cluster identity". The
+    # token is the credential; `namespace` and `ca.crt` are what a client
+    # actually preparing to call the API server fetches alongside it, so
+    # answering all three lets the follow-up distinguish a dictionary
+    # walking a filename from a reader assembling a working config.
+    #
+    # Both spellings are registered because `/var/run` is a symlink to
+    # `/run` on every systemd host, so the same file has two absolute
+    # names and dictionaries carry both.
+    **{
+        f"{root}/secrets/kubernetes.io/serviceaccount/{leaf}": entry
+        for root in ("/var/run", "/run")
+        for leaf, entry in (
+            (
+                "token",
+                (
+                    "k8s-serviceaccount-token",
+                    render_fake_k8s_sa_token,
+                    "text/plain; charset=utf-8",
+                ),
+            ),
+            (
+                "namespace",
+                (
+                    "k8s-serviceaccount-namespace",
+                    render_fake_k8s_sa_namespace,
+                    "text/plain; charset=utf-8",
+                ),
+            ),
+            (
+                "ca.crt",
+                (
+                    "k8s-serviceaccount-ca-cert",
+                    render_fake_k8s_sa_ca_cert,
+                    "application/x-pem-file",
+                ),
+            ),
+        )
+    },
 }
 
 
@@ -25977,10 +26122,35 @@ def _ssrf_candidate_urls(query_string: str) -> list[tuple[str, str]]:
                 "://" in candidate
                 or candidate.startswith("//")
                 or candidate[:5].lower() == "file:"
+                or _is_local_path_value(candidate)
             ):
                 out.append((key[:64], candidate[:512]))
                 break
     return out
+
+
+def _is_local_path_value(value: str) -> bool:
+    """True for a bare filesystem path — the scheme-less read spelling.
+
+    The same entry paths that carry `url=file:///app/.env` carry
+    `file=../../.env` and `file=/etc/passwd` in the same sweep, and the
+    plain spelling is the more common of the two. Requiring a scheme
+    meant every one of those fell out of the candidate list and was
+    answered as an unrecognised request, even though the document the
+    source asked for already had a renderer behind it.
+
+    Deliberately narrow: a traversal segment, or a single leading slash.
+    A protocol-relative `//host/path` is excluded because it names a
+    remote authority and belongs to the host tables, not to a read.
+    """
+    if not value or "://" in value:
+        return False
+    normalised = value.replace("\\", "/")
+    if normalised.startswith("//"):
+        return False
+    if ".." in normalised.split("/"):
+        return True
+    return normalised.startswith("/")
 
 
 def _ssrf_split_url(url: str) -> tuple[str, str]:
@@ -26020,6 +26190,13 @@ def _ssrf_file_path(url: str) -> str:
     scheme, sep, rest = url.partition(":")
     if sep and scheme.strip().lower() == "file":
         return "/" + rest.lstrip("/").split("?", 1)[0].split("#", 1)[0]
+    # Scheme-less read: `../../.env`, `/etc/passwd`, `..\..\web.config`.
+    # Anchored at `/` and handed over as-is — `resolve_fs_read` collapses
+    # the `..` segments and walks leading directories itself, so a
+    # relative walk lands on the same document as its absolute spelling.
+    if _is_local_path_value(url):
+        normalised = url.replace("\\", "/")
+        return "/" + normalised.lstrip("/").split("?", 1)[0].split("#", 1)[0]
     return ""
 
 
