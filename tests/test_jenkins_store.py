@@ -48,6 +48,9 @@ def test_master_key_spellings_all_resolve(path):
     "/jenkins/config.xml.bak",
     "/.jenkins/config.xml",
     "/config/jenkins.xml",
+    # The extension a packaged install gives the same document. Sweeps
+    # that walk `/config/` ask for both spellings and only one answered.
+    "/config/jenkins.conf",
     "/var/jenkins_home/config.xml",
 ])
 def test_root_config_spellings_all_resolve(path):

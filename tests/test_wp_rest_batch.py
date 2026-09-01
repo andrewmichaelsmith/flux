@@ -101,6 +101,67 @@ def test_alias_disabled_returns_none(monkeypatch):
     assert tbenv.wp_rest_route_alias("/", "rest_route=/wp/v2/users") is None
 
 
+# --- Prefix-less REST address naming (pure) ----------------------------
+#
+# Naming only. The prefix-less spelling deliberately stays a 404 — a real
+# install serves REST under exactly one `rest_url_prefix`, so answering
+# both spellings would be a fleet-wide tell. These tests pin the route
+# extraction that makes the spelling countable in the log.
+
+
+@pytest.mark.parametrize("path,expected", [
+    # The collections an injection-testing run walks.
+    ("/wp/v2/posts", "/wp/v2/posts"),
+    ("/wp/v2/pages", "/wp/v2/pages"),
+    ("/wp/v2/users", "/wp/v2/users"),
+    ("/wp/v2/media", "/wp/v2/media"),
+    ("/wp/v2/categories", "/wp/v2/categories"),
+    ("/wp/v2/tags", "/wp/v2/tags"),
+    # An indexed single, which is the spelling the observed payloads carry.
+    ("/wp/v2/posts/999999", "/wp/v2/posts/999999"),
+    # Trailing slash collapses, as it does in `wp_rest_route_of`.
+    ("/wp/v2/posts/", "/wp/v2/posts"),
+    # The namespace root itself.
+    ("/wp/v2", "/wp/v2"),
+    # Install subdirectories collapse onto the canonical route.
+    ("/blog/wp/v2/posts", "/wp/v2/posts"),
+    ("/wordpress/wp/v2/users", "/wp/v2/users"),
+    ("/staging/wp/v2/posts/2", "/wp/v2/posts/2"),
+    # Case-insensitive, like every other WP matcher here.
+    ("/WP/V2/Posts", "/wp/v2/posts"),
+    # A query string never steers route resolution.
+    ("/wp/v2/posts/999999?author_exclude=1", "/wp/v2/posts/999999"),
+])
+def test_prefixless_route_is_named(path, expected):
+    assert tbenv.wp_rest_prefixless_route(path) == expected
+
+
+@pytest.mark.parametrize("path", [
+    # Already canonical — that address has its own extractor.
+    "/wp-json/wp/v2/posts",
+    "/blog/wp-json/wp/v2/posts",
+    # Other namespaces are too short and generic to claim prefix-less: an
+    # unrelated application may legitimately own these paths.
+    "/batch/v1",
+    "/oembed/1.0/embed",
+    "/gravitysmtp/v1/config",
+    # Near-misses on the namespace itself.
+    "/wp/v3/posts",
+    "/wp/v2x/posts",
+    "/wpv2/posts",
+    "/wp-admin/v2/posts",
+    "/api/wp/v2/posts",
+    # A subdirectory outside the dictionary is not an install root.
+    "/random/wp/v2/posts",
+    # No climbing out of the namespace.
+    "/wp/v2/../../etc/passwd",
+    "/",
+    "",
+])
+def test_prefixless_route_declines_everything_else(path):
+    assert tbenv.wp_rest_prefixless_route(path) is None
+
+
 # --- Batch path matching (pure) ---------------------------------------
 
 
@@ -341,3 +402,44 @@ async def test_alias_form_reaches_the_user_enum_trap(flux_client):
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "wp-user-enum-rest-list"
     assert entry["wpRestRoutePath"] == "/wp-json/wp/v2/users/"
+
+
+async def test_prefixless_address_is_named_but_still_404s(flux_client):
+    """The contract in one test: the response is the 404 it always was —
+    answering would be a fleet-wide tell — and the log line now names the
+    REST route that was asked for."""
+    canonical = await flux_client.get("/wp-json/wp/v2/nope-not-a-route")
+    baseline = await canonical.read()
+
+    resp = await flux_client.get("/wp/v2/users")
+    assert resp.status == 404
+    assert await resp.read() == baseline
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "not-handled"
+    assert entry["path"] == "/wp/v2/users"
+    assert entry["wpRestPrefixlessRoute"] == "/wp/v2/users"
+    # The rewrite fields belong to the `?rest_route=` alias; naming a
+    # prefix-less address must not claim them, or alias counts inflate.
+    assert "wpRestRoutePath" not in entry
+
+
+async def test_prefixless_injection_probe_is_captured_with_its_route(flux_client):
+    """The traffic this names: an injection-testing run walking a payload
+    ladder over a collection's query parameters. The query was always
+    captured; the route it was aimed at was not."""
+    resp = await flux_client.get(
+        "/wp/v2/posts/999999?author_exclude=0%29+OR+1--+-&orderby=none",
+    )
+    assert resp.status == 404
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["wpRestPrefixlessRoute"] == "/wp/v2/posts/999999"
+    assert "author_exclude" in entry["query"]
+
+
+async def test_foreign_namespaces_are_not_named(flux_client):
+    """A short generic namespace is not claimed prefix-less; an unrelated
+    application that owns `/batch/v1` keeps an unannotated 404."""
+    resp = await flux_client.get("/batch/v1")
+    assert resp.status == 404
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert "wpRestPrefixlessRoute" not in entry

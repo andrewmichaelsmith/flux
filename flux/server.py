@@ -4908,6 +4908,49 @@ def wp_rest_route_alias(path: str, query_string: str) -> str | None:
     return normalize_path(_WP_REST_ALIAS_CANONICAL_PREFIX + route)
 
 
+def wp_rest_prefixless_route(path: str) -> str | None:
+    """Return the REST route a prefix-less WP-REST address names —
+    `/wp/v2/posts/8` for `/wp/v2/posts/8` — or None when the path does not
+    name the `wp/v2` namespace.
+
+    **This does not change what is served.** The prefix-less spelling stays
+    a 404, deliberately: WordPress serves REST under exactly one
+    `rest_url_prefix`, so an install answering `/wp-json/wp/v2/posts`
+    cannot also answer `/wp/v2/posts`. Answering both would make every host
+    running this distinguishable from a real install, identically —
+    the reasoning the REST index trap already records for this same
+    spelling, and it still holds.
+
+    What was missing is not a response, it is a name. The spelling is what
+    tooling emits after mis-joining a route key onto a base URL that
+    already ends in `/wp-json`, and injection-testing runs walk a long
+    payload ladder over it — boolean, time-based, error-based and union
+    branches against a collection's query parameters, all of which flux
+    already captures. Those requests were landing in the undifferentiated
+    `not-handled` bucket, indistinguishable from a crawler asking for
+    `/about`. Naming the route makes the campaign countable without
+    changing a single response byte.
+
+    Restricted to the `wp/v2` namespace: it is the one with observed
+    demand, and it is specific enough that no unrelated application owns
+    it, whereas the short generic namespaces (`batch/v1`, `oembed/1.0`)
+    would start claiming paths that are not WordPress at all.
+    """
+    raw = (path or "").split("?", 1)[0]
+    if ".." in raw:
+        return None
+    lp = raw.lower()
+    head = f"/{_WP_REST_NAMESPACE}"
+    # Root install first, then a common install subdirectory
+    # (`/blog/wp/v2/posts`). Root is tried first so that `wp` appearing in
+    # the subdirectory dictionary cannot claim the namespace's own segment.
+    for prefix in ("", *(f"/{d}" for d in _WP_REST_ALIAS_SUBDIRS)):
+        base = prefix + head
+        if lp == base or lp.startswith(base + "/"):
+            return normalize_path(lp[len(prefix):]).rstrip("/") or head
+    return None
+
+
 def _wp_batch_strip_subdir(lp: str) -> str:
     """Return `lp` with a WordPress install subdirectory stripped, so
     `/blog/wp-json/batch/v1` and `/wp-json/batch/v1` reach the same
@@ -22855,6 +22898,10 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/jenkins/config.xml.bak",
             "/.jenkins/config.xml",
             "/config/jenkins.xml",
+            # Same document under the extension a packaged install gives
+            # it. Sweeps that walk `/config/` ask for both spellings and
+            # only one of them was answered.
+            "/config/jenkins.conf",
             "/jenkins_home/config.xml",
             "/var/jenkins_home/config.xml",
             "/var/lib/jenkins/config.xml",
@@ -36279,6 +36326,15 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # trap having to learn the alias separately. `log_context` keeps the
     # request as it arrived; only dispatch sees the rewrite, and the
     # rewrite itself is logged so alias use stays countable.
+    # The prefix-less spelling of the same routes is *named* but never
+    # rewritten — see `wp_rest_prefixless_route`. Stamping the route here,
+    # ahead of dispatch, leaves the response path untouched by
+    # construction: the request still falls through to the same 404 it
+    # always got, and the log line now says which REST route was asked for.
+    prefixless = wp_rest_prefixless_route(path)
+    if prefixless is not None:
+        log_context["wpRestPrefixlessRoute"] = prefixless[:200]
+
     if WP_REST_ROUTE_ALIAS_ENABLED:
         aliased = wp_rest_route_alias(path, query_string)
         if aliased is not None and aliased != path:
