@@ -508,6 +508,17 @@ payload — see [`docs/webhook-receiver.md`](./docs/webhook-receiver.md).
 | `HONEYPOT_WEBHOOK_RECEIVER_ENABLED` | on | Master switch. Matches `/api/[vN/]webhook[s]/<token>/{event,events,callback,delivery,deliveries}`. The acknowledgement contains no canary, so this trap needs no `TRACEBIT_API_KEY`. |
 | `HONEYPOT_WEBHOOK_RECEIVER_BODY_PREVIEW_LIMIT` | `512` | Bytes of the delivery body kept in `webhookBodyPreview`. |
 
+## Jolokia JMX-over-HTTP operations
+
+Answers the `read` / `exec` / `write` / `search` / `version` follow-ups
+the MBean listing invites — see
+[`docs/jolokia-jmx.md`](./docs/jolokia-jmx.md).
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_JOLOKIA_PROTOCOL_ENABLED` | on | Master switch. Matches operations beneath any Jolokia mount point; the bare mount and `<mount>/list` stay with the exact-path listing trap. Needs `TRACEBIT_API_KEY` — the MBean tree carries the canary — so a keyless deployment 404s it regardless. |
+| `HONEYPOT_JOLOKIA_AGENT_VERSION` | `1.7.2` | Agent version reported by `<mount>/version`. |
+
 ## Bind address / port
 
 Flux listens on `127.0.0.1:18081` (aiohttp). To change, edit

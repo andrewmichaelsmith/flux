@@ -19346,118 +19346,759 @@ def render_actuator_trace(r: dict[str, object]) -> bytes:
     return json.dumps(payload, indent=2).encode("utf-8")
 
 
-def render_actuator_jolokia_list(r: dict[str, object]) -> bytes:
-    # Jolokia is the JMX-over-HTTP bridge Spring ships when the
-    # `jolokia` dependency is on the classpath. The `list` operation
-    # enumerates every JMX MBean the JVM exposes — scanners chain
-    # this list response to find the `com.sun.management:type=
-    # DiagnosticCommand` bean, whose `vmCommandLine` / `vmSystemProperties`
-    # operations exec arbitrary diagnostic commands. The same scanners
-    # also grep the list output for env-var-shaped attribute values
-    # because `java.lang:type=Runtime`'s `SystemProperties` attribute
-    # reflects every `-D` JVM flag — including credential-bearing ones
-    # like `-Daws.accessKeyId=...`. We mirror the v1 list-response
-    # shape (real Jolokia: `{request, value: <domain-tree>, status,
-    # timestamp}`) and surface the AWS canary inside the
-    # `Runtime.SystemProperties` MBean description and a sentinel
-    # SystemProperties value.
-    aws = _aws(r)
-    ak = aws.get("awsAccessKeyId", "")
-    sk = aws.get("awsSecretAccessKey", "")
-    payload = {
-        "request": {"type": "list"},
-        "value": {
-            "java.lang": {
-                "type=Runtime": {
-                    "op": {},
-                    "attr": {
-                        "Name": {"rw": False, "type": "java.lang.String", "desc": "Name"},
-                        "Pid": {"rw": False, "type": "long", "desc": "Pid"},
-                        "Uptime": {"rw": False, "type": "long", "desc": "Uptime"},
-                        "SystemProperties": {
-                            "rw": False,
-                            "type": "javax.management.openmbean.TabularData",
-                            "desc": (
-                                "JVM system properties (resolved -D flags); "
-                                f"includes aws.accessKeyId={ak} from launch"
-                            ),
-                        },
-                        "InputArguments": {
-                            "rw": False,
-                            "type": "[Ljava.lang.String;",
-                            "desc": (
-                                "Launch args: -Dspring.profiles.active=prod "
-                                f"-Daws.accessKeyId={ak} "
-                                f"-Daws.secretKey={sk}"
-                            ),
-                        },
+# --- Jolokia (JMX-over-HTTP) -------------------------------------------
+#
+# Jolokia is the JMX bridge Spring mounts when the `jolokia` dependency is
+# on the classpath. It is a **protocol**, not a page: `list` enumerates the
+# MBean tree, and every interesting thing after that is a second request
+# naming something the listing just published — `read/<mbean>/<attribute>`
+# for a value, `exec/<mbean>/<operation>` to invoke one. The
+# `com.sun.management:type=DiagnosticCommand` bean is the reason the
+# endpoint is on every scanner's list: its `vmCommandLine` /
+# `vmSystemProperties` operations print the JVM's launch flags, which is
+# where `-Daws.accessKeyId=...` lives on a badly-configured deployment.
+#
+# Serving `list` and 404ing `read` / `exec` is the worst of both worlds:
+# it publishes a tree, tells the client exactly which bean to go after,
+# and then ends the exchange one request before the client says what it
+# wanted. The follow-up request *is* the measurement — it carries the
+# MBean, the operation and the arguments the client chose — and a
+# credential handed over through the JMX bridge is a second, independent
+# delivery channel from the file-shaped traps.
+#
+# `jolokiaAdvertised` is the discriminator this trap exists to produce. A
+# client naming `JMImplementation:type=MBeanServerDelegate` is running the
+# stock agent-fingerprint read that every off-the-shelf Jolokia tool
+# fires. A client naming a bean that only appears in *our* output has
+# parsed what we served it. Those are different populations and they must
+# not share a bucket.
+JOLOKIA_PROTOCOL_ENABLED = _env_bool("HONEYPOT_JOLOKIA_PROTOCOL_ENABLED")
+JOLOKIA_AGENT_VERSION = (os.environ.get("HONEYPOT_JOLOKIA_AGENT_VERSION") or "1.7.2").strip() or "1.7.2"
+JOLOKIA_PROTOCOL_VERSION = "7.2"
+# A bulk POST is a list of requests. Real agents accept them unbounded;
+# we answer a prefix and drop the rest so one request cannot make us
+# render an arbitrary amount of output.
+JOLOKIA_MAX_BULK_REQUESTS = 20
+JOLOKIA_ARG_LOG_LIMIT = 256
+
+# Every mount point the agent turns up on. The `/actuator/`-prefixed
+# spellings are Spring's; the bare ones are a standalone agent WAR. All of
+# them are swept, and `<prefix>` is followed by the operation, so the
+# match has to be a prefix match rather than an exact path.
+_JOLOKIA_PREFIXES: tuple[str, ...] = (
+    "/actuator/jolokia",
+    "/jolokia",
+    "/manage/jolokia",
+    "/management/jolokia",
+    "/monitoring/jolokia",
+    "/api/jolokia",
+    "/app/jolokia",
+    "/backend/jolokia",
+    "/api/actuator/jolokia",
+    "/app/actuator/jolokia",
+    "/backend/actuator/jolokia",
+)
+_JOLOKIA_TYPES: frozenset[str] = frozenset({
+    "read", "write", "exec", "list", "search", "version",
+})
+# The members whose value carries a credential. Everything else answers
+# without touching upstream, so an agent-fingerprint sweep across
+# `version` / `search` / `MBeanServerDelegate` costs no canary quota.
+_JOLOKIA_CANARY_MEMBERS: frozenset[tuple[str, str]] = frozenset({
+    ("java.lang:type=Runtime", "SystemProperties"),
+    ("java.lang:type=Runtime", "InputArguments"),
+    ("com.sun.management:type=DiagnosticCommand", "vmCommandLine"),
+    ("com.sun.management:type=DiagnosticCommand", "vmSystemProperties"),
+    ("org.springframework.boot:type=Endpoint,name=Env", "environment"),
+})
+_JOLOKIA_CANARY_MBEANS: frozenset[str] = frozenset({
+    "com.internal.tools:type=Config",
+})
+# Domains no real JVM has and no stock scanner dictionary carries. Their
+# only source is this server's own output — the logger names under
+# `/actuator/loggers`, the handler class names under `/actuator/mappings`.
+# A request naming one is a client that read what we served it, which is
+# a different and much smaller population than the one firing
+# `JMImplementation:type=MBeanServerDelegate` at every host it finds.
+_JOLOKIA_HOUSE_DOMAINS: tuple[str, ...] = ("com.internal.",)
+
+_PROCESS_START_EPOCH = time.time()
+
+
+def _jolokia_uptime_ms() -> int:
+    """Uptime the way a JVM reports it.
+
+    Not cosmetic: a constant here would make every response from every
+    sensor byte-identical and frozen at whatever moment the literal was
+    written, which is a fleet-wide tell on a value real agents move every
+    millisecond.
+    """
+    return max(int((time.time() - _PROCESS_START_EPOCH) * 1000), 1)
+
+
+def _jolokia_mbean_tree(ak: str, sk: str, jdbc_url: str) -> dict[str, dict[str, object]]:
+    """The MBean tree `list` publishes — and the only thing `read` /
+    `exec` / `search` will answer for.
+
+    One source for the listing and the follow-ups, deliberately: a tree
+    that advertises a bean the next request 404s is the cheapest possible
+    tell that the listing is canned.
+    """
+    return {
+        "java.lang": {
+            "type=Runtime": {
+                "op": {},
+                "attr": {
+                    "Name": {"rw": False, "type": "java.lang.String", "desc": "Name"},
+                    "Pid": {"rw": False, "type": "long", "desc": "Pid"},
+                    "Uptime": {"rw": False, "type": "long", "desc": "Uptime"},
+                    "StartTime": {"rw": False, "type": "long", "desc": "StartTime"},
+                    "VmName": {"rw": False, "type": "java.lang.String", "desc": "VmName"},
+                    "VmVendor": {"rw": False, "type": "java.lang.String", "desc": "VmVendor"},
+                    "VmVersion": {"rw": False, "type": "java.lang.String", "desc": "VmVersion"},
+                    "ClassPath": {"rw": False, "type": "java.lang.String", "desc": "ClassPath"},
+                    "SystemProperties": {
+                        "rw": False,
+                        "type": "javax.management.openmbean.TabularData",
+                        "desc": (
+                            "JVM system properties (resolved -D flags); "
+                            f"includes aws.accessKeyId={ak} from launch"
+                        ),
                     },
-                    "desc": "Java runtime",
+                    "InputArguments": {
+                        "rw": False,
+                        "type": "[Ljava.lang.String;",
+                        "desc": (
+                            "Launch args: -Dspring.profiles.active=prod "
+                            f"-Daws.accessKeyId={ak} "
+                            f"-Daws.secretKey={sk}"
+                        ),
+                    },
                 },
-                "type=Memory": {
-                    "op": {
-                        "gc": {"args": [], "ret": "void", "desc": "gc"},
-                    },
-                    "attr": {
-                        "HeapMemoryUsage": {
-                            "rw": False,
-                            "type": "javax.management.openmbean.CompositeData",
-                            "desc": "HeapMemoryUsage",
-                        },
-                    },
-                    "desc": "Memory",
-                },
+                "desc": "Java runtime",
             },
-            "com.sun.management": {
-                "type=DiagnosticCommand": {
-                    "op": {
-                        "vmCommandLine": {
-                            "args": [],
-                            "ret": "java.lang.String",
-                            "desc": "Print command line of the target VM",
-                        },
-                        "vmSystemProperties": {
-                            "args": [],
-                            "ret": "java.lang.String",
-                            "desc": "Print system properties",
-                        },
-                        "vmFlags": {
-                            "args": [
-                                {"name": "arguments", "type": "[Ljava.lang.String;", "desc": "arguments"},
-                            ],
-                            "ret": "java.lang.String",
-                            "desc": "Print VM flag options",
-                        },
-                        "gcRun": {"args": [], "ret": "java.lang.String", "desc": "gcRun"},
-                    },
-                    "attr": {},
-                    "desc": "Diagnostic Commands",
+            "type=Memory": {
+                "op": {
+                    "gc": {"args": [], "ret": "void", "desc": "gc"},
                 },
+                "attr": {
+                    "HeapMemoryUsage": {
+                        "rw": False,
+                        "type": "javax.management.openmbean.CompositeData",
+                        "desc": "HeapMemoryUsage",
+                    },
+                    "NonHeapMemoryUsage": {
+                        "rw": False,
+                        "type": "javax.management.openmbean.CompositeData",
+                        "desc": "NonHeapMemoryUsage",
+                    },
+                },
+                "desc": "Memory",
             },
-            "org.springframework.boot": {
-                "type=Endpoint,name=Env": {
-                    "op": {
-                        "environment": {
-                            "args": [
-                                {"name": "pattern", "type": "java.lang.String", "desc": "pattern"},
-                            ],
-                            "ret": "java.util.Map",
-                            "desc": "environment",
-                        },
-                    },
-                    "attr": {},
-                    "desc": "/actuator/env MBean",
+            "type=OperatingSystem": {
+                "op": {},
+                "attr": {
+                    "Name": {"rw": False, "type": "java.lang.String", "desc": "Name"},
+                    "Arch": {"rw": False, "type": "java.lang.String", "desc": "Arch"},
+                    "AvailableProcessors": {"rw": False, "type": "int", "desc": "AvailableProcessors"},
+                    "SystemLoadAverage": {"rw": False, "type": "double", "desc": "SystemLoadAverage"},
                 },
-                "type=Endpoint,name=Health": {
-                    "op": {"health": {"args": [], "ret": "java.util.Map", "desc": "health"}},
-                    "attr": {},
-                    "desc": "/actuator/health MBean",
-                },
+                "desc": "Operating System",
             },
         },
-        "timestamp": 1719567890,
+        "com.sun.management": {
+            "type=DiagnosticCommand": {
+                "op": {
+                    "vmCommandLine": {
+                        "args": [],
+                        "ret": "java.lang.String",
+                        "desc": "Print command line of the target VM",
+                    },
+                    "vmSystemProperties": {
+                        "args": [],
+                        "ret": "java.lang.String",
+                        "desc": "Print system properties",
+                    },
+                    "vmFlags": {
+                        "args": [
+                            {"name": "arguments", "type": "[Ljava.lang.String;", "desc": "arguments"},
+                        ],
+                        "ret": "java.lang.String",
+                        "desc": "Print VM flag options",
+                    },
+                    "vmVersion": {"args": [], "ret": "java.lang.String", "desc": "Print JVM version"},
+                    "threadPrint": {
+                        "args": [
+                            {"name": "arguments", "type": "[Ljava.lang.String;", "desc": "arguments"},
+                        ],
+                        "ret": "java.lang.String",
+                        "desc": "Print all threads with stacktraces",
+                    },
+                    "gcRun": {"args": [], "ret": "java.lang.String", "desc": "gcRun"},
+                    "help": {
+                        "args": [
+                            {"name": "arguments", "type": "[Ljava.lang.String;", "desc": "arguments"},
+                        ],
+                        "ret": "java.lang.String",
+                        "desc": "Display help information",
+                    },
+                },
+                "attr": {},
+                "desc": "Diagnostic Commands",
+            },
+        },
+        "JMImplementation": {
+            # The stock agent fingerprint. Every off-the-shelf Jolokia
+            # tool reads these four before doing anything else, and none
+            # of them carries a secret — so answering costs nothing and
+            # separates the tool population from the one that read our
+            # listing.
+            "type=MBeanServerDelegate": {
+                "op": {},
+                "attr": {
+                    "MBeanServerId": {"rw": False, "type": "java.lang.String", "desc": "MBeanServerId"},
+                    "ImplementationName": {"rw": False, "type": "java.lang.String", "desc": "ImplementationName"},
+                    "ImplementationVendor": {"rw": False, "type": "java.lang.String", "desc": "ImplementationVendor"},
+                    "ImplementationVersion": {"rw": False, "type": "java.lang.String", "desc": "ImplementationVersion"},
+                    "SpecificationName": {"rw": False, "type": "java.lang.String", "desc": "SpecificationName"},
+                    "SpecificationVendor": {"rw": False, "type": "java.lang.String", "desc": "SpecificationVendor"},
+                    "SpecificationVersion": {"rw": False, "type": "java.lang.String", "desc": "SpecificationVersion"},
+                },
+                "desc": "MBeanServer delegate",
+            },
+        },
+        "com.zaxxer.hikari": {
+            "type=PoolConfig (HikariPool-1)": {
+                "op": {},
+                "attr": {
+                    "PoolName": {"rw": False, "type": "java.lang.String", "desc": "PoolName"},
+                    "JdbcUrl": {
+                        "rw": False,
+                        "type": "java.lang.String",
+                        "desc": "Configured JDBC URL (credentials inline)",
+                    },
+                    "Username": {"rw": False, "type": "java.lang.String", "desc": "Username"},
+                    "MaximumPoolSize": {"rw": True, "type": "int", "desc": "MaximumPoolSize"},
+                    "ConnectionTimeout": {"rw": True, "type": "long", "desc": "ConnectionTimeout"},
+                },
+                "desc": "HikariCP pool configuration",
+            },
+        },
+        "com.internal.tools": {
+            # The application's own bean. `com.internal.tools` is the
+            # package name the rest of this surface already publishes, so
+            # a client drilling into this domain got the name from us.
+            "type=Config": {
+                "op": {
+                    "reload": {"args": [], "ret": "java.lang.String", "desc": "Reload configuration"},
+                },
+                "attr": {
+                    "Environment": {"rw": False, "type": "java.lang.String", "desc": "Environment"},
+                    "AwsAccessKeyId": {"rw": False, "type": "java.lang.String", "desc": "AwsAccessKeyId"},
+                    "AwsSecretKey": {"rw": False, "type": "java.lang.String", "desc": "AwsSecretKey"},
+                    "WebhookSecret": {"rw": False, "type": "java.lang.String", "desc": "WebhookSecret"},
+                    "LogLevel": {"rw": True, "type": "java.lang.String", "desc": "LogLevel"},
+                },
+                "desc": "Application configuration",
+            },
+        },
+        "org.springframework.boot": {
+            "type=Endpoint,name=Env": {
+                "op": {
+                    "environment": {
+                        "args": [
+                            {"name": "pattern", "type": "java.lang.String", "desc": "pattern"},
+                        ],
+                        "ret": "java.util.Map",
+                        "desc": "environment",
+                    },
+                },
+                "attr": {},
+                "desc": "/actuator/env MBean",
+            },
+            "type=Endpoint,name=Health": {
+                "op": {"health": {"args": [], "ret": "java.util.Map", "desc": "health"}},
+                "attr": {},
+                "desc": "/actuator/health MBean",
+            },
+        },
+    }
+
+
+def _jolokia_object_names(tree: dict[str, dict[str, object]]) -> list[str]:
+    """Every `<domain>:<props>` name the tree publishes."""
+    return [f"{domain}:{props}" for domain, beans in tree.items() for props in beans]
+
+
+def _jolokia_bean(tree: dict[str, dict[str, object]], mbean: str) -> dict[str, object] | None:
+    domain, _, props = mbean.partition(":")
+    beans = tree.get(domain)
+    if not isinstance(beans, dict):
+        return None
+    bean = beans.get(props)
+    return bean if isinstance(bean, dict) else None
+
+
+def _jolokia_jdbc_url() -> str:
+    """A JDBC URL with the password inline, per hit.
+
+    Hikari's `JdbcUrl` is exactly where a plaintext DB password ends up
+    on a real deployment. Synthetic rather than canary-backed for the
+    same reason as every other DB password here — a replay against
+    Postgres raises no alert — but it must still be per-hit, because a
+    fixed one is a string every sensor shares.
+    """
+    return (
+        "jdbc:postgresql://db.internal:5432/appdb"
+        f"?user=app_rw&password={_fake_db_password()}&sslmode=require"
+    )
+
+
+def _jolokia_system_properties(ak: str, sk: str) -> dict[str, str]:
+    return {
+        "java.version": "17.0.11",
+        "java.vendor": "Eclipse Adoptium",
+        "os.name": "Linux",
+        "user.name": "app",
+        "user.dir": "/app",
+        "spring.profiles.active": "prod",
+        "aws.region": "us-east-1",
+        "aws.accessKeyId": ak,
+        "aws.secretKey": sk,
+    }
+
+
+def _jolokia_input_arguments(ak: str, sk: str) -> list[str]:
+    return [
+        "-Xms512m",
+        "-Xmx2048m",
+        "-Dspring.profiles.active=prod",
+        "-Daws.region=us-east-1",
+        f"-Daws.accessKeyId={ak}",
+        f"-Daws.secretKey={sk}",
+        "-Djava.security.egd=file:/dev/./urandom",
+    ]
+
+
+def _jolokia_attribute_values(
+    ak: str, sk: str, jdbc_url: str, webhook_secret: str,
+) -> dict[str, dict[str, object]]:
+    """Concrete values for every readable attribute in the tree."""
+    return {
+        "java.lang:type=Runtime": {
+            "Name": "1@app-01",
+            "Pid": 1,
+            "Uptime": _jolokia_uptime_ms(),
+            "StartTime": int(_PROCESS_START_EPOCH * 1000),
+            "VmName": "OpenJDK 64-Bit Server VM",
+            "VmVendor": "Eclipse Adoptium",
+            "VmVersion": "17.0.11+9",
+            "ClassPath": "/app/app.jar",
+            "SystemProperties": _jolokia_system_properties(ak, sk),
+            "InputArguments": _jolokia_input_arguments(ak, sk),
+        },
+        "java.lang:type=Memory": {
+            "HeapMemoryUsage": {
+                "init": 536870912, "committed": 1073741824,
+                "max": 2147483648, "used": 412356096,
+            },
+            "NonHeapMemoryUsage": {
+                "init": 7667712, "committed": 92798976,
+                "max": -1, "used": 89231360,
+            },
+        },
+        "java.lang:type=OperatingSystem": {
+            "Name": "Linux",
+            "Arch": "amd64",
+            "AvailableProcessors": 2,
+            "SystemLoadAverage": 0.42,
+        },
+        "JMImplementation:type=MBeanServerDelegate": {
+            "MBeanServerId": "app-01_1717000000000",
+            "ImplementationName": "JMX",
+            "ImplementationVendor": "Oracle Corporation",
+            "ImplementationVersion": "17.0.11+9",
+            "SpecificationName": "Java Management Extensions",
+            "SpecificationVendor": "Oracle Corporation",
+            "SpecificationVersion": "1.4",
+        },
+        "com.zaxxer.hikari:type=PoolConfig (HikariPool-1)": {
+            "PoolName": "HikariPool-1",
+            "JdbcUrl": jdbc_url,
+            "Username": "app_rw",
+            "MaximumPoolSize": 10,
+            "ConnectionTimeout": 30000,
+        },
+        "com.internal.tools:type=Config": {
+            "Environment": "production",
+            "AwsAccessKeyId": ak,
+            "AwsSecretKey": sk,
+            "WebhookSecret": webhook_secret,
+            "LogLevel": "INFO",
+        },
+    }
+
+
+def _jolokia_operation_values(
+    ak: str, sk: str, jdbc_url: str,
+) -> dict[str, dict[str, object]]:
+    """Return values for every operation the tree publishes.
+
+    `vmCommandLine` and `vmSystemProperties` are the two the diagnostic
+    bean is swept for, and both print the launch flags — which is where
+    the credential is.
+    """
+    props = _jolokia_system_properties(ak, sk)
+    args = " ".join(_jolokia_input_arguments(ak, sk))
+    return {
+        "com.sun.management:type=DiagnosticCommand": {
+            "vmCommandLine": f"java {args} -jar /app/app.jar",
+            "vmSystemProperties": "\n".join(f"{k}={v}" for k, v in props.items()),
+            "vmFlags": (
+                "-XX:CICompilerCount=2 -XX:InitialHeapSize=536870912 "
+                "-XX:MaxHeapSize=2147483648 -XX:+UseG1GC "
+                "-XX:+UseCompressedOops"
+            ),
+            "vmVersion": "OpenJDK 64-Bit Server VM version 17.0.11+9\nJDK 17.0.11+9",
+            "threadPrint": (
+                'Full thread dump OpenJDK 64-Bit Server VM (17.0.11+9 mixed mode):\n\n'
+                '"main" #1 prio=5 os_prio=0 tid=0x00007f4c0800e000 nid=0x1 waiting on condition\n'
+                "   java.lang.Thread.State: TIMED_WAITING (parking)\n"
+                '"HikariPool-1 housekeeper" #24 daemon prio=5 os_prio=0 nid=0x2c waiting on condition\n'
+                "   java.lang.Thread.State: TIMED_WAITING (parking)\n"
+            ),
+            "gcRun": "Command executed successfully",
+            "help": (
+                "The following commands are available:\n"
+                "GC.run\nThread.print\nVM.command_line\nVM.flags\n"
+                "VM.system_properties\nVM.version\nhelp\n"
+            ),
+        },
+        "java.lang:type=Memory": {"gc": None},
+        "com.internal.tools:type=Config": {"reload": "configuration reloaded"},
+        "org.springframework.boot:type=Endpoint,name=Env": {
+            "environment": {
+                "activeProfiles": ["prod"],
+                "propertySources": [
+                    {
+                        "name": "systemEnvironment",
+                        "properties": {
+                            "AWS_ACCESS_KEY_ID": {"value": ak},
+                            "AWS_SECRET_ACCESS_KEY": {"value": sk},
+                            "AWS_REGION": {"value": "us-east-1"},
+                            "SPRING_DATASOURCE_URL": {"value": jdbc_url},
+                        },
+                    },
+                ],
+            },
+        },
+        "org.springframework.boot:type=Endpoint,name=Health": {
+            "health": {"status": "UP"},
+        },
+    }
+
+
+@dataclass(frozen=True)
+class JolokiaRequest:
+    """One Jolokia operation, however it arrived.
+
+    The GET form puts everything in the path; the POST form puts the same
+    fields in a JSON object, and a POST body may be a *list* of them. One
+    shape either way, so the handler and the log line do not have to care
+    which spelling the client used.
+    """
+    type: str
+    mbean: str = ""
+    attribute: str = ""
+    operation: str = ""
+    arguments: tuple[str, ...] = ()
+    inner_path: str = ""
+    value: str = ""
+
+
+def jolokia_protocol_rest(path: str) -> str | None:
+    """The part of the path after a Jolokia mount point, or None.
+
+    Returns `""` for the bare mount — which the exact-path canary trap
+    already answers, so the dispatch only consults this for something
+    deeper.
+    """
+    lowered = path.lower()
+    for prefix in _JOLOKIA_PREFIXES:
+        if lowered == prefix or lowered == prefix + "/":
+            return ""
+        if lowered.startswith(prefix + "/"):
+            return path[len(prefix) + 1:]
+    return None
+
+
+# Jolokia escapes a `/` inside an ObjectName as `!/` so the name survives
+# the path split, and `!!` is a literal `!`. Splitting first and
+# unescaping after would read a truncated bean name, so the escape is
+# parked on a sentinel across the split.
+_JOLOKIA_SLASH_SENTINEL = "\x00jslash\x00"
+_JOLOKIA_BANG_SENTINEL = "\x00jbang\x00"
+
+
+def _jolokia_split(rest: str) -> list[str]:
+    parked = rest.replace("!!", _JOLOKIA_BANG_SENTINEL).replace("!/", _JOLOKIA_SLASH_SENTINEL)
+    return [
+        s.replace(_JOLOKIA_SLASH_SENTINEL, "/").replace(_JOLOKIA_BANG_SENTINEL, "!")
+        for s in parked.split("/") if s != ""
+    ]
+
+
+def parse_jolokia_get(rest: str) -> JolokiaRequest | None:
+    """Parse the GET spelling: `<type>/<mbean>/<member>/<args...>`."""
+    if not rest:
+        return None
+    segments = _jolokia_split(rest)
+    if not segments:
+        return None
+    op_type = segments[0].lower()
+    if op_type not in _JOLOKIA_TYPES:
+        return None
+    rest_segments = segments[1:]
+    if op_type == "version":
+        return JolokiaRequest(type="version")
+    if op_type == "list":
+        return JolokiaRequest(type="list", inner_path="/".join(rest_segments))
+    if op_type == "search":
+        return JolokiaRequest(type="search", mbean="/".join(rest_segments))
+    if not rest_segments:
+        return None
+    mbean = rest_segments[0]
+    if op_type == "read":
+        return JolokiaRequest(
+            type="read", mbean=mbean,
+            attribute=rest_segments[1] if len(rest_segments) > 1 else "",
+            inner_path="/".join(rest_segments[2:]),
+        )
+    if op_type == "write":
+        return JolokiaRequest(
+            type="write", mbean=mbean,
+            attribute=rest_segments[1] if len(rest_segments) > 1 else "",
+            value=rest_segments[2] if len(rest_segments) > 2 else "",
+        )
+    return JolokiaRequest(
+        type="exec", mbean=mbean,
+        operation=rest_segments[1] if len(rest_segments) > 1 else "",
+        arguments=tuple(rest_segments[2:]),
+    )
+
+
+def _jolokia_request_from_object(obj: object) -> JolokiaRequest | None:
+    if not isinstance(obj, dict):
+        return None
+    op_type = str(obj.get("type") or "").lower()
+    if op_type not in _JOLOKIA_TYPES:
+        return None
+    raw_args = obj.get("arguments")
+    if isinstance(raw_args, list):
+        arguments = tuple(str(a)[:JOLOKIA_ARG_LOG_LIMIT] for a in raw_args[:12])
+    else:
+        arguments = ()
+    attribute = obj.get("attribute")
+    if isinstance(attribute, list):
+        attribute = ",".join(str(a) for a in attribute[:12])
+    return JolokiaRequest(
+        type=op_type,
+        mbean=str(obj.get("mbean") or "")[:512],
+        attribute=str(attribute or "")[:256],
+        operation=str(obj.get("operation") or "")[:256],
+        arguments=arguments,
+        inner_path=str(obj.get("path") or "")[:256],
+        value=str(obj.get("value") or "")[:256],
+    )
+
+
+def parse_jolokia_post(body: bytes) -> list[JolokiaRequest]:
+    """Parse the POST spelling, single or bulk. Never raises."""
+    try:
+        parsed = json.loads(body.decode("utf-8", "replace") or "null")
+    except (ValueError, UnicodeDecodeError):
+        return []
+    if isinstance(parsed, list):
+        requests = [_jolokia_request_from_object(o) for o in parsed[:JOLOKIA_MAX_BULK_REQUESTS]]
+        return [r for r in requests if r is not None]
+    single = _jolokia_request_from_object(parsed)
+    return [single] if single is not None else []
+
+
+def jolokia_request_needs_canary(req: JolokiaRequest) -> bool:
+    """Whether answering this request means spending a canary.
+
+    `version`, `search` and the delegate reads carry nothing, so an agent
+    fingerprint sweep — which is most of the traffic — costs no upstream
+    quota. `list` does spend one, because the tree's descriptions are one
+    of the places the credential is surfaced.
+    """
+    if req.type in ("version", "search"):
+        return False
+    if req.type == "list":
+        return True
+    if req.mbean in _JOLOKIA_CANARY_MBEANS:
+        return True
+    member = req.attribute if req.type in ("read", "write") else req.operation
+    return (req.mbean, member) in _JOLOKIA_CANARY_MEMBERS
+
+
+def _jolokia_request_echo(req: JolokiaRequest) -> dict[str, object]:
+    """The `request` block a real agent echoes back."""
+    echo: dict[str, object] = {"type": req.type}
+    if req.mbean:
+        echo["mbean"] = req.mbean
+    if req.attribute:
+        echo["attribute"] = req.attribute
+    if req.operation:
+        echo["operation"] = req.operation
+    if req.arguments:
+        echo["arguments"] = list(req.arguments)
+    if req.inner_path:
+        echo["path"] = req.inner_path
+    return echo
+
+
+def _jolokia_ok(req: JolokiaRequest, value: object) -> dict[str, object]:
+    return {
+        "request": _jolokia_request_echo(req),
+        "value": value,
+        "timestamp": int(time.time()),
         "status": 200,
     }
+
+
+def _jolokia_error(
+    req: JolokiaRequest, error_type: str, message: str, status: int = 404,
+) -> dict[str, object]:
+    """A Jolokia failure envelope.
+
+    Answered inside an HTTP 200, which is what the agent does: the
+    protocol carries its own status. Worth answering rather than
+    dropping — a client that gets `InstanceNotFoundException` knows the
+    bridge is live and tries the next bean on its list, and each of those
+    guesses is the dictionary we are here to collect.
+    """
+    return {
+        "request": _jolokia_request_echo(req),
+        "error_type": error_type,
+        "error": f"{error_type} : {message}",
+        "status": status,
+        "timestamp": int(time.time()),
+    }
+
+
+def _jolokia_glob_matches(pattern: str, name: str) -> bool:
+    """ObjectName pattern match, as `search` uses it (`*` wildcards)."""
+    try:
+        regex = "^" + ".*".join(re.escape(part) for part in pattern.split("*")) + "$"
+        return re.match(regex, name) is not None
+    except re.error:
+        return False
+
+
+def resolve_jolokia_request(
+    req: JolokiaRequest, ak: str, sk: str, jdbc_url: str, webhook_secret: str,
+) -> dict[str, object]:
+    """Answer one parsed request against the published tree."""
+    tree = _jolokia_mbean_tree(ak, sk, jdbc_url)
+
+    if req.type == "version":
+        return _jolokia_ok(req, {
+            "agent": JOLOKIA_AGENT_VERSION,
+            "protocol": JOLOKIA_PROTOCOL_VERSION,
+            "details": {"agent_version": JOLOKIA_AGENT_VERSION, "agent_type": "servlet"},
+            "config": {"agentContext": "/jolokia", "agentId": "app-01-jolokia"},
+            "info": {},
+        })
+
+    if req.type == "search":
+        pattern = req.mbean or "*:*"
+        return _jolokia_ok(req, [
+            name for name in _jolokia_object_names(tree)
+            if _jolokia_glob_matches(pattern, name)
+        ])
+
+    if req.type == "list":
+        if not req.inner_path:
+            return _jolokia_ok(req, tree)
+        segments = [s for s in req.inner_path.split("/") if s]
+        node: object = tree
+        for segment in segments:
+            if not isinstance(node, dict) or segment not in node:
+                return _jolokia_error(
+                    req, "javax.management.InstanceNotFoundException",
+                    f"{req.inner_path} is not a registered MBean path",
+                )
+            node = node[segment]
+        return _jolokia_ok(req, node)
+
+    bean = _jolokia_bean(tree, req.mbean)
+    if bean is None:
+        return _jolokia_error(
+            req, "javax.management.InstanceNotFoundException",
+            f"{req.mbean} is not registered in the MBean server",
+        )
+
+    attrs = bean.get("attr") if isinstance(bean.get("attr"), dict) else {}
+    ops = bean.get("op") if isinstance(bean.get("op"), dict) else {}
+    values = _jolokia_attribute_values(ak, sk, jdbc_url, webhook_secret).get(req.mbean, {})
+
+    if req.type == "read":
+        if not req.attribute:
+            # Attribute-less read returns every attribute, which is how
+            # a client dumps a bean in one request.
+            return _jolokia_ok(req, {name: values.get(name) for name in attrs})
+        if req.attribute not in attrs:
+            return _jolokia_error(
+                req, "javax.management.AttributeNotFoundException",
+                f"No such attribute {req.attribute} on {req.mbean}",
+            )
+        return _jolokia_ok(req, values.get(req.attribute))
+
+    if req.type == "write":
+        if req.attribute not in attrs:
+            return _jolokia_error(
+                req, "javax.management.AttributeNotFoundException",
+                f"No such attribute {req.attribute} on {req.mbean}",
+            )
+        if not attrs[req.attribute].get("rw"):
+            return _jolokia_error(
+                req, "javax.management.AttributeNotFoundException",
+                f"Attribute {req.attribute} on {req.mbean} is not writable",
+                status=400,
+            )
+        # A real write returns the *previous* value. Letting the one
+        # writable attribute actually take is the point: a client that
+        # sees a mutation succeed has a reason to send another one, and
+        # what it chooses to change is worth more than the refusal.
+        return _jolokia_ok(req, values.get(req.attribute))
+
+    if req.operation not in ops:
+        return _jolokia_error(
+            req, "java.lang.IllegalArgumentException",
+            f"No such operation {req.operation} on {req.mbean}",
+            status=400,
+        )
+    op_values = _jolokia_operation_values(ak, sk, jdbc_url).get(req.mbean, {})
+    return _jolokia_ok(req, op_values.get(req.operation))
+
+
+def render_actuator_jolokia_list(r: dict[str, object]) -> bytes:
+    """The `list` response the exact-path trap serves.
+
+    Same envelope and same tree the protocol handler answers with, so the
+    listing a client reads and the follow-up it sends cannot disagree.
+    """
+    aws = _aws(r)
+    payload = _jolokia_ok(
+        JolokiaRequest(type="list"),
+        _jolokia_mbean_tree(
+            aws.get("awsAccessKeyId", ""),
+            aws.get("awsSecretAccessKey", ""),
+            _jolokia_jdbc_url(),
+        ),
+    )
     return json.dumps(payload, indent=2).encode("utf-8")
 
 
@@ -23153,12 +23794,16 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     # Real `/trace` responses leak inbound `Authorization` headers
     # verbatim — AWS SigV4 headers carry the access-key id in the
     # `Credential=` segment, which harvesters grep for. Cover the 2.x
-    # rename too.
+    # rename too — and the 3.x one, which renamed it again to
+    # `httpexchanges`: a client that walks all three spellings is
+    # covering Boot versions, and answering only two of them says our
+    # version and theirs disagree.
     CanaryTrap(
         "actuator-trace",
         (
             "/actuator/trace",
             "/actuator/httptrace",
+            "/actuator/httpexchanges",
             "/trace",
             "/manage/trace",
             "/management/trace",
@@ -23168,6 +23813,9 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/manage/httptrace",
             "/management/httptrace",
             "/api/actuator/httptrace",
+            "/manage/httpexchanges",
+            "/management/httpexchanges",
+            "/api/actuator/httpexchanges",
         ),
         ("aws",),
         render_actuator_trace,
@@ -23180,7 +23828,12 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     # `com.sun.management:type=DiagnosticCommand` for `vmCommandLine` /
     # `vmSystemProperties` exec, or grep the list for env-var-shaped
     # attribute values surfaced by `java.lang:type=Runtime`'s
-    # `SystemProperties` / `InputArguments`.
+    # `SystemProperties` / `InputArguments`. Those follow-ups are served
+    # by the protocol handler; this entry is the listing they start from.
+    # Every spelling here is also a `_JOLOKIA_PREFIXES` mount, so the
+    # listing and the operations beneath it are reachable at the same
+    # addresses — a mount that answers `list` and 404s `read` would be
+    # the tell.
     CanaryTrap(
         "actuator-jolokia",
         (
@@ -23191,7 +23844,15 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/jolokia/",
             "/jolokia/list",
             "/manage/jolokia",
+            "/manage/jolokia/list",
             "/management/jolokia",
+            "/management/jolokia/list",
+            "/monitoring/jolokia",
+            "/api/jolokia",
+            "/api/jolokia/",
+            "/api/jolokia/list",
+            "/app/jolokia",
+            "/backend/jolokia",
             "/api/actuator/jolokia",
             "/app/actuator/jolokia",
             "/backend/actuator/jolokia",
@@ -31205,7 +31866,7 @@ async def _handle_server_status(
 # the index is canned.
 _ACTUATOR_INDEX_ENDPOINTS: tuple[str, ...] = (
     "env", "health", "configprops", "mappings", "threaddump", "heapdump",
-    "logfile", "httptrace", "jolokia", "flyway", "scheduledtasks",
+    "logfile", "httptrace", "httpexchanges", "jolokia", "flyway", "scheduledtasks",
     "refresh", "prometheus", "trace", "dump", "healthcheck",
     # Served by the observability surface rather than the canary table —
     # no credential slot, so no canary spend.
@@ -34028,6 +34689,111 @@ def is_webhook_receiver_path(path: str) -> bool:
     return webhook_receiver_token(path) is not None
 
 
+async def _handle_jolokia_protocol(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    rest: str,
+    request_body: bytes,
+    request_id: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+) -> web.Response | None:
+    """Answer the Jolokia operations that follow a `list`.
+
+    Returns None when the path sits under a mount point but does not name
+    an operation, so a `/jolokia/<junk>` guess still falls through to the
+    same 404 everything else gets rather than announcing that this prefix
+    is special.
+
+    The log line carries the whole request — type, MBean, attribute or
+    operation, arguments — because that is the payload. `jolokiaHouseBean`
+    says whether the MBean names a domain only this server publishes: a
+    client running the stock agent fingerprint and a client that walked
+    our own tree are different populations, and the answer is the same
+    either way, so the flag is the only place that difference is recorded.
+    """
+    if request.method == "POST":
+        requests = parse_jolokia_post(request_body)
+    else:
+        parsed = parse_jolokia_get(rest)
+        requests = [parsed] if parsed is not None else []
+    if not requests:
+        return None
+
+    first = requests[0]
+    log_context = {
+        **log_context,
+        "jolokiaForm": "post" if request.method == "POST" else "get",
+        "jolokiaType": first.type,
+        "jolokiaMBean": first.mbean[:256],
+        "jolokiaAttribute": first.attribute[:128],
+        "jolokiaOperation": first.operation[:128],
+        "jolokiaArgs": [a[:JOLOKIA_ARG_LOG_LIMIT] for a in first.arguments[:8]],
+        "jolokiaHouseBean": any(
+            r.mbean.startswith(_JOLOKIA_HOUSE_DOMAINS)
+            or r.inner_path.startswith(_JOLOKIA_HOUSE_DOMAINS)
+            for r in requests
+        ),
+    }
+    if len(requests) > 1:
+        log_context["jolokiaBulkCount"] = len(requests)
+        log_context["jolokiaBulkTypes"] = [r.type for r in requests]
+
+    ak = sk = ""
+    if any(jolokia_request_needs_canary(r) for r in requests):
+        tracebit_response = await _get_or_issue_canary(
+            ("aws",), client_ip, request_id, host, user_agent, path, proto,
+        )
+        if tracebit_response is None:
+            append_log({
+                **log_context, "status": CREDENTIAL_FAILURE_STATUS,
+                "result": "jolokia-error",
+            })
+            return _credential_failure_response()
+        aws = _aws(tracebit_response)
+        ak = aws.get("awsAccessKeyId", "")
+        sk = aws.get("awsSecretAccessKey", "")
+        log_context["canaryTypes"] = [
+            k for k, v in tracebit_response.items() if v
+        ]
+
+    jdbc_url = _jolokia_jdbc_url()
+    webhook_secret = f"whsec_{secrets.token_urlsafe(24)}"
+    answers = [
+        resolve_jolokia_request(r, ak, sk, jdbc_url, webhook_secret)
+        for r in requests
+    ]
+    payload: object = answers if len(answers) > 1 else answers[0]
+    body = json.dumps(payload, indent=2).encode("utf-8")
+
+    resolved = [a for a in answers if a.get("status") == 200]
+    if len(requests) > 1:
+        result = "jolokia-bulk"
+    elif resolved:
+        result = f"jolokia-{first.type}"
+    else:
+        result = "jolokia-miss"
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": result,
+        "jolokiaResolved": len(resolved),
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=200,
+        body=b"" if request.method == "HEAD" else body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        },
+    )
+
+
 async def _handle_webhook_receiver(
     request: web.Request,
     log_context: dict[str, object],
@@ -36647,6 +37413,31 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 request, dbg, request_id, path,
                 client_ip, host, user_agent, proto, log_context,
             )
+
+    # Jolokia operations, for the third time the same reason: the MBean
+    # listing is what makes `read` and `exec` reachable, and it is
+    # already served — dead-ending the follow-up is dead-ending the
+    # chain one request before the client says what it wanted.
+    #
+    # The listing's own addresses are left alone. A GET of the bare mount
+    # or of `<mount>/list` stays with the exact-path canary trap so its
+    # result tag does not move under older data; everything deeper is an
+    # operation. A POST to the bare mount is the bulk-request form, so
+    # that one *is* an operation despite sitting at the listing's address.
+    # Needs a Tracebit key for the same reason the listing does: the tree
+    # it answers from carries the canary.
+    if API_KEY and JOLOKIA_PROTOCOL_ENABLED:
+        jolokia_rest = jolokia_protocol_rest(path)
+        if jolokia_rest is not None and (
+            request.method == "POST"
+            or (jolokia_rest and jolokia_rest.lower().strip("/") != "list")
+        ):
+            jolokia_response = await _handle_jolokia_protocol(
+                request, log_context, path, jolokia_rest, request_body,
+                request_id, client_ip, host, user_agent, proto,
+            )
+            if jolokia_response is not None:
+                return jolokia_response
 
     # Directly after the metadata tree, and ahead of the tarpit, for the
     # same reason: this is the indirect way into that tree, and the

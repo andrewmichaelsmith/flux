@@ -389,6 +389,36 @@ than replaying a path. See [docs](./docs/laravel-debugbar.md).
 | `laravel-debugbar-clockwork` | 200 | `bytes: int` | Unconfigured Clockwork shim (`{}`). No canary issued. |
 | `laravel-debugbar-open-get-error` | 404 | — | Canary issuance failed. Only `open-get` can produce this. |
 
+### Jolokia JMX-over-HTTP operations
+
+The operations that follow the MBean listing. Every line carries
+`jolokiaForm` (`get` / `post`), `jolokiaType`, `jolokiaMBean`,
+`jolokiaAttribute`, `jolokiaOperation`, `jolokiaArgs` (first 8, each
+truncated), `jolokiaResolved` (how many of the requests were answered
+rather than refused), and `jolokiaHouseBean`.
+
+`jolokiaHouseBean` is the discriminator: true when the request names an
+MBean domain whose only source is this server's own output, false for the
+`JMImplementation:type=MBeanServerDelegate` fingerprint every stock
+Jolokia tool fires at every host. The response is the same either way. A
+bulk POST also carries `jolokiaBulkCount` and `jolokiaBulkTypes`. See
+[docs](./docs/jolokia-jmx.md).
+
+| `result` | `status` | Extras | Meaning |
+| --- | --- | --- | --- |
+| `jolokia-version` | 200 | `bytes: int` | Agent/protocol version. No canary issued. |
+| `jolokia-search` | 200 | `bytes: int` | ObjectName glob over the published tree. No canary issued. |
+| `jolokia-list` | 200 | `canaryTypes: [..]` | A subtree of the MBean listing (`list/<domain>`). The bare listing keeps its own `actuator-jolokia` tag. |
+| `jolokia-read` | 200 | `canaryTypes: [..]` when the attribute carries one | One attribute, or every attribute of a bean. |
+| `jolokia-write` | 200 | `bytes: int` | A write that took; the value returned is the previous one, as a real agent does. |
+| `jolokia-exec` | 200 | `canaryTypes: [..]` when the operation carries one | An MBean operation was invoked; `jolokiaArgs` holds what it was called with. |
+| `jolokia-bulk` | 200 | `jolokiaBulkCount`, `jolokiaBulkTypes` | A POST carrying several requests; answered as a JSON array. |
+| `jolokia-miss` | 200 | `jolokiaResolved: 0` | Well-formed request naming a bean, attribute or operation the tree does not publish. Answered with the agent's own error envelope inside a 200 — the protocol carries its own status, so that is what a real agent returns. |
+| `jolokia-error` | 404 | — | Canary issuance failed; byte-identical to `not-handled`. |
+
+A path under a Jolokia mount that names no operation produces no line of
+its own — it falls through to `not-handled`, the same as any other path.
+
 ### Auth.js / NextAuth credential-provider surface
 
 Every line carries `nextauthOp` (which route) and `nextauthProvider` (the

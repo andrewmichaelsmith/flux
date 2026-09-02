@@ -649,6 +649,13 @@ def test_all_trap_families_default_on():
         "acknowledgement contains no canary, so it needs no upstream key, "
         "and a delivery that 404s leaves only a body hash behind."
     )
+    assert tbenv.JOLOKIA_PROTOCOL_ENABLED, (
+        "HONEYPOT_JOLOKIA_PROTOCOL_ENABLED should default to True — the "
+        "MBean listing is already served, so leaving the `read` / `exec` "
+        "follow-ups off means publishing a tree and 404ing every operation "
+        "it names. The agent-fingerprint sweep spends no canary and the "
+        "dispatch still requires TRACEBIT_API_KEY."
+    )
     assert tbenv.OBSERVABILITY_ENABLED, (
         "HONEYPOT_OBSERVABILITY_ENABLED should default to True — the "
         "surface issues no canary on any branch, so a sweep across it "
