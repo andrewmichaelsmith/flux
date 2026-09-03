@@ -671,6 +671,14 @@ def test_all_trap_families_default_on():
     )
     assert tbenv.VITE_FS_ENABLED
     assert tbenv.VITE_FS_SYSTEM_FILES_ENABLED
+    assert tbenv.PHP_FILTER_LFI_ENABLED, (
+        "HONEYPOT_PHP_FILTER_LFI_ENABLED should default to True — it "
+        "resolves through the same file-read walk `/@fs/` already uses, "
+        "so it furnishes no new file and spends no canary the webroot "
+        "probe for the same file would not have spent. Off, the read "
+        "returns a body that cannot have come from the filter the client "
+        "named, which is a tell as well as a lost credential."
+    )
     assert tbenv.WEBSHELL_ENABLED
     assert tbenv.WEBSHELL_SWEEP_ENABLED, (
         "HONEYPOT_WEBSHELL_SWEEP_ENABLED should default to True — the literal "

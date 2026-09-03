@@ -1302,6 +1302,65 @@ VITE_FS_MAX_SUFFIX_WALK = max(
 # list of files carrying no secret; this is not an answer-everything
 # switch, which would be its own obvious tell.
 VITE_FS_SYSTEM_FILES_ENABLED = _env_bool("HONEYPOT_VITE_FS_SYSTEM_FILES_ENABLED")
+
+# --- `php://filter` local-file-read primitive --------------------------
+# The third surface that hands a client an arbitrary file read, after the
+# `/@fs/` dev-server prefix and the appliance body traversal. Here the
+# path does not arrive in the request target at all: it rides inside a
+# PHP stream-wrapper URL in a *query parameter* —
+# `?page=php://filter/convert.base64-encode/resource=wp-config.php`.
+#
+# Three client populations converge on the same wrapper syntax:
+#
+#  1. Generic LFI sink discovery — one script name walked across a
+#     dictionary of parameter names (`page`, `path`, `file`, `template`,
+#     `p`, `f`, `include`, `document`, `0`, …) looking for the one that
+#     reaches an `include()`. Every probe is a distinct request, so a
+#     sweep is large and completely uniform.
+#  2. Plugin-specific read bugs where the sink parameter is already
+#     known and named in the advisory, so the client asks once per
+#     candidate install path rather than once per parameter.
+#  3. PHP-CGI argument injection (CVE-2024-4577 and its predecessors),
+#     which smuggles `-d auto_prepend_file=php://filter/...` into the
+#     query. That one is not an application bug at all — same wrapper,
+#     completely different vulnerability class — and the parameter name
+#     is what separates it.
+#
+# Answering matters more here than for a bare `/.env` probe, because the
+# wrapper names its own encoding. A client that asked for
+# `convert.base64-encode` and gets plaintext back sees a response that
+# cannot have come from the filter it requested, so it learns the sink is
+# fake and never reads the credential. Honouring the requested filter
+# chain is therefore not decoration — it is the difference between a
+# credential that gets harvested and replayed and one that gets
+# discarded. `_apply_php_filters` implements the encodings; the resource
+# resolves through the same `resolve_fs_read` walk the other read
+# surfaces use, so every file already furnished for `/@fs/` is furnished
+# here for free.
+#
+# The miss is a 200 with an empty body, not a 404. A missing include on a
+# PHP host with `display_errors` off emits nothing and the script still
+# returns — 404 would claim the *script* does not exist, contradicting
+# the 200 the same client just got from another parameter on the same
+# script and marking the host as instrumented.
+PHP_FILTER_LFI_ENABLED = _env_bool("HONEYPOT_PHP_FILTER_LFI_ENABLED")
+# Marker that identifies the wrapper in a decoded query string.
+_PHP_FILTER_MARKER = "php://filter"
+# Cap on how many filters we execute from one chain. Filter-chain RCE
+# generators emit hundreds of `convert.iconv.*` steps in a single
+# parameter; the cap bounds the work one request can ask for. Chains
+# longer than this still parse and still log — only the encoding stops.
+PHP_FILTER_MAX_FILTERS = max(
+    int((os.environ.get("HONEYPOT_PHP_FILTER_MAX_FILTERS") or "64").strip() or "64"),
+    1,
+)
+# How many URL-decode passes to attempt on the query string. The
+# argument-injection vector arrives with `=` percent-encoded inside an
+# already-encoded query, so one pass is not always enough to see the
+# wrapper; more than two has never been needed and unbounded decoding
+# would let a request manufacture a marker that was never sent.
+_PHP_FILTER_DECODE_PASSES = 2
+
 # --- Cloud instance / container role-credential service -----------------
 # Credential-harvester dictionaries have grown a distinct branch that asks
 # for *ephemeral role* credentials rather than long-lived key files:
@@ -15776,6 +15835,73 @@ def render_stock_nginx_conf() -> bytes:
     ).encode("utf-8")
 
 
+def render_stock_php_ini() -> bytes:
+    """Distro-packaged `php.ini`, as the file-read surfaces serve it.
+
+    Read for the same reason `/etc/passwd` is: it confirms the primitive
+    works, and it is the file that says whether the next step is worth
+    attempting. The directives a client actually greps for are the ones
+    that gate the follow-up — `allow_url_include` and `allow_url_fopen`
+    decide whether a remote include is possible, `disable_functions`
+    decides whether a webshell would have anything to call, `open_basedir`
+    decides how far a read can reach.
+
+    Answering with the packaged defaults is the honest response for a host
+    that never hardened PHP, which is the same host that would have the
+    include bug in the first place. Nothing here is secret — a php.ini
+    carries no credential — so the body is fixed, and deliberately so: a
+    per-hit-random php.ini would be a tell, since a real one does not
+    change between two reads a second apart.
+    """
+    return (
+        "[PHP]\n"
+        "engine = On\n"
+        "short_open_tag = Off\n"
+        "precision = 14\n"
+        "output_buffering = 4096\n"
+        "zlib.output_compression = Off\n"
+        "implicit_flush = Off\n"
+        "serialize_precision = -1\n"
+        "disable_functions =\n"
+        "disable_classes =\n"
+        "zend.enable_gc = On\n"
+        "expose_php = On\n"
+        "max_execution_time = 30\n"
+        "max_input_time = 60\n"
+        "memory_limit = 128M\n"
+        "error_reporting = E_ALL & ~E_DEPRECATED\n"
+        "display_errors = Off\n"
+        "display_startup_errors = Off\n"
+        "log_errors = On\n"
+        "error_log = /var/log/php_errors.log\n"
+        "post_max_size = 8M\n"
+        "auto_prepend_file =\n"
+        "auto_append_file =\n"
+        "default_mimetype = \"text/html\"\n"
+        "default_charset = \"UTF-8\"\n"
+        "include_path = \".:/usr/share/php\"\n"
+        "doc_root =\n"
+        "user_dir =\n"
+        "enable_dl = Off\n"
+        "file_uploads = On\n"
+        "upload_max_filesize = 2M\n"
+        "max_file_uploads = 20\n"
+        "allow_url_fopen = On\n"
+        "allow_url_include = Off\n"
+        "default_socket_timeout = 60\n"
+        "\n"
+        "[Date]\n"
+        "date.timezone = UTC\n"
+        "\n"
+        "[Session]\n"
+        "session.save_handler = files\n"
+        "session.save_path = \"/var/lib/php/sessions\"\n"
+        "session.use_strict_mode = 0\n"
+        "session.cookie_httponly =\n"
+        "session.gc_maxlifetime = 1440\n"
+    ).encode("utf-8")
+
+
 def render_printenv_dump(r: dict[str, object], *, host: str = "") -> bytes:
     """Plausible `printenv`/CGI-environment block with AWS_* values bound to
     a Tracebit canary. Synthesised non-credential context (hostname, PWD,
@@ -26232,6 +26358,31 @@ _VITE_FS_SYSTEM_FILES: "dict[str, tuple[str, Callable[[], bytes], str]]" = {
         render_stock_nginx_conf,
         "text/plain; charset=utf-8",
     ),
+    # `php.ini`, at every packaged location. A read primitive reached
+    # through a PHP include bug is read *by* PHP, so this is the file
+    # that says whether the next step in the chain is available at all —
+    # which is why clients ask for it immediately after `/etc/passwd`
+    # confirms the primitive. The Debian/Ubuntu layout puts it under a
+    # version-and-SAPI directory, so the same file has a couple of dozen
+    # absolute names and a client that guesses the wrong PHP minor gets
+    # nothing; enumerating the layout is what makes the guess irrelevant.
+    **{
+        location: ("etc-php-ini", render_stock_php_ini, "text/plain; charset=utf-8")
+        for location in (
+            *(
+                f"/etc/php/{version}/{sapi}/php.ini"
+                for version in ("7.0", "7.1", "7.2", "7.3", "7.4",
+                                "8.0", "8.1", "8.2", "8.3", "8.4")
+                for sapi in ("cli", "fpm", "apache2", "cgi")
+            ),
+            # RHEL/Alpine/source builds keep it flat.
+            "/etc/php.ini",
+            "/etc/php7/php.ini",
+            "/etc/php8/php.ini",
+            "/usr/local/etc/php/php.ini",
+            "/usr/local/lib/php.ini",
+        )
+    },
     # Root-only, so it means something different from the two above: a
     # source that asks for it is testing whether the read primitive runs
     # privileged, not just whether it works. The hashes are minted per
@@ -26574,6 +26725,200 @@ def resolve_fs_read(raw_path: str) -> FsReadTarget:
             system_file = requested.lower()
 
     return FsReadTarget(requested, trap, depth, bare_env, system_file)
+
+
+@dataclass(frozen=True)
+class PhpFilterRead:
+    """One `php://filter/...` stream-wrapper read, as the client wrote it.
+
+    `target` is the resolution of `resource` against the shared file-read
+    walk, so this carries both what was asked for and what will answer.
+    Every field survives to the log line whether or not anything answers,
+    because the wrapper itself is the intel: the parameter name says which
+    vulnerability class the client believes it is exploiting, the filter
+    list says which follow-up it has tooling for, and the resource says
+    what it came for.
+    """
+
+    param: str                  # query parameter carrying the wrapper
+    filters: tuple[str, ...]    # filter names, left to right
+    resource: str               # raw `resource=` value, as written
+    target: "FsReadTarget"
+
+    @property
+    def uses_iconv(self) -> bool:
+        """Whether the chain contains a charset-conversion step.
+
+        `convert.iconv.*` is the primitive the published filter-chain
+        oracle and RCE generators are built on, and it has no purpose in
+        a plain read — a client that wants file bytes asks for
+        base64-encode and stops. Its presence therefore separates a
+        client running a generator from one walking a dictionary, which
+        is the more interesting half of this population and far smaller.
+        """
+        return any(f.lower().startswith("convert.iconv.") for f in self.filters)
+
+    @property
+    def is_cgi_arg_injection(self) -> bool:
+        """Whether the wrapper arrived as a PHP-CGI directive override.
+
+        `-d auto_prepend_file=php://filter/...` is not an application
+        include bug at all; it is argument injection into the PHP-CGI
+        binary, and the target is the PHP deployment rather than any
+        script on it. Same wrapper syntax, different vulnerability, so it
+        must not be counted as an LFI sink discovery.
+        """
+        return self.param.lower() in ("auto_prepend_file", "auto_append_file")
+
+
+def _decode_query_layers(query: str) -> str:
+    """Percent-decode `query` until it stops changing, bounded.
+
+    The argument-injection vector encodes `=` inside an already-encoded
+    query (`...auto_prepend_file%3Dphp://filter/...%3D.env`), so a single
+    pass leaves the wrapper unreadable. The pass count is bounded because
+    decoding without a limit lets a request that never contained a marker
+    manufacture one out of doubly-escaped percent signs.
+    """
+    decoded = query or ""
+    for _ in range(_PHP_FILTER_DECODE_PASSES):
+        nxt = unquote_plus(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+    return decoded
+
+
+def _split_php_filter_spec(spec: str) -> "tuple[tuple[str, ...], str]":
+    """Split everything after `php://filter/` into (filters, resource).
+
+    PHP's own grammar is slash-separated segments where each segment is
+    either a `|`-separated filter list — optionally prefixed `read=` or
+    `write=` — or the terminal `resource=<path>`. The resource is the
+    awkward part: its value is a filesystem path, so it contains the same
+    slash the segments are split on. Everything from `resource=` onward
+    is therefore the resource, rejoined.
+    """
+    filters: list[str] = []
+    parts = spec.split("/")
+    for index, segment in enumerate(parts):
+        lowered = segment.lower()
+        if lowered.startswith("resource="):
+            rest = [segment[len("resource="):], *parts[index + 1:]]
+            return tuple(filters), "/".join(rest)
+        body = segment
+        for prefix in ("read=", "write="):
+            if lowered.startswith(prefix):
+                body = segment[len(prefix):]
+                break
+        for name in body.split("|"):
+            name = name.strip()
+            if name:
+                filters.append(name)
+    return tuple(filters), ""
+
+
+def _php_filter_param(decoded: str, marker_at: int) -> str:
+    """Name of the query parameter whose value is the wrapper.
+
+    Read backwards from the marker to the `=` that introduces it, then
+    back again to whatever separated this pair from the previous one.
+    Whitespace and `+` count as separators so the argument-injection form
+    (`-d auto_prepend_file=php://filter/...`) yields the directive name
+    rather than the whole `-d ...` fragment.
+    """
+    head = decoded[:marker_at]
+    if not head.endswith("="):
+        return ""
+    name = head[:-1]
+    for separator in ("&", "?", ";", " ", "+", "\t"):
+        name = name.rsplit(separator, 1)[-1]
+    return name.lstrip("-")
+
+
+def parse_php_filter_read(query: str) -> "PhpFilterRead | None":
+    """Parse a `php://filter` read out of a query string.
+
+    Returns None when the query carries no wrapper, so dispatch falls
+    through untouched. `php://input` is deliberately *not* matched here:
+    that wrapper reads the request body rather than a file and belongs to
+    the PHP-CGI code-execution branch, which classifies it as an exploit
+    attempt rather than a file read.
+    """
+    if not PHP_FILTER_LFI_ENABLED:
+        return None
+    decoded = _decode_query_layers(query)
+    marker_at = decoded.lower().find(_PHP_FILTER_MARKER)
+    if marker_at < 0:
+        return None
+    spec = decoded[marker_at + len(_PHP_FILTER_MARKER):].lstrip("/")
+    # A wrapper in a query sits alongside other parameters; the value ends
+    # at the first separator PHP would not have accepted inside it.
+    for terminator in ("&", "#", " ", "+", "\t", '"', "'"):
+        spec = spec.split(terminator, 1)[0]
+    filters, resource = _split_php_filter_spec(spec)
+    return PhpFilterRead(
+        param=_php_filter_param(decoded, marker_at),
+        filters=filters,
+        resource=resource,
+        target=resolve_fs_read(resource),
+    )
+
+
+def _rot13(body: bytes) -> bytes:
+    out = bytearray(body)
+    for index, byte in enumerate(out):
+        if 0x41 <= byte <= 0x5A:
+            out[index] = (byte - 0x41 + 13) % 26 + 0x41
+        elif 0x61 <= byte <= 0x7A:
+            out[index] = (byte - 0x61 + 13) % 26 + 0x61
+    return bytes(out)
+
+
+def apply_php_filters(body: bytes, filters: "tuple[str, ...]") -> bytes:
+    """Run `body` through the requested filter chain, left to right.
+
+    Only the conversions a read chain actually uses are implemented. The
+    point is not filter fidelity for its own sake — it is that a client
+    which asked for `convert.base64-encode` must receive base64, or its
+    own decode step fails and it discards the credential it just read.
+    That is the entire value of the trap, so the encodings that carry
+    credentials are exact and everything else passes through.
+
+    `convert.iconv.*` passes through unchanged. Real iconv would transcode,
+    but every body served here is ASCII, where the transcodings these
+    chains name are near-identity; reimplementing them would add a large
+    surface to gain bytes no client inspects. A decode step given input
+    it cannot decode returns empty, matching PHP, which emits nothing
+    rather than raising when a filter fails mid-stream.
+    """
+    for name in filters[:PHP_FILTER_MAX_FILTERS]:
+        lowered = name.lower()
+        if lowered == "convert.base64-encode":
+            body = base64.b64encode(body)
+        elif lowered == "convert.base64-decode":
+            try:
+                body = base64.b64decode(body, validate=False)
+            except Exception:  # noqa: BLE001 — a broken chain outputs nothing
+                return b""
+        elif lowered == "string.rot13":
+            body = _rot13(body)
+        elif lowered == "string.toupper":
+            body = body.upper()
+        elif lowered == "string.tolower":
+            body = body.lower()
+        elif lowered == "zlib.deflate":
+            compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+            body = compressor.compress(body) + compressor.flush()
+        elif lowered == "zlib.inflate":
+            try:
+                body = zlib.decompress(body, -zlib.MAX_WBITS)
+            except Exception:  # noqa: BLE001 — same as a failed decode above
+                return b""
+        # Anything else — `convert.iconv.*`, `string.strip_tags`, a filter
+        # name that does not exist — leaves the stream unchanged, which is
+        # also what PHP does with a filter it cannot instantiate.
+    return body
 
 
 _DEBUGBAR_PREFIX = "/_debugbar"
@@ -36219,6 +36564,68 @@ async def _send_fs_read(
     )
 
 
+async def _send_php_filter_lfi(
+    request: web.Request,
+    read: "PhpFilterRead",
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.Response:
+    """Answer a `php://filter` read, encoded the way the client asked.
+
+    The body comes from the same resolution every other read surface
+    uses, so a `.env` read through an include bug is byte-identical to a
+    bare `/.env` probe before encoding — and then goes through the
+    requested filter chain, which is what makes it parseable by the
+    client that asked for it.
+
+    Result tags stay prefixed `php-filter-` so this population never
+    merges with the webroot probes for the same files. The three
+    populations that share this wrapper are separable afterwards by
+    `phpFilterParam` alone: a dictionary of sink names, one advisory's
+    named parameter, or a PHP-CGI directive override.
+    """
+    extra_log: dict[str, object] = {
+        # The script the wrapper rode on. For an application include bug
+        # this is the vulnerable file the client believes it found; for
+        # argument injection it is incidental.
+        "phpFilterEntry": path[:256],
+        # Which parameter carried it — the field that separates sink
+        # discovery from a named-advisory probe from CGI argument
+        # injection without needing to re-parse the query.
+        "phpFilterParam": read.param[:64],
+        # The file asked for, exactly as written, before traversal
+        # collapse. Relative spellings say what the client assumes the
+        # working directory is.
+        "phpFilterResource": read.resource[:512],
+        # And after collapse — the path that was actually resolved.
+        "phpFilterRequestedPath": read.target.requested_path[:512],
+        "phpFilterChain": [f[:64] for f in read.filters[:16]],
+        "phpFilterCount": len(read.filters),
+        # Set only when true, so its presence is exactly the "this client
+        # is running a filter-chain generator" signal.
+        **({"phpFilterIconv": True} if read.uses_iconv else {}),
+        **({"phpFilterCgiArg": True} if read.is_cgi_arg_injection else {}),
+    }
+    response = await _send_fs_read(
+        request, read.target, request_id, path,
+        client_ip, host, user_agent, proto, log_context,
+        result_prefix="php-filter-", extra_log=extra_log,
+        # A PHP include of a file that isn't there emits nothing and the
+        # script still completes. 404 would say the *script* is missing,
+        # which contradicts the 200 the same client just got from another
+        # parameter on the same script.
+        miss_status=200, miss_body=b"", miss_content_type="text/html; charset=UTF-8",
+    )
+    if read.filters and response.status == 200 and response.body:
+        response.body = apply_php_filters(bytes(response.body), read.filters)
+    return response
+
+
 def _build_backup_archive_body(r: dict[str, object], ext_family: str) -> tuple[bytes, str]:
     """Build the response body for a backup-archive trap hit.
 
@@ -37306,6 +37713,25 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_body_rce_request(path, query_string, request_body):
         return await _handle_body_rce(request, log_context, path, query_string, request_body)
+
+    # `php://filter` reads run immediately after the body-RCE gate, and
+    # deliberately not before it: the two share the argument-injection
+    # vector, and `php://input` there means the client is executing code
+    # from the request body rather than reading a file. Letting the read
+    # branch see it first would reclassify an RCE attempt as a file read.
+    #
+    # Everything below this line matches on the request *path*, and the
+    # wrapper rides in the query — so a client sweeping parameter names
+    # against `/index.php` would otherwise be answered by whichever trap
+    # owns that path, with a body that cannot have come from the filter
+    # it named. Claiming it here keeps the read primitive coherent.
+    if API_KEY and PHP_FILTER_LFI_ENABLED:
+        php_filter = parse_php_filter_read(query_string)
+        if php_filter is not None:
+            return await _send_php_filter_lfi(
+                request, php_filter, request_id, path,
+                client_ip, host, user_agent, proto, log_context,
+            )
 
     # Bare GET/HEAD against the canonical PHP-CGI paths — falls through
     # to here only when no body-RCE exploit query/body matched above,

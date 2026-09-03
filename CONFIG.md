@@ -147,6 +147,19 @@ dispatched behind it, so it cannot outlive it.
 | `HONEYPOT_SSRF_AZURE_TENANT_ID` | `f5884f75-…-b9831abcf4f2` | Tenant id used in the token's issuer and `tid` claim. Non-secret. |
 | `HONEYPOT_SSRF_AZURE_SUBSCRIPTION_ID` | `d5f9e2e1-…-b3d1e8912e70` | Subscription id in the instance document and the token's `xms_mirid`. A separate id from the tenant — they are different things in Azure. Non-secret. |
 
+## `php://filter` local file read
+
+Reads whose path arrives inside a PHP stream-wrapper URL in a query
+parameter rather than in the request target. Resolves the named resource
+through the same walk the `/@fs/` read primitive uses, then runs the
+response body through the filter chain the client asked for — see
+[`docs/php-filter-lfi.md`](./docs/php-filter-lfi.md).
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_PHP_FILTER_LFI_ENABLED` | on | Master switch. Answers any query containing `php://filter`, on any path. Dispatch also requires `TRACEBIT_API_KEY`, and runs *after* the PHP-CGI body-RCE gate so `php://input` stays classified as code execution rather than a file read. |
+| `HONEYPOT_PHP_FILTER_MAX_FILTERS` | `64` | Cap on how many filters from one chain are executed. Filter-chain RCE generators emit hundreds of `convert.iconv.*` steps in a single parameter; longer chains still parse and still log, only the encoding stops. |
+
 ## Observability / debug surface
 
 No Tracebit key required — the surface issues no canary on any branch.

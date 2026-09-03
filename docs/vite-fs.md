@@ -66,6 +66,7 @@ system file only means anything at the path it really lives at
 | --- | --- |
 | `/etc/passwd` | The same account list the command-injection trap prints for `cat /etc/passwd`, so a scanner probing both surfaces sees one consistent host |
 | `/etc/nginx/nginx.conf` | The unmodified packaged config — no vhost, no upstream, nothing that reflects real deployment shape |
+| `php.ini` (every packaged location — `/etc/php/<version>/<sapi>/php.ini`, `/etc/php.ini`, `/usr/local/etc/php/php.ini`, …) | Distro defaults. A client reads it for `allow_url_include` / `allow_url_fopen` / `disable_functions` — the directives that say whether the next step in the chain is available |
 | `/etc/shadow` | Hashes minted per hit, over the same account list as `/etc/passwd`. Root-only, so asking for it is a different question: whether the read runs privileged |
 | `/var/run/secrets/kubernetes.io/serviceaccount/token` (and the `/run` spelling) | A projected service-account JWT, minted per hit |
 | `…/serviceaccount/namespace` | The namespace the token claims, so the volume describes one coherent pod |
@@ -93,7 +94,7 @@ worth reading.
 ## What it logs
 
 Result tag is `vite-fs-<trap>` on a hit, `vite-fs-etc-passwd` /
-`vite-fs-etc-shadow` / `vite-fs-etc-nginx-conf` /
+`vite-fs-etc-shadow` / `vite-fs-etc-nginx-conf` / `vite-fs-etc-php-ini` /
 `vite-fs-k8s-serviceaccount-{token,namespace,ca-cert}` for a system
 file, and `vite-fs-miss` otherwise. The
 prefix keeps the filesystem-walk population separable from the webroot
