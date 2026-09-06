@@ -16508,6 +16508,199 @@ def render_azure_credentials_ini(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+# --- CI/CD deploy descriptors ------------------------------------------
+# Secret-dredging dictionaries that walk `.env` / `.aws/credentials` also
+# ask for the files a deploy pipeline leaves in a webroot: the Kubernetes
+# cloud-provider config, an SDK-auth service-principal dump, and the AWS
+# CodeBuild / CodeDeploy specs. Three of the four are credential-bearing
+# in real deployments, which is why they are asked for at all.
+#
+# The specs are the more interesting half. Unlike a flat credential file
+# they are *descriptors*: they name other files by path. Answering them
+# with a spec that references paths this server already serves turns a
+# single probe into an observable decision — a client that merely greps
+# the response for key material stops here, while one that parses the
+# document and fetches what it names produces a second, attributable
+# request. That difference is not visible when the path 404s.
+
+
+def render_azure_node_json(r: dict[str, object]) -> bytes:
+    """`azure.json` — the Kubernetes Azure cloud-provider config written
+    to `/etc/kubernetes/azure.json` on every AKS/aks-engine node.
+
+    It is a genuine service-principal store: `aadClientSecret` holds a
+    credential scoped to the node's resource group, which is why it is
+    a standing item in cloud-config dredging dictionaries. Canary lands
+    in that slot so a byte-grepping harvester picks it up regardless of
+    whether it understands the surrounding schema.
+    """
+    aws = _aws(r)
+    return (
+        json.dumps(
+            {
+                "cloud": "AzurePublicCloud",
+                "tenantId": str(uuid.uuid4()),
+                "subscriptionId": str(uuid.uuid4()),
+                "aadClientId": str(uuid.uuid4()),
+                "aadClientSecret": aws.get("awsSecretAccessKey", ""),
+                "resourceGroup": "mc_prod-rg_prod-aks_eastus",
+                "location": "eastus",
+                "vmType": "vmss",
+                "subnetName": "aks-subnet",
+                "securityGroupName": "aks-agentpool-nsg",
+                "vnetName": "aks-vnet",
+                "vnetResourceGroup": "prod-rg",
+                "routeTableName": "aks-agentpool-routetable",
+                "primaryAvailabilitySetName": "",
+                "primaryScaleSetName": "aks-nodepool1-vmss",
+                "cloudProviderBackoff": True,
+                "cloudProviderBackoffRetries": 6,
+                "cloudProviderBackoffDuration": 5,
+                "cloudProviderRatelimit": True,
+                "cloudProviderRatelimitQPS": 10,
+                "cloudProviderRatelimitBucket": 100,
+                "useManagedIdentityExtension": False,
+                "userAssignedIdentityID": "",
+                "useInstanceMetadata": True,
+                "loadBalancerSku": "Standard",
+                "excludeMasterFromStandardLB": True,
+                "maximumLoadBalancerRuleCount": 250,
+            },
+            indent=4,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def render_azure_credentials_json(r: dict[str, object]) -> bytes:
+    """`azure-credentials.json` — the `az ad sp create-for-rbac
+    --sdk-auth` output block. It is what deployment docs tell operators
+    to paste into a CI secret, so copies get committed and land in
+    webroots; the endpoint URLs below are the fixed, public ones that
+    the real command emits. Canary occupies `clientSecret`.
+    """
+    aws = _aws(r)
+    return (
+        json.dumps(
+            {
+                "clientId": str(uuid.uuid4()),
+                "clientSecret": aws.get("awsSecretAccessKey", ""),
+                "subscriptionId": str(uuid.uuid4()),
+                "tenantId": str(uuid.uuid4()),
+                "activeDirectoryEndpointUrl": "https://login.microsoftonline.com",
+                "resourceManagerEndpointUrl": "https://management.azure.com/",
+                "activeDirectoryGraphResourceId": "https://graph.windows.net/",
+                "sqlManagementEndpointUrl": "https://management.core.windows.net:8443/",
+                "galleryEndpointUrl": "https://gallery.azure.com/",
+                "managementEndpointUrl": "https://management.core.windows.net/",
+            },
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def render_buildspec_yml(r: dict[str, object]) -> bytes:
+    """`buildspec.yml` — AWS CodeBuild build specification.
+
+    Hardcoding keys under `env/variables` instead of using
+    `secrets-manager` is a long-standing CodeBuild misconfiguration, so
+    a credential pair here is the shape a harvester is looking for; the
+    canary occupies it. The surrounding document is the part that does
+    the work: it names `.env.production` and a `scripts/` hook, both of
+    which this server answers, so a client that parses the spec rather
+    than grepping it can be seen taking the next step.
+    """
+    aws = _aws(r)
+    return (
+        "version: 0.2\n"
+        "\n"
+        "env:\n"
+        "  variables:\n"
+        "    AWS_DEFAULT_REGION: us-east-1\n"
+        "    ARTIFACT_BUCKET: prod-deploy-artifacts\n"
+        f"    AWS_ACCESS_KEY_ID: {aws.get('awsAccessKeyId', '')}\n"
+        f"    AWS_SECRET_ACCESS_KEY: {aws.get('awsSecretAccessKey', '')}\n"
+        "  secrets-manager:\n"
+        "    DB_PASSWORD: prod/rds/app:password\n"
+        "    SENTRY_DSN: prod/observability/sentry:dsn\n"
+        "\n"
+        "phases:\n"
+        "  install:\n"
+        "    runtime-versions:\n"
+        "      python: 3.11\n"
+        "      nodejs: 20\n"
+        "  pre_build:\n"
+        "    commands:\n"
+        "      - cp .env.production .env\n"
+        "      - pip install -r requirements.txt --quiet\n"
+        "  build:\n"
+        "    commands:\n"
+        "      - ./scripts/deploy.sh --env production\n"
+        "  post_build:\n"
+        "    commands:\n"
+        "      - aws s3 sync dist/ s3://$ARTIFACT_BUCKET/$CODEBUILD_RESOLVED_SOURCE_VERSION/\n"
+        "\n"
+        "artifacts:\n"
+        "  files:\n"
+        "    - '**/*'\n"
+        "  base-directory: dist\n"
+        "  name: app-$(date +%Y%m%d)\n"
+        "\n"
+        "cache:\n"
+        "  paths:\n"
+        "    - '/root/.cache/pip/**/*'\n"
+    ).encode("utf-8")
+
+
+def render_appspec_yml(r: dict[str, object]) -> bytes:
+    """`appspec.yml` — AWS CodeDeploy application specification.
+
+    Deliberately carries no credential: a real appspec has nowhere to
+    put one, and inventing a slot would make the document read as bait
+    to anyone who knows the format. Its value is referential — the hook
+    entries name scripts under `scripts/`, so this file's job is to
+    describe a next request rather than to hand over a secret.
+    """
+    return (
+        "version: 0.0\n"
+        "os: linux\n"
+        "\n"
+        "files:\n"
+        "  - source: /\n"
+        "    destination: /var/www/app\n"
+        "\n"
+        "permissions:\n"
+        "  - object: /var/www/app\n"
+        "    owner: www-data\n"
+        "    group: www-data\n"
+        "    mode: 755\n"
+        "    type:\n"
+        "      - directory\n"
+        "\n"
+        "hooks:\n"
+        "  ApplicationStop:\n"
+        "    - location: scripts/stop_server.sh\n"
+        "      timeout: 300\n"
+        "      runas: root\n"
+        "  BeforeInstall:\n"
+        "    - location: scripts/install_dependencies.sh\n"
+        "      timeout: 300\n"
+        "      runas: root\n"
+        "  AfterInstall:\n"
+        "    - location: scripts/fetch_secrets.sh\n"
+        "      timeout: 300\n"
+        "      runas: root\n"
+        "  ApplicationStart:\n"
+        "    - location: scripts/start_server.sh\n"
+        "      timeout: 300\n"
+        "      runas: root\n"
+        "  ValidateService:\n"
+        "    - location: scripts/healthcheck.sh\n"
+        "      timeout: 60\n"
+    ).encode("utf-8")
+
+
 def render_gem_credentials(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     return (
@@ -25758,6 +25951,59 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_azure_credentials_ini,
         "text/plain; charset=utf-8",
+    ),
+    # `azure.json` / `azure-credentials.json` — the Kubernetes Azure
+    # cloud-provider config and the SDK-auth service-principal dump.
+    # Both are asked for by the same dictionaries that walk the flat
+    # `.azure/credentials` above, and both hold a client secret in the
+    # real deployments they are copied from.
+    CanaryTrap(
+        "azure-node-json",
+        (
+            "/azure.json",
+            "/etc/kubernetes/azure.json",
+            *_app_layout_variants("azure.json"),
+        ),
+        ("aws",),
+        render_azure_node_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "azure-credentials-json",
+        (
+            "/azure-credentials.json",
+            "/azure_credentials.json",
+            *_app_layout_variants("azure-credentials.json"),
+        ),
+        ("aws",),
+        render_azure_credentials_json,
+        "application/json; charset=utf-8",
+    ),
+    # CodeBuild / CodeDeploy specs. `buildspec.yml` is credential-bearing
+    # because hardcoding keys under `env/variables` is the common
+    # misconfiguration; `appspec.yml` is not, and is answered for its
+    # referential value instead — see the renderers.
+    CanaryTrap(
+        "codebuild-buildspec",
+        (
+            "/buildspec.yml",
+            "/buildspec.yaml",
+            *_app_layout_variants("buildspec.yml"),
+        ),
+        ("aws",),
+        render_buildspec_yml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "codedeploy-appspec",
+        (
+            "/appspec.yml",
+            "/appspec.yaml",
+            *_app_layout_variants("appspec.yml"),
+        ),
+        (),
+        render_appspec_yml,
+        "application/x-yaml; charset=utf-8",
     ),
     CanaryTrap(
         "gem-credentials",
