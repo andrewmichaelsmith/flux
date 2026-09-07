@@ -6,6 +6,7 @@ import base64
 import bz2
 import gzip
 import hashlib
+import hmac
 import html
 import io
 import ipaddress
@@ -3150,6 +3151,97 @@ JOOMLA4_CONFIG_VERSION = (
 TOMCAT_PATH_BYPASS_ENABLED = _env_bool("HONEYPOT_TOMCAT_PATH_BYPASS_ENABLED")
 
 
+# --- SPA build manifest, and the config chunk it names -------------------
+# The same dredging dictionaries that walk `/config.js` and `/env.js` also
+# ask for a *build manifest*: `/.vite/manifest.json` and its `dist/` and
+# `build/` placements. A manifest is not a credential file and holds
+# nothing worth grepping, which is exactly what makes it useful here.
+#
+# A real Vite manifest maps each source entry to the hashed filename the
+# build emitted for it. Answering with one lets the response name a file
+# the client never asked for and could not have guessed: the hash is
+# derived per client address from a secret generated at process start, so
+# it is not in any wordlist, not shared between deployments, and not
+# reachable by enumeration.
+#
+# That turns a single probe into a decision with two distinguishable
+# outcomes. A client that greps the body for key material finds none and
+# stops. A client that *parses* the manifest and fetches the chunk it
+# names produces a second request that can only exist if the first
+# response was read — and that second request is where the canary lives.
+# The fork is invisible while the path 404s, and no other trap here
+# measures it, because every other referenced path is one a dictionary
+# could have reached on its own.
+#
+# A well-formed chunk request carrying a hash this process did not mint
+# for that address is logged separately rather than dropped: it is the
+# shape a replay across deployments would take, and it is worth seeing.
+SPA_BUILD_MANIFEST_ENABLED = _env_bool("HONEYPOT_SPA_BUILD_MANIFEST_ENABLED")
+
+# Per-process secret behind the chunk hash. Regenerated on restart, so a
+# hash never becomes a stable long-lived identifier, and distinct per
+# deployment, so the manifest is not a fleet-wide fingerprint the way a
+# baked-in filename would be.
+_SPA_MANIFEST_SECRET = secrets.token_bytes(32)
+
+# Vite truncates its content hash to 8 lowercase hex characters; matching
+# that exactly is what makes the emitted filename unremarkable.
+_SPA_CHUNK_HASH_LEN = 8
+
+# Webroot placements the build manifest is served under.
+# `/.vite/manifest.json` is the Vite 5 default; the bare `manifest.json`
+# spellings are what the same sweep asks for under a built output
+# directory.
+_SPA_MANIFEST_PATHS = frozenset({
+    "/.vite/manifest.json",
+    "/dist/.vite/manifest.json",
+    "/build/.vite/manifest.json",
+    "/public/.vite/manifest.json",
+    "/static/.vite/manifest.json",
+    "/dist/manifest.json",
+    "/build/manifest.json",
+    "/static/manifest.json",
+    "/assets/manifest.json",
+})
+
+# Progressive-web-app manifest. A different document to the build
+# manifest despite the name, and swept alongside it. It names no chunk
+# and mints no canary — it is here so a deployment that serves a build
+# manifest also serves the file a real single-page app would have beside
+# it. Having one and not the other is the kind of inconsistency this
+# trap otherwise exists to avoid.
+_SPA_WEBMANIFEST_PATHS = frozenset({
+    "/manifest.webmanifest",
+    "/dist/manifest.webmanifest",
+    "/build/manifest.webmanifest",
+    "/site.webmanifest",
+})
+
+# The chunk the build manifest names. Anchored on the whole path so a
+# bare `/assets/env-config.js` — which the webapp-config-bundle table
+# already owns, with a closer-fitting body — is not swallowed here.
+_SPA_CHUNK_RE = re.compile(
+    r"^(?:/dist|/build|/public|/static)?/assets/env-config-([0-9a-f]{6,32})\.js$"
+)
+
+
+def _spa_chunk_hash(client_ip: str) -> str:
+    """Chunk hash this deployment names in the manifest it serves to
+    `client_ip`.
+
+    Keyed on the address rather than a session so a sweep that fetches
+    the manifest and the chunk over separate connections still agrees
+    with itself, without holding per-client state that a fan-out could
+    grow without bound.
+    """
+    digest = hmac.new(
+        _SPA_MANIFEST_SECRET,
+        (client_ip or "-").encode("utf-8", "replace"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest[:_SPA_CHUNK_HASH_LEN]
+
+
 # --- Fake Spring Cloud Gateway Actuator extension (CVE-2022-22947) -------
 # `/actuator/gateway/routes` is the route-management surface for Spring
 # Cloud Gateway 3.0.x / 3.1.0. CVE-2022-22947 (Spring4Shell-adjacent) is
@@ -5526,6 +5618,21 @@ def _telescope_strip_prefix(lp: str) -> str:
         if lp.startswith(head + "/"):
             return "/telescope" + lp[len(head):]
     return lp
+
+
+def is_spa_build_manifest_path(path: str) -> bool:
+    """Match the SPA build manifest, the PWA webmanifest beside it, and
+    the per-client config chunk the build manifest names.
+
+    Query strings are stripped before comparing — a cache-busting
+    `?v=...` on an asset URL is normal and should dispatch the same way.
+    """
+    if not SPA_BUILD_MANIFEST_ENABLED:
+        return False
+    lp = path.lower().split("?", 1)[0]
+    if lp in _SPA_MANIFEST_PATHS or lp in _SPA_WEBMANIFEST_PATHS:
+        return True
+    return _SPA_CHUNK_RE.match(lp) is not None
 
 
 def is_telescope_path(path: str) -> bool:
@@ -11554,6 +11661,114 @@ def render_webapp_config_bundle_json(r: dict[str, object]) -> bytes:
     than a `window.__APP_ENV__` assignment."""
     env_obj = _build_webapp_config_bundle_env_obj(r)
     return json.dumps(env_obj, separators=(",", ":"), indent=2).encode("utf-8")
+
+
+def render_spa_build_manifest(chunk_hash: str) -> bytes:
+    """Vite 5 build manifest (`.vite/manifest.json`).
+
+    Carries no credential and requests no canary type: a manifest that
+    held a secret would not be a manifest. Its whole job is the
+    `src/env-config.ts` entry, whose `file` names a chunk that exists
+    nowhere else — not in a wordlist, not in another deployment's
+    manifest, not derivable from the request. Fetching it is therefore
+    proof the client read this body rather than merely receiving it.
+
+    Everything around that entry is ordinary Vite output — an
+    `index.html` entry, a shared vendor chunk, a CSS asset, the
+    `isEntry` / `imports` / `css` keys a parser expects — so the one
+    interesting reference does not sit alone.
+    """
+    vendor_hash = secrets.token_hex(4)
+    index_hash = secrets.token_hex(4)
+    css_hash = secrets.token_hex(4)
+    manifest = {
+        "index.html": {
+            "file": f"assets/index-{index_hash}.js",
+            "name": "index",
+            "src": "index.html",
+            "isEntry": True,
+            "css": [f"assets/index-{css_hash}.css"],
+            "imports": ["_vendor.js", "src/env-config.ts"],
+        },
+        "_vendor.js": {
+            "file": f"assets/vendor-{vendor_hash}.js",
+            "name": "vendor",
+        },
+        # The referenced chunk. Named like every other emitted asset so
+        # it does not read as bait, and hashed per client so a hit on it
+        # can only have come from this response.
+        "src/env-config.ts": {
+            "file": f"assets/env-config-{chunk_hash}.js",
+            "name": "env-config",
+            "src": "src/env-config.ts",
+            "isDynamicEntry": True,
+        },
+        f"assets/index-{css_hash}.css": {
+            "file": f"assets/index-{css_hash}.css",
+            "src": "src/styles/index.css",
+        },
+    }
+    return json.dumps(manifest, separators=(",", ":"), indent=2).encode("utf-8")
+
+
+def render_spa_webmanifest(host: str) -> bytes:
+    """Progressive-web-app manifest. No credential, no canary, no
+    reference to the config chunk — a real `.webmanifest` has nowhere to
+    put any of them. It exists so the app surface is internally
+    consistent for a client that looks at more than one file.
+
+    The app name goes through `_appliance_display_host` for the same
+    reason every vendor portal's title does: behind a proxy that
+    rewrites `Host`, the value that arrives is a loopback literal, and a
+    manifest naming the app `127.0.0.1` is both implausible and
+    identical from every deployment running this software."""
+    site_name = _appliance_display_host(host, "app")
+    return json.dumps(
+        {
+            "name": site_name,
+            "short_name": site_name.split(".", 1)[0][:12] or "app",
+            "start_url": "/",
+            "scope": "/",
+            "display": "standalone",
+            "background_color": "#ffffff",
+            "theme_color": "#1f2937",
+            "icons": [
+                {
+                    "src": "/assets/icon-192.png",
+                    "sizes": "192x192",
+                    "type": "image/png",
+                },
+                {
+                    "src": "/assets/icon-512.png",
+                    "sizes": "512x512",
+                    "type": "image/png",
+                    "purpose": "any maskable",
+                },
+            ],
+        },
+        separators=(",", ":"),
+        indent=2,
+    ).encode("utf-8")
+
+
+def render_spa_config_chunk(r: dict[str, object]) -> bytes:
+    """The chunk the build manifest named.
+
+    Same runtime-config shape and same canary slots as the
+    webapp-config-bundle body — a client that reaches this file by
+    parsing the manifest should find what it would have found by
+    guessing the filename, or the reward for parsing would look
+    conspicuously different from the reward for not.
+    """
+    env_obj = _build_webapp_config_bundle_env_obj(r)
+    return (
+        "// env-config — generated at build time, injected at container start\n"
+        "// DO NOT COMMIT WITH POPULATED CREDENTIALS\n"
+        "window.__RUNTIME_CONFIG__ = "
+        + json.dumps(env_obj, separators=(",", ":"))
+        + ";\n"
+        "export default window.__RUNTIME_CONFIG__;\n"
+    ).encode("utf-8")
 
 
 def render_spring_gateway_routes_get(r: dict[str, object]) -> bytes:
@@ -26102,6 +26317,18 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
                 # closer-fitting body.
                 "aws-config.js", "__env.js",
                 "configuration.js", "app.config.js",
+                # Container-injected runtime config. The `env-config.js`
+                # / `environment.js` pair is what the common
+                # "generate the config at container start" recipe emits
+                # for a Dockerised React or Angular build, and
+                # `runtime.js` is the Angular CLI runtime bundle name
+                # that gets swept with them. Each was recurring in the
+                # same dredging sweep while falling through to a 404.
+                "env-config.js", "environment.js", "runtime.js",
+                # Credential-named spellings from the same dictionary.
+                # A build never emits these; a scanner asks for them
+                # because a developer sometimes does.
+                "config.json.js", "credentials.js", "aws_creds.js",
             )
         ),
         ("aws",),
@@ -33563,6 +33790,102 @@ async def _handle_gravity_smtp(
     )
 
 
+# Two trap objects rather than one with a suffix, so the outcome is
+# readable straight off the `result` tag: a hash this process minted for
+# this address, versus a well-formed one it did not. Both render the same
+# body — the distinction is in how the client got here, not in what it
+# gets, and rewarding one less than the other would give the difference
+# away.
+_SPA_CONFIG_CHUNK_TRAP_REFERENCED = CanaryTrap(
+    "spa-config-chunk-referenced",
+    (),
+    ("aws",),
+    render_spa_config_chunk,
+    "application/javascript; charset=utf-8",
+)
+_SPA_CONFIG_CHUNK_TRAP_FOREIGN = CanaryTrap(
+    "spa-config-chunk-foreign",
+    (),
+    ("aws",),
+    render_spa_config_chunk,
+    "application/javascript; charset=utf-8",
+)
+
+
+async def _handle_spa_build_manifest(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    """SPA build-manifest surface. Three routes:
+
+      - build manifest (`/.vite/manifest.json` and its `dist/` /
+        `build/` placements) → Vite manifest JSON naming a per-client
+        `assets/env-config-<hash>.js` chunk. No canary: a manifest holds
+        none, and issuing one here would spend quota on a body no
+        harvester greps.
+      - `.webmanifest` → PWA manifest. No canary, no chunk reference.
+      - `assets/env-config-<hash>.js` → the referenced chunk, with an
+        AWS canary in the runtime-config slots. Tagged
+        `spa-config-chunk-referenced` when the hash is the one this
+        process minted for this address — which it can only be if the
+        client read the manifest — and `spa-config-chunk-foreign`
+        otherwise.
+
+    Logs `spaManifestKind`, and on the chunk route `spaChunkHash` and
+    `spaChunkReferenced`.
+    """
+    lpath = path.lower().split("?", 1)[0]
+    host = str(log_context.get("host", ""))
+    client_ip = str(log_context.get("clientIp", ""))
+    request_id = str(log_context.get("requestId", ""))
+    user_agent = str(log_context.get("userAgent", ""))
+    proto = str(log_context.get("protocol", ""))
+
+    chunk_match = _SPA_CHUNK_RE.match(lpath)
+    if chunk_match is not None:
+        offered = chunk_match.group(1)
+        expected = _spa_chunk_hash(client_ip)
+        referenced = hmac.compare_digest(offered, expected)
+        trap = (
+            _SPA_CONFIG_CHUNK_TRAP_REFERENCED
+            if referenced
+            else _SPA_CONFIG_CHUNK_TRAP_FOREIGN
+        )
+        return await _send_canary_trap(
+            request, trap, request_id, path, client_ip, host,
+            user_agent, proto, log_context,
+            extra_log={
+                "spaManifestKind": "config-chunk",
+                "spaChunkHash": offered,
+                "spaChunkReferenced": referenced,
+            },
+        )
+
+    if lpath in _SPA_WEBMANIFEST_PATHS:
+        body = render_spa_webmanifest(host)
+        append_log({
+            **log_context, "status": 200, "result": "spa-webmanifest",
+            "spaManifestKind": "webmanifest",
+            "canaryTypes": [], "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": "application/manifest+json; charset=utf-8"},
+        )
+
+    body = render_spa_build_manifest(_spa_chunk_hash(client_ip))
+    append_log({
+        **log_context, "status": 200, "result": "spa-build-manifest",
+        "spaManifestKind": "build-manifest",
+        "canaryTypes": [], "bytes": len(body),
+    })
+    return web.Response(
+        status=200, body=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+
+
 async def _handle_telescope(
     request: web.Request,
     log_context: dict[str, object],
@@ -37893,6 +38216,13 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_telescope_path(path):
         return await _handle_telescope(request, log_context, path, query_string)
+
+    # Gated on the key because the chunk route mints a canary. Without
+    # one the manifest would name a file that 404s, which is a worse
+    # answer than not serving the manifest at all — the reference is the
+    # whole point of it.
+    if API_KEY and is_spa_build_manifest_path(path):
+        return await _handle_spa_build_manifest(request, log_context, path)
 
     if API_KEY and is_oidc_discovery_path(path):
         return await _handle_oidc_discovery(request, log_context, path)

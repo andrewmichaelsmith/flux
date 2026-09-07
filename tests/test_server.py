@@ -661,6 +661,13 @@ def test_all_trap_families_default_on():
         "surface issues no canary on any branch, so a sweep across it "
         "costs nothing upstream and only the leads it names spend one."
     )
+    assert tbenv.SPA_BUILD_MANIFEST_ENABLED, (
+        "HONEYPOT_SPA_BUILD_MANIFEST_ENABLED should default to True — the "
+        "manifest itself spends no quota, and only a client that parsed it "
+        "and fetched the chunk it names costs an issuance. Turning it off "
+        "buys nothing and removes the one route here that distinguishes a "
+        "response-parsing client from a dictionary replaying paths."
+    )
     assert tbenv.FAKE_GIT_ENABLED, (
         "FAKE_GIT_ENABLED should default to True — the per-IP cache bounds "
         "quota burn and the dispatch still requires TRACEBIT_API_KEY."
