@@ -11533,6 +11533,61 @@ def render_joomla4_config_application(
     return json.dumps(envelope, separators=(",", ":")).encode("utf-8")
 
 
+def render_pm2_ecosystem_config(r: dict[str, object]) -> bytes:
+    """PM2 `ecosystem.config.js` — the process-manager descriptor a Node
+    deployment keeps beside its app.
+
+    It is asked for because of its `env` / `env_production` blocks: PM2
+    injects those into the process environment, so it is the one place a
+    Node deployment routinely keeps production credentials in a
+    committed file. The canary goes in the AWS slots there, which is
+    where the real one would be.
+
+    Like the CI descriptors, it also names other files — `script`,
+    `cwd`, `error_file`, `out_file` — so a client that parses it rather
+    than grepping it has somewhere to go next.
+    """
+    aws = _aws(r)
+    config = {
+        "apps": [
+            {
+                "name": "api",
+                "script": "./dist/server.js",
+                "cwd": "/srv/app",
+                "instances": "max",
+                "exec_mode": "cluster",
+                "watch": False,
+                "max_memory_restart": "512M",
+                "error_file": "/var/log/pm2/api-error.log",
+                "out_file": "/var/log/pm2/api-out.log",
+                "env": {
+                    "NODE_ENV": "development",
+                    "PORT": 3000,
+                },
+                "env_production": {
+                    "NODE_ENV": "production",
+                    "PORT": 3000,
+                    "DATABASE_URL": (
+                        "postgres://app:" + _fake_db_password()
+                        + "@db.internal:5432/app_production"
+                    ),
+                    "AWS_REGION": "us-east-1",
+                    "AWS_ACCESS_KEY_ID": aws.get("awsAccessKeyId", ""),
+                    "AWS_SECRET_ACCESS_KEY": aws.get("awsSecretAccessKey", ""),
+                    "AWS_SESSION_TOKEN": aws.get("awsSessionToken", ""),
+                    "S3_BUCKET": "app-uploads-prod",
+                },
+            },
+        ],
+    }
+    return (
+        "// PM2 process definition\n"
+        "module.exports = "
+        + json.dumps(config, separators=(",", ":"), indent=2)
+        + ";\n"
+    ).encode("utf-8")
+
+
 def render_tomcat_path_bypass_env_js(r: dict[str, object], filename: str) -> bytes:
     """JS env-config object — the shape React / Vite / Vue dev builds
     emit as `env.js` (or `env.prod.js`, `env.development.js`) so
@@ -23893,6 +23948,28 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_amplify_config_json,
         "application/json; charset=utf-8",
     ),
+    # PM2 process definition. Its `env_production` block is injected
+    # into the process environment, which makes it the one file a Node
+    # deployment routinely keeps production credentials in and commits —
+    # and it was 404ing while every neighbouring descriptor answered.
+    CanaryTrap(
+        "pm2-ecosystem-config",
+        (
+            "/ecosystem.config.js",
+            "/ecosystem.config.cjs",
+            "/ecosystem.json",
+            "/pm2.config.js",
+            "/pm2.json",
+            "/app/ecosystem.config.js",
+            "/api/ecosystem.config.js",
+            "/backend/ecosystem.config.js",
+            "/srv/ecosystem.config.js",
+            "/config/ecosystem.config.js",
+        ),
+        ("aws",),
+        render_pm2_ecosystem_config,
+        "application/javascript; charset=utf-8",
+    ),
     CanaryTrap(
         "serverless-config",
         (
@@ -23923,6 +24000,19 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # those because a malformed SQLite is more revealing than a
             # 404, but the JSON sibling is the most replay-valuable file.
             "/.config/gcloud/application_default_credentials.json",
+            # Same file under the home directories a deployed app
+            # actually runs as. The bare spelling above only matches a
+            # request rooted at the webroot; a dredging sweep that has
+            # worked out the service account asks for the absolute path,
+            # and those were 404ing while the bare one answered.
+            "/home/ubuntu/.config/gcloud/application_default_credentials.json",
+            "/home/ec2-user/.config/gcloud/application_default_credentials.json",
+            "/home/app/.config/gcloud/application_default_credentials.json",
+            "/root/.config/gcloud/application_default_credentials.json",
+            # Project-local GCP key spellings observed in the same sweep
+            # as the `*service*account*` names already listed.
+            "/gcp.json",
+            "/config/gcp.json",
             # Bare-filename service-account key names. Credential
             # harvesters walking a deployed webroot cannot know the
             # project's naming convention, so they enumerate the whole
@@ -26555,6 +26645,15 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/settings.py~",
             "/local_settings.py",
             "/production_settings.py",
+            # `settings.local.py` is the dotted spelling of the same
+            # override file. It was 404ing while `/local_settings.py`
+            # answered, which is a gap in the spelling list rather than
+            # a different file.
+            "/settings.local.py",
+            "/app/settings.local.py",
+            "/core/settings.local.py",
+            "/backend/settings.local.py",
+            "/config/settings.local.py",
         ),
         ("aws",),
         render_python_settings,
