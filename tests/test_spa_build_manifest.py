@@ -75,6 +75,28 @@ def test_near_miss_paths_do_not_match(path):
     assert not tbenv.is_spa_build_manifest_path(path)
 
 
+def test_no_manifest_path_is_also_claimed_by_the_canary_trap_table():
+    """This trap dispatches by predicate, not by table entry, so the
+    existing duplicate-path guard cannot see it — that one compares
+    table entries against each other.
+
+    Whichever of the two is consulted first silently wins, so a future
+    table entry for (say) `/dist/manifest.json` would shadow this trap
+    with no test failing anywhere. Pin it from this side.
+    """
+    clashes = {
+        p: tbenv._TRAP_BY_PATH[p].name
+        for p in (tbenv._SPA_MANIFEST_PATHS | tbenv._SPA_WEBMANIFEST_PATHS)
+        if p in tbenv._TRAP_BY_PATH
+    }
+    assert not clashes, f"also claimed by the CanaryTrap table: {clashes}"
+
+
+def test_chunk_regex_does_not_shadow_a_canary_trap_path():
+    shadowed = [p for p in tbenv._TRAP_BY_PATH if tbenv._SPA_CHUNK_RE.match(p)]
+    assert not shadowed, f"chunk regex swallows table paths: {shadowed}"
+
+
 def test_query_string_is_stripped():
     assert tbenv.is_spa_build_manifest_path("/.vite/manifest.json?v=2")
     assert tbenv.is_spa_build_manifest_path("/assets/env-config-deadbeef.js?t=1")
