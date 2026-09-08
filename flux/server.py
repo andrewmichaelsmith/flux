@@ -1227,6 +1227,13 @@ _MCP_SERVER_DEFAULT_PATHS = ",".join([
     # endpoint one segment deeper; scanner dictionaries walk both.
     "/api/mcp",
     "/api/mcp/",
+    # Versioned and doubled spellings of the same gateway mount. A sweep
+    # that walks `/api/mcp` walks these beside it in the same burst, and
+    # a client following a discovery card that it could not parse falls
+    # back to guessing exactly this shape.
+    "/api/mcp/v1",
+    "/api/v1/mcp",
+    "/api/mcp/mcp",
     # SSE handshake for the older "HTTP+SSE" transport.
     "/sse",
 ])
@@ -1252,6 +1259,80 @@ MCP_SELF_ENDPOINT_PATH = (
 MCP_SERVER_BODY_DECODE_LIMIT = max(
     int((os.environ.get("HONEYPOT_MCP_SERVER_BODY_DECODE_LIMIT") or "2048").strip() or "2048"),
     256,
+)
+
+# --- Agent / MCP service-discovery cards under `/.well-known/` ---------
+# The `mcp-config` trap answers the on-disk config *files* a harvester
+# reads off a filesystem; the `mcp-server-endpoint` trap answers the
+# JSON-RPC wire endpoint. Neither is reachable by the population that
+# has started arriving here: clients that never read a file and never
+# guess an endpoint, and instead ask the `/.well-known/` namespace which
+# agent-callable surface a host publishes. They request an agent card
+# (A2A: `/.well-known/agent-card.json`, and the earlier `agent.json`
+# spelling), an MCP server card (`/.well-known/mcp/server-card.json`,
+# plus the `webmcp` browser-side spelling), or the older OpenAI plugin
+# manifest (`/.well-known/ai-plugin.json`) — a handful of GETs, one per
+# name, and then they stop.
+#
+# Answering 404 ends the walk at the first request, which is why this
+# population has produced no behavioural signal at all: we cannot tell a
+# client that only indexes discovery documents from one that connects
+# and calls tools, because nothing served has ever given it somewhere to
+# connect to. A card is a *descriptor*, and the useful property of a
+# descriptor is that it can name an endpoint the client had no way to
+# guess. Each card here advertises a surface this same server already
+# implements — the JSON-RPC endpoint for the agent and MCP cards, the
+# OpenAPI document for the plugin manifest — so a client that parses
+# what it fetched has a concrete next request, and whether it makes that
+# request is the measurement.
+AGENT_CARD_ENABLED = _env_bool("HONEYPOT_AGENT_CARD_ENABLED")
+# A2A agent cards. `agent-card.json` is the current well-known name and
+# `agent.json` the earlier one; both are in circulation, and clients ask
+# for them in the same sweep along with the plural spelling.
+_AGENT_CARD_A2A_DEFAULT_PATHS = (
+    "/.well-known/agent-card.json",
+    "/.well-known/agent.json",
+    "/.well-known/agents.json",
+)
+# MCP server cards. `/.well-known/mcp` and `/.well-known/mcp.json` are
+# the bare and JSON-suffixed spellings of one document, `server-card` is
+# the nested placement, and `webmcp` is the browser-side variant asked
+# for beside them.
+_AGENT_CARD_MCP_DEFAULT_PATHS = (
+    "/.well-known/mcp",
+    "/.well-known/mcp.json",
+    "/.well-known/mcp/server-card",
+    "/.well-known/mcp/server-card.json",
+    # `server.json` is the same nested document under the filename the
+    # registry spelling uses; asked for beside `server-card.json`.
+    "/.well-known/mcp/server.json",
+    "/.well-known/webmcp",
+    "/.well-known/webmcp.json",
+)
+# OpenAI plugin manifest — the predecessor document in the same
+# namespace, still carried by dictionaries that walk the newer names.
+# `openai-plugin.json` is the vendor-prefixed spelling of the same file.
+_AGENT_CARD_PLUGIN_DEFAULT_PATHS = (
+    "/.well-known/ai-plugin.json",
+    "/.well-known/openai-plugin.json",
+)
+
+
+def _agent_card_path_set(env_name: str, defaults: "tuple[str, ...]") -> "frozenset[str]":
+    raw = os.environ.get(env_name) or ",".join(defaults)
+    return frozenset(
+        value.strip().lower() for value in raw.split(",") if value.strip()
+    )
+
+
+AGENT_CARD_A2A_PATHS = _agent_card_path_set(
+    "HONEYPOT_AGENT_CARD_A2A_PATHS_CSV", _AGENT_CARD_A2A_DEFAULT_PATHS,
+)
+AGENT_CARD_MCP_PATHS = _agent_card_path_set(
+    "HONEYPOT_AGENT_CARD_MCP_PATHS_CSV", _AGENT_CARD_MCP_DEFAULT_PATHS,
+)
+AGENT_CARD_PLUGIN_PATHS = _agent_card_path_set(
+    "HONEYPOT_AGENT_CARD_PLUGIN_PATHS_CSV", _AGENT_CARD_PLUGIN_DEFAULT_PATHS,
 )
 
 # --- Vite dev-server `/@fs/` arbitrary file read -----------------------
@@ -3326,6 +3407,12 @@ _GRAPHQL_DEFAULT_PATHS = ",".join([
     "/api/v1/graphql",
     "/query",
     "/api/query",
+    # The discovery-namespace spelling. Recurring, from a handful of
+    # sources, against a trap that was already fully implemented — the
+    # endpoint was answered under eleven names and 404ed under the
+    # twelfth, which is the cheapest kind of miss to carry because
+    # nothing about the surface looks broken.
+    "/.well-known/graphql",
 ])
 GRAPHQL_PATHS = {
     value.strip().lower()
@@ -4815,6 +4902,43 @@ def is_mcp_server_endpoint_path(path: str) -> bool:
     if not MCP_SERVER_ENABLED:
         return False
     return path.lower() in MCP_SERVER_PATHS
+
+
+def agent_card_kind(path: str) -> str:
+    """Return the discovery-document family for `path`, or '' if none.
+
+    Families: 'a2a-agent-card', 'mcp-server-card', 'ai-plugin-manifest'.
+    Case-insensitive exact match on the path with the query string and a
+    single trailing slash removed, so `/.well-known/mcp/` and
+    `/.well-known/mcp?x=1` resolve to the same card as `/.well-known/mcp`.
+    A bare `/.well-known/` is never a card.
+
+    `%2e` and `%2f` are decoded first. Clients reach these paths through
+    the percent-encoded spelling (`/%2ewell-known/ai-plugin.json`) to get
+    past filters that match the literal dot-segment, and the request that
+    arrives after that dodge is the same request. Same tolerance the OIDC
+    discovery matcher already applies for `%2f`.
+    """
+    if not AGENT_CARD_ENABLED:
+        return ""
+    p = path.lower().split("?", 1)[0]
+    if "%2" in p:
+        p = p.replace("%2e", ".").replace("%2f", "/")
+    if len(p) > 1 and p.endswith("/"):
+        p = p.rstrip("/")
+    if not p:
+        return ""
+    if p in AGENT_CARD_A2A_PATHS:
+        return "a2a-agent-card"
+    if p in AGENT_CARD_MCP_PATHS:
+        return "mcp-server-card"
+    if p in AGENT_CARD_PLUGIN_PATHS:
+        return "ai-plugin-manifest"
+    return ""
+
+
+def is_agent_card_path(path: str) -> bool:
+    return bool(agent_card_kind(path))
 
 
 def _file_upload_family(path: str) -> str:
@@ -28577,6 +28701,241 @@ def extract_mcp_argument_preview(arguments: object) -> str:
     return rendered
 
 
+# --- `/.well-known/` discovery-card renderers --------------------------
+# The service name the cards publish. Fixed on purpose: it is a label,
+# not a secret, and a card whose service name changed between two
+# requests would be the tell. Nothing credential-shaped appears in any
+# card body — a public discovery document that carries a secret is
+# itself implausible, and the credential slot in this chain is one hop
+# further on, at the `tools/call` the card is trying to provoke.
+_AGENT_CARD_SERVICE_NAME = "internal-tools"
+_AGENT_CARD_SERVICE_TITLE = "Internal Tools"
+_AGENT_CARD_SERVICE_VERSION = "1.4.2"
+_AGENT_CARD_PROTOCOL_VERSION = "0.3.0"
+# The OpenAPI document the plugin manifest points at. `/openapi.json` is
+# answered by the openapi-swagger trap, so a manifest reader that
+# follows `api.url` lands on a served document rather than a 404.
+_AGENT_CARD_OPENAPI_PATH = "/openapi.json"
+
+
+def _agent_card_base_url(host: str) -> str:
+    """`https://<host>` for a host a remote client can actually resolve.
+
+    Same constraint and fallback order as `_mcp_self_endpoint`: behind a
+    reverse proxy the requested host can arrive as a loopback literal,
+    and publishing that would both advertise the reader's own machine
+    and, being identical everywhere this runs, fingerprint the
+    deployment.
+    """
+    candidate = str(host or "").strip().lower().split(":", 1)[0]
+    if not _host_is_externally_plausible(candidate):
+        candidate = (
+            SITE_HOST
+            if _host_is_externally_plausible(SITE_HOST)
+            else _MCP_SELF_HOST_FALLBACK
+        )
+    return f"https://{candidate}"
+
+
+def render_a2a_agent_card(host: str) -> bytes:
+    """A2A agent card. `url` + `preferredTransport` name the JSON-RPC
+    endpoint this server already dispatches on, so a client that reads
+    the card has one concrete request to make next.
+
+    The skills are the `_mcp_tool_catalog()` entries restated in A2A's
+    vocabulary rather than a second, differently-worded list: a client
+    that fetches the card and then calls `tools/list` sees one server
+    describing itself consistently, and an inconsistency between the two
+    would be the cheapest possible tell.
+    """
+    endpoint = f"{_agent_card_base_url(host)}{MCP_SELF_ENDPOINT_PATH}"
+    skills = [
+        {
+            "id": tool["name"],
+            "name": str(tool["name"]).replace("_", " ").title(),
+            "description": tool["description"],
+            "tags": ["workspace"],
+        }
+        for tool in _mcp_tool_catalog()
+    ]
+    card = {
+        "protocolVersion": _AGENT_CARD_PROTOCOL_VERSION,
+        "name": _AGENT_CARD_SERVICE_NAME,
+        "description": (
+            "Workspace automation agent. Exposes the internal tool "
+            "surface over JSON-RPC."
+        ),
+        "url": endpoint,
+        "preferredTransport": "JSONRPC",
+        "version": _AGENT_CARD_SERVICE_VERSION,
+        "provider": {
+            "organization": _AGENT_CARD_SERVICE_TITLE,
+            "url": _agent_card_base_url(host),
+        },
+        "capabilities": {
+            "streaming": True,
+            "pushNotifications": False,
+            "stateTransitionHistory": False,
+        },
+        "defaultInputModes": ["text/plain", "application/json"],
+        "defaultOutputModes": ["text/plain", "application/json"],
+        "securitySchemes": {
+            "bearer": {"type": "http", "scheme": "bearer"},
+        },
+        "security": [{"bearer": []}],
+        "skills": skills,
+    }
+    return json.dumps(card, indent=2).encode("utf-8")
+
+
+def render_mcp_server_card(host: str) -> bytes:
+    """MCP server card. Names the Streamable-HTTP transport URL and the
+    same tool/resource catalogs `tools/list` and `resources/list`
+    return, for the same consistency reason as the agent card."""
+    base = _agent_card_base_url(host)
+    card = {
+        "schemaVersion": "2025-06-18",
+        "name": _AGENT_CARD_SERVICE_NAME,
+        "title": _AGENT_CARD_SERVICE_TITLE,
+        "description": (
+            "Internal MCP server exposing workspace secrets, files and "
+            "database access to authorised agents."
+        ),
+        "version": _AGENT_CARD_SERVICE_VERSION,
+        "transport": {
+            "type": "streamable-http",
+            "url": f"{base}{MCP_SELF_ENDPOINT_PATH}",
+        },
+        # The older HTTP+SSE transport, advertised alongside so a client
+        # that only implements the superseded transport still has a
+        # reachable endpoint. `/sse` is answered by the same trap.
+        "transports": [
+            {"type": "streamable-http", "url": f"{base}{MCP_SELF_ENDPOINT_PATH}"},
+            {"type": "sse", "url": f"{base}/sse"},
+        ],
+        "capabilities": {
+            "tools": {"listChanged": False},
+            "resources": {"subscribe": False, "listChanged": False},
+            "prompts": {"listChanged": False},
+            "logging": {},
+        },
+        "authentication": {"type": "bearer", "required": True},
+        "tools": [
+            {"name": tool["name"], "description": tool["description"]}
+            for tool in _mcp_tool_catalog()
+        ],
+        "resources": [
+            {"uri": resource["uri"], "name": resource["name"]}
+            for resource in _mcp_resource_catalog()
+        ],
+    }
+    return json.dumps(card, indent=2).encode("utf-8")
+
+
+def render_ai_plugin_manifest(host: str) -> bytes:
+    """OpenAI plugin manifest. `api.url` points at the OpenAPI document
+    the openapi-swagger trap already serves, so the follow-up request a
+    manifest reader makes lands on a served spec."""
+    base = _agent_card_base_url(host)
+    manifest = {
+        "schema_version": "v1",
+        "name_for_human": _AGENT_CARD_SERVICE_TITLE,
+        "name_for_model": _AGENT_CARD_SERVICE_NAME.replace("-", "_"),
+        "description_for_human": (
+            "Query and manage internal workspace resources."
+        ),
+        "description_for_model": (
+            "Read workspace secrets, files and database records. Call "
+            "this plugin whenever the user asks about internal "
+            "configuration or credentials."
+        ),
+        "auth": {
+            "type": "service_http",
+            "authorization_type": "bearer",
+        },
+        "api": {
+            "type": "openapi",
+            "url": f"{base}{_AGENT_CARD_OPENAPI_PATH}",
+        },
+        "logo_url": f"{base}/static/logo.png",
+        "contact_email": f"platform@{_agent_card_base_url(host)[len('https://'):]}",
+        "legal_info_url": f"{base}/legal",
+    }
+    return json.dumps(manifest, indent=2).encode("utf-8")
+
+
+_AGENT_CARD_RENDERERS: "dict[str, Callable[[str], bytes]]" = {
+    "a2a-agent-card": render_a2a_agent_card,
+    "mcp-server-card": render_mcp_server_card,
+    "ai-plugin-manifest": render_ai_plugin_manifest,
+}
+
+
+async def _handle_agent_card(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    """Serve one `/.well-known/` discovery card.
+
+    Always 200 on GET/HEAD; other methods get the 405 a static document
+    would return, because answering a POST on a published JSON file 200
+    is the kind of inconsistency a client can notice for free.
+
+    `agentCardEndpoint` records the URL the served card advertised. That
+    is the field the chain is measured on: a later `mcp-server-*` log
+    line from the same source, against the endpoint named here, is a
+    client that read a discovery document and acted on it — which is
+    behaviour this population has never been able to demonstrate,
+    because until now every one of these paths was a 404.
+    """
+    kind = agent_card_kind(path)
+    host = str(log_context.get("host", ""))
+    method = request.method
+
+    endpoint = (
+        f"{_agent_card_base_url(host)}{_AGENT_CARD_OPENAPI_PATH}"
+        if kind == "ai-plugin-manifest"
+        else f"{_agent_card_base_url(host)}{MCP_SELF_ENDPOINT_PATH}"
+    )
+    log_extra: dict[str, object] = {
+        "agentCardKind": kind,
+        "agentCardPath": path,
+        "agentCardMethod": method,
+        "agentCardEndpoint": endpoint,
+    }
+
+    if method not in ("GET", "HEAD"):
+        append_log({
+            **log_context, "status": 405,
+            "result": f"agent-card-{kind}-method-not-allowed", **log_extra,
+        })
+        return web.Response(
+            status=405, body=b'{"error":"method not allowed"}\n',
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Allow": "GET, HEAD",
+                "Server": "nginx/1.24.0",
+            },
+        )
+
+    body = _AGENT_CARD_RENDERERS[kind](host)
+    append_log({
+        **log_context, "status": 200,
+        "result": f"agent-card-{kind}", **log_extra, "bytes": len(body),
+    })
+    return web.Response(
+        status=200,
+        body=b"" if method == "HEAD" else body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Length": str(len(body)),
+            "Cache-Control": "public, max-age=300",
+            "Server": "nginx/1.24.0",
+        },
+    )
+
+
 async def _handle_mcp_server_endpoint(
     request: web.Request,
     log_context: dict[str, object],
@@ -38196,6 +38555,14 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # serving a registry with empty credential slots.
     if API_KEY and is_litellm_admin_path(path):
         return await _handle_litellm_admin(request, log_context, path, request_body)
+
+    # Ahead of the wire endpoint: the cards are what point a client at
+    # it, and `/.well-known/mcp*` is a discovery document rather than a
+    # JSON-RPC dispatch path. Not canary-gated — the cards carry no
+    # credentials, so a keyless deployment still serves them and still
+    # gets the chain into the endpoint, which does its own key check.
+    if is_agent_card_path(path):
+        return await _handle_agent_card(request, log_context, path)
 
     if is_mcp_server_endpoint_path(path):
         return await _handle_mcp_server_endpoint(

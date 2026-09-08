@@ -269,6 +269,30 @@ Extras on every `mcp-server-*` line:
 | `mcpResourceUri` | string | `params.uri` from a `resources/read`, truncated to 400 chars. |
 | `types` | list | `["aws"]` on `mcp-server-tools-call-issued` / `mcp-server-resources-read-issued`. |
 
+### Agent / MCP service-discovery cards
+
+One log line per hit.
+
+| `result` | status | Meaning |
+| --- | --- | --- |
+| `agent-card-a2a-agent-card` | 200 | A2A agent card served (`/.well-known/agent-card.json`, `agent.json`, `agents.json`). |
+| `agent-card-mcp-server-card` | 200 | MCP server card served (`/.well-known/mcp[.json]`, `mcp/server-card[.json]`, `mcp/server.json`, `webmcp[.json]`). |
+| `agent-card-ai-plugin-manifest` | 200 | OpenAI plugin manifest served (`/.well-known/ai-plugin.json`, `openai-plugin.json`). |
+| `agent-card-<kind>-method-not-allowed` | 405 | Non-GET/HEAD on a card path — what a static JSON document returns. |
+
+Extras on every `agent-card-*` line:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `agentCardKind` | string | `a2a-agent-card` / `mcp-server-card` / `ai-plugin-manifest`. |
+| `agentCardPath` | string | The path as requested, before normalisation — preserves the `%2e`-encoded dot-segment spelling. |
+| `agentCardMethod` | string | Request method. |
+| `agentCardEndpoint` | string | The URL the served card advertised: the JSON-RPC endpoint for the two cards, `/openapi.json` for the plugin manifest. **This is the join key for the chain** — a later `mcp-server-*` line from the same source against this endpoint is a client that read a discovery document and acted on it, which is the one thing a 404 on these paths could never show. |
+
+No canary is issued on any branch: the cards carry no credential, and
+the issuance is one hop on, at the `tools/call` the card exists to
+provoke.
+
 ### Fake SonicWall SSL VPN
 
 One log line per hit.

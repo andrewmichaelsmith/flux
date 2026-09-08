@@ -706,6 +706,13 @@ def test_all_trap_families_default_on():
         "reached through, so an install with it off hides them."
     )
     assert tbenv.MCP_SERVER_ENABLED
+    assert tbenv.AGENT_CARD_ENABLED, (
+        "HONEYPOT_AGENT_CARD_ENABLED should default to True — the cards "
+        "carry no credential and spend no upstream quota, and only a "
+        "client that parsed one and called the endpoint it names costs an "
+        "issuance. Off, the discovery sweep that reaches these paths ends "
+        "on a 404 and leaves nothing behind but the path list."
+    )
     assert tbenv.SONICWALL_ENABLED
     assert tbenv.CISCO_WEBVPN_ENABLED
     assert tbenv.IVANTI_VPN_ENABLED
