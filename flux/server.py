@@ -237,6 +237,91 @@ _WEBHOOK_RECEIVER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# --- Billing / payment-method API ------------------------------------------
+# A sweep that posts a card object to every spelling of "add a payment
+# method" is not looking for a secret or a CMS — it is testing which
+# hosts accept an *unauthenticated* write to billing. That is a broken-
+# access-control probe, and the interesting question is not that it
+# arrived but what the sender does with a host that says yes.
+#
+# So the trap answers the write. A 404 tells the sender "not here" and
+# ends the exchange; a created payment-method object tells it "this host
+# is misconfigured", which is the state that earns a second visit.
+#
+# The response carries no credential and needs no issuing key: a billing
+# API has no reason to hand a caller a secret, so there is nothing here
+# that could become a fixed literal shipped by every deployment. Card
+# identifiers are per-request random, and a submitted card number is
+# never echoed or logged — only its last four digits, which is what a
+# real processor returns.
+PAYMENT_API_ENABLED = _env_bool("HONEYPOT_PAYMENT_API_ENABLED")
+PAYMENT_API_BODY_PREVIEW_LIMIT = max(
+    int((os.environ.get("HONEYPOT_PAYMENT_API_BODY_PREVIEW_LIMIT") or "512").strip() or "512"),
+    64,
+)
+
+# Leaf names that are unambiguously about a stored payment instrument.
+# Claimed on path alone, because no other surface wants them.
+_PAYMENT_API_LEAF = (
+    r"payment[-_]?methods?|payment[-_]?sources?|cards?|credit[-_]?cards?|"
+    r"change[-_]payment|update[-_]card|card[-_]update|payment[-_]update|"
+    r"billing[-_]info|payment[-_]info|payment[-_]details|billing[-_]details"
+)
+# Owner segments the observed spellings hang the leaf off.
+_PAYMENT_API_OWNER = (
+    r"account|accounts|user|users|profile|customer|customers|"
+    r"settings|billing|payment|payments|subscription|subscriptions|me"
+)
+_PAYMENT_API_PREFIX = r"^(?:/api)?(?:/v\d{1,2})?"
+
+# Tier A — a billing leaf, with or without owner segments in front of
+# it: /api/v1/billing/payment-methods, /api/v1/cards, /payment/update-card,
+# /api/v1/settings/billing/update-card.
+_PAYMENT_API_RE = re.compile(
+    _PAYMENT_API_PREFIX
+    + r"(?:/(?:" + _PAYMENT_API_OWNER + r"))*"
+    + r"/(?:" + _PAYMENT_API_LEAF + r")"
+    + r"(?:/(?P<id>[A-Za-z0-9._:-]{1,128}))?"
+    + r"/?$",
+    re.IGNORECASE,
+)
+
+# Tier B — `/api/v1/account`, `/api/v1/profile/payment` and friends: an
+# owner segment with no billing leaf after it. Far too generic to claim
+# on the path alone (a bare account endpoint is not ours to answer), so
+# these are claimed only when the request actually carries a card. The
+# discriminator is the body, not the address.
+_PAYMENT_API_OWNER_ONLY_RE = re.compile(
+    _PAYMENT_API_PREFIX
+    + r"(?:/(?:" + _PAYMENT_API_OWNER + r"))+"
+    + r"/?$",
+    re.IGNORECASE,
+)
+
+# JSON keys that mean "there is a card in this body". Kept broad because
+# the point is to recognise a card object across naming conventions, not
+# to validate one.
+_PAYMENT_CARD_KEYS = frozenset({
+    "number", "card_number", "cardnumber", "cardnum", "pan", "cc", "ccnum",
+    "cc_number", "card", "credit_card", "creditcard", "payment_method",
+    "paymentmethod", "source", "token", "cvc", "cvv", "cvv2", "security_code",
+    "exp_month", "exp_year", "expiry", "expiration", "exp", "exp_date",
+})
+
+# Publicly-documented processor test numbers. A sweep carrying one of
+# these is exercising an integration; a Luhn-valid number that is *not*
+# one of these is a different and much more interesting event, so the
+# two are logged as separate booleans rather than collapsed into one.
+_PAYMENT_TEST_PANS = frozenset({
+    "4242424242424242", "4000056655665556", "5555555555554444",
+    "5200828282828210", "5105105105105100", "378282246310005",
+    "371449635398431", "6011111111111117", "6011000990139424",
+    "3056930009020004", "3566002020360505", "6200000000000005",
+    "4111111111111111", "4012888888881881", "4222222222222",
+    "5431111111111111", "6011601160116611", "4000000000000002",
+    "4000000000009995", "4100000000000019", "5555555555554477",
+})
+
 # --- Fake /.git/ tree configuration ---
 # Default-on: flux is a honeypot, and the /.git/ tree is one of the most
 # valuable traps we have. The per-IP cache (FAKE_GIT_CACHE_TTL_SECONDS)
@@ -36061,6 +36146,316 @@ def is_webhook_receiver_path(path: str) -> bool:
     return webhook_receiver_token(path) is not None
 
 
+# --- Billing / payment-method API ------------------------------------------
+
+
+def _luhn_ok(digits: str) -> bool:
+    """Luhn check. Says the number is card-*shaped*, nothing more."""
+    if not digits.isdigit() or not 12 <= len(digits) <= 19:
+        return False
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = ord(ch) - 48
+        if i % 2:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _card_brand(digits: str) -> str:
+    """Brand from the issuer prefix. Presentation only."""
+    if digits.startswith("4"):
+        return "visa"
+    if digits[:2] in {"34", "37"}:
+        return "amex"
+    if digits[:2] in {"51", "52", "53", "54", "55"} or (
+        digits[:4].isdigit() and 2221 <= int(digits[:4] or 0) <= 2720
+    ):
+        return "mastercard"
+    if digits[:4] == "6011" or digits[:2] == "65":
+        return "discover"
+    if digits[:2] in {"36", "38", "30"}:
+        return "diners"
+    if digits[:2] in {"35"}:
+        return "jcb"
+    if digits[:2] == "62":
+        return "unionpay"
+    return "unknown"
+
+
+def _payment_digits(value: object) -> str:
+    """Digits out of a submitted card-number field, bounded."""
+    if not isinstance(value, (str, int)):
+        return ""
+    return "".join(ch for ch in str(value) if ch.isdigit())[:19]
+
+
+def _redact_pans(text: str) -> str:
+    """Replace anything card-shaped in free text with its last four.
+
+    A body preview is worth keeping; a card number is not. If a sender
+    ever posts a real card here — the case that makes this trap worth
+    building — flux must not be the thing that writes it to disk. Only
+    the last four digits survive, which is what a processor stores and
+    what is sufficient to correlate two visits by the same sender.
+    """
+    def _sub(m: re.Match[str]) -> str:
+        raw = m.group(0)
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if not _luhn_ok(digits):
+            return raw
+        return "*" * (len(digits) - 4) + digits[-4:]
+
+    return re.sub(r"\d(?:[ -]?\d){11,18}", _sub, text)
+
+
+def payment_api_target(path: str) -> str | None:
+    """Return the billing resource id (or "") for a payment path, else None.
+
+    Tier A only — the spellings whose leaf segment is unambiguously a
+    stored payment instrument. The generic owner-only spellings
+    (`/api/v1/account`) are deliberately not matched here; they go
+    through `is_payment_api_body_path`, which requires a card in the
+    body, so a bare account endpoint is never claimed on address alone.
+    """
+    if not PAYMENT_API_ENABLED:
+        return None
+    m = _PAYMENT_API_RE.match(path)
+    if not m:
+        return None
+    return m.group("id") or ""
+
+
+def is_payment_api_path(path: str) -> bool:
+    return payment_api_target(path) is not None
+
+
+def body_carries_card(request_body: bytes) -> bool:
+    """True when the body looks like it is carrying a payment instrument.
+
+    Accepts both JSON objects and form encoding, because the same sweep
+    shows up in both. The test is the presence of card-object keys, not
+    a valid card: a sender probing with a junk number is still probing.
+    """
+    if not request_body:
+        return False
+    blob = request_body[:PAYMENT_API_BODY_PREVIEW_LIMIT * 4]
+    try:
+        parsed = json.loads(blob.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        parsed = None
+    keys: set[str] = set()
+    if isinstance(parsed, dict):
+        keys = {str(k).lower() for k in parsed}
+        for value in parsed.values():
+            if isinstance(value, dict):
+                keys |= {str(k).lower() for k in value}
+    else:
+        text = blob.decode("utf-8", "replace")
+        for pair in re.split(r"[&;]", text):
+            name, _, _ = pair.partition("=")
+            name = name.strip().lower()
+            if name:
+                keys.add(name)
+    return bool(keys & _PAYMENT_CARD_KEYS)
+
+
+def is_payment_api_body_path(path: str, request_body: bytes) -> bool:
+    """Tier B: a generic owner path, claimed only because it carries a card."""
+    if not PAYMENT_API_ENABLED:
+        return False
+    if not _PAYMENT_API_OWNER_ONLY_RE.match(path):
+        return False
+    return body_carries_card(request_body)
+
+
+def _payment_card_facts(request_body: bytes) -> dict[str, object]:
+    """Everything worth keeping about a submitted card, minus the card.
+
+    `luhnValid and not testRange` is the discriminating pair: a sweep
+    carrying a documented processor test number is exercising an
+    integration, while a Luhn-valid number that is not one is a
+    different event entirely.
+    """
+    facts: dict[str, object] = {}
+    if not request_body:
+        return facts
+    blob = request_body[:PAYMENT_API_BODY_PREVIEW_LIMIT * 4]
+    parsed: object = None
+    try:
+        parsed = json.loads(blob.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        parsed = None
+
+    fields: dict[str, object] = {}
+    if isinstance(parsed, dict):
+        for key, value in parsed.items():
+            fields[str(key).lower()] = value
+            if isinstance(value, dict):
+                for sub, subval in value.items():
+                    fields.setdefault(str(sub).lower(), subval)
+    else:
+        text = blob.decode("utf-8", "replace")
+        for pair in re.split(r"[&;]", text):
+            name, sep, value = pair.partition("=")
+            if sep:
+                fields[name.strip().lower()] = value.strip()
+
+    if fields:
+        facts["paymentBodyFields"] = sorted(fields)[:40]
+
+    digits = ""
+    for key in ("number", "card_number", "cardnumber", "cardnum", "pan",
+                "cc", "ccnum", "cc_number"):
+        if key in fields:
+            digits = _payment_digits(fields[key])
+            if digits:
+                break
+    if digits:
+        # Only ever the last four. The full number is never logged.
+        facts["paymentCardLast4"] = digits[-4:]
+        facts["paymentCardBrand"] = _card_brand(digits)
+        facts["paymentCardLuhnValid"] = _luhn_ok(digits)
+        facts["paymentCardTestRange"] = digits in _PAYMENT_TEST_PANS
+    for key, out in (("name", "paymentCardholderName"),
+                     ("cardholder_name", "paymentCardholderName"),
+                     ("exp_month", "paymentCardExpMonth"),
+                     ("exp_year", "paymentCardExpYear")):
+        value = fields.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            facts.setdefault(out, str(value)[:64])
+    return facts
+
+
+def _payment_method_object(last4: str = "", brand: str = "",
+                           exp_month: str = "", exp_year: str = "") -> dict[str, object]:
+    """A stored-payment-method object.
+
+    Every identifier is per-request random — no fixed literal ships with
+    the deployment. When the caller supplied a card we echo only its
+    last four and brand, which is exactly what a processor returns and
+    is what makes the acknowledgement read as genuine.
+    """
+    if not last4:
+        last4 = f"{secrets.randbelow(10000):04d}"
+    if not brand:
+        brand = secrets.choice(("visa", "mastercard", "amex"))
+    return {
+        "id": "pm_" + secrets.token_hex(12),
+        "object": "payment_method",
+        "billing_details": {"name": None, "email": None},
+        "card": {
+            "brand": brand,
+            "last4": last4,
+            "exp_month": int(exp_month) if str(exp_month).isdigit() else secrets.randbelow(12) + 1,
+            "exp_year": int(exp_year) if str(exp_year).isdigit() else 2029 + secrets.randbelow(3),
+            "fingerprint": secrets.token_urlsafe(16)[:16],
+            "country": "US",
+            "funding": "credit",
+        },
+        "customer": "cus_" + secrets.token_hex(8),
+        "created": int(time.time()),
+        "livemode": True,
+    }
+
+
+async def _handle_payment_api(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Answer a billing write as though authorisation had passed.
+
+    A sweep posting a card object to every spelling of "add a payment
+    method" is asking which hosts accept an unauthenticated write. A 404
+    answers "not this one" and the sender moves on with only a body hash
+    left behind. Accepting the write answers "this one", which is the
+    state worth being in: the response names the operations it invites,
+    so a client that parses it has somewhere to go next, and a second
+    visit separates a dictionary replaying addresses from a client
+    acting on what it was told.
+
+    Nothing here is a credential. Identifiers are per-request random,
+    and the only part of the caller's card that survives — into the
+    response or the log — is its last four digits.
+    """
+    facts = _payment_card_facts(request_body)
+    method = request.method.upper()
+    resource_id = payment_api_target(path) or ""
+
+    last4 = str(facts.get("paymentCardLast4", "") or "")
+    brand = str(facts.get("paymentCardBrand", "") or "")
+    if brand == "unknown":
+        brand = ""
+    exp_month = str(facts.get("paymentCardExpMonth", "") or "")
+    exp_year = str(facts.get("paymentCardExpYear", "") or "")
+
+    if method in ("GET", "HEAD"):
+        action = "list"
+        status = 200
+        if resource_id:
+            action = "get"
+            payload: dict[str, object] = _payment_method_object()
+        else:
+            payload = {
+                "object": "list",
+                "url": path,
+                "has_more": False,
+                "data": [_payment_method_object() for _ in range(2)],
+            }
+    elif method == "DELETE":
+        action = "delete"
+        status = 200
+        payload = {
+            "id": resource_id or ("pm_" + secrets.token_hex(12)),
+            "object": "payment_method",
+            "deleted": True,
+        }
+    else:
+        # POST / PUT / PATCH — the write the sweep came for.
+        action = "create" if method == "POST" else "update"
+        status = 201 if method == "POST" else 200
+        payload = _payment_method_object(last4, brand, exp_month, exp_year)
+        # Name the next operations. A client that only replays a
+        # dictionary ignores these; one that parses the answer has a
+        # concrete follow-up, and taking it is the signal.
+        pm_id = str(payload.get("id", ""))
+        payload["default_source"] = pm_id
+        payload["links"] = {
+            "self": f"/api/v1/payment_methods/{pm_id}",
+            "set_default": f"/api/v1/payment_methods/{pm_id}/default",
+            "payouts": "/api/v1/payouts",
+        }
+
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    preview = _redact_pans(
+        request_body[:PAYMENT_API_BODY_PREVIEW_LIMIT].decode("utf-8", "replace")
+    )
+    append_log({
+        **log_context,
+        "status": status,
+        "result": "payment-api-probe",
+        "paymentApiAction": action,
+        "paymentApiMethod": method,
+        "paymentApiResourceId": resource_id[:128],
+        "paymentApiContentType": request.headers.get("Content-Type", "")[:120],
+        # Card numbers are redacted to their last four before this is
+        # written; see _redact_pans.
+        "paymentBodyPreview": preview,
+        **facts,
+        "bytes": len(body),
+    })
+    if method == "HEAD":
+        body = b""
+    return web.Response(
+        status=status, body=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+
+
 async def _handle_jolokia_protocol(
     request: web.Request,
     log_context: dict[str, object],
@@ -38964,6 +39359,19 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # keyless deployment, where it is one of the few traps that does.
     if WEBHOOK_RECEIVER_ENABLED and is_webhook_receiver_path(path):
         return await _handle_webhook_receiver(request, log_context, path, request_body)
+
+    # Billing writes. Same late-chain reasoning as the webhook receiver:
+    # the match is an `/api/...` shape, so anything above that wants a
+    # specific address has already claimed it. Needs no issuing key —
+    # the response contains no credential — so it keeps working on a
+    # keyless deployment. Tier A matches on the path; the generic
+    # owner-only spellings are claimed only when the body carries a
+    # card, so a bare account endpoint is never answered on address
+    # alone.
+    if PAYMENT_API_ENABLED and (
+        is_payment_api_path(path) or is_payment_api_body_path(path, request_body)
+    ):
+        return await _handle_payment_api(request, log_context, path, request_body)
 
     # Backup-archive pattern trap runs after exact-path canary lookup so
     # that explicit entries (e.g. `/backup.sql` -> sql-dump trap) keep

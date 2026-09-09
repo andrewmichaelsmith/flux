@@ -521,6 +521,16 @@ payload — see [`docs/webhook-receiver.md`](./docs/webhook-receiver.md).
 | `HONEYPOT_WEBHOOK_RECEIVER_ENABLED` | on | Master switch. Matches `/api/[vN/]webhook[s]/<token>/{event,events,callback,delivery,deliveries}`. The acknowledgement contains no canary, so this trap needs no `TRACEBIT_API_KEY`. |
 | `HONEYPOT_WEBHOOK_RECEIVER_BODY_PREVIEW_LIMIT` | `512` | Bytes of the delivery body kept in `webhookBodyPreview`. |
 
+## Billing / payment-method API
+
+Accepts an unauthenticated write to a stored-payment-method endpoint
+instead of 404ing it — see [`docs/payment-api.md`](./docs/payment-api.md).
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_PAYMENT_API_ENABLED` | on | Master switch. Matches billing leaf names (`payment-methods`, `cards`, `update-card`, `change_payment`, …) on path alone; generic owner spellings (`/api/v1/account`) only when the body carries a card. The response contains no canary, so this trap needs no `TRACEBIT_API_KEY`. |
+| `HONEYPOT_PAYMENT_API_BODY_PREVIEW_LIMIT` | `512` | Bytes of the submitted body kept in `paymentBodyPreview`, after card numbers are redacted to their last four. |
+
 ## Jolokia JMX-over-HTTP operations
 
 Answers the `read` / `exec` / `write` / `search` / `version` follow-ups

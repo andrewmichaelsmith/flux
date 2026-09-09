@@ -649,6 +649,14 @@ def test_all_trap_families_default_on():
         "acknowledgement contains no canary, so it needs no upstream key, "
         "and a delivery that 404s leaves only a body hash behind."
     )
+    assert tbenv.PAYMENT_API_ENABLED, (
+        "HONEYPOT_PAYMENT_API_ENABLED should default to True — the "
+        "acknowledgement carries no credential, so it spends no upstream "
+        "quota and needs no issuing key. A billing write that 404s tells "
+        "the sender this host is not misconfigured and ends the exchange; "
+        "answering it is the only way to observe what a sender does with "
+        "a host that accepted an unauthenticated write."
+    )
     assert tbenv.JOLOKIA_PROTOCOL_ENABLED, (
         "HONEYPOT_JOLOKIA_PROTOCOL_ENABLED should default to True — the "
         "MBean listing is already served, so leaving the `read` / `exec` "
