@@ -678,6 +678,46 @@ def test_read_style_entry_spellings_resolve(entry):
     assert resolved.cloud == "aws"
 
 
+@pytest.mark.parametrize(
+    "entry", ["/load", "/api/load", "/request", "/api/request"])
+def test_loader_style_entry_spellings_resolve(entry):
+    """Loader spellings swept by the same client population, in the same burst.
+
+    `/load` and `/request` were silent misses while carrying the
+    link-local metadata address as their parameter value. Every source
+    observed sending either one also sent `/fetch` *and* `/proxy` — a
+    total overlap rather than the partial one that qualified the
+    read-style spellings — so they are another spelling of this surface
+    rather than a different behaviour wearing a similar name.
+    `/api/load` and `/api/request` are their symmetric partners under the
+    `/api`-prefix convention the rest of the set already follows.
+    """
+    resolved = tbenv.resolve_ssrf_relay(entry, f"url={AWS_ROOT}")
+    assert resolved is not None, f"{entry} is a spelling scanners actually send"
+    assert resolved.cloud == "aws"
+
+
+def test_loader_entries_do_not_swallow_ordinary_requests():
+    """The entry path alone must not fire the trap: with no parameter
+    naming a metadata host or a file we furnish, these are ordinary
+    application paths and belong to the router's 404. `/load` and
+    `/request` are both plausible real endpoint names, so this boundary
+    matters more for them than for `/screenshot`."""
+    for entry in ("/load", "/api/load", "/request", "/api/request"):
+        assert tbenv.resolve_ssrf_relay(entry, "") is None
+        assert tbenv.resolve_ssrf_relay(entry, "id=42") is None
+
+
+def test_redirect_is_deliberately_not_an_entry_path():
+    """`/redirect` is swept by exactly the sources that send `/load` and
+    `/request`, so it passes the source-overlap test those two pass — and
+    still stays out, because the objection to it was never about who sends
+    it. A redirect endpoint answers with a 302 instead of dereferencing
+    the target, so serving metadata document content from one is a shape
+    no real application produces."""
+    assert tbenv.resolve_ssrf_relay("/redirect", f"url={AWS_ROOT}") is None
+
+
 def test_resolve_is_deliberately_not_an_entry_path():
     """`/resolve` is swept too, but by a disjoint set of sources — none of
     them sends `/proxy` or `/fetch`. That makes it a different behaviour

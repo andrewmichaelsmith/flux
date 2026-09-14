@@ -1672,6 +1672,15 @@ _SSRF_RELAY_ENTRY_PATHS: frozenset[str] = frozenset({
     # rest of this set already follows.
     "/read", "/api/read",
     "/file", "/api/file",
+    # `/load` and `/request` are the same bet once more, and the source
+    # overlap is total rather than partial: every source observed sending
+    # either one also sent `/fetch` *and* `/proxy`, in the same sweep, with
+    # the link-local metadata address as the parameter value. That is the
+    # test `/resolve` fails and these two pass. `/api/load` and
+    # `/api/request` are their symmetric partners under the `/api`-prefix
+    # convention the rest of this set already follows.
+    "/load", "/api/load",
+    "/request", "/api/request",
 })
 # Hosts whose metadata tree uses the EC2 `/latest/meta-data/...` layout.
 # Alibaba Cloud mirrors that layout at its own link-local address, so it

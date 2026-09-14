@@ -21,7 +21,7 @@ them falls through to the router's 404.
 
 | Method | Entry path | Fires when | Log tag |
 | --- | --- | --- | --- |
-| GET / HEAD | `/fetch`, `/api/fetch`, `/v1/fetch`, `/api/v1/fetch`, `/proxy`, `/api/proxy`, `/v1/proxy`, `/render`, `/api/render`, `/preview`, `/api/preview`, `/screenshot`, `/thumbnail`, `/url`, `/api/url`, `/import`, `/api/import`, `/download`, `/api/download`, `/image`, `/api/image`, `/read`, `/api/read`, `/file`, `/api/file`, `/webhook`, `/api/webhook`, `/webhook/test`, `/api/webhook/test` (± trailing slash) | a parameter value resolves to an EC2-layout metadata host | `ssrf-relay-aws-<imdsKind>` |
+| GET / HEAD | `/fetch`, `/api/fetch`, `/v1/fetch`, `/api/v1/fetch`, `/proxy`, `/api/proxy`, `/v1/proxy`, `/render`, `/api/render`, `/preview`, `/api/preview`, `/screenshot`, `/thumbnail`, `/url`, `/api/url`, `/import`, `/api/import`, `/download`, `/api/download`, `/image`, `/api/image`, `/read`, `/api/read`, `/file`, `/api/file`, `/load`, `/api/load`, `/request`, `/api/request`, `/webhook`, `/api/webhook`, `/webhook/test`, `/api/webhook/test` (± trailing slash) | a parameter value resolves to an EC2-layout metadata host | `ssrf-relay-aws-<imdsKind>` |
 | GET / HEAD | same | a parameter value resolves to a GCP metadata host | `ssrf-relay-gcp-<index\|sa-index\|email\|token>` |
 | GET / HEAD | same | a parameter value resolves to the Azure `/metadata/…` layout | `ssrf-relay-azure-<token\|instance\|versions>` |
 | GET / HEAD | same | a parameter value names a local file we furnish, as a `file://` URL or a bare/traversal path | `ssrf-relay-file-<trap>` |
@@ -44,15 +44,28 @@ being swept by the very sources that also send `/proxy` and `/fetch`, and
 both were silent misses. `/api/read` and `/file` are their symmetric
 partners under the `/api`-prefix convention the rest of the set follows.
 
+`/load` and `/request` were added on that same reasoning, with the
+overlap total rather than partial: **every** source observed sending
+either one also sent `/fetch` *and* `/proxy`, in the same burst, with the
+link-local metadata address as the parameter value. `/api/load` and
+`/api/request` are their symmetric partners under the same convention.
+Both bare spellings are also plausible names for a real application
+endpoint, so a test pins that the entry path alone does not fire the
+trap — without a parameter naming a metadata host or a file we furnish,
+they stay with the router's 404.
+
 `/resolve` is swept too but stays **out**: its sources are disjoint from
 this surface's — none of them sends `/proxy` or `/fetch` — which makes it
 a different behaviour wearing a similar name rather than another spelling
 of this one.
 
-`/redirect` is deliberately **not** an entry path. A redirect endpoint
-answers with a 302 rather than dereferencing the target, so returning
-metadata document content from one would be a shape no real application
-produces. A test pins that it stays unmatched.
+`/redirect` is deliberately **not** an entry path, and it is the case
+that shows the source-overlap test is not the only one that matters: it
+is swept by exactly the sources that send `/load` and `/request`, so it
+*passes* that test and still stays out. A redirect endpoint answers with
+a 302 rather than dereferencing the target, so returning metadata
+document content from one would be a shape no real application produces.
+A test pins that it stays unmatched.
 
 ### On telling Azure from AWS
 
