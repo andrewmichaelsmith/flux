@@ -219,6 +219,95 @@ _CANARY_ECHO_ACCOUNT_PREFIXES: set[str] = set()
 # that still means "this came from the account we issue from".
 _CANARY_ECHO_PREFIX_LEN = 12
 
+# --- Interpolation-payload observer ----------------------------------------
+# Some clients do not ask for a path at all. They put an expression the
+# *server* is expected to evaluate into a header, and wait to see whether
+# anything resolves it — Log4Shell's `${jndi:ldap://...}` being the
+# canonical shape. Nothing about that request distinguishes it from any
+# other 404: the path is usually `/`, the fingerprint is whatever HTTP
+# library the sender happens to use, and the volume is low because one
+# probe per host is all the technique needs.
+#
+# Like the canary-echo observer above, this is a pure measurement layer.
+# It serves no route, and it never changes a byte of any response — a
+# server that reacted to an interpolation payload would be separable from
+# a real one by sending it one and watching what changed, which is worth
+# more to the sender than the measurement is to us. Only the log line
+# differs.
+INTERPOLATION_PROBE_ENABLED = _env_bool("HONEYPOT_INTERPOLATION_PROBE_ENABLED")
+
+# Bytes of request body scanned. The body is already read and capped
+# upstream; this bounds the regex work, not the read.
+INTERPOLATION_PROBE_BODY_SCAN_LIMIT = max(
+    int((os.environ.get("HONEYPOT_INTERPOLATION_PROBE_BODY_SCAN_LIMIT") or "8192").strip() or "8192"), 256
+)
+# Distinct values reported per list field, so a sender pasting a whole
+# payload dictionary into one header cannot produce an unbounded row.
+INTERPOLATION_PROBE_MAX_REPORTED = max(
+    int((os.environ.get("HONEYPOT_INTERPOLATION_PROBE_MAX_REPORTED") or "8").strip() or "8"), 1
+)
+# Characters of the raw payload kept as a sample. Enough to read the
+# shape by eye; short enough that it cannot be used to pad the log.
+INTERPOLATION_PROBE_SAMPLE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_INTERPOLATION_PROBE_SAMPLE_LIMIT") or "180").strip() or "180"), 32
+)
+
+# `${::-j}` and `${lower:j}` are the two standard ways of spelling a
+# single character so that a literal `jndi` never appears on the wire.
+# Both collapse to that character; applying them repeatedly recovers the
+# plain payload from the obfuscated one. Bounded below, because these
+# rewrites are what an adversary would use to make us loop.
+_INTERP_DEOBF_MARKER_RE = re.compile(r"\$\{\s*::?-([^${}])\}")
+_INTERP_DEOBF_CASE_RE = re.compile(r"\$\{\s*(lower|upper)\s*:\s*([^${}])\s*\}", re.IGNORECASE)
+_INTERP_DEOBF_MAX_PASSES = 6
+
+# A JNDI lookup names the protocol it wants the server to speak. The
+# host that follows is the sender's own infrastructure, which is the
+# single most useful thing on the line: it is an identifier for the
+# operator rather than for the tool they ran.
+_INTERP_JNDI_RE = re.compile(
+    r"\$\{\s*jndi\s*:\s*([a-z0-9+.-]{1,12})\s*:/{0,3}([^\s]{0,200})",
+    re.IGNORECASE,
+)
+# A lookup nested in the host position resolves to its value before the
+# name is looked up, so the static labels around it are still the
+# collector's domain. Stripping the nested part is what recovers it.
+_INTERP_NESTED_RE = re.compile(r"\$\{[^{}]{0,160}\}")
+_INTERP_NESTED_MAX_PASSES = 4
+# Log4j resolves `${env:NAME}` and `${sys:NAME}` before the lookup fires,
+# so a name nested inside a JNDI host is an exfiltration request: the
+# value leaves inside a DNS label. Which names are asked for is a direct
+# statement of what the sender is looking for.
+_INTERP_LOOKUP_RE = re.compile(
+    r"\$\{\s*(env|sys|java|main|ctx|base64|date|lower|upper|sd|k8s|web|jvmrunargs|bundle)\s*:\s*([^:${}]{0,80})",
+    re.IGNORECASE,
+)
+# Struts/OGNL (`%{...}`) and Spring SpEL (`#{...}`) reach the same place
+# by a different grammar. Matching the aggressive tokens rather than the
+# bare braces keeps ordinary `#{}`-using template traffic out.
+_INTERP_OGNL_RE = re.compile(
+    r"[%#]\{[^}]{0,200}?(?:@java\.|#_memberAccess|#context|getRuntime|ProcessBuilder|#cmd|new\s+java)",
+    re.IGNORECASE,
+)
+_INTERP_SPEL_RE = re.compile(r"\$\{\s*T\s*\(", re.IGNORECASE)
+# The bare shape, kept last and lowest-confidence: a `${...}` that none
+# of the above claimed. Template syntax leaks into real traffic often
+# enough that this is a weak signal on its own, but it is the one that
+# catches a grammar nobody has written a pattern for yet.
+_INTERP_BARE_RE = re.compile(r"\$\{[^}]{1,200}\}")
+
+# Runs against every header of every request, so it is the one pattern
+# whose cost is paid on ordinary traffic. Only the three opening
+# sequences that can begin an expression; a bare `{` is not one, or
+# every JSON body would pay for the full pass.
+_INTERP_PREFILTER_RE = re.compile(r"[$%#]\{")
+
+# Which headers get looked at is deliberately *not* configured here:
+# `scan_headers()` reads them all. An allow-list would have to be
+# guessed, and the guess is what fails — these sweeps spray whatever
+# header list their tool ships with, and the interesting ones are by
+# definition the ones nobody thought to enumerate.
+
 # --- Inbound webhook receiver ----------------------------------------------
 # Tooling that posts its results to a collector sometimes posts them
 # here instead — same request, wrong host. Those arrive as POSTs to a
@@ -4818,6 +4907,40 @@ def header_subset(headers: object) -> dict[str, str]:
         value = headers.get(name)
         if value:
             values[name] = value[:HEADER_VALUE_LOG_LIMIT]
+    return values
+
+
+# How many headers the shape-matched observers look at, and how much of
+# each. A sender controls both the count and the length, so both are
+# bounded; the limits are far above what any real client sends.
+SCAN_HEADER_MAX_COUNT = 64
+SCAN_HEADER_VALUE_LIMIT = 4096
+
+
+def scan_headers(headers: object) -> dict[str, str]:
+    """Every header on the request, bounded, for the observers to match
+    against.
+
+    Deliberately *not* `header_subset()`. That list is the set of headers
+    whose values get written to the log, and it is short on purpose. The
+    observers need the opposite property: a credential or a payload
+    arrives in whichever header the sender chose, and the ones they
+    choose — `User-Agent`, `Referer`, `Authorization` — are exactly the
+    ones not worth logging verbatim. Scanning only the logged subset made
+    both observers blind to their own documented cases: a bearer token is
+    not in `LOG_HEADER_NAMES`, and neither is `User-Agent`.
+
+    Nothing here is logged as-is. Callers report the header *name* a
+    finding came from and the extracted identifier, never the value.
+    """
+    values: dict[str, str] = {}
+    try:
+        items = list(headers.items())
+    except AttributeError:
+        return values
+    for name, value in items[:SCAN_HEADER_MAX_COUNT]:
+        if isinstance(value, str) and value:
+            values[str(name)] = value[:SCAN_HEADER_VALUE_LIMIT]
     return values
 
 
@@ -15536,6 +15659,176 @@ def canary_echo_scan(
         "canaryEchoIn": sorted({found[k] for k in reported}),
         "canaryEchoCount": len(found),
     }
+
+
+def _interp_deobfuscate(text: str) -> str:
+    """Collapse the per-character spellings an interpolation payload uses
+    to keep a literal `jndi` off the wire.
+
+    `${::-j}` and `${lower:j}` both resolve to `j` at evaluation time, so
+    a payload spelled entirely out of them is byte-different from every
+    plain one while behaving identically. Collapsing them is what makes
+    one pattern match both, instead of needing a pattern per spelling.
+
+    Bounded to `_INTERP_DEOBF_MAX_PASSES`, and stops as soon as a pass
+    changes nothing. The rewrites shrink the string, so the bound is a
+    guard against a crafted input rather than a functional limit.
+    """
+    for _ in range(_INTERP_DEOBF_MAX_PASSES):
+        collapsed = _INTERP_DEOBF_MARKER_RE.sub(lambda m: m.group(1), text)
+        collapsed = _INTERP_DEOBF_CASE_RE.sub(
+            lambda m: m.group(2).lower() if m.group(1).lower() == "lower" else m.group(2).upper(),
+            collapsed,
+        )
+        if collapsed == text:
+            break
+        text = collapsed
+    return text
+
+
+def _interp_callback_host(raw: str) -> str:
+    """Recover the collector's hostname from the host position of a JNDI
+    lookup.
+
+    Two things get in the way. The URL tail (`/a`, `?x`, the closing
+    brace) is not part of the name, and a nested `${env:...}` that
+    supplies a label at evaluation time is not part of it either — that
+    one is the exfiltration channel, and filing it as a hostname would
+    put a variable name in the field used to attribute a sender.
+    Removing it leaves the static labels, which are the sender's own
+    domain and the thing worth counting.
+    """
+    for _ in range(_INTERP_NESTED_MAX_PASSES):
+        stripped = _INTERP_NESTED_RE.sub("", raw)
+        if stripped == raw:
+            break
+        raw = stripped
+    # An unbalanced remainder means a nested lookup ran past the bound
+    # above; everything from there on is unresolved, so drop it.
+    cut = raw.find("${")
+    if cut != -1:
+        raw = raw[:cut]
+    for stop in ("}", "/", "?", "#"):
+        index = raw.find(stop)
+        if index != -1:
+            raw = raw[:index]
+    return raw.strip().strip("'\"").strip(".").lower()[:160]
+
+
+def interpolation_probe_scan(
+    raw_target: str,
+    headers: dict[str, object] | None,
+    body: bytes,
+) -> dict[str, object]:
+    """Look for an expression this server was expected to evaluate, and
+    describe what was asked for. Returns `{}` when there is nothing.
+
+    Scans the request target (raw and percent-decoded), every header, and
+    the head of the body. The caller merges the result into the log
+    context *before* dispatch, so the finding rides on whichever trap
+    answers — a JNDI payload sent to a path some trap owns is exactly as
+    interesting as one sent to `/`, and in practice it is usually both at
+    once, because these sweeps spray every path they know.
+
+    The response is not consulted anywhere. See the module comment.
+    """
+    if not INTERPOLATION_PROBE_ENABLED:
+        return {}
+
+    families: set[str] = set()
+    where: set[str] = set()
+    callbacks: dict[str, None] = {}
+    lookup_keys: dict[str, None] = {}
+    samples: list[str] = []
+    hits = 0
+
+    def scan(text: str, location: str) -> None:
+        nonlocal hits
+        # Cheap reject first. This runs on every header of every request,
+        # so the common case has to cost one substring scan and stop —
+        # an opening brace alone is not enough, because ordinary JSON
+        # bodies have plenty of those.
+        if not text or not _INTERP_PREFILTER_RE.search(text):
+            return
+        plain = _interp_deobfuscate(text)
+        # An obfuscated payload is itself the signal: a client spelling
+        # `jndi` one character at a time is not sending a template by
+        # accident.
+        obfuscated = plain != text
+        local: set[str] = set()
+
+        for match in _INTERP_JNDI_RE.finditer(plain):
+            local.add("jndi")
+            scheme = match.group(1).lower()
+            host = _interp_callback_host(match.group(2))
+            callbacks.setdefault(f"{scheme}://{host}"[:200], None)
+
+        for match in _INTERP_LOOKUP_RE.finditer(plain):
+            prefix = match.group(1).lower()
+            name = match.group(2).strip()
+            if prefix in {"env", "sys"}:
+                local.add("credential-lookup" if prefix == "env" else "log4j-lookup")
+                if name:
+                    lookup_keys.setdefault(f"{prefix}:{name}"[:80], None)
+            else:
+                local.add("log4j-lookup")
+
+        if _INTERP_OGNL_RE.search(plain):
+            local.add("ognl")
+        if _INTERP_SPEL_RE.search(plain):
+            local.add("spel")
+        if not local and _INTERP_BARE_RE.search(plain):
+            local.add("bare-expression")
+
+        if not local:
+            return
+        if obfuscated:
+            local.add("obfuscated")
+        families.update(local)
+        where.add(location)
+        hits += 1
+        if len(samples) < INTERPOLATION_PROBE_MAX_REPORTED:
+            sample = text.strip()[:INTERPOLATION_PROBE_SAMPLE_LIMIT]
+            if sample not in samples:
+                samples.append(sample)
+
+    if raw_target:
+        scan(raw_target, "target")
+        try:
+            decoded = unquote(raw_target)
+        except (UnicodeDecodeError, ValueError):
+            decoded = ""
+        if decoded and decoded != raw_target:
+            scan(decoded, "target")
+
+    if headers:
+        for name, value in headers.items():
+            if isinstance(value, str) and value:
+                scan(value, f"header:{str(name).lower()}")
+
+    if body:
+        scan(body[:INTERPOLATION_PROBE_BODY_SCAN_LIMIT].decode("utf-8", "replace"), "body")
+
+    if not families:
+        return {}
+
+    cap = INTERPOLATION_PROBE_MAX_REPORTED
+    fields: dict[str, object] = {
+        "interpolationFamilies": sorted(families),
+        "interpolationIn": sorted(where),
+        "interpolationCount": hits,
+        "interpolationSamples": samples,
+    }
+    if callbacks:
+        # The host a lookup points at is the sender's infrastructure.
+        # Reported before the count is capped so the total stays true.
+        fields["interpolationCallbacks"] = list(callbacks)[:cap]
+        fields["interpolationCallbackCount"] = len(callbacks)
+    if lookup_keys:
+        # Which variables the sender wants read out. `env:` names are a
+        # direct statement of what they are collecting.
+        fields["interpolationLookupKeys"] = list(lookup_keys)[:cap]
+    return fields
 
 
 # --- Render functions: (tracebit_response) -> bytes ---
@@ -38897,14 +39190,34 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # not-handled ones. Purely additive to the log: no branch below
     # reads these fields, so a request carrying a credential is answered
     # exactly as it would have been without one.
+    # Built once and shared by both observers below. Every header, not
+    # the logged subset — see `scan_headers()` for why the two differ.
+    scanned_headers = (
+        scan_headers(request.headers)
+        if (CANARY_ECHO_ENABLED or INTERPOLATION_PROBE_ENABLED)
+        else None
+    )
+
     if CANARY_ECHO_ENABLED:
         echo = canary_echo_scan(
             str(log_context["rawTarget"]),
-            log_context.get("headers") if isinstance(log_context.get("headers"), dict) else None,
+            scanned_headers,
             request_body,
         )
         if echo:
             log_context.update(echo)
+
+    # Same contract as the echo observer: stamped before dispatch, read
+    # by no branch below, so a request carrying a payload is answered
+    # byte-for-byte as it would have been without one.
+    if INTERPOLATION_PROBE_ENABLED:
+        interp = interpolation_probe_scan(
+            str(log_context["rawTarget"]),
+            scanned_headers,
+            request_body,
+        )
+        if interp:
+            log_context.update(interp)
 
     path = str(log_context["path"])
     query_string = str(log_context["query"])

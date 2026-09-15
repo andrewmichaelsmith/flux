@@ -169,6 +169,19 @@ def test_scan_finds_a_key_in_a_header():
     assert out["canaryEchoIn"] == ["header:authorization"]
 
 
+def test_scan_surface_is_every_header_not_the_logged_subset():
+    """Regression. The scan used to be handed `header_subset()` — the
+    list of headers whose values get *written to the log* — which does
+    not contain `Authorization`. A bearer token, the case this feature's
+    own documentation leads with, therefore never matched in production
+    while the unit test above passed, because that test hands the scan a
+    dict directly and so never exercised the real surface."""
+    assert "Authorization" not in tbenv.LOG_HEADER_NAMES
+    assert "Authorization" in tbenv.scan_headers(
+        {"Authorization": f"Bearer {FOREIGN_KEY}", "Host": "example"}
+    )
+
+
 def test_scan_finds_a_key_in_the_body():
     out = tbenv.canary_echo_scan("/", {}, b'{"key":"%s"}' % FOREIGN_KEY.encode())
     assert out["canaryEchoIn"] == ["body"]
@@ -261,6 +274,33 @@ async def test_echo_is_stamped_on_an_unhandled_path(flux_client):
     assert entry["result"] == "not-handled"
     assert entry["canaryEchoMatch"] == "own"
     assert entry["canaryEchoKeyIds"] == [OWN_KEY]
+
+
+async def test_echo_is_stamped_for_a_key_sent_as_a_bearer_token(flux_client):
+    """End-to-end, through the real request path — which is where the
+    `header_subset()` surface bug lived. A credential "sent as a bearer
+    token" is the leading example in this feature's documentation, and
+    it silently never matched, because the scan was handed the logged
+    header subset and `Authorization` is not in it. Only a test that
+    goes through an actual request can catch that class of bug; the
+    unit tests hand the scan a dict and always passed."""
+    await flux_client.get(
+        "/no-such-path", headers={"Authorization": f"Bearer {FOREIGN_KEY}"}
+    )
+    entry = _last(flux_client.log_path)
+    assert entry["canaryEchoKeyIds"] == [FOREIGN_KEY]
+    assert entry["canaryEchoIn"] == ["header:authorization"]
+
+
+async def test_echo_is_stamped_for_a_key_in_any_unlogged_header(flux_client):
+    """`User-Agent`, `Referer` and `Cookie` are likewise absent from the
+    logged subset, and are all places a harvest gets pasted."""
+    await flux_client.get(
+        "/no-such-path",
+        headers={"User-Agent": f"python-requests/2.31 {FOREIGN_KEY}"},
+    )
+    entry = _last(flux_client.log_path)
+    assert entry["canaryEchoIn"] == ["header:user-agent"]
 
 
 async def test_echo_is_stamped_on_a_path_another_trap_owns(flux_client):

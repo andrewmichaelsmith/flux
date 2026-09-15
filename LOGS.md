@@ -29,10 +29,17 @@ Every line includes these — they're built in `_handle()` before dispatch.
 | `debugbarOp` | string | Laravel Debugbar only: which step of the stored-request protocol was asked for — `index`, `open-list`, `open-get`, `asset-js`, `asset-css`, `clockwork`. |
 | `debugbarStoredId` | string | The stored-request id the client named on `op=get`; `""` on every other step. |
 | `debugbarIdKnown` | bool | True when `debugbarStoredId` is one this host advertises. An `open-list` followed by an `open-get` with `debugbarIdKnown=true` from the same source is a client that parsed our listing rather than replaying a path — see [docs/laravel-debugbar.md](./docs/laravel-debugbar.md). |
-| `canaryEchoKeyIds` | list | Present only when the request carried an AWS access key id. The ids found — in the request target, the logged header subset, or the head of the body — most interesting first, capped by `HONEYPOT_CANARY_ECHO_MAX_REPORTED`. Stamped before dispatch, so these four fields can appear on **any** trap's line, not just `not-handled`. The matching secret is never logged. See [docs/canary-echo.md](./docs/canary-echo.md). |
+| `canaryEchoKeyIds` | list | Present only when the request carried an AWS access key id. The ids found — in the request target, **any** request header, or the head of the body — most interesting first, capped by `HONEYPOT_CANARY_ECHO_MAX_REPORTED`. Stamped before dispatch, so these four fields can appear on **any** trap's line, not just `not-handled`. The matching secret is never logged. See [docs/canary-echo.md](./docs/canary-echo.md). |
 | `canaryEchoMatch` | string | `own` (this process served that exact key), `account` (same issuing account, served by a sibling host), or `foreign` (somebody else's). The closest relationship any key on the request has. |
 | `canaryEchoIn` | list | Where the reported ids were found: `target`, `body`, `header:<lowercased name>`. |
 | `canaryEchoCount` | int | Distinct key ids found, before the reporting cap — so a truncated `canaryEchoKeyIds` still has a true total beside it. |
+| `interpolationFamilies` | list | Present only when the request carried an expression the server was expected to evaluate. Which grammars were recognised: `jndi`, `credential-lookup` (an `${env:…}` read), `log4j-lookup`, `ognl`, `spel`, `bare-expression`, plus `obfuscated` when the payload was spelled character-by-character to keep the literal off the wire. Stamped before dispatch, so these fields can appear on **any** trap's line, not just `not-handled`. See [docs/interpolation-probe.md](./docs/interpolation-probe.md). |
+| `interpolationIn` | list | Where payloads were found: `target`, `body`, `header:<lowercased name>`. Header names are reported; header values are not. |
+| `interpolationCallbacks` | list | The `scheme://host` each lookup points at, after de-obfuscation and after stripping any nested lookup from the host position. This is the sender's own infrastructure. Capped by `HONEYPOT_INTERPOLATION_PROBE_MAX_REPORTED`. |
+| `interpolationCallbackCount` | int | Distinct callbacks found, before the reporting cap. |
+| `interpolationLookupKeys` | list | The `env:<NAME>` / `sys:<NAME>` variables the payload asks to have resolved. A name nested inside a callback host leaves as a DNS label, so this is the exfiltration request itself — and a direct statement of what the sender is collecting. |
+| `interpolationCount` | int | How many places on the request carried a payload. A sweep spraying one payload across ten headers reports 10. |
+| `interpolationSamples` | list | Short verbatim excerpts of the payloads, deduplicated and truncated to `HONEYPOT_INTERPOLATION_PROBE_SAMPLE_LIMIT`, for reading the shape by eye. |
 
 ## Result tags
 

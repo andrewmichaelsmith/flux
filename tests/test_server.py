@@ -644,6 +644,14 @@ def test_all_trap_families_default_on():
         "the only thing turning it off buys is not knowing when a credential "
         "this server handed out comes back to it."
     )
+    assert tbenv.INTERPOLATION_PROBE_ENABLED, (
+        "HONEYPOT_INTERPOLATION_PROBE_ENABLED should default to True — it "
+        "serves no route, issues nothing, spends no upstream quota and never "
+        "alters a response, so turning it off buys nothing except not knowing "
+        "that a sender asked this server to evaluate an expression. Those "
+        "requests carry no path worth matching, so without the observer they "
+        "are indistinguishable from any other 404."
+    )
     assert tbenv.WEBHOOK_RECEIVER_ENABLED, (
         "HONEYPOT_WEBHOOK_RECEIVER_ENABLED should default to True — the "
         "acknowledgement contains no canary, so it needs no upstream key, "

@@ -511,6 +511,29 @@ learned at runtime from credentials actually served; a configured or
 committed prefix would let anyone test a credential for canary-ness
 offline against this public repository.
 
+The scan covers **every** request header, not the subset whose values
+`LOG_HEADER_NAMES` writes to the log. Those are different questions, and
+answering them with one list meant a key sent as a bearer token — the
+leading example in the feature's own documentation — never matched.
+
+## Interpolation-payload observer
+
+Notices an expression the server was expected to evaluate — Log4Shell
+`${jndi:…}`, Log4j `${env:…}` lookups, OGNL, SpEL — in the target, any
+header, or the body head. Serves no route and never alters a response;
+see [`docs/interpolation-probe.md`](./docs/interpolation-probe.md).
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_INTERPOLATION_PROBE_ENABLED` | on | Master switch. Issues nothing, spends no upstream quota, and changes no byte of any response — it only adds `interpolation*` log fields when a payload is present. |
+| `HONEYPOT_INTERPOLATION_PROBE_BODY_SCAN_LIMIT` | `8192` | Bytes of request body scanned. Bounds the regex, not the read. |
+| `HONEYPOT_INTERPOLATION_PROBE_MAX_REPORTED` | `8` | Distinct callbacks, lookup keys and samples named on one log line, so a sender pasting a whole payload dictionary into one header cannot produce an unbounded row. `interpolationCallbackCount` still reports the true total. |
+| `HONEYPOT_INTERPOLATION_PROBE_SAMPLE_LIMIT` | `180` | Characters of each payload kept verbatim in `interpolationSamples` — enough to read the shape, short enough that it cannot be used to pad the log. |
+
+Header count, header value length and de-obfuscation passes are bounded
+in the source rather than by env var; all three are inputs a sender
+controls, and the ceilings sit far above anything a real client sends.
+
 ## Inbound webhook receiver
 
 Acknowledges webhook deliveries instead of 404ing them, keeping the
