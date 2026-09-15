@@ -433,10 +433,16 @@ async def test_integration_env_serves_canary_payload(live_server, monkeypatch):
 async def test_integration_env_hides_tracebit_failure(live_server, monkeypatch):
     """Upstream issuance failures must be logged but must not be visible to
     the client — the response is the generic 404, not a distinctive 502."""
-    async def boom(*_a, **_kw):
-        raise aiohttp.ClientConnectionError("connection refused")
+    # Patched at `_get_or_issue_canary`, the seam every canary surface now
+    # shares. `/.env` used to call the issuing API directly, so this test
+    # used to have to fail it one layer lower. Failure at the shared seam
+    # surfaces as `None` plus the exception in the caller's `error_sink`.
+    async def boom(*_a, error_sink=None, **_kw):
+        if error_sink is not None:
+            error_sink["exc"] = aiohttp.ClientConnectionError("connection refused")
+        return None
 
-    monkeypatch.setattr(tbenv, "issue_credentials", boom)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", boom)
     base, log_path = live_server
     async with aiohttp.ClientSession() as session:
         async with session.get(
@@ -453,16 +459,20 @@ async def test_integration_env_hides_tracebit_http_error(live_server, monkeypatc
     from yarl import URL
     from multidict import CIMultiDict, CIMultiDictProxy
 
-    async def upstream_500(*_a, **_kw):
+    async def upstream_500(*_a, error_sink=None, **_kw):
         info = aiohttp.RequestInfo(
             url=URL("http://tracebit.test"),
             method="POST",
             headers=CIMultiDictProxy(CIMultiDict()),
             real_url=URL("http://tracebit.test"),
         )
-        raise aiohttp.ClientResponseError(info, (), status=500, message="boom")
+        if error_sink is not None:
+            error_sink["exc"] = aiohttp.ClientResponseError(
+                info, (), status=500, message="boom",
+            )
+        return None
 
-    monkeypatch.setattr(tbenv, "issue_credentials", upstream_500)
+    monkeypatch.setattr(tbenv, "_get_or_issue_canary", upstream_500)
     base, log_path = live_server
     async with aiohttp.ClientSession() as session:
         async with session.get(

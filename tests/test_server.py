@@ -17122,3 +17122,75 @@ def test_append_log_drops_unserialisable_payload(tmp_path, monkeypatch):
     monkeypatch.setattr(tbenv, "LOG_MAX_BYTES", 0)
     tbenv.append_log({"result": "not-handled", "bad": object()})
     assert not log_path.exists() or log_path.read_text() == ""
+
+
+@pytest.mark.asyncio
+async def test_env_handler_shares_the_canary_cache(monkeypatch, aiohttp_client, tmp_path):
+    """A read burst on `/.env` must cost one upstream issuance, not N.
+
+    `/.env` is reachable from the high-fan-out read primitives — the
+    `php://filter` wrapper and the `/@fs/` resolver both resolve to this
+    handler — so one client can drive hundreds of reads through it in a
+    couple of minutes. `_send_env()` predates the shared canary cache and
+    issued directly, so those bursts raced into the upstream API, which
+    rate-limited them; the failures then surfaced to the client as plain
+    404s, concentrated on the clients reading the most.
+    """
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_CANARY_CACHE", {})
+    monkeypatch.setattr(tbenv, "_CANARY_INFLIGHT", {})
+    monkeypatch.setattr(tbenv, "_CANARY_LOCK", None)
+
+    issue_calls = 0
+
+    async def _issue(*a, **kw):
+        nonlocal issue_calls
+        issue_calls += 1
+        await asyncio.sleep(0.01)
+        return {"aws": {"awsAccessKeyId": f"AKIAFAKE{issue_calls:04d}",
+                        "awsSecretAccessKey": "s" * 40}}
+
+    monkeypatch.setattr(tbenv, "issue_credentials", _issue)
+    client = await aiohttp_client(tbenv.create_app())
+
+    responses = await asyncio.gather(*[
+        client.get("/.env", headers={"X-Forwarded-For": "198.51.100.7"})
+        for _ in range(25)
+    ])
+    assert all(r.status == 200 for r in responses), (
+        "a burst must not produce failures — the rate-correlated 404 is both "
+        "a lost canary and a tell, since no real server answers the same "
+        "file with 200 or 404 depending on how fast it is asked"
+    )
+    assert issue_calls == 1, f"expected 1 upstream issuance for the burst, got {issue_calls}"
+
+    bodies = [await r.read() for r in responses]
+    assert all(b == bodies[0] for b in bodies), "one client must see one consistent secret"
+
+
+@pytest.mark.asyncio
+async def test_env_handler_separates_clients(monkeypatch, aiohttp_client, tmp_path):
+    """The cache is per-IP: two clients must not be served the same
+    credential, or a replay could not be attributed to who took it."""
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_CANARY_CACHE", {})
+    monkeypatch.setattr(tbenv, "_CANARY_INFLIGHT", {})
+    monkeypatch.setattr(tbenv, "_CANARY_LOCK", None)
+
+    issue_calls = 0
+
+    async def _issue(*a, **kw):
+        nonlocal issue_calls
+        issue_calls += 1
+        return {"aws": {"awsAccessKeyId": f"AKIAFAKE{issue_calls:04d}",
+                        "awsSecretAccessKey": "s" * 40}}
+
+    monkeypatch.setattr(tbenv, "issue_credentials", _issue)
+    client = await aiohttp_client(tbenv.create_app())
+
+    a = await (await client.get("/.env", headers={"X-Forwarded-For": "198.51.100.8"})).read()
+    b = await (await client.get("/.env", headers={"X-Forwarded-For": "198.51.100.9"})).read()
+    assert a != b
+    assert issue_calls == 2

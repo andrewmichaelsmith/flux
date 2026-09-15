@@ -15479,6 +15479,7 @@ async def _get_or_issue_canary(
     user_agent: str,
     path: str,
     proto: str,
+    error_sink: "dict[str, object] | None" = None,
 ) -> dict[str, object] | None:
     """Per-(IP, types) TTL-cached canary issuance.
 
@@ -15488,6 +15489,12 @@ async def _get_or_issue_canary(
     Future via `_CANARY_INFLIGHT` — without this single-flight gate, a burst
     of N parallel hits on the same key all bypass the empty cache and all hit
     the upstream API, which then rate-limits and fails every trap response.
+
+    `None` means no canary — the upstream call failed, or the issuance this
+    request was waiting on did. Callers that need to say *how* it failed can
+    pass an `error_sink` dict; the request that actually made the call stores
+    the exception under `"exc"`. Waiters leave it empty, because they made no
+    call and have nothing first-hand to report.
     """
     now = time.monotonic()
     cache_key = (client_ip or f"_anon-{request_id}", types)
@@ -15514,7 +15521,9 @@ async def _get_or_issue_canary(
     try:
         try:
             resp = await issue_credentials(request_id, client_ip, host, user_agent, path, proto, types=types)
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            if error_sink is not None:
+                error_sink["exc"] = exc
             async with lock:
                 _CANARY_INFLIGHT.pop(cache_key, None)
             if not waiter.done():
@@ -38952,22 +38961,43 @@ async def _send_env(
     of this body.
     """
     log_context = {**log_context, **(extra_log or {})}
-    try:
-        tracebit_response = await issue_credentials(request_id, client_ip, host, user_agent, path, proto)
-    except aiohttp.ClientResponseError as exc:
-        append_log({
-            **log_context,
-            "status": CREDENTIAL_FAILURE_STATUS,
-            "result": f"{result_prefix}tracebit-http-error",
-            "tracebitStatus": exc.status,
-            "error": (exc.message or "")[:400],
-        })
-        return _credential_failure_response()
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-        append_log({
-            **log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": f"{result_prefix}tracebit-error",
-            "error": _exc_detail(exc)[:400],
-        })
+    # Routed through the shared per-IP cache rather than calling the issuing
+    # API directly, which is what this handler used to do. `/.env` is not
+    # only reached as `/.env`: the read primitives (`php://filter`, `/@fs/`)
+    # resolve to it too, and those are high-fan-out surfaces where a single
+    # client sends hundreds of reads in a couple of minutes. Issuing once per
+    # request meant such a burst raced into the upstream API, which rate-
+    # limited it, and roughly one in seven reads came back as a failure the
+    # client saw as a plain 404 — worst of all on the clients that read the
+    # most, which are the ones the canary is for. Every other canary surface
+    # already shares this cache; this handler predates it and was missed.
+    issue_error: dict[str, object] = {}
+    tracebit_response = await _get_or_issue_canary(
+        tuple(CANARY_TYPES), client_ip, request_id, host, user_agent, path, proto,
+        error_sink=issue_error,
+    )
+    if tracebit_response is None:
+        exc = issue_error.get("exc")
+        if isinstance(exc, aiohttp.ClientResponseError):
+            append_log({
+                **log_context,
+                "status": CREDENTIAL_FAILURE_STATUS,
+                "result": f"{result_prefix}tracebit-http-error",
+                "tracebitStatus": exc.status,
+                "error": (exc.message or "")[:400],
+            })
+        else:
+            append_log({
+                **log_context, "status": CREDENTIAL_FAILURE_STATUS,
+                "result": f"{result_prefix}tracebit-error",
+                # A request that waited on someone else's issuance has no
+                # exception of its own; say so rather than logging an empty
+                # `error` that reads like a timeout with no message.
+                "error": (
+                    _exc_detail(exc) if isinstance(exc, BaseException)
+                    else "coalesced issuance returned no credential"
+                )[:400],
+            })
         return _credential_failure_response()
 
     payload = format_env_payload(tracebit_response).encode("utf-8")
