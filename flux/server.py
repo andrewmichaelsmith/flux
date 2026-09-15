@@ -1460,6 +1460,104 @@ MCP_SERVER_BODY_DECODE_LIMIT = max(
 # what it fetched has a concrete next request, and whether it makes that
 # request is the measurement.
 AGENT_CARD_ENABLED = _env_bool("HONEYPOT_AGENT_CARD_ENABLED")
+
+# --- Fake Tomcat Manager ---------------------------------------------------
+# `/manager/html` is one of the most-asked-for addresses on the web and it
+# was answering 404, which ends the exchange at the cheapest possible
+# moment. A real Tomcat with the Manager app deployed answers an
+# unauthenticated GET with `401` and a Basic challenge, and that single
+# byte of difference is what turns a path probe into a credential attempt:
+# the scanner now has something to brute, and what it brutes is the
+# dictionary we want.
+#
+# The same sweep that asks for `/manager/html` asks for the JBoss consoles,
+# the cluster REST APIs and the monitoring UIs beside it, so those are
+# matched here too — one operator-console vocabulary rather than one
+# product.
+#
+# The chain worth reaching is the deploy step. Every Tomcat Manager brute
+# exists to upload a WAR, so accepting the credential and then accepting
+# the upload is what captures the payload instead of the attempt.
+TOMCAT_MANAGER_ENABLED = _env_bool("HONEYPOT_TOMCAT_MANAGER_ENABLED")
+# Bytes of an uploaded application kept for hashing. The body is read and
+# capped upstream; this bounds what is hashed and previewed.
+TOMCAT_MANAGER_UPLOAD_SCAN_LIMIT = max(
+    int((os.environ.get("HONEYPOT_TOMCAT_MANAGER_UPLOAD_SCAN_LIMIT") or "65536").strip() or "65536"), 1024
+)
+TOMCAT_MANAGER_REALM = (
+    os.environ.get("HONEYPOT_TOMCAT_MANAGER_REALM") or "Tomcat Manager Application"
+)
+# Version pinned inside the window where these consoles are commonly left
+# exposed, and consistent across every surface the trap serves: a client
+# that reads `serverinfo` and then the HTML must not see two Tomcats.
+TOMCAT_MANAGER_VERSION = (
+    os.environ.get("HONEYPOT_TOMCAT_MANAGER_VERSION") or "9.0.65.0"
+)
+
+# The Manager application proper — HTML UI, the text API tooling drives,
+# and the status pages.
+_TOMCAT_MANAGER_UI_PATHS: frozenset[str] = frozenset({
+    "/manager", "/manager/html", "/manager/status", "/manager/status/all",
+    "/host-manager", "/host-manager/html", "/manager/jmxproxy",
+})
+_TOMCAT_MANAGER_TEXT_PATHS: frozenset[str] = frozenset({
+    "/manager/text/list", "/manager/text/serverinfo", "/manager/text/sessions",
+    "/manager/text/threaddump", "/manager/text/vminfo",
+    "/host-manager/text/list",
+})
+# Where an application arrives. `text/deploy` is the PUT tooling uses;
+# `html/upload` is the multipart form the browser UI posts.
+_TOMCAT_MANAGER_DEPLOY_PATHS: frozenset[str] = frozenset({
+    "/manager/text/deploy", "/manager/text/undeploy", "/manager/text/reload",
+    "/manager/html/upload", "/manager/html/deploy", "/manager/html/undeploy",
+    "/manager/deploy", "/manager/upload",
+})
+# The neighbouring consoles the same dictionary walks. Matched so the
+# sweep meets one consistent server rather than a mix of 401s and 404s,
+# which is itself a fingerprint.
+_TOMCAT_MANAGER_CONSOLE_PATHS: frozenset[str] = frozenset({
+    "/jmx-console", "/web-console", "/admin-console",
+    "/invoker/jmxinvokerservlet",
+    # The HtmlAdaptor is the JBoss console's invoke surface — the step a
+    # client takes after the console itself answers, so it is listed even
+    # though the console index is what gets asked for first.
+    "/jmx-console/htmladaptor",
+})
+# Deliberately NOT claimed: bare `/status` and `/debug`. They are generic
+# enough that neighbours flux already answers better live under them, and
+# neither shows the demand the addresses above do.
+
+
+def tomcat_manager_kind(path: str) -> str:
+    """Which Tomcat Manager surface `path` names, or '' for none.
+
+    Kinds: 'ui', 'text', 'deploy', 'console'. Matching is
+    case-insensitive and tolerant of a trailing slash, because the
+    dictionaries spell these both ways and a server that answered only
+    one spelling would be separable from a real one.
+    """
+    if not TOMCAT_MANAGER_ENABLED:
+        return ""
+    p = path.lower().split("?", 1)[0]
+    if len(p) > 1 and p.endswith("/"):
+        p = p.rstrip("/")
+    if not p:
+        return ""
+    if p in _TOMCAT_MANAGER_DEPLOY_PATHS:
+        return "deploy"
+    if p in _TOMCAT_MANAGER_TEXT_PATHS:
+        return "text"
+    if p in _TOMCAT_MANAGER_UI_PATHS:
+        return "ui"
+    if p in _TOMCAT_MANAGER_CONSOLE_PATHS:
+        return "console"
+    return ""
+
+
+def is_tomcat_manager_path(path: str) -> bool:
+    return bool(tomcat_manager_kind(path))
+
+
 # A2A agent cards. `agent-card.json` is the current well-known name and
 # `agent.json` the earlier one; both are in circulation, and clients ask
 # for them in the same sweep along with the plural spelling.
@@ -5156,6 +5254,38 @@ def agent_card_kind(path: str) -> str:
 
 def is_agent_card_path(path: str) -> bool:
     return bool(agent_card_kind(path))
+
+
+def parse_basic_auth(header: str) -> "tuple[str, str] | None":
+    """Split an HTTP Basic `Authorization` header into (user, password).
+
+    Returns `None` when the header is absent, names a different scheme, or
+    does not decode — all of which are "no credential was presented" as far
+    as the caller is concerned, and all of which a real server answers with
+    the same challenge.
+
+    The password is returned so the caller can hash and measure it. No
+    caller stores it.
+    """
+    if not header:
+        return None
+    parts = header.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "basic":
+        return None
+    try:
+        # `binascii.Error` subclasses `ValueError`, so this covers both the
+        # malformed-base64 and wrong-padding cases.
+        raw = base64.b64decode(parts[1].strip(), validate=True)
+    except ValueError:
+        return None
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        decoded = raw.decode("latin-1", errors="replace")
+    if ":" not in decoded:
+        return None
+    user, password = decoded.split(":", 1)
+    return user, password
 
 
 def _file_upload_family(path: str) -> str:
@@ -29267,6 +29397,267 @@ _AGENT_CARD_RENDERERS: "dict[str, Callable[[str], bytes]]" = {
 }
 
 
+def _tomcat_401_body() -> bytes:
+    """Tomcat's own 401 page, which is what a client sees before it decides
+    whether this address is worth a credential."""
+    return (
+        "<!doctype html><html lang=\"en\"><head>"
+        "<title>401 Unauthorized</title>"
+        "<style type=\"text/css\">body {font-family:Tahoma,Arial,sans-serif;} "
+        "h1, h2, h3, b {color:white;background-color:#525D76;} "
+        "h1 {font-size:22px;} h2 {font-size:16px;} h3 {font-size:14px;} "
+        "p {font-size:12px;} a {color:black;} "
+        ".line {height:1px;background-color:#525D76;border:none;}</style>"
+        "</head><body><h1>HTTP Status 401 &ndash; Unauthorized</h1>"
+        "<hr class=\"line\" /><p><b>Type</b> Status Report</p>"
+        "<p><b>Message</b> Unauthorized</p>"
+        "<p><b>Description</b> The request has not been applied because it "
+        "lacks valid authentication credentials for the target resource.</p>"
+        f"<hr class=\"line\" /><h3>Apache Tomcat/{TOMCAT_MANAGER_VERSION}</h3>"
+        "</body></html>"
+    ).encode("utf-8")
+
+
+# The applications a small deployment actually has. Names are ordinary
+# and non-credential: what is worth faking here is a plausible place to
+# deploy into, not a secret.
+_TOMCAT_MANAGER_APPS: tuple[tuple[str, str, str, str], ...] = (
+    ("/", "None specified", "true", "0"),
+    ("/docs", "None specified", "true", "0"),
+    ("/examples", "None specified", "true", "0"),
+    ("/host-manager", "None specified", "true", "0"),
+    ("/manager", "None specified", "true", "1"),
+)
+
+
+def _tomcat_manager_html() -> bytes:
+    """The Manager UI application list.
+
+    The deploy form is the point of the page: it names the address an
+    upload goes to, so a client that parses this has a concrete next
+    request rather than having to know the API.
+    """
+    rows = "".join(
+        f"<tr><td><a href=\"{html.escape(ctx)}\">{html.escape(ctx)}</a></td>"
+        f"<td>{html.escape(ver)}</td><td>{html.escape(running)}</td>"
+        f"<td>{html.escape(sessions)}</td></tr>"
+        for ctx, ver, running, sessions in _TOMCAT_MANAGER_APPS
+    )
+    return (
+        "<!doctype html><html><head>"
+        "<title>/manager</title>"
+        "<style type=\"text/css\">body{font-family:Tahoma,Arial,sans-serif;}"
+        "table{width:100%;} td{font-size:12px;}</style></head><body>"
+        "<h1>Tomcat Web Application Manager</h1>"
+        "<table><tr><th>Path</th><th>Version</th><th>Running</th>"
+        "<th>Sessions</th></tr>"
+        f"{rows}</table>"
+        "<h2>Deploy</h2>"
+        "<p>WAR file to deploy</p>"
+        "<form method=\"post\" action=\"/manager/html/upload\" "
+        "enctype=\"multipart/form-data\">"
+        "<input type=\"file\" name=\"deployWar\" size=\"40\">"
+        "<input type=\"submit\" value=\"Deploy\">"
+        "</form>"
+        f"<hr><h3>Apache Tomcat/{TOMCAT_MANAGER_VERSION}</h3>"
+        "</body></html>"
+    ).encode("utf-8")
+
+
+def _tomcat_text_list() -> bytes:
+    lines = "\n".join(
+        f"{ctx}:running:{sessions}:{ctx.strip('/') or 'ROOT'}"
+        for ctx, _ver, _running, sessions in _TOMCAT_MANAGER_APPS
+    )
+    return (
+        "OK - Listed applications for virtual host [localhost]\n"
+        f"{lines}\n"
+    ).encode("utf-8")
+
+
+def _tomcat_text_serverinfo() -> bytes:
+    return (
+        "OK - Server info\n"
+        f"Tomcat Version: Apache Tomcat/{TOMCAT_MANAGER_VERSION}\n"
+        "OS Name: Linux\n"
+        "OS Version: 5.15.0-91-generic\n"
+        "OS Architecture: amd64\n"
+        "JVM Version: 11.0.21+9-post-Ubuntu-0ubuntu122.04\n"
+        "JVM Vendor: Ubuntu\n"
+    ).encode("utf-8")
+
+
+def _tomcat_jmxproxy_body(r: dict[str, object]) -> bytes:
+    """The JMX proxy's Runtime bean, environment included.
+
+    This is the one surface here that carries a credential, and it is the
+    natural place for one: a JVM's environment is exactly where a
+    deployment's cloud keys live, and reading it is why a client asks the
+    proxy for the Runtime bean rather than any other. The values are a
+    per-request canary, so what is read here is measurable if it is used.
+    """
+    aws = _aws(r)
+    key_id = str(aws.get("awsAccessKeyId", "") or "")
+    secret = str(aws.get("awsSecretAccessKey", "") or "")
+    return (
+        "OK - Attribute get 'java.lang:type=Runtime' - 'SystemProperties'\n"
+        "OK - Attribute get 'java.lang:type=Runtime' - 'Environment'\n"
+        "java.runtime.name = OpenJDK Runtime Environment\n"
+        f"java.version = 11.0.21\n"
+        "catalina.base = /opt/tomcat\n"
+        "catalina.home = /opt/tomcat\n"
+        "user.name = tomcat\n"
+        "AWS_DEFAULT_REGION = us-east-1\n"
+        f"AWS_ACCESS_KEY_ID = {key_id}\n"
+        f"AWS_SECRET_ACCESS_KEY = {secret}\n"
+        "SPRING_PROFILES_ACTIVE = production\n"
+    ).encode("utf-8")
+
+
+async def _handle_tomcat_manager(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    request_id: str,
+    request_body: bytes,
+) -> web.Response:
+    """Answer the operator-console vocabulary the way a real Tomcat does.
+
+    Unauthenticated, that is `401` plus a Basic challenge — which is the
+    whole point. A `404` tells a scanner there is nothing here and the
+    exchange ends; a `401` tells it there is something here worth a
+    password, and the passwords it then tries are the measurement.
+
+    Authenticated, the credential is recorded and the request is answered.
+    Accepting any credential is deliberate: a sink that can never succeed
+    records the dictionary and nothing about what a client does once it is
+    in, and what it does once it is in — upload an application — is the
+    behaviour worth capturing.
+    """
+    kind = tomcat_manager_kind(path)
+    method = request.method
+    lpath = path.lower().split("?", 1)[0].rstrip("/") or path.lower()
+
+    log_extra: dict[str, object] = {
+        "tomcatSurface": kind,
+        "tomcatPath": path[:256],
+        "tomcatMethod": method,
+    }
+
+    creds = parse_basic_auth(request.headers.get("Authorization", ""))
+    if creds is None:
+        append_log({
+            **log_context, "status": 401,
+            "result": f"tomcat-manager-{kind}-challenge", **log_extra,
+        })
+        return web.Response(
+            status=401, body=_tomcat_401_body(),
+            headers={
+                "WWW-Authenticate": f'Basic realm="{TOMCAT_MANAGER_REALM}"',
+                "Content-Type": "text/html;charset=utf-8",
+                "Server": f"Apache-Coyote/1.1",
+            },
+        )
+
+    username, password = creds
+    # The username is the interesting half and is short; the password is
+    # hashed so the same guess is groupable across sources without the
+    # value being stored. Length separates a dictionary run from a
+    # random-blob one.
+    log_extra.update({
+        "tomcatUsername": username[:64],
+        "tomcatPasswordSha256": hashlib.sha256(
+            password.encode("utf-8", errors="replace")
+        ).hexdigest(),
+        "tomcatPasswordLen": len(password),
+    })
+
+    # `PUT /manager/text/deploy` is how tooling deploys, and it never
+    # reaches here: the gate in `handle()` turns away every method outside
+    # GET/HEAD/POST before dispatch. That gate is a deliberate decision
+    # with its own rationale, so this trap does not reopen it — it answers
+    # the POST upload its own HTML advertises, and the PUT case is left as
+    # a measured argument for revisiting the gate rather than a silent
+    # widening of it. See docs/fake-tomcat-manager.md.
+    if kind == "deploy" or (method == "POST" and request_body):
+        captured = request_body[:TOMCAT_MANAGER_UPLOAD_SCAN_LIMIT]
+        log_extra.update({
+            "tomcatDeployBytes": len(request_body),
+            "tomcatDeploySha256": (
+                hashlib.sha256(captured).hexdigest() if captured else ""
+            ),
+            # A WAR is a zip; `PK` says an application really arrived
+            # rather than an empty probe of the deploy address.
+            "tomcatDeployIsArchive": captured[:2] == b"PK",
+            "tomcatDeployPath": (request.rel_url.query.get("path") or "")[:128],
+        })
+        append_log({
+            **log_context, "status": 200,
+            "result": "tomcat-manager-deploy", **log_extra,
+        })
+        context_path = request.rel_url.query.get("path") or "/app"
+        return web.Response(
+            status=200,
+            body=f"OK - Deployed application at context path [{context_path}]\n".encode("utf-8"),
+            headers={
+                "Content-Type": "text/plain;charset=utf-8",
+                "Server": "Apache-Coyote/1.1",
+            },
+        )
+
+    if kind == "text":
+        if lpath.endswith("/serverinfo"):
+            body, ctype = _tomcat_text_serverinfo(), "text/plain;charset=utf-8"
+        else:
+            body, ctype = _tomcat_text_list(), "text/plain;charset=utf-8"
+        append_log({
+            **log_context, "status": 200,
+            "result": "tomcat-manager-text", **log_extra,
+        })
+        return web.Response(
+            status=200, body=body,
+            headers={"Content-Type": ctype, "Server": "Apache-Coyote/1.1"},
+        )
+
+    if lpath.endswith("/jmxproxy"):
+        tracebit_response = await _get_or_issue_canary(
+            ("aws",), client_ip, request_id, host, user_agent, path, proto,
+        )
+        if tracebit_response is None:
+            append_log({
+                **log_context, "status": CREDENTIAL_FAILURE_STATUS,
+                "result": "tomcat-manager-jmxproxy-tracebit-error", **log_extra,
+            })
+            return _credential_failure_response()
+        append_log({
+            **log_context, "status": 200,
+            "result": "tomcat-manager-jmxproxy", **log_extra,
+        })
+        return web.Response(
+            status=200, body=_tomcat_jmxproxy_body(tracebit_response),
+            headers={
+                "Content-Type": "text/plain;charset=utf-8",
+                "Server": "Apache-Coyote/1.1",
+            },
+        )
+
+    append_log({
+        **log_context, "status": 200,
+        "result": f"tomcat-manager-{kind}", **log_extra,
+    })
+    return web.Response(
+        status=200, body=_tomcat_manager_html(),
+        headers={
+            "Content-Type": "text/html;charset=utf-8",
+            "Server": "Apache-Coyote/1.1",
+        },
+    )
+
+
 async def _handle_agent_card(
     request: web.Request,
     log_context: dict[str, object],
@@ -39308,6 +39699,18 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # JSON-RPC dispatch path. Not canary-gated — the cards carry no
     # credentials, so a keyless deployment still serves them and still
     # gets the chain into the endpoint, which does its own key check.
+    # Ahead of the agent-card block only because these addresses are
+    # unambiguous and exact-matched; neither can shadow the other.
+    # Gated on the issuing key as well as the switch, because the jmxproxy
+    # surface mints a canary — the rest of the trap needs no key, but a
+    # keyless deployment answering four of five surfaces and 404ing the
+    # fifth is the kind of inconsistency that gives a server away.
+    if API_KEY and is_tomcat_manager_path(path):
+        return await _handle_tomcat_manager(
+            request, log_context, path, client_ip, host, user_agent, proto,
+            request_id, request_body,
+        )
+
     if is_agent_card_path(path):
         return await _handle_agent_card(request, log_context, path)
 

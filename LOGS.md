@@ -33,6 +33,14 @@ Every line includes these — they're built in `_handle()` before dispatch.
 | `canaryEchoMatch` | string | `own` (this process served that exact key), `account` (same issuing account, served by a sibling host), or `foreign` (somebody else's). The closest relationship any key on the request has. |
 | `canaryEchoIn` | list | Where the reported ids were found: `target`, `body`, `header:<lowercased name>`. |
 | `canaryEchoCount` | int | Distinct key ids found, before the reporting cap — so a truncated `canaryEchoKeyIds` still has a true total beside it. |
+| `tomcatSurface` | string | Fake Tomcat Manager only: which surface was asked for — `ui`, `text`, `deploy` or `console`. See [docs/fake-tomcat-manager.md](./docs/fake-tomcat-manager.md). |
+| `tomcatPath` / `tomcatMethod` | string | The address and verb, as asked for. |
+| `tomcatUsername` | string | Present only on an authenticated request. The username half of the Basic credential. |
+| `tomcatPasswordSha256` | string | sha256 of the password. The value itself is never logged; the hash is what groups one dictionary entry across many senders. |
+| `tomcatPasswordLen` | int | Password length — separates a dictionary run from a random-blob one without storing the value. |
+| `tomcatDeployBytes` / `tomcatDeploySha256` | int / string | Size and hash of an uploaded application. |
+| `tomcatDeployIsArchive` | bool | True when the upload starts with a zip header, i.e. an application really arrived rather than a client touching the deploy address. |
+| `tomcatDeployPath` | string | The context path the client asked to deploy at. |
 | `interpolationFamilies` | list | Present only when the request carried an expression the server was expected to evaluate. Which grammars were recognised: `jndi`, `credential-lookup` (an `${env:…}` read), `log4j-lookup`, `ognl`, `spel`, `bare-expression`, plus `obfuscated` when the payload was spelled character-by-character to keep the literal off the wire. Stamped before dispatch, so these fields can appear on **any** trap's line, not just `not-handled`. See [docs/interpolation-probe.md](./docs/interpolation-probe.md). |
 | `interpolationIn` | list | Where payloads were found: `target`, `body`, `header:<lowercased name>`. Header names are reported; header values are not. |
 | `interpolationCallbacks` | list | The `scheme://host` each lookup points at, after de-obfuscation and after stripping any nested lookup from the host position. This is the sender's own infrastructure. Capped by `HONEYPOT_INTERPOLATION_PROBE_MAX_REPORTED`. |

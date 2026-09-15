@@ -516,6 +516,19 @@ The scan covers **every** request header, not the subset whose values
 answering them with one list meant a key sent as a bearer token — the
 leading example in the feature's own documentation — never matched.
 
+## Fake Tomcat Manager
+
+Answers the Tomcat Manager / Host Manager / JBoss console vocabulary with
+a Basic challenge instead of a 404, accepts any credential, and captures
+what gets deployed. See [`docs/fake-tomcat-manager.md`](./docs/fake-tomcat-manager.md).
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_TOMCAT_MANAGER_ENABLED` | on | Master switch. Only the `jmxproxy` surface spends a canary and it goes through the per-IP cache, so the challenge and credential-capture steps cost nothing upstream. The whole trap is additionally gated on the issuing key, so a keyless deployment 404s every surface rather than answering some and not others. |
+| `HONEYPOT_TOMCAT_MANAGER_REALM` | `Tomcat Manager Application` | Basic realm in the `WWW-Authenticate` challenge. Tomcat's stock value; change it only to match a specific deployment being imitated. |
+| `HONEYPOT_TOMCAT_MANAGER_VERSION` | `9.0.65.0` | Version reported by the HTML footer, the 401 page and `text/serverinfo` alike — a client that reads two surfaces must not see two Tomcats. |
+| `HONEYPOT_TOMCAT_MANAGER_UPLOAD_SCAN_LIMIT` | `65536` | Bytes of an uploaded application hashed. Bounds the hash, not the read. |
+
 ## Interpolation-payload observer
 
 Notices an expression the server was expected to evaluate — Log4Shell

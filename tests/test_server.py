@@ -644,6 +644,14 @@ def test_all_trap_families_default_on():
         "the only thing turning it off buys is not knowing when a credential "
         "this server handed out comes back to it."
     )
+    assert tbenv.TOMCAT_MANAGER_ENABLED, (
+        "HONEYPOT_TOMCAT_MANAGER_ENABLED should default to True — only the "
+        "jmxproxy surface spends a canary, and it goes through the per-IP "
+        "cache, so the challenge and credential-capture steps cost nothing "
+        "upstream. A 404 on these addresses ends the exchange at the "
+        "cheapest possible moment; the 401 is what turns a path probe into "
+        "a credential attempt."
+    )
     assert tbenv.INTERPOLATION_PROBE_ENABLED, (
         "HONEYPOT_INTERPOLATION_PROBE_ENABLED should default to True — it "
         "serves no route, issues nothing, spends no upstream quota and never "
