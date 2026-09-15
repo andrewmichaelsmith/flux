@@ -60,6 +60,17 @@ what gets written down. Conflating them is what made a payload in
 `User-Agent` read as an ordinary 404. Header *names* are reported, and
 the extracted callbacks and variable names; raw header values are not.
 
+**Brace style is not the gate.** Struts, the Ivanti `format=` sink and
+the `script:javascript:` evaluators all wrap Java reflection in `${…}`
+rather than `%{…}` or `#{…}`, and matching only the latter two filed a
+large, very active population as bare expressions. What decides an `ognl`
+match is the token list — `@java.`, `#_memberAccess`, `#context`,
+`getRuntime`, `ProcessBuilder`, `OgnlContext`, `MethodAccessor`,
+`IOUtils`, `.forName(`, `script:javascript` — every one of which is an
+unambiguous Java-execution marker. `${7*7}`, the canonical
+does-this-evaluate probe, carries none of them and stays in the
+low-confidence bucket where it belongs.
+
 Everything a sender controls is bounded — header count, header length,
 body bytes scanned, de-obfuscation passes, and the length of every
 reported list.

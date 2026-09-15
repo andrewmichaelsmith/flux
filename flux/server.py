@@ -285,8 +285,18 @@ _INTERP_LOOKUP_RE = re.compile(
 # Struts/OGNL (`%{...}`) and Spring SpEL (`#{...}`) reach the same place
 # by a different grammar. Matching the aggressive tokens rather than the
 # bare braces keeps ordinary `#{}`-using template traffic out.
+# `${…}` belongs here as well as `%{…}` and `#{…}`: Struts, the Ivanti
+# `format=` sink and the `script:javascript:` evaluators all wrap Java
+# reflection in the dollar spelling, and matching only the other two
+# filed those as bare expressions. The gate is the token list, not the
+# brace style — every entry is an unambiguous Java-execution marker, so
+# widening the prefix does not widen what counts as a hit.
 _INTERP_OGNL_RE = re.compile(
-    r"[%#]\{[^}]{0,200}?(?:@java\.|#_memberAccess|#context|getRuntime|ProcessBuilder|#cmd|new\s+java)",
+    r"[$%#]\{[^}]{0,300}?(?:"
+    r"@java\.|@org\.apache|#_memberAccess|#context|#cmd|new\s+java"
+    r"|getRuntime|ProcessBuilder|OgnlContext|MethodAccessor|IOUtils"
+    r"|\.forName\s*\(|script\s*:\s*javascript"
+    r")",
     re.IGNORECASE,
 )
 _INTERP_SPEL_RE = re.compile(r"\$\{\s*T\s*\(", re.IGNORECASE)
