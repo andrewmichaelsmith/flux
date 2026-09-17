@@ -23942,6 +23942,66 @@ def _app_layout_variants(canonical: str) -> tuple[str, ...]:
     )
 
 
+# Home directories a credential-dredging sweep walks. These dictionaries
+# do not guess one home directory — they enumerate the whole set of
+# account names a cloud image, a CI runner, or a managed notebook is
+# likely to run as, and ask for the same credential file under each. The
+# names below are the account set those sweeps actually walk:
+#
+#   * distro cloud-image defaults (`ubuntu`, `debian`, `centos`, ...),
+#   * CI/CD runner accounts (`runner`, `github-runner`, `gitlab-runner`,
+#     `circleci`, `jenkins`),
+#   * managed-service accounts (`ssm-user`, `cloud-user`, `azureuser`),
+#   * data/ML accounts (`jovyan` for Jupyter images, `sagemaker-user`,
+#     `airflow`, `hadoop`, `glue_user`) — these matter disproportionately
+#     because those roles are the ones carrying managed-inference and
+#     data-plane entitlements, which is what a harvested key gets spent
+#     on,
+#   * generic app-service accounts (`app`, `deploy`, `node`, `www-data`).
+#
+# One data source drives every home-dir cred trap below. Answering a
+# proper subset of this list is its own tell: a host that returns a
+# credential file for `/home/ec2-user/...` but 404s the byte-identical
+# `/home/jenkins/...` is separable from a real filesystem by the sweep
+# that walks both in one pass, so the set is kept whole rather than
+# grown one observed username at a time.
+_CRED_HOME_DIRS: tuple[str, ...] = (
+    "/root",
+    # Bare `/home/.aws/credentials` — the spelling a dictionary emits
+    # when it templates `/home/$USER/` with an empty variable.
+    "/home",
+    *(
+        f"/home/{user}"
+        for user in (
+            # distro cloud-image defaults
+            "ubuntu", "debian", "centos", "fedora", "rocky",
+            "almalinux", "sles", "core", "vagrant", "admin", "user",
+            # AWS / Azure / managed-service defaults
+            "ec2-user", "ssm-user", "cloud-user", "azureuser",
+            "bitnami", "oracle",
+            # CI/CD runner accounts
+            "runner", "github-runner", "gitlab-runner", "circleci",
+            "jenkins",
+            # data / ML accounts
+            "jovyan", "sagemaker-user", "airflow", "hadoop",
+            "glue_user",
+            # generic app-service accounts
+            "app", "deploy", "node", "www-data",
+        )
+    ),
+)
+
+
+def _home_dir_variants(canonical: str) -> tuple[str, ...]:
+    """Return `<home>/<canonical>` variants across `_CRED_HOME_DIRS`
+    for a canonical dotfile path like `.aws/credentials`. `canonical`
+    is written without a leading `/`."""
+    return tuple(
+        f"{home}/{canonical}"
+        for home in _CRED_HOME_DIRS
+    )
+
+
 CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     CanaryTrap(
         "shell-rc",
@@ -23998,16 +24058,10 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # and `.bash_history`. A path-traversal-style misconfigured
             # static route exposes these via the absolute home-dir
             # path. Same INI renderer; harvester greps for AKIA bytes.
-            "/root/.aws/credentials",
-            "/home/.aws/credentials",
-            "/home/ubuntu/.aws/credentials",
-            "/home/runner/.aws/credentials",
-            "/home/ec2-user/.aws/credentials",
-            "/home/admin/.aws/credentials",
-            "/home/app/.aws/credentials",
-            "/home/node/.aws/credentials",
-            "/home/deploy/.aws/credentials",
-            "/home/www-data/.aws/credentials",
+            # Driven by `_CRED_HOME_DIRS` so the account set stays
+            # whole — see the comment there on why answering a subset
+            # is separable from a real filesystem.
+            *_home_dir_variants(".aws/credentials"),
             # App-layout webroot-prefix variants — harvester
             # dictionaries walk `<prefix>/.aws/credentials` under
             # Laravel `/storage/` and `/app/` layouts alongside
@@ -24054,12 +24108,10 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/.aws/config",
             # `~/.aws/config` webroot-prefix variants — same rationale
             # as the credentials-file trap. Home-dir and app-layout
-            # prefixes.
-            "/root/.aws/config",
-            "/home/.aws/config",
-            "/home/ubuntu/.aws/config",
-            "/home/runner/.aws/config",
-            "/home/ec2-user/.aws/config",
+            # prefixes. The sweep asks for `config` and `credentials`
+            # under the same account in one pass, so the home-dir set
+            # is the same one.
+            *_home_dir_variants(".aws/config"),
             *_app_layout_variants(".aws/config"),
         ),
         ("aws",),
@@ -24665,10 +24717,19 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # request rooted at the webroot; a dredging sweep that has
             # worked out the service account asks for the absolute path,
             # and those were 404ing while the bare one answered.
-            "/home/ubuntu/.config/gcloud/application_default_credentials.json",
-            "/home/ec2-user/.config/gcloud/application_default_credentials.json",
-            "/home/app/.config/gcloud/application_default_credentials.json",
-            "/root/.config/gcloud/application_default_credentials.json",
+            *_home_dir_variants(
+                ".config/gcloud/application_default_credentials.json"
+            ),
+            # Undotted `gcloud/` directory and the flat `gcloud.json`
+            # filename. Same fallback reasoning as the undotted `aws/`
+            # spellings above: a harvester that cannot place the real
+            # `~/.config/gcloud/` asks whether the ADC file was copied
+            # somewhere servable, and drops the leading dot when it
+            # does. Both spellings were 404ing while the dotted
+            # directory answered.
+            "/gcloud/application_default_credentials.json",
+            "/gcloud/credentials.json",
+            "/gcloud.json",
             # Project-local GCP key spellings observed in the same sweep
             # as the `*service*account*` names already listed.
             "/gcp.json",
@@ -26869,14 +26930,23 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "azure-cli-access-tokens",
-        ("/.azure/accesstokens.json",),
+        (
+            "/.azure/accesstokens.json",
+            # Home-dir spellings: the token cache is walked in the same
+            # `.azure/` directory pass as `credentials`, under the same
+            # account names.
+            *_home_dir_variants(".azure/accesstokens.json"),
+        ),
         ("aws",),
         render_azure_access_tokens_json,
         "application/json; charset=utf-8",
     ),
     CanaryTrap(
         "azure-cli-msal-cache",
-        ("/.azure/msal_token_cache.json",),
+        (
+            "/.azure/msal_token_cache.json",
+            *_home_dir_variants(".azure/msal_token_cache.json"),
+        ),
         ("aws",),
         render_azure_msal_token_cache_json,
         "application/json; charset=utf-8",
@@ -26910,7 +26980,13 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         "azure-credentials-file",
         (
             "/.azure/credentials",
-            "/root/.azure/credentials",
+            # Home-dir spellings. The multi-cloud sweeps walk the
+            # `.azure/` sibling under the same account names they
+            # already walk for `.aws/credentials`, so a host that
+            # answered the AWS file but 404'd the Azure one under an
+            # identical home directory advertised which of the two it
+            # was pretending to have.
+            *_home_dir_variants(".azure/credentials"),
             *_app_layout_variants(".azure/credentials"),
         ),
         ("aws",),

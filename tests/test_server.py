@@ -2917,6 +2917,78 @@ def test_app_layout_credential_prefix_variants(path, expected_trap):
     )
 
 
+# Home-directory credential spellings. The dredging sweeps enumerate a
+# whole set of account names and ask for the same credential file under
+# each, so every canonical below must be answered under every home in
+# `_CRED_HOME_DIRS` — answering a proper subset is the split that makes
+# the host separable from a real filesystem.
+@pytest.mark.parametrize("canonical,expected_trap", [
+    (".aws/credentials", "aws-credentials-file"),
+    (".aws/config", "aws-config-file"),
+    (".azure/credentials", "azure-credentials-file"),
+    (".azure/accesstokens.json", "azure-cli-access-tokens"),
+    (".azure/msal_token_cache.json", "azure-cli-msal-cache"),
+    (".config/gcloud/application_default_credentials.json", "firebase-json"),
+])
+def test_home_dir_credential_variants_are_complete(canonical, expected_trap):
+    missing = []
+    for home in tbenv._CRED_HOME_DIRS:
+        path = f"{home}/{canonical}"
+        trap = tbenv._TRAP_BY_PATH.get(path.lower())
+        if trap is None or trap.name != expected_trap:
+            missing.append((path, trap and trap.name))
+    assert not missing, (
+        f"{canonical} not answered uniformly across _CRED_HOME_DIRS: {missing}"
+    )
+
+
+@pytest.mark.parametrize("user", [
+    # CI/CD orchestrator and managed-notebook accounts. These carry the
+    # data-plane and managed-inference entitlements that make a
+    # harvested key worth spending, so they are the ones worth being
+    # certain about rather than leaving to the generic list.
+    "jenkins", "jovyan", "sagemaker-user", "airflow", "glue_user",
+    "hadoop", "github-runner", "gitlab-runner", "circleci", "ssm-user",
+    "azureuser", "cloud-user",
+])
+def test_orchestrator_and_notebook_home_dirs_answer_cloud_creds(user):
+    for canonical, expected in (
+        (".aws/credentials", "aws-credentials-file"),
+        (".azure/credentials", "azure-credentials-file"),
+    ):
+        trap = tbenv._TRAP_BY_PATH.get(f"/home/{user}/{canonical}")
+        assert trap is not None and trap.name == expected, (
+            f"/home/{user}/{canonical} should dispatch to {expected}, "
+            f"got {trap and trap.name!r}"
+        )
+
+
+@pytest.mark.parametrize("path", [
+    # Undotted / flattened gcloud ADC spellings — the fallback a
+    # harvester emits when it cannot place the real `~/.config/gcloud/`.
+    "/gcloud/application_default_credentials.json",
+    "/gcloud/credentials.json",
+    "/gcloud.json",
+])
+def test_undotted_gcloud_adc_spellings_answer(path):
+    trap = tbenv._TRAP_BY_PATH.get(path)
+    assert trap is not None and trap.name == "firebase-json", (
+        f"{path!r} should dispatch to firebase-json, got {trap and trap.name!r}"
+    )
+
+
+def test_home_dir_cred_variants_reach_the_vite_fs_surface():
+    # `/@fs/<abs-path>` resolves through the same trap table, so a home
+    # directory added to the table must be readable through the
+    # dev-server read primitive too, without being listed twice.
+    for user in ("jenkins", "jovyan", "sagemaker-user"):
+        target = tbenv.resolve_fs_read(f"/@fs/home/{user}/.aws/credentials")
+        assert target.trap is not None, (
+            f"/@fs/home/{user}/.aws/credentials should resolve to a trap"
+        )
+        assert target.trap.name == "aws-credentials-file"
+
+
 def test_azure_credentials_ini_shape_and_canary():
     # Render the azure-credentials-file trap directly and confirm the
     # embedded AWS canary secret lands in the client_secret slot
