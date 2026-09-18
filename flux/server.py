@@ -737,6 +737,113 @@ def webshell_sweep_observe(src_ip: str, path: str, now: float | None = None) -> 
 # bugs (KCFinder ≤ 3.20 CVE-2018-15706, jquery.filer pre-1.3.5 SDK
 # vulnerabilities, Blueimp jQuery-File-Upload < 9.22.1 CVE-2018-9206).
 # Default-on like webshell: the trap is cheap, logs are cheap, the
+# --- WordPress plugin upload-vector matrix --------------------------------
+# A recurring campaign shape probes several WordPress plugin upload
+# endpoints in one burst, then immediately GETs one token-named `.php`
+# file back from *each* endpoint's landing directory. The token is the
+# same across the whole burst, so the only thing the GET round varies is
+# the directory — it is an A/B test over upload vectors, and the answer
+# the operator reads is which landing path returns their file.
+#
+# Answering that honestly is worth more than either extreme. A blanket
+# 404 ends the exchange and tells the operator nothing was writable. A
+# blanket 200 is worse: it claims every plugin vulnerability on the host
+# is live simultaneously, which no real install looks like, and it makes
+# the fabrication obvious to anyone who checks more than one path.
+#
+# So this trap accepts exactly one vector per source, chosen from a
+# per-process secret so the choice is stable for a source but is not the
+# same vector on every host running flux. The accepted vector answers in
+# its plugin's own success idiom and the landing path it names then
+# serves the operator's own uploaded bytes back; the refused vectors
+# answer in their plugin's failure idiom and their landing paths stay
+# 404. One positive out of several tries is what a single writable
+# plugin actually looks like, and which vector the operator escalates on
+# is the measurement this trap exists to produce.
+WP_PLUGIN_UPLOAD_ENABLED = _env_bool("HONEYPOT_WP_PLUGIN_UPLOAD_ENABLED")
+WP_PLUGIN_UPLOAD_TTL_SECONDS = max(
+    int((os.environ.get("HONEYPOT_WP_PLUGIN_UPLOAD_TTL_SECONDS") or "3600").strip() or "3600"),
+    60,
+)
+WP_PLUGIN_UPLOAD_MAX_SOURCES = max(
+    int((os.environ.get("HONEYPOT_WP_PLUGIN_UPLOAD_MAX_SOURCES") or "4096").strip() or "4096"),
+    64,
+)
+WP_PLUGIN_UPLOAD_MAX_CLAIMS_PER_SOURCE = max(
+    int(
+        (os.environ.get("HONEYPOT_WP_PLUGIN_UPLOAD_MAX_CLAIMS_PER_SOURCE") or "32").strip()
+        or "32"
+    ),
+    4,
+)
+# Bytes of an uploaded part retained so the landing path can serve the
+# operator's own file back. Bounded because the registry is in memory.
+WP_PLUGIN_UPLOAD_BODY_LIMIT = max(
+    int((os.environ.get("HONEYPOT_WP_PLUGIN_UPLOAD_BODY_LIMIT") or "8192").strip() or "8192"),
+    256,
+)
+
+# Each vector: the endpoint the upload is POSTed to, and the directory
+# that plugin writes into — which is the address the verification GET
+# goes to. `action` is set for the `admin-ajax.php` vectors, which are
+# distinguished only by their query parameter.
+_WP_PLUGIN_UPLOAD_VECTORS: tuple[dict[str, str], ...] = (
+    {
+        "id": "wp-file-manager",
+        "path": "/wp-content/plugins/wp-file-manager/lib/php/connector.minimal.php",
+        "action": "",
+        "landing": "/wp-content/plugins/wp-file-manager/lib/files",
+        "idiom": "elfinder",
+    },
+    {
+        "id": "contact-form-7-db",
+        "path": "/wp-content/plugins/contact-form-7-db/img/upload.php",
+        "action": "",
+        "landing": "/wp-content/plugins/contact-form-7-db/img",
+        "idiom": "plain",
+    },
+    {
+        "id": "backup-backup",
+        "path": "/wp-content/plugins/backup-backup/includes/backup-heart.php",
+        "action": "",
+        "landing": "/wp-content/uploads",
+        "idiom": "plain",
+    },
+    {
+        "id": "kaswara",
+        "path": "/wp-admin/admin-ajax.php",
+        "action": "uploadfonticon",
+        "landing": "/wp-content/uploads/kaswara/fonts",
+        "idiom": "ajax",
+    },
+    {
+        "id": "wpr-addons",
+        "path": "/wp-admin/admin-ajax.php",
+        "action": "wpr_addons_upload_file",
+        "landing": "/wp-content/uploads/wpr-addons/templates",
+        "idiom": "ajax",
+    },
+    {
+        "id": "ecsload",
+        "path": "/wp-admin/admin-ajax.php",
+        "action": "ecsload",
+        "landing": "/wp-content/uploads",
+        "idiom": "ajax",
+    },
+)
+_WP_PLUGIN_UPLOAD_ALT_PATHS: dict[str, str] = {
+    # elFinder ships both spellings of the same connector.
+    "/wp-content/plugins/wp-file-manager/lib/php/connector.php": "wp-file-manager",
+}
+# Per-process, so the vector a source is told is writable differs between
+# hosts. A fleet that accepted the same vector everywhere would be one
+# request away from being identified as a fleet.
+_WP_PLUGIN_UPLOAD_SECRET = secrets.token_bytes(16)
+# src_ip -> (expiry, {landing path -> claim}). A claim records whether the
+# vector was accepted and, when it was, the bytes to serve back.
+_WP_PLUGIN_UPLOAD_CLAIMS: dict[str, tuple[float, dict[str, dict[str, object]]]] = {}
+
+
 # value is the POST body. The handler returns a plausible "ready"
 # response on GET and a plausible "uploaded" response on POST so the
 # scanner sends its actual exploit body; we capture multipart filenames
@@ -5320,6 +5427,218 @@ def is_file_upload_path(path: str) -> bool:
     if not FILE_UPLOAD_ENABLED:
         return False
     return bool(_file_upload_family(path))
+
+
+def _wp_plugin_upload_action(query_string: str) -> str:
+    """Return the lowercased `action` parameter, which is the only thing
+    that tells the `admin-ajax.php` upload vectors apart."""
+    if not query_string:
+        return ""
+    values = parse_qs(query_string, keep_blank_values=True).get("action") or []
+    return (values[0] if values else "").strip().lower()
+
+
+def wp_plugin_upload_vector(path: str, query_string: str = "") -> dict[str, str] | None:
+    """Return the upload vector a request addresses, or None.
+
+    An `admin-ajax.php` request is claimed only when its `action` names
+    one of the upload handlers; every other use of that address — which
+    is most of them — is left to the trap that already owns it.
+    """
+    if not WP_PLUGIN_UPLOAD_ENABLED or not path:
+        return None
+    lp = path.lower().split("?", 1)[0].rstrip("/") or "/"
+    alt = _WP_PLUGIN_UPLOAD_ALT_PATHS.get(lp)
+    action = _wp_plugin_upload_action(query_string)
+    for vector in _WP_PLUGIN_UPLOAD_VECTORS:
+        if alt is not None:
+            if vector["id"] == alt:
+                return vector
+            continue
+        if lp != vector["path"]:
+            continue
+        if vector["action"] and action != vector["action"]:
+            continue
+        if not vector["action"]:
+            return vector
+        return vector
+    return None
+
+
+def wp_plugin_upload_accepted_vector(src_ip: str) -> str:
+    """The one vector this source is told is writable.
+
+    Derived from a per-process secret so it is stable for a source across
+    its burst — a matrix probe that got two different answers for the same
+    vector would be more suspicious than any single answer — while not
+    being the same vector on every host.
+    """
+    digest = hmac.new(
+        _WP_PLUGIN_UPLOAD_SECRET, (src_ip or "").encode("utf-8", "replace"), hashlib.sha256,
+    ).digest()
+    return _WP_PLUGIN_UPLOAD_VECTORS[digest[0] % len(_WP_PLUGIN_UPLOAD_VECTORS)]["id"]
+
+
+def _wp_plugin_upload_prune(now: float) -> None:
+    for key in [k for k, v in _WP_PLUGIN_UPLOAD_CLAIMS.items() if v[0] <= now]:
+        del _WP_PLUGIN_UPLOAD_CLAIMS[key]
+    while len(_WP_PLUGIN_UPLOAD_CLAIMS) > WP_PLUGIN_UPLOAD_MAX_SOURCES:
+        oldest = min(_WP_PLUGIN_UPLOAD_CLAIMS, key=lambda k: _WP_PLUGIN_UPLOAD_CLAIMS[k][0])
+        del _WP_PLUGIN_UPLOAD_CLAIMS[oldest]
+
+
+def wp_plugin_upload_register(
+    src_ip: str,
+    vector: dict[str, str],
+    accepted: bool,
+    filenames: list[str],
+    content: bytes,
+    now: float | None = None,
+) -> list[str]:
+    """Record what this source was told about a vector, and return the
+    landing paths that claim covers.
+
+    Both answers are recorded. The refusals matter as much as the
+    acceptance: a landing path whose vector we refused has to keep its
+    404 even against a trap that would otherwise answer it, or the host
+    contradicts itself inside one burst.
+    """
+    moment = time.time() if now is None else now
+    _wp_plugin_upload_prune(moment)
+    entry = _WP_PLUGIN_UPLOAD_CLAIMS.get(src_ip)
+    if entry is None or entry[0] <= moment:
+        entry = (moment + WP_PLUGIN_UPLOAD_TTL_SECONDS, {})
+        _WP_PLUGIN_UPLOAD_CLAIMS[src_ip] = entry
+    claims = entry[1]
+    landing = vector["landing"]
+    # The directory itself is claimed, so a verification GET for a name
+    # we could not parse out of the multipart body is still answered
+    # consistently with what this source was told.
+    keys = [landing + "/"]
+    for name in filenames[:8]:
+        leaf = posixpath.basename(name.replace("\\", "/")).strip()
+        if leaf:
+            keys.append(f"{landing}/{leaf}".lower())
+    for key in keys:
+        key = key.lower()
+        if len(claims) >= WP_PLUGIN_UPLOAD_MAX_CLAIMS_PER_SOURCE and key not in claims:
+            continue
+        # Two vectors can write into the same directory, and the operator
+        # probes both. A refusal must not overwrite an acceptance for the
+        # same address: the file really is there, whichever vector put it
+        # there, and taking it back mid-burst is the contradiction this
+        # registry exists to prevent. Order of arrival decides nothing.
+        existing = claims.get(key)
+        if existing is not None and existing.get("accepted") and not accepted:
+            continue
+        claims[key] = {
+            "vector": vector["id"],
+            "accepted": accepted,
+            "content": content[:WP_PLUGIN_UPLOAD_BODY_LIMIT] if accepted else b"",
+        }
+    return sorted(set(keys))
+
+
+def wp_plugin_upload_lookup(
+    src_ip: str, path: str, now: float | None = None,
+) -> dict[str, object] | None:
+    """Return this source's claim for a landing path, or None.
+
+    Matches the exact filename first, then the directory the vector
+    writes into — the operator names the file, so an exact hit is the
+    common case and the directory claim is the fallback.
+    """
+    if not WP_PLUGIN_UPLOAD_ENABLED or not path:
+        return None
+    moment = time.time() if now is None else now
+    entry = _WP_PLUGIN_UPLOAD_CLAIMS.get(src_ip)
+    if entry is None or entry[0] <= moment:
+        return None
+    claims = entry[1]
+    lp = path.lower().split("?", 1)[0]
+    if not lp.endswith(".php"):
+        return None
+    exact = claims.get(lp)
+    if exact is not None:
+        return exact
+    return claims.get(posixpath.dirname(lp) + "/")
+
+
+def wp_plugin_upload_part_body(body: bytes, content_type: str) -> bytes:
+    """The bytes of the first file part in a multipart upload.
+
+    The landing path serves this back, so it has to be the operator's
+    file and not the multipart envelope around it — echoing the envelope
+    would put our own boundary markers in a response that is supposed to
+    be their file. A body that is not multipart at all is returned as it
+    arrived, which is what the raw-POST upload vectors send.
+    """
+    if not body:
+        return b""
+    ct_raw = content_type or ""
+    ct_low = ct_raw.lower()
+    if "multipart/form-data" not in ct_low or "boundary=" not in ct_low:
+        return body
+    boundary_start = ct_low.index("boundary=") + len("boundary=")
+    boundary = ct_raw[boundary_start:].split(";", 1)[0].strip()
+    if boundary.startswith('"') and boundary.endswith('"') and len(boundary) >= 2:
+        boundary = boundary[1:-1]
+    if not boundary:
+        return body
+    sep = b"--" + boundary.encode("latin-1", errors="replace")
+    for chunk in body.split(sep)[1:1 + FILE_UPLOAD_MAX_PARTS]:
+        if not chunk or chunk[:2] == b"--":
+            continue
+        if chunk[:2] == b"\r\n":
+            chunk = chunk[2:]
+        elif chunk[:1] == b"\n":
+            chunk = chunk[1:]
+        header_end = chunk.find(b"\r\n\r\n")
+        step = 4
+        if header_end == -1:
+            header_end = chunk.find(b"\n\n")
+            step = 2
+            if header_end == -1:
+                continue
+        headers = chunk[:header_end]
+        if b"filename=" not in headers.lower():
+            # A plain form field, not the upload.
+            continue
+        part = chunk[header_end + step:]
+        # Trim the CRLF the sender puts before the next boundary.
+        if part.endswith(b"\r\n"):
+            part = part[:-2]
+        elif part.endswith(b"\n"):
+            part = part[:-1]
+        return part
+    return b""
+
+
+def _wp_plugin_upload_rendered(content: bytes) -> bytes:
+    """What the landing path serves back.
+
+    A verification stub is almost always a single `echo`/`print` of a
+    literal — the operator greps the response for the token it prints.
+    That one shape is emulated so the response is what a host running
+    the file would return. Anything else is served as it arrived, which
+    is what a host that stored the file without executing it returns;
+    nothing here interprets the upload.
+    """
+    if not content:
+        return b""
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content
+    match = re.fullmatch(
+        r"\s*<\?(?:php|=)?\s*(?:echo|print)\s*\(?\s*"
+        r"(['\"])(?P<literal>(?:(?!\1).)*)\1\s*\)?\s*;?\s*(?:\?>)?\s*",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        return match.group("literal").encode("utf-8")
+    return content
 
 
 def is_webapp_form_path(path: str) -> bool:
@@ -37876,6 +38195,150 @@ async def _handle_webshell(
     )
 
 
+def render_wp_plugin_upload_response(
+    vector: dict[str, str], accepted: bool, filenames: list[str],
+) -> tuple[bytes, str]:
+    """The plugin's own answer to an upload, in its own idiom.
+
+    A refusal has to be as plausible as an acceptance — the operator is
+    reading both, and a refusal that does not look like the plugin's is
+    as much of a tell as a 404 everywhere.
+    """
+    name = ""
+    for candidate in filenames:
+        leaf = posixpath.basename(candidate.replace("\\", "/")).strip()
+        if leaf:
+            name = leaf
+            break
+    landing = vector["landing"]
+    idiom = vector["idiom"]
+    if idiom == "elfinder":
+        if accepted:
+            payload = {
+                "added": [{
+                    "name": name or "upload.php",
+                    "hash": "l1_" + secrets.token_hex(6),
+                    "phash": "l1_" + secrets.token_hex(4),
+                    "mime": "text/x-php",
+                    "ts": int(time.time()),
+                    "size": secrets.randbelow(4096) + 64,
+                    "read": 1, "write": 1, "locked": 0,
+                }],
+            }
+        else:
+            payload = {"error": ["errUploadFile", name or "upload.php", "errPerm"]}
+        return (json.dumps(payload) + "\n").encode("utf-8"), "application/json"
+    if idiom == "ajax":
+        if accepted:
+            payload = {
+                "success": True,
+                "data": {"url": f"{landing}/{name or 'upload.php'}", "name": name or "upload.php"},
+            }
+        else:
+            payload = {"success": False, "data": {"message": "Sorry, this file type is not permitted for security reasons."}}
+        return (json.dumps(payload) + "\n").encode("utf-8"), "application/json"
+    # `plain` — the two endpoints that answer with a bare line.
+    if accepted:
+        return (f"{landing}/{name or 'upload.php'}\n").encode("utf-8"), "text/plain"
+    return b"0\n", "text/plain"
+
+
+async def _handle_wp_plugin_upload(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+    vector: dict[str, str],
+    client_ip: str,
+) -> web.Response:
+    """Answer one WordPress plugin upload vector, and remember what was
+    claimed so the verification GET that follows agrees with it."""
+    content_type = request.headers.get("Content-Type", "")
+    names, filenames, part_content_types, has_php_shell = extract_multipart_parts(
+        request_body, content_type, FILE_UPLOAD_MAX_PARTS,
+    )
+    accepted = wp_plugin_upload_accepted_vector(client_ip) == vector["id"]
+    landing_paths = wp_plugin_upload_register(
+        client_ip, vector, accepted, filenames,
+        wp_plugin_upload_part_body(request_body, content_type),
+    )
+    body, response_content_type = render_wp_plugin_upload_response(
+        vector, accepted, filenames,
+    )
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": "wp-plugin-upload-attempt",
+        "wpPluginUploadVector": vector["id"],
+        "wpPluginUploadAccepted": accepted,
+        "wpPluginUploadLandingDir": vector["landing"],
+        "wpPluginUploadAction": _wp_plugin_upload_action(query_string),
+        "wpPluginUploadPartCount": len(names),
+        "wpPluginUploadFieldNames": sorted(set(names))[:32],
+        "wpPluginUploadFilenames": filenames[:32],
+        "wpPluginUploadPartContentTypes": sorted(set(part_content_types))[:32],
+        "wpPluginUploadHasPhpShell": has_php_shell,
+        "wpPluginUploadClaims": landing_paths[:8],
+        "contentType": content_type[:120],
+    }
+    if request_body:
+        log_entry["bodyPreview"] = request_body[:FILE_UPLOAD_BODY_DECODE_LIMIT].decode(
+            "utf-8", errors="replace",
+        )
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": f"{response_content_type}; charset=utf-8",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+async def _handle_wp_plugin_upload_landing(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    claim: dict[str, object],
+) -> web.Response:
+    """Answer the verification GET for a landing path this source was
+    already given an answer about.
+
+    The whole value of the trap is that this agrees with the POST: the
+    accepted vector's file is there, every refused vector's is not.
+    """
+    accepted = bool(claim.get("accepted"))
+    vector_id = str(claim.get("vector", ""))
+    if not accepted:
+        append_log({
+            **log_context,
+            "status": 404,
+            "result": "wp-plugin-upload-refuted",
+            "wpPluginUploadVector": vector_id,
+        })
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+    content = claim.get("content") or b""
+    body = _wp_plugin_upload_rendered(content if isinstance(content, bytes) else b"")
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": "wp-plugin-upload-verified",
+        "wpPluginUploadVector": vector_id,
+        "wpPluginUploadServedBytes": len(body),
+    })
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_file_upload(
     request: web.Request,
     log_context: dict[str, object],
@@ -40035,6 +40498,30 @@ async def handle(request: web.Request) -> web.StreamResponse:
         return await _handle_nextauth(
             request, log_context, path, query_string, request_body,
         )
+
+    # WordPress plugin upload vectors, and the landing paths they name.
+    # Ahead of the `wp-login` block because the upload vectors are told
+    # apart from every other use of `admin-ajax.php` by their `action`
+    # parameter, which that block does not read. Ahead of the shell-jacking
+    # sweep gate because a landing path whose vector this source was
+    # refused has to stay 404 — the gate would otherwise answer it on
+    # shape alone and contradict the refusal inside the same burst.
+    _wp_plugin_vector = (
+        wp_plugin_upload_vector(path, query_string)
+        if request.method == "POST"
+        else None
+    )
+    if _wp_plugin_vector is not None:
+        return await _handle_wp_plugin_upload(
+            request, log_context, path, query_string, request_body,
+            _wp_plugin_vector, client_ip,
+        )
+    if request.method in {"GET", "HEAD"}:
+        _wp_plugin_claim = wp_plugin_upload_lookup(client_ip, path)
+        if _wp_plugin_claim is not None:
+            return await _handle_wp_plugin_upload_landing(
+                request, log_context, path, _wp_plugin_claim,
+            )
 
     if is_wp_login_path(path):
         return await _handle_wp_login(request, log_context, path, request_body)

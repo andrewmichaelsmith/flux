@@ -638,6 +638,13 @@ def test_all_trap_families_default_on():
         "nothing upstream."
     )
     assert tbenv.SSRF_RELAY_ENABLED
+    assert tbenv.WP_PLUGIN_UPLOAD_ENABLED, (
+        "HONEYPOT_WP_PLUGIN_UPLOAD_ENABLED should default to True — it "
+        "issues nothing and spends no upstream quota, and turning it off "
+        "puts the plugin upload vectors back on the 404 path while the "
+        "sweep gate still answers their landing paths on shape alone, "
+        "which is the incoherent pairing the trap exists to remove."
+    )
     assert tbenv.CANARY_ECHO_ENABLED, (
         "HONEYPOT_CANARY_ECHO_ENABLED should default to True — it issues "
         "nothing, spends no upstream quota and never alters a response, so "
