@@ -737,6 +737,57 @@ def webshell_sweep_observe(src_ip: str, path: str, now: float | None = None) -> 
 # bugs (KCFinder ≤ 3.20 CVE-2018-15706, jquery.filer pre-1.3.5 SDK
 # vulnerabilities, Blueimp jQuery-File-Upload < 9.22.1 CVE-2018-9206).
 # Default-on like webshell: the trap is cheap, logs are cheap, the
+# --- Code-execution and file-read API surface -----------------------------
+# A distributed fleet walks a dictionary of low-code-platform and web-IDE
+# API endpoints that take their argument in a POST body: a command to run,
+# source to validate, a template to render, a path to read. The sources
+# present themselves as AI crawlers — a rotating set of assistant and
+# search-bot user agents — which no real crawler of that name does,
+# because none of them POST to an exec endpoint.
+#
+# Every one of these addresses used to 404, and a 404 is answered before
+# the body is ever looked at. The payload is the whole point of the
+# request and it was the one thing not being recorded. Answering them
+# plausibly costs nothing upstream and turns a path count into the
+# operator's actual payload.
+CODE_EXEC_API_ENABLED = _env_bool("HONEYPOT_CODE_EXEC_API_ENABLED")
+CODE_EXEC_API_BODY_PREVIEW_LIMIT = max(
+    int(
+        (os.environ.get("HONEYPOT_CODE_EXEC_API_BODY_PREVIEW_LIMIT") or "2048").strip()
+        or "2048"
+    ),
+    256,
+)
+# Exact addresses, grouped by what the endpoint claims to do with the body.
+_CODE_EXEC_API_PATHS: dict[str, str] = {
+    "/api/fs/exec": "exec",
+    "/api/v1/validate/code": "validate",
+    "/api/templates/preview": "template",
+    "/api/designer/v1/file-content": "read",
+    "/read-document": "read",
+}
+# The web-IDE terminal endpoint ships under its own directory and under a
+# webroot install, so the prefix is left open the way the file-upload
+# matchers leave theirs open.
+_CODE_EXEC_API_TERMINAL_RE = re.compile(
+    r"^(?:/[^/]+)*/lib/terminal-xhr\.php$", re.IGNORECASE,
+)
+# The body keys these endpoints take their argument under.
+_CODE_EXEC_API_ARG_KEYS: tuple[str, ...] = (
+    "cmd", "command", "exec", "run", "script", "code", "source", "src",
+    "template", "tpl", "content", "body", "input", "query", "expression",
+    "path", "file", "filename", "filepath", "document", "doc", "name",
+)
+# Server-side template injection probes are arithmetic: the sender writes
+# a product they can recognise in the response and reads the result to
+# find out whether the expression was evaluated. The wrappers below are
+# the syntaxes that probe is written in across the common engines.
+_CODE_EXEC_API_SSTI_RE = re.compile(
+    r"(?P<open>\{\{|\$\{|#\{|<%=)\s*"
+    r"(?P<lhs>\d{1,6})\s*(?P<op>[*+\-/])\s*(?P<rhs>\d{1,6})"
+    r"\s*(?P<close>\}\}|\}|%>)",
+)
+
 # --- WordPress plugin upload-vector matrix --------------------------------
 # A recurring campaign shape probes several WordPress plugin upload
 # endpoints in one burst, then immediately GETs one token-named `.php`
@@ -5427,6 +5478,107 @@ def is_file_upload_path(path: str) -> bool:
     if not FILE_UPLOAD_ENABLED:
         return False
     return bool(_file_upload_family(path))
+
+
+def code_exec_api_family(path: str) -> str:
+    """Return which of the four endpoint kinds this address is, or ``""``."""
+    if not CODE_EXEC_API_ENABLED or not path:
+        return ""
+    lp = path.lower().split("?", 1)[0].rstrip("/") or "/"
+    family = _CODE_EXEC_API_PATHS.get(lp)
+    if family:
+        return family
+    if _CODE_EXEC_API_TERMINAL_RE.match(lp):
+        return "exec"
+    return ""
+
+
+def is_code_exec_api_path(path: str) -> bool:
+    return bool(code_exec_api_family(path))
+
+
+def _code_exec_api_argument(body: bytes, content_type: str, query_string: str) -> str:
+    """Pull the endpoint's argument out of wherever the sender put it.
+
+    These endpoints are probed with JSON, with a form encoding and on the
+    query string, by tooling that does not know which the server wants, so
+    all three are read rather than guessed at.
+    """
+    text = body[:CODE_EXEC_API_BODY_PREVIEW_LIMIT].decode("utf-8", errors="replace")
+    ct = (content_type or "").lower()
+    if text and "json" in ct:
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict):
+            for key in _CODE_EXEC_API_ARG_KEYS:
+                for candidate in (key, key.upper()):
+                    value = doc.get(candidate)
+                    if isinstance(value, str) and value.strip():
+                        return value
+            for value in doc.values():
+                if isinstance(value, str) and value.strip():
+                    return value
+    for source in (text, query_string or ""):
+        if not source:
+            continue
+        try:
+            pairs = parse_qs(source, keep_blank_values=True)
+        except ValueError:
+            continue
+        for key in _CODE_EXEC_API_ARG_KEYS:
+            values = pairs.get(key) or pairs.get(key.upper())
+            if values and str(values[0]).strip():
+                return str(values[0])
+    # Nothing recognised the shape — the raw body is still the argument.
+    return text
+
+
+def code_exec_api_render_template(template: str) -> tuple[str, bool]:
+    """Evaluate the arithmetic a template-injection probe is made of.
+
+    Returns ``(rendered, evaluated)``. Only an integer product/sum inside
+    one of the recognised wrappers is computed, and only with Python's own
+    arithmetic on two bounded integers — nothing is evaluated as code, and
+    anything that is not that exact shape is left as it arrived, which is
+    what an engine that did not interpolate emits.
+    """
+    if not template:
+        return "", False
+    evaluated = False
+    count = 0
+
+    def substitute(match: re.Match[str]) -> str:
+        nonlocal evaluated, count
+        if count >= 8:
+            return match.group(0)
+        opener, closer = match.group("open"), match.group("close")
+        # `${...}` and `#{...}` close with a single brace; `{{...}}` with two.
+        if opener in {"${", "#{"} and closer != "}":
+            return match.group(0)
+        if opener == "{{" and closer != "}}":
+            return match.group(0)
+        if opener == "<%=" and closer != "%>":
+            return match.group(0)
+        lhs, rhs = int(match.group("lhs")), int(match.group("rhs"))
+        op = match.group("op")
+        if op == "*":
+            value = lhs * rhs
+        elif op == "+":
+            value = lhs + rhs
+        elif op == "-":
+            value = lhs - rhs
+        else:
+            if rhs == 0:
+                return match.group(0)
+            value = lhs // rhs
+        evaluated = True
+        count += 1
+        return str(value)
+
+    rendered = _CODE_EXEC_API_SSTI_RE.sub(substitute, template)
+    return rendered, evaluated
 
 
 def _wp_plugin_upload_action(query_string: str) -> str:
@@ -38243,6 +38395,85 @@ def render_wp_plugin_upload_response(
     return b"0\n", "text/plain"
 
 
+async def _handle_code_exec_api(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+    family: str,
+) -> web.Response:
+    """Answer a code-execution / file-read API probe, recording the
+    argument it carried before deciding anything about the response."""
+    method = request.method
+    content_type = request.headers.get("Content-Type", "")
+    argument = _code_exec_api_argument(request_body, content_type, query_string)
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": f"code-exec-api-{family}",
+        "codeExecApiFamily": family,
+        "codeExecApiPath": path,
+        "codeExecApiMethod": method,
+        "codeExecApiArgument": argument[:CODE_EXEC_API_BODY_PREVIEW_LIMIT],
+        "codeExecApiArgumentLen": len(argument),
+        "contentType": content_type[:120],
+    }
+    if request_body:
+        log_entry["bodyPreview"] = request_body[
+            :CODE_EXEC_API_BODY_PREVIEW_LIMIT
+        ].decode("utf-8", errors="replace")
+
+    body: bytes
+    response_content_type = "application/json"
+    if family == "exec":
+        output = simulate_command_output(argument)
+        log_entry["codeExecApiCommand"] = argument[:400]
+        if path.lower().endswith("terminal-xhr.php"):
+            # The web-IDE terminal answers with the raw output, not JSON.
+            body = output.encode("utf-8")
+            response_content_type = "text/plain"
+        else:
+            body = (json.dumps({
+                "ok": True, "exitCode": 0, "stdout": output, "stderr": "",
+            }) + "\n").encode("utf-8")
+    elif family == "validate":
+        # A validator that rejects ends the exchange; one that accepts
+        # invites the next, longer payload.
+        body = (json.dumps({
+            "valid": True, "errors": [], "warnings": [],
+            "language": "javascript", "durationMs": secrets.randbelow(40) + 3,
+        }) + "\n").encode("utf-8")
+    elif family == "template":
+        rendered, evaluated = code_exec_api_render_template(argument)
+        log_entry["codeExecApiTemplateEvaluated"] = evaluated
+        log_entry["codeExecApiRenderedPreview"] = rendered[:400]
+        body = (json.dumps({
+            "rendered": rendered, "engine": "nunjucks", "errors": [],
+        }) + "\n").encode("utf-8")
+    else:
+        # `read` — the measurement is which file was asked for. The body
+        # is a plausible non-secret document; a credential-shaped answer
+        # belongs to the traps that mint a canary for it, not here.
+        log_entry["codeExecApiRequestedPath"] = argument[:400]
+        body = (json.dumps({
+            "path": argument[:200],
+            "encoding": "utf-8",
+            "content": "# Untitled\n\nDraft document.\n",
+            "modified": utc_now(),
+        }) + "\n").encode("utf-8")
+
+    append_log(log_entry)
+    return web.Response(
+        status=200, body=body,
+        headers={
+            "Content-Type": f"{response_content_type}; charset=utf-8",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 async def _handle_wp_plugin_upload(
     request: web.Request,
     log_context: dict[str, object],
@@ -40497,6 +40728,17 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_nextauth_path(path):
         return await _handle_nextauth(
             request, log_context, path, query_string, request_body,
+        )
+
+    # Code-execution / file-read API surface. Late in the chain: these
+    # are `/api/...` and webroot shapes, so anything above that wants a
+    # specific address has already claimed it. Needs no issuing key — the
+    # response carries no credential — so it keeps working on a keyless
+    # deployment.
+    _code_exec_family = code_exec_api_family(path)
+    if _code_exec_family:
+        return await _handle_code_exec_api(
+            request, log_context, path, query_string, request_body, _code_exec_family,
         )
 
     # WordPress plugin upload vectors, and the landing paths they name.

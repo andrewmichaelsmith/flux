@@ -638,6 +638,12 @@ def test_all_trap_families_default_on():
         "nothing upstream."
     )
     assert tbenv.SSRF_RELAY_ENABLED
+    assert tbenv.CODE_EXEC_API_ENABLED, (
+        "HONEYPOT_CODE_EXEC_API_ENABLED should default to True — it issues "
+        "nothing and spends no upstream quota, and these addresses are "
+        "probed with the payload in the POST body, which a 404 answers "
+        "without ever reading."
+    )
     assert tbenv.WP_PLUGIN_UPLOAD_ENABLED, (
         "HONEYPOT_WP_PLUGIN_UPLOAD_ENABLED should default to True — it "
         "issues nothing and spends no upstream quota, and turning it off "
