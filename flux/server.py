@@ -22090,6 +22090,105 @@ def render_phpinfo(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_phpinfo_source(r: dict[str, object]) -> bytes:
+    """The *source* of a diagnostic script, for the editor-backup spellings.
+
+    `phpinfo.php.bak` / `.old` / `.save` / `~` are not executed — the
+    suffix takes the file outside the interpreter's handler, so the server
+    hands back the bytes. That makes the backup spelling a different
+    disclosure from the live one: the live path leaks whatever the runtime
+    happens to hold, the backup leaks whatever the operator typed, which is
+    where an inline credential actually lives.
+
+    Rendering the HTML table here would be the wrong answer twice over —
+    a real host cannot execute a `.bak`, so returning rendered output is
+    a tell that the response is fabricated.
+
+    Shape follows the `wp-config.php.bak` precedent: a script an operator
+    plausibly wrote and then renamed rather than deleted. The connectivity
+    check is what carries the credentials, since a bare `<?php phpinfo();`
+    holds nothing worth grepping for.
+    """
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    db_password = _fake_db_password()
+    return (
+        "<?php\n"
+        "// deployment diagnostics - REMOVE BEFORE GOING LIVE\n"
+        "// renamed out of the way 2024-11-03, kept for the next rollout\n"
+        "\n"
+        "error_reporting(E_ALL);\n"
+        "ini_set('display_errors', '1');\n"
+        "\n"
+        "$db = [\n"
+        "    'host' => 'db.internal',\n"
+        "    'port' => 3306,\n"
+        "    'name' => 'app_prod',\n"
+        "    'user' => 'app_rw',\n"
+        f"    'pass' => '{db_password}',\n"
+        "];\n"
+        "\n"
+        "// S3 media + nightly dump target\n"
+        f"putenv('AWS_ACCESS_KEY_ID={ak}');\n"
+        f"putenv('AWS_SECRET_ACCESS_KEY={sk}');\n"
+        f"putenv('AWS_SESSION_TOKEN={st}');\n"
+        "putenv('AWS_DEFAULT_REGION=us-east-1');\n"
+        "putenv('S3_BUCKET=app-prod-media');\n"
+        "\n"
+        "try {\n"
+        "    $pdo = new PDO(\n"
+        "        \"mysql:host={$db['host']};port={$db['port']};dbname={$db['name']}\",\n"
+        "        $db['user'], $db['pass']\n"
+        "    );\n"
+        "    echo \"db ok\\n\";\n"
+        "} catch (PDOException $e) {\n"
+        "    echo \"db FAILED: \" . $e->getMessage() . \"\\n\";\n"
+        "}\n"
+        "\n"
+        "phpinfo();\n"
+    ).encode("utf-8")
+
+
+def render_environment_dump(r: dict[str, object]) -> bytes:
+    """Environment dump for a route literally named `_environment`.
+
+    The framework behind this route is not pinned down — it arrives both
+    at the webroot and behind a front-controller prefix, which is a
+    deployment-layout difference rather than a product tell. The response
+    is therefore the lowest common denominator every such route shares:
+    `KEY=value` over the process environment, which is the shape the
+    client is grepping for regardless of which framework emitted it.
+    """
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    db_password = _fake_db_password()
+    return (
+        "APP_ENV=production\n"
+        "APP_DEBUG=true\n"
+        "APP_URL=https://localhost\n"
+        "DB_CONNECTION=mysql\n"
+        "DB_HOST=db.internal\n"
+        "DB_PORT=3306\n"
+        "DB_DATABASE=app_prod\n"
+        "DB_USERNAME=app_rw\n"
+        f"DB_PASSWORD={db_password}\n"
+        f"AWS_ACCESS_KEY_ID={ak}\n"
+        f"AWS_SECRET_ACCESS_KEY={sk}\n"
+        f"AWS_SESSION_TOKEN={st}\n"
+        "AWS_DEFAULT_REGION=us-east-1\n"
+        "AWS_BUCKET=app-prod-media\n"
+        "CACHE_DRIVER=redis\n"
+        "REDIS_HOST=redis.internal\n"
+        "QUEUE_CONNECTION=redis\n"
+        "LOG_CHANNEL=stack\n"
+    ).encode("utf-8")
+
+
+
 def _decode_ssh_value(raw: str) -> str:
     # Tracebit Community returns ``sshPrivateKey`` and ``sshPublicKey`` as
     # base64 over the on-wire JSON. If we serve the base64 verbatim to a
@@ -25223,6 +25322,12 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/privatekey.json",
             "/key.json",
             "/keys.json",
+            # Two more spellings from the same bare-filename walk. Both
+            # were 404ing while their siblings in this very tuple
+            # answered, so a harvester cycling the set stopped one
+            # filename short of the issuance.
+            "/keyfile.json",
+            "/gcp-sa.json",
             "/token.json",
             "/api-keys.json",
             "/api/keys.json",
@@ -26141,6 +26246,42 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_phpinfo,
         "text/html; charset=utf-8",
+    ),
+    CanaryTrap(
+        "phpinfo-source",
+        # The editor-backup spellings of the two most-walked diagnostic
+        # leaves. These cannot reach the shell-jacking sweep gate — that
+        # matcher requires a `.php` ending, and every suffix here takes
+        # the name past it — so without an entry they 404 no matter how
+        # wide the sweep around them gets.
+        tuple(
+            f"/{leaf}{suffix}"
+            for leaf in ("phpinfo.php", "info.php", "php.php", "test.php")
+            for suffix in (
+                ".bak", ".old", ".save", "~", ".orig", ".swp",
+                ".backup", ".txt", ".bak~", ".old~", ".save~", ".tmp",
+            )
+        ),
+        ("aws",),
+        render_phpinfo_source,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "environment-dump",
+        (
+            "/_environment",
+            # Same route behind a front controller. The two spellings
+            # arrive from near-identical source populations, which is one
+            # client testing both deployment layouts rather than two
+            # clients.
+            "/webroot/index.php/_environment",
+            "/index.php/_environment",
+            "/app.php/_environment",
+            "/public/index.php/_environment",
+        ),
+        ("aws",),
+        render_environment_dump,
+        "text/plain; charset=utf-8",
     ),
     CanaryTrap(
         "ssh-private-key",
