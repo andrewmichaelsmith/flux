@@ -5317,7 +5317,11 @@ def extract_svn_path(path: str) -> str | None:
 
 
 def is_tarpit_path(path: str) -> bool:
-    stripped = path.rstrip("/") or "/"
+    # Case-folded once, like every sibling matcher here: a scanner asking
+    # for `/.ENV` or `/app/.Env` is asking for the same file as `/.env`,
+    # and a filename comparison that says otherwise only answers the
+    # spelling we happened to write down.
+    stripped = (path.rstrip("/") or "/").lower()
     if stripped == "/.env":
         return False
     # Paths with a dedicated CanaryTrap entry (e.g. `/.env.production`,
@@ -5325,7 +5329,7 @@ def is_tarpit_path(path: str) -> bool:
     # generic tarpit. Without this exemption the dispatch order in
     # `handle()` — tarpit first, canary trap second — silently shadows
     # those entries and turns them into dead code.
-    if stripped.lower() in _TRAP_BY_PATH:
+    if stripped in _TRAP_BY_PATH:
         return False
     if stripped.endswith("/.env"):
         return True
@@ -22506,6 +22510,230 @@ def render_yarnrc_yml(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+# Non-Node dependency manifests — Composer (PHP), Bundler (Ruby) and pip
+# (Python).
+#
+# Flux already answers the Node set (`package.json`, `package-lock.json`,
+# `yarn.lock`, `.yarnrc*`) and 404s every other ecosystem's equivalent. That
+# asymmetry is the problem this closes twice over. A harvester walking a
+# config/secret dictionary asks all of them, so the misses are simply lost
+# reads; and a server that hands over a Node lockfile while insisting it has
+# no `composer.lock` describes a stack that does not exist, which is a tell
+# available to anyone who asks for both.
+#
+# Each of these three formats carries private-registry credentials in the
+# file itself, the same way an npm lockfile carries them in the resolved-URL
+# userinfo, so the canary placement is the same idea in each ecosystem's
+# native spelling: Composer's `http-basic` block, Bundler's `source` URL
+# userinfo, and pip's `--extra-index-url`. Whichever file a scanner takes,
+# it walks away with the same replayable credential.
+#
+# The manifests are the fingerprinting step before an exploit attempt — the
+# question they answer is "which package, at which version". Naming a small
+# internal-looking dependency set at pinned versions is what makes the
+# follow-up request, if one comes, worth reading.
+_PHP_DEPS_HOST = "composer.internal-tools.lan"
+_RUBY_DEPS_HOST = "gems.internal-tools.lan"
+_PY_DEPS_HOST = "pypi.internal-tools.lan"
+
+# (package, version) filler — plausible internal library names, not
+# credentials, so fixed values are fine here (same rule as the Node set).
+_PHP_DEPS_PACKAGES: tuple[tuple[str, str], ...] = (
+    ("internal-tools/auth-client", "2.4.1"),
+    ("internal-tools/feature-flags", "1.7.0"),
+    ("internal-tools/db-orm", "0.12.3"),
+)
+_RUBY_DEPS_PACKAGES: tuple[tuple[str, str], ...] = (
+    ("internal_auth_client", "2.4.1"),
+    ("internal_feature_flags", "1.7.0"),
+    ("internal_db_orm", "0.12.3"),
+)
+_PY_DEPS_PACKAGES: tuple[tuple[str, str], ...] = (
+    ("internal-auth-client", "2.4.1"),
+    ("internal-feature-flags", "1.7.0"),
+    ("internal-db-orm", "0.12.3"),
+)
+
+
+def _deps_canary_userinfo(r: dict[str, object], host: str) -> tuple[str, str, str]:
+    """(username, password, host) for a private-registry URL.
+
+    Same contract as `_node_deps_canary_userinfo`: the password is the
+    gitlab-username-password canary when one was issued, and a per-hit
+    synthetic otherwise, so a failed issuance still never ships a fixed
+    literal across the fleet.
+    """
+    creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
+    if not isinstance(creds, dict):
+        creds = {}
+    username = str(creds.get("username", "") or "deploy")
+    password = str(creds.get("password", "") or "") or _fake_db_password()
+    return username, password, host
+
+
+def _fake_composer_reference() -> str:
+    # `composer.lock` pins each package to a git commit. Per-hit random so
+    # the lockfile is not a fleet-wide constant.
+    return secrets.token_hex(20)
+
+
+def _fake_gem_checksum() -> str:
+    # Bundler 2.5+ records a sha256 per gem in the `CHECKSUMS` section.
+    return hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+
+
+def _fake_py_hash() -> str:
+    # pip `--require-hashes` style `--hash=sha256:<hex>` pin.
+    return "sha256:" + hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+
+
+def render_composer_json(r: dict[str, object]) -> bytes:
+    username, password, host = _deps_canary_userinfo(r, _PHP_DEPS_HOST)
+    doc = {
+        "name": "internal-tools/api",
+        "description": "Internal API service",
+        "type": "project",
+        "require": {
+            "php": ">=8.1",
+            **{name: "^" + version for name, version in _PHP_DEPS_PACKAGES},
+        },
+        "repositories": [
+            {"type": "composer", "url": f"https://{host}"},
+        ],
+        # Composer's own auth spelling. `composer config --auth` writes this
+        # into auth.json, but committing it into composer.json is common
+        # enough that harvesters read it from here.
+        "config": {
+            "http-basic": {
+                host: {"username": username, "password": password},
+            },
+        },
+    }
+    return (json.dumps(doc, indent=4) + "\n").encode("utf-8")
+
+
+def render_composer_lock(r: dict[str, object]) -> bytes:
+    username, password, host = _deps_canary_userinfo(r, _PHP_DEPS_HOST)
+    encoded_password = quote(password, safe="") if password else ""
+    auth_url = f"https://{username}:{encoded_password}@{host}"
+    packages = []
+    for name, version in _PHP_DEPS_PACKAGES:
+        reference = _fake_composer_reference()
+        packages.append({
+            "name": name,
+            "version": version,
+            "source": {
+                "type": "git",
+                "url": f"{auth_url}/{name}.git",
+                "reference": reference,
+            },
+            "dist": {
+                "type": "zip",
+                "url": f"{auth_url}/dists/{name}/{version}.zip",
+                "reference": reference,
+                "shasum": "",
+            },
+        })
+    doc = {
+        "_readme": [
+            "This file locks the dependencies of your project to a known state",
+            "Read more about it at https://getcomposer.org/doc/01-basic-usage.md",
+        ],
+        "content-hash": secrets.token_hex(16),
+        "packages": packages,
+        "packages-dev": [],
+        "platform": {"php": ">=8.1"},
+    }
+    return (json.dumps(doc, indent=4) + "\n").encode("utf-8")
+
+
+def render_gemfile(r: dict[str, object]) -> bytes:
+    username, password, host = _deps_canary_userinfo(r, _RUBY_DEPS_HOST)
+    encoded_password = quote(password, safe="") if password else ""
+    lines = [
+        'source "https://rubygems.org"\n',
+        "\n",
+        "# Internal gem server\n",
+        f'source "https://{username}:{encoded_password}@{host}" do\n',
+    ]
+    for name, version in _RUBY_DEPS_PACKAGES:
+        lines.append(f'  gem "{name}", "~> {version}"\n')
+    lines.append("end\n")
+    return "".join(lines).encode("utf-8")
+
+
+def render_gemfile_lock(r: dict[str, object]) -> bytes:
+    username, password, host = _deps_canary_userinfo(r, _RUBY_DEPS_HOST)
+    encoded_password = quote(password, safe="") if password else ""
+    specs = "".join(
+        f"      {name} ({version})\n" for name, version in _RUBY_DEPS_PACKAGES
+    )
+    deps = "".join(
+        f"  {name} (~> {version})\n" for name, version in _RUBY_DEPS_PACKAGES
+    )
+    checksums = "".join(
+        f"  {name} ({version}) sha256={_fake_gem_checksum()}\n"
+        for name, version in _RUBY_DEPS_PACKAGES
+    )
+    return (
+        "GEM\n"
+        f"  remote: https://{username}:{encoded_password}@{host}/\n"
+        "  specs:\n"
+        f"{specs}"
+        "\n"
+        "PLATFORMS\n"
+        "  ruby\n"
+        "\n"
+        "DEPENDENCIES\n"
+        f"{deps}"
+        "\n"
+        "CHECKSUMS\n"
+        f"{checksums}"
+        "\n"
+        "BUNDLED WITH\n"
+        "   2.5.9\n"
+    ).encode("utf-8")
+
+
+def render_requirements_txt(r: dict[str, object]) -> bytes:
+    username, password, host = _deps_canary_userinfo(r, _PY_DEPS_HOST)
+    encoded_password = quote(password, safe="") if password else ""
+    lines = [
+        "# Internal package index\n",
+        f"--extra-index-url https://{username}:{encoded_password}@{host}/simple\n",
+        "\n",
+    ]
+    for name, version in _PY_DEPS_PACKAGES:
+        lines.append(f"{name}=={version} \\\n")
+        lines.append(f"    --hash={_fake_py_hash()}\n")
+    return "".join(lines).encode("utf-8")
+
+
+def render_pipfile(r: dict[str, object]) -> bytes:
+    username, password, host = _deps_canary_userinfo(r, _PY_DEPS_HOST)
+    encoded_password = quote(password, safe="") if password else ""
+    packages = "".join(
+        f'{name} = "=={version}"\n' for name, version in _PY_DEPS_PACKAGES
+    )
+    return (
+        "[[source]]\n"
+        'name = "pypi"\n'
+        'url = "https://pypi.org/simple"\n'
+        "verify_ssl = true\n"
+        "\n"
+        "[[source]]\n"
+        'name = "internal"\n'
+        f'url = "https://{username}:{encoded_password}@{host}/simple"\n'
+        "verify_ssl = true\n"
+        "\n"
+        "[packages]\n"
+        f"{packages}"
+        "\n"
+        "[requires]\n"
+        'python_version = "3.11"\n'
+    ).encode("utf-8")
+
+
 def render_pypirc(r: dict[str, object]) -> bytes:
     creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
     if not isinstance(creds, dict):
@@ -26541,6 +26769,82 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("gitlab-username-password",),
         render_package_json,
         "application/json; charset=utf-8",
+    ),
+    # Non-Node dependency manifests. Same reasoning as the Node set above,
+    # in each ecosystem's own spelling — see the renderer block for why the
+    # asymmetry mattered. `.bak`/`.old`/`.save` spellings are included for
+    # the same reason the phpinfo and env families carry them: an editor
+    # backup is a separate filename, so the sweep gate (which only claims
+    # names ending in `.php`) can never reach it.
+    CanaryTrap(
+        "composer-json",
+        (
+            "/composer.json",
+            "/composer.json.bak",
+            "/composer.json.old",
+            "/composer.json.save",
+        ),
+        ("gitlab-username-password",),
+        render_composer_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "composer-lock",
+        (
+            "/composer.lock",
+            "/composer.lock.bak",
+            "/composer.lock.old",
+        ),
+        ("gitlab-username-password",),
+        render_composer_lock,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "gemfile",
+        (
+            "/gemfile",
+            "/gemfile.bak",
+            "/gemfile.old",
+        ),
+        ("gitlab-username-password",),
+        render_gemfile,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "gemfile-lock",
+        (
+            "/gemfile.lock",
+            "/gemfile.lock.bak",
+            "/gemfile.lock.old",
+        ),
+        ("gitlab-username-password",),
+        render_gemfile_lock,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "requirements-txt",
+        (
+            "/requirements.txt",
+            "/requirements.txt.bak",
+            "/requirements.txt.old",
+            "/requirements-dev.txt",
+            "/requirements/base.txt",
+        ),
+        ("gitlab-username-password",),
+        render_requirements_txt,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "pipfile",
+        # `Pipfile.lock` is deliberately absent: it is JSON, and answering a
+        # JSON filename with TOML is a worse tell than the 404 it replaces.
+        (
+            "/pipfile",
+            "/pipfile.bak",
+        ),
+        ("gitlab-username-password",),
+        render_pipfile,
+        "text/plain; charset=utf-8",
     ),
     CanaryTrap(
         "yarnrc",
@@ -41115,7 +41419,14 @@ async def handle(request: web.Request) -> web.StreamResponse:
             headers={"Content-Type": "text/plain; charset=utf-8"},
         )
 
-    if path != "/.env" or not API_KEY:
+    # Case-folded for the same reason as `is_tarpit_path`: this is the
+    # last branch before the catch-all 404, so an exact-case comparison
+    # here is what decided that `/.ENV` is not `/.env` — while the
+    # traversal walk that reaches the same file already folded case, and
+    # every other credential trap (`/.AWS/credentials`, `/.GIT/config`,
+    # `/WP-CONFIG.PHP`, and even `/.ENV.PRODUCTION`) answers regardless
+    # of spelling. The headline trap was the only one that did not.
+    if path.lower() != "/.env" or not API_KEY:
         append_log({**log_context, "status": 404, "result": "not-handled"})
         return web.Response(
             status=404, body=b"not found\n",

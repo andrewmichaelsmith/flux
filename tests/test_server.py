@@ -17263,6 +17263,76 @@ async def test_env_handler_shares_the_canary_cache(monkeypatch, aiohttp_client, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["/.env", "/.ENV", "/.Env", "/.EnV"])
+async def test_env_answers_regardless_of_case(
+    monkeypatch, aiohttp_client, tmp_path, spelling,
+):
+    """`/.env` answers whatever case it is asked in.
+
+    Every other credential trap here already folds case — `/.AWS/credentials`,
+    `/.GIT/config`, `/.SVN/entries`, `/WP-CONFIG.PHP`, `/ID_RSA`, and even the
+    `/.ENV.PRODUCTION` variant — and the `/@fs/` traversal walk folds case on
+    its way to this very file. The bare route was the one exception, because
+    its dispatch is the last branch before the catch-all 404 and compared the
+    raw path. So the headline trap was the only one a capitalised spelling
+    could walk past, and it did: uppercase and mixed-case requests for it turn
+    up in deployment logs.
+    """
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_CANARY_CACHE", {})
+    monkeypatch.setattr(tbenv, "_CANARY_INFLIGHT", {})
+    monkeypatch.setattr(tbenv, "_CANARY_LOCK", None)
+    monkeypatch.setattr(tbenv, "issue_credentials", _fake_canary)
+
+    client = await aiohttp_client(tbenv.create_app())
+    resp = await client.get(spelling, headers={"X-Forwarded-For": "198.51.100.61"})
+
+    assert resp.status == 200, f"{spelling} must reach the canary handler"
+    assert b"AKIAFAKEEXAMPLE01" in await resp.read(), (
+        f"{spelling} must carry the same canary payload as the lowercase route"
+    )
+
+
+@pytest.mark.asyncio
+async def test_env_case_variants_are_not_swallowed_by_the_tarpit(
+    monkeypatch, aiohttp_client, tmp_path,
+):
+    """A capitalised `/.env` reaches the canary handler, not the tarpit.
+
+    `is_tarpit_path()` runs ahead of the `/.env` dispatch, so folding case in
+    only one of the two would move the defect rather than fix it: the request
+    would stop 404ing and start draining down the redirect chain instead,
+    which still costs the canary the trap exists to place.
+    """
+    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "_CANARY_CACHE", {})
+    monkeypatch.setattr(tbenv, "_CANARY_INFLIGHT", {})
+    monkeypatch.setattr(tbenv, "_CANARY_LOCK", None)
+    monkeypatch.setattr(tbenv, "issue_credentials", _fake_canary)
+
+    assert not tbenv.is_tarpit_path("/.ENV")
+    assert not tbenv.is_tarpit_path("/.Env")
+    # The invariant this fix introduces: case never changes the routing
+    # decision. `/x/.env` has no dedicated trap entry so it is tarpit-bound,
+    # and its capitalised spelling must be too (it was not, before);
+    # `/app/.env` does have one, so both spellings stay exempt.
+    for probe in ("/x/.env", "/app/.env", "/.env.local", "/mailer/.env"):
+        assert tbenv.is_tarpit_path(probe) == tbenv.is_tarpit_path(probe.upper()), (
+            f"{probe} and {probe.upper()} must route the same way"
+        )
+    assert tbenv.is_tarpit_path("/x/.ENV"), "unclaimed prefixed spellings stay tarpit-bound"
+
+    client = await aiohttp_client(tbenv.create_app())
+    resp = await client.get(
+        "/.ENV", headers={"X-Forwarded-For": "198.51.100.62"},
+        allow_redirects=False,
+    )
+    assert resp.status == 200, "must be the canary answer, not a tarpit redirect"
+
+
+@pytest.mark.asyncio
 async def test_env_handler_separates_clients(monkeypatch, aiohttp_client, tmp_path):
     """The cache is per-IP: two clients must not be served the same
     credential, or a replay could not be attributed to who took it."""
