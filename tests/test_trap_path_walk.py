@@ -74,9 +74,26 @@ def test_unknown_leading_segment_does_not_resolve():
         assert tbenv.resolve_canary_trap(path) == (None, 0), path
 
 
+def test_walk_reaches_three_layout_dirs():
+    """The JVM build tree nests the same config three deep by
+    construction, so three is inside what real dictionaries walk."""
+    trap, depth = tbenv.resolve_canary_trap("/admin/config/backup/aws.json")
+    assert trap is not None and trap.name == "aws-credentials-json"
+    assert depth == 3
+    for path in (
+        "/src/main/resources/application.properties",
+        "/build/resources/main/application.properties",
+        "/target/classes/application.properties",
+    ):
+        trap, depth = tbenv.resolve_canary_trap(path)
+        assert trap is not None, path
+
+
 def test_walk_stops_at_the_depth_cap():
-    """Three layout dirs deep is past what real dictionaries walk."""
-    assert tbenv.resolve_canary_trap("/admin/config/backup/aws.json") == (None, 0)
+    """Four layout dirs deep is past what real dictionaries walk."""
+    assert tbenv.resolve_canary_trap(
+        "/admin/config/backup/storage/aws.json"
+    ) == (None, 0)
 
 
 def test_walk_stops_at_the_first_unrecognised_segment():
@@ -339,3 +356,108 @@ def test_both_deploy_renderers_reject_a_loopback_host():
         }},
     }))
     assert sftp["host"] == "deploy.internal"
+
+
+# --------------------------------------------------------------------------
+# Home-directory resolution — the "answer the whole set" invariant
+# --------------------------------------------------------------------------
+
+# One representative leaf per renderer family. The point of the sweep is
+# not these specific files; it is that whatever the table answers at the
+# webroot, it answers identically under every layout prefix and every
+# home directory, because a dictionary walks all of them in one pass and
+# any subset we decline is a difference no filesystem could produce.
+_CONSISTENCY_LEAVES = (
+    "/.aws/credentials",
+    "/.pulumi/credentials.json",
+    "/.claude/.credentials.json",
+    "/.claude/credentials.json",
+    "/.codex/auth.json",
+    "/.codex/config.toml",
+    "/.gemini/oauth_creds.json",
+    "/.config/gh/hosts.yml",
+    "/.config/rclone/rclone.conf",
+    "/.terraformrc",
+    "/.netrc",
+    "/.git-credentials",
+)
+
+
+@pytest.mark.parametrize("leaf", _CONSISTENCY_LEAVES)
+def test_leaf_answers_under_every_app_layout_prefix(leaf):
+    bare, _ = tbenv.resolve_canary_trap(leaf)
+    assert bare is not None, leaf
+    for prefix in tbenv._APP_LAYOUT_CRED_PREFIXES:
+        path = f"/{prefix}{leaf}"
+        trap, _ = tbenv.resolve_canary_trap(path)
+        assert trap is not None, path
+        assert trap.name == bare.name, path
+
+
+@pytest.mark.parametrize("leaf", _CONSISTENCY_LEAVES)
+def test_leaf_answers_under_every_credential_home_dir(leaf):
+    """`/home/ec2-user/<leaf>` and `/home/jenkins/<leaf>` are the same
+    read. Answering one and 404ing the other is separable from a real
+    filesystem by the sweep that walks both."""
+    bare, _ = tbenv.resolve_canary_trap(leaf)
+    assert bare is not None, leaf
+    for home in tbenv._CRED_HOME_DIRS:
+        path = f"{home}{leaf}"
+        trap, _ = tbenv.resolve_canary_trap(path)
+        assert trap is not None, path
+        # A home directory may have its own renderer — `/root/` gets a
+        # root-flavoured variant of some files — but it stays in the
+        # same family. What must not happen is a 404.
+        assert trap.name.startswith(bare.name), path
+
+
+def test_home_dir_walk_keeps_the_vocabulary_gate():
+    """Stripping a home directory does not turn the walk into an
+    answer-anything switch — the segments after it still have to be
+    layout names."""
+    for path in (
+        "/home/ubuntu/9f2a1c/aws.json",
+        "/root/zzqx/.aws/credentials",
+        "/home/jenkins/9f2a1c/config/aws.json",
+    ):
+        assert tbenv.resolve_canary_trap(path) == (None, 0), path
+
+
+def test_bare_home_dir_is_not_a_read():
+    """A home directory with no file after it names nothing."""
+    for path in ("/home/ubuntu", "/home/ubuntu/", "/root", "/home"):
+        assert tbenv.resolve_canary_trap(path) == (None, 0), path
+
+
+def test_iis_webroot_spelling_matches_the_unix_ones():
+    """`wwwroot` was the only common webroot name missing from the
+    vocabulary, which made the Windows spelling of every credential path
+    a 404 while `/www/` and `/htdocs/` answered."""
+    for leaf in ("/.aws/credentials", "/.codex/auth.json", "/aws.json"):
+        expected, _ = tbenv.resolve_canary_trap(f"/www{leaf}")
+        assert expected is not None, leaf
+        trap, _ = tbenv.resolve_canary_trap(f"/wwwroot{leaf}")
+        assert trap is not None and trap.name == expected.name, leaf
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        # Dot-less spellings of the AI-assistant credential files. The
+        # real names are dot-prefixed; the dictionaries walk both.
+        ("/.claude/credentials.json", "claude-credentials"),
+        ("/.config/claude/credentials.json", "claude-credentials"),
+        ("/backup/.claude/credentials.json", "claude-credentials"),
+        ("/wwwroot/.claude/credentials.json", "claude-credentials"),
+        ("/home/ubuntu/.claude/credentials.json", "claude-credentials"),
+        # `config.json` for a tool whose config file is TOML can only be
+        # a guess, and the JSON body is what the guess expects.
+        ("/.codex/config.json", "codex-auth"),
+        ("/wwwroot/.codex/auth.json", "codex-auth"),
+        ("/home/.codex/auth.json", "codex-auth"),
+    ],
+)
+def test_ai_assistant_credential_spellings(path, expected):
+    trap, _ = tbenv.resolve_canary_trap(path)
+    assert trap is not None, path
+    assert trap.name == expected, path

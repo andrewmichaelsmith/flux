@@ -24787,6 +24787,13 @@ _CRED_HOME_DIRS: tuple[str, ...] = (
             "app", "deploy", "node", "www-data",
         )
     ),
+    # Service accounts whose home directory is not under /home. A CI or
+    # database daemon installed from a distro package gets its home here,
+    # and it is the account the pipeline's credentials belong to, so the
+    # same dictionaries ask for `.aws/credentials` under it.
+    "/var/lib/jenkins",
+    "/var/lib/postgresql",
+    "/var/lib/mysql",
 )
 
 
@@ -27034,6 +27041,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # the AI-editor bundle below, so a keyless fetcher that only
             # tries the Anthropic-branded path lands here.
             "/.config/anthropic/credentials/default.json",
+            # Dot-less spellings. The real file is dot-prefixed
+            # (`~/.claude/.credentials.json`), but the dictionaries walk
+            # the plain `credentials.json` form under both parents — a
+            # reasonable guess for anyone who has only read that the
+            # credentials live under `~/.claude/`, and one we were the
+            # only party treating as a different file.
+            "/.claude/credentials.json",
+            "/.config/claude/credentials.json",
         ),
         ("aws",),
         render_claude_credentials_json,
@@ -27192,7 +27207,16 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     # above `render_codex_auth_json` for context.
     CanaryTrap(
         "codex-auth",
-        ("/.codex/auth.json", "/root/.codex/auth.json"),
+        (
+            "/.codex/auth.json",
+            "/root/.codex/auth.json",
+            # `config.json` is the spelling a dictionary emits for a tool
+            # whose config it has not actually looked at — the real file
+            # is `config.toml`, so the `.json` name can only be a guess,
+            # and the JSON body here is what that guess expects to find.
+            "/.codex/config.json",
+            "/root/.codex/config.json",
+        ),
         ("aws",),
         render_codex_auth_json,
         "application/json; charset=utf-8",
@@ -28680,6 +28704,59 @@ _TRAP_WALK_EXTRA_PREFIXES: tuple[str, ...] = (
     "files", "info", "infra", "json", "keys",
     "media", "new", "root", "secret", "secrets", "services", "settings",
     "sql", "srv", "upload", "uploads", "user", "users", "var",
+    # --- Layout names observed leading a leaf this table already
+    # renders, and declined only because the parent was not in this
+    # vocabulary. Grouped by the convention that produces them, because
+    # a dictionary that walks one member of a group walks the rest.
+    #
+    # JVM build-output trees. `src/main/resources/application.properties`
+    # is where Spring keeps its config, and the compiled copies land
+    # under `target/classes/` (Maven) and `build/resources/main/`
+    # (Gradle) — a deployed artifact exploded into the webroot exposes
+    # all three spellings of the same file.
+    "classes", "resources", "target",
+    # Infrastructure-as-code and config-management trees. These exist to
+    # hold secrets, which is why a credential-dredging dictionary walks
+    # them: `ansible/vars/secrets.yml`, `chef/data_bags/`, Helm values
+    # and rendered k8s manifests.
+    "charts", "chef", "cluster", "data_bags", "helm", "manifests",
+    "ops", "playbooks", "roles", "vars",
+    # CLI-tool config directories that sit beside a project rather than
+    # in the home directory.
+    "doctl", "supabase", "tf",
+    # Framework/project-name directories. A Django or Rails project
+    # deployed into the webroot puts `settings.py` under a directory
+    # named for the project, and the generic placeholders below are what
+    # the tutorials — and therefore the dictionaries — use.
+    "django", "main", "myapp", "mysite", "spring",
+    # Classic PHP include trees.
+    "class", "include", "includes", "system",
+    # Webroot spellings this list was missing. `wwwroot` is the IIS /
+    # ASP.NET default and was the only common webroot name absent, which
+    # made the Windows spelling of every credential path a 404 while the
+    # Unix spellings answered.
+    "bkp", "downloads", "envs", "js", "wwwroot",
+    # A CMS installed into a subdirectory rather than at the root, and
+    # the directories that sit beside it.
+    "apache", "blog", "console", "credentials", "ssl", "workflows",
+)
+
+
+# Leading-dot directories that a walk may drop. These are the same shape
+# as the plain layout names above — a directory a real deployment could
+# have — but the dot spellings arrive from two different sources: a
+# repository checked out into the webroot (`.github/`, `.gitlab/`,
+# `.travis/`, `.vscode/`, `.idea/`), and a home directory served as the
+# webroot, which exposes per-tool config dirs (`.config/`, `.aws/`,
+# `.kube/`, `.terraform/`).
+#
+# Kept separate from the plain list only for readability; both feed the
+# one `_TRAP_WALK_PREFIXES` set.
+_TRAP_WALK_DOTDIR_PREFIXES: tuple[str, ...] = (
+    ".aws", ".azure", ".claude", ".cloudflare", ".codex", ".config",
+    ".digitalocean", ".do", ".docker", ".gcloud", ".github", ".gitlab",
+    ".circleci", ".heroku", ".idea", ".kube", ".local", ".ssh",
+    ".terraform", ".travis", ".vscode",
 )
 
 _TRAP_WALK_PREFIXES: frozenset[str] = frozenset(
@@ -28688,14 +28765,26 @@ _TRAP_WALK_PREFIXES: frozenset[str] = frozenset(
         *_ENV_WEBROOT_PREFIXES,
         *_APP_LAYOUT_CRED_PREFIXES,
         *_TRAP_WALK_EXTRA_PREFIXES,
+        *_TRAP_WALK_DOTDIR_PREFIXES,
     )
 )
 
-# How many leading directory segments the walk may drop. Two covers
-# effectively all of the nesting real dictionaries use (`/admin/x.json`,
-# `/admin/config/x.json`); going deeper buys almost nothing and widens
-# the surface on which we answer paths a real server would not.
-TRAP_WALK_MAX_DEPTH = 2
+# How many leading directory segments the walk may drop. Originally two,
+# on the reasoning that `/admin/x.json` and `/admin/config/x.json` cover
+# what real dictionaries nest. Replaying a window of declined paths back
+# through the matcher contradicted that: the single largest group of
+# leaves this table already renders but never reached was the JVM build
+# tree, which is three deep by construction —
+# `src/main/resources/application.properties`,
+# `build/resources/main/application.properties`,
+# `target/classes/application.properties`. Those are not an unusual
+# nesting, they are where the file lives.
+#
+# Three is still cheap, because depth is not the gate: every segment
+# dropped must independently be a known layout name, so a third segment
+# only widens the surface where three consecutive layout words appear.
+# `/9f2a1c/x/y/aws.json` is as dead at depth 3 as it was at depth 2.
+TRAP_WALK_MAX_DEPTH = 3
 
 # --- phpinfo() under an arbitrary parent ---------------------------------
 # The layout walk above gates on the *parent* directory, because for a
@@ -28755,6 +28844,48 @@ def _nested_phpinfo_trap(path: str) -> "tuple[CanaryTrap | None, int]":
     return find_canary_trap("/" + segments[-1]), len(segments) - 1
 
 
+# Home directories, in segment form, longest first so `/home/ubuntu`
+# wins over `/home`. Built from the same `_CRED_HOME_DIRS` list the
+# individual traps use, so the walk and the hand-listed variants cannot
+# disagree about which accounts exist.
+_CRED_HOME_SEGMENTS: tuple[tuple[str, ...], ...] = tuple(
+    sorted(
+        (tuple(seg for seg in home.lower().split("/") if seg) for home in _CRED_HOME_DIRS),
+        key=len,
+        reverse=True,
+    )
+)
+
+
+def _walk_start_depths(segments: "list[str]") -> "tuple[int, ...]":
+    """Segment offsets the layout walk may start from.
+
+    Always 0 — the bare-webroot case. Plus, when the path opens with a
+    home directory, the offset just past it, so the rest of the path is
+    resolved exactly as if it had arrived at the webroot.
+
+    This is what keeps the answer set whole. A credential file under a
+    home directory is not a different file: `/home/jenkins/.aws/credentials`
+    and `/.aws/credentials` are the same read, arriving from a traversal
+    that resolved to an absolute path instead of a relative one. Before
+    this, a handful of traps enumerated `_CRED_HOME_DIRS` as literal table
+    entries and the rest did not, so a sweep walking one dictionary across
+    both got a credential file for `/home/ubuntu/.aws/credentials` and a
+    404 for the byte-identical `/home/ubuntu/.pulumi/credentials.json`.
+    That difference is not something a filesystem can produce, so it
+    fingerprints the responder to anyone who walks both — which is exactly
+    what these dictionaries do in a single pass.
+    """
+    lowered = [seg.lower() for seg in segments]
+    for home in _CRED_HOME_SEGMENTS:
+        n = len(home)
+        # Leave at least the leaf behind; a bare home directory with no
+        # file after it is not a read of anything.
+        if n < len(lowered) and tuple(lowered[:n]) == home:
+            return (0, n)
+    return (0,)
+
+
 def resolve_canary_trap(path: str) -> "tuple[CanaryTrap | None, int]":
     """Find the trap that should answer `path`, tolerating app-layout nesting.
 
@@ -28782,16 +28913,21 @@ def resolve_canary_trap(path: str) -> "tuple[CanaryTrap | None, int]":
         return _nested_phpinfo_trap(path)
 
     segments = [s for s in path.split("/") if s]
-    # Need at least one directory plus the leaf to have anything to drop.
-    for depth in range(1, min(len(segments), TRAP_WALK_MAX_DEPTH + 1)):
-        if segments[depth - 1].lower() not in _TRAP_WALK_PREFIXES:
-            # The first non-layout segment ends the walk — a dictionary
-            # word we do not recognise means we are no longer looking at
-            # a plausible deployment layout.
-            break
-        found = find_canary_trap("/" + "/".join(segments[depth:]))
-        if found is not None:
-            return found, depth
+    for depth in _walk_start_depths(segments):
+        # Need at least one directory plus the leaf to have anything to drop.
+        for extra in range(0, min(len(segments) - depth, TRAP_WALK_MAX_DEPTH) + 1):
+            if extra and segments[depth + extra - 1].lower() not in _TRAP_WALK_PREFIXES:
+                # The first non-layout segment ends the walk — a dictionary
+                # word we do not recognise means we are no longer looking at
+                # a plausible deployment layout.
+                break
+            if depth + extra == 0:
+                # Depth 0 with no home prefix is the exact lookup, already
+                # tried above.
+                continue
+            found = find_canary_trap("/" + "/".join(segments[depth + extra:]))
+            if found is not None:
+                return found, depth + extra
     # Every layout-walk exit lands here: out of depth, unknown parent, or
     # no table entry at any depth. None of those say anything about a leaf
     # that is diagnostic on its own, so the leaf-gated resolver gets its
