@@ -88,6 +88,7 @@ burning quota.
 | `CANARY_TRAP_CACHE_MAX_ENTRIES` | `1024` | |
 | `HONEYPOT_TRAP_PATH_WALK_ENABLED` | **on** | Let an exact-path trap also answer when the file arrives nested under a recognised app-layout directory (`/admin/aws.json`). Capped at two segments; every segment dropped must be a known layout name, so arbitrary parents still 404. See [docs/trap-path-walk.md](./docs/trap-path-walk.md). |
 | `HONEYPOT_PHPINFO_NESTED_ENABLED` | **on** | Answer the phpinfo() family under *any* parent directory, up to four segments deep (`/wp-admin/phpinfo.php`, `/crm/backend/phpinfo.php`). Gated on the leaf filename rather than the parent, because a phpinfo page belongs to no framework layout. Only unambiguous phpinfo leaf names are eligible — the generic stems (`test.php`, `x.php`, `1.php`) stay root-only. See [docs/phpinfo-nested.md](./docs/phpinfo-nested.md). |
+| `HONEYPOT_SYSTEM_FILE_READS_ENABLED` | **on** | Answer the fixed world-readable system-file list (`/etc/passwd`, `/etc/shadow`, `/etc/nginx/nginx.conf`, `php.ini` at every packaged location, the kubelet's projected service-account volume, `/.dockerenv`, `/proc/<pid>/{cgroup,cmdline}`) when the request names the file by its own absolute path, rather than only behind the `/@fs/` dev-server prefix. Exact lookup, no layout walk — an absolute system path does not move with a project. Needs no issuing key. See [docs/system-file-reads.md](./docs/system-file-reads.md). |
 
 ## Laravel Debugbar
 

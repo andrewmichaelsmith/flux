@@ -71,6 +71,9 @@ system file only means anything at the path it really lives at
 | `/var/run/secrets/kubernetes.io/serviceaccount/token` (and the `/run` spelling) | A projected service-account JWT, minted per hit |
 | `…/serviceaccount/namespace` | The namespace the token claims, so the volume describes one coherent pod |
 | `…/serviceaccount/ca.crt` | The cluster CA bundle — public material, random per hit so it is not a fleet constant |
+| `/.dockerenv` | Zero bytes, as the real file is — its existence is the whole message |
+| `/proc/{self,1}/cgroup` | A cgroup v2 `0::` line naming a burstable pod under containerd; pod UID and container ID random per hit |
+| `/proc/{self,1}/cmdline` | NUL-separated argv, naming the runtime `/proc/<pid>/environ` already claims |
 
 Most of these bodies carry no credential, so no canary is spent and no
 per-IP quota applies. The service-account token is the exception: it is a
@@ -95,8 +98,9 @@ worth reading.
 
 Result tag is `vite-fs-<trap>` on a hit, `vite-fs-etc-passwd` /
 `vite-fs-etc-shadow` / `vite-fs-etc-nginx-conf` / `vite-fs-etc-php-ini` /
-`vite-fs-k8s-serviceaccount-{token,namespace,ca-cert}` for a system
-file, and `vite-fs-miss` otherwise. The
+`vite-fs-k8s-serviceaccount-{token,namespace,ca-cert}` /
+`vite-fs-dockerenv-marker` / `vite-fs-proc-cgroup` /
+`vite-fs-proc-cmdline` for a system file, and `vite-fs-miss` otherwise. The
 prefix keeps the filesystem-walk population separable from the webroot
 population: the same body served for `/.aws/credentials` and for
 `/@fs/root/.aws/credentials` represents two different scanner behaviours
@@ -139,3 +143,4 @@ correctly, since it is no longer an `/@fs/` read.
 | `HONEYPOT_VITE_FS_ENABLED` | `true` | Master switch |
 | `HONEYPOT_VITE_FS_MAX_SUFFIX_WALK` | `12` | Max leading directories stripped during resolution |
 | `HONEYPOT_VITE_FS_SYSTEM_FILES_ENABLED` | `true` | Answer the world-readable system-file list |
+| `HONEYPOT_SYSTEM_FILE_READS_ENABLED` | `true` | Answer the same list when the file is named by its own absolute path, without the `/@fs/` prefix — see [system-file-reads.md](./system-file-reads.md) |

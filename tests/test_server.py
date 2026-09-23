@@ -626,6 +626,13 @@ def test_all_trap_families_default_on():
         "layout-vocabulary walk cannot cover."
     )
     assert tbenv.CLOUD_IMDS_ENABLED
+    assert tbenv.SYSTEM_FILE_READS_ENABLED, (
+        "HONEYPOT_SYSTEM_FILE_READS_ENABLED should default to True — the "
+        "system-file table is the oracle a read primitive is confirmed "
+        "against before it is walked to the credential files, and a "
+        "dictionary asks for those names by their own absolute path far "
+        "more often than behind the `/@fs/` prefix."
+    )
     assert tbenv.FORTIGATE_VPN_ACCEPT_ENABLED, (
         "HONEYPOT_FORTIGATE_VPN_ACCEPT_ENABLED should default to True — a "
         "credential sink that can never succeed records the dictionary and "

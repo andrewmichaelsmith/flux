@@ -1825,6 +1825,29 @@ VITE_FS_MAX_SUFFIX_WALK = max(
 # switch, which would be its own obvious tell.
 VITE_FS_SYSTEM_FILES_ENABLED = _env_bool("HONEYPOT_VITE_FS_SYSTEM_FILES_ENABLED")
 
+# The same fixed list of system files, answered when the request names
+# one by its own absolute path rather than behind the `/@fs/` prefix.
+# A read primitive delivers the path both ways and the table could only
+# be reached one of them: `normalize_path` collapses the traversal
+# spellings (`/static../etc/passwd`, `/js../etc/passwd`,
+# `/..%252f..%252f..%252fetc/passwd`, `/;.%2e/.%2e/etc/passwd`) down to
+# the bare absolute name, and a dictionary with no traversal to spend
+# asks for it bare to begin with. Both landed in the catch-all 404 while
+# the byte-identical read behind `/@fs/` was served — so the surface that
+# exists to make the read primitive behave like a real one declined the
+# commonest way of exercising it.
+#
+# The precedent is already in the trap table, which answers bare
+# `/proc/self/environ` and has since that trap shipped. Answering the
+# process environment while insisting the same process has no
+# `/proc/self/cmdline` and no `/proc/self/cgroup` describes a machine
+# that does not exist, and one sweep walks all three.
+#
+# Separate switch from the `/@fs/` reader because it is a separate
+# surface: a deployment that wants the dev-server prefix answered but
+# not bare absolute paths can have that.
+SYSTEM_FILE_READS_ENABLED = _env_bool("HONEYPOT_SYSTEM_FILE_READS_ENABLED")
+
 # --- `php://filter` local-file-read primitive --------------------------
 # The third surface that hands a client an arbitrary file read, after the
 # `/@fs/` dev-server prefix and the appliance body traversal. Here the
@@ -8937,6 +8960,68 @@ def render_fake_k8s_sa_namespace() -> bytes:
     return K8S_SA_NAMESPACE.encode("ascii")
 
 
+def render_dockerenv() -> bytes:
+    """`/.dockerenv` — the marker the runtime drops in every container's
+    root, and the first thing a recon script reads to decide whether the
+    read primitive it just found is pointed at a container or at a host.
+
+    Real `/.dockerenv` is zero bytes. That is the whole file: its
+    existence is the answer, and a body would be the tell. So the
+    response is a 200 with no content, which is exactly what a reader
+    gets from a real one — and distinguishable from our 404, which is
+    what it got before.
+    """
+    return b""
+
+
+def render_proc_self_cgroup() -> bytes:
+    """`/proc/<pid>/cgroup` — the second read of the same recon step, and
+    the one that says *which* orchestrator. `/.dockerenv` answers "a
+    container"; this names the pod and the container runtime under it,
+    which is how a reader decides whether the kubelet's projected
+    service-account volume is worth walking to next.
+
+    cgroup v2 shape — a single `0::` line — because that is what a
+    current containerd node serves, and the slice path is the one
+    kubelet builds for a burstable pod. The pod UID and container ID are
+    random per hit for the same reason the service-account token's UIDs
+    are: they identify, so a fixed pair would be one pod shared by every
+    host running this software. Two reads therefore describe two pods,
+    as two reads of the token already do.
+    """
+    pod_uid = str(uuid.uuid4()).replace("-", "_")
+    container_id = secrets.token_hex(32)
+    return (
+        "0::/kubepods.slice/kubepods-burstable.slice/"
+        f"kubepods-burstable-pod{pod_uid}.slice/"
+        f"cri-containerd-{container_id}.scope\n"
+    ).encode("ascii")
+
+
+def render_proc_self_cmdline() -> bytes:
+    """`/proc/<pid>/cmdline` — the third read, and the one that names the
+    process the read primitive is running inside.
+
+    NUL-separated argv with a trailing NUL, the on-disk shape, for the
+    same reason `/proc/<pid>/environ` is NUL-separated: a reader greps
+    the raw bytes rather than tokenising. The argv is the runtime the
+    environment block already claims — `NODE_ENV=production` out of
+    `PWD=/var/www/html` — because the two files are read in one pass and
+    a process that is node in one and something else in the other is a
+    tell the reader gets for free.
+
+    Fixed, unlike the cgroup IDs above: a command line is not an
+    identifier, and the corresponding fields in the environment block
+    (`PATH`, `PWD`, `USER`) are fixed for the same reason.
+    """
+    argv = (
+        "/usr/local/bin/node",
+        "--max-old-space-size=2048",
+        "/var/www/html/server.js",
+    )
+    return ("\x00".join(argv) + "\x00").encode("ascii")
+
+
 def render_fake_k8s_sa_ca_cert() -> bytes:
     """The cluster CA bundle from the same projected volume.
 
@@ -13656,12 +13741,26 @@ def _appliance_display_host(host: str, fallback: str) -> str:
     else the configured site host, else the vendor placeholder the
     caller supplied.
     """
+    return _external_host_or_site(host) or fallback
+
+
+def _external_host_or_site(host: str) -> str:
+    """The externally-plausible name for this request, or empty.
+
+    The two-step every caller below shares: the requested host when it
+    could be a real external name, else the configured site host. Split
+    out so the log line can record the same answer the response was
+    built from — a trap row that says `127.0.0.1` while the page it
+    describes said the deployment's own name cannot be joined back to
+    the name the client was served, which is the whole of the
+    attribution it was written down for.
+    """
     h = (host or "").strip().lower().split(":", 1)[0]
     if _host_is_externally_plausible(h):
         return h
     if _host_is_externally_plausible(SITE_HOST):
         return SITE_HOST
-    return fallback
+    return ""
 
 
 def _external_base_url(host: str) -> str:
@@ -28683,6 +28782,44 @@ _VITE_FS_SYSTEM_FILES: "dict[str, tuple[str, Callable[[], bytes], str]]" = {
             ),
         )
     },
+    # The three files read *before* the projected volume above, in the
+    # step that decides whether it is worth reading at all: is this a
+    # container, under what orchestrator, running what. They arrive from
+    # the same sources and in the same sweep as the token, and the trap
+    # table has answered the fourth member of that set —
+    # `/proc/self/environ` — since it shipped. Answering one leg of a
+    # four-file read and 404ing three describes a machine with an
+    # environment block but no command line, which is a sharper tell than
+    # any of the three bodies could be.
+    #
+    # `/.dockerenv` is zero bytes by design; see its renderer.
+    "/.dockerenv": (
+        "dockerenv-marker",
+        render_dockerenv,
+        "application/octet-stream",
+    ),
+    # `curproc` is deliberately absent where `proc-environ` carries it:
+    # that spelling is FreeBSD's, and neither cgroup nor cmdline exists
+    # there, so answering it would claim a file the named kernel does
+    # not have.
+    **{
+        f"/proc/{pid}/cgroup": (
+            "proc-cgroup",
+            render_proc_self_cgroup,
+            "text/plain; charset=utf-8",
+        )
+        for pid in ("self", "1")
+    },
+    **{
+        f"/proc/{pid}/cmdline": (
+            "proc-cmdline",
+            render_proc_self_cmdline,
+            # Same reasoning as `proc-environ`: the NUL bytes are what a
+            # real static handler serves as octet-stream.
+            "application/octet-stream",
+        )
+        for pid in ("self", "1")
+    },
 }
 
 
@@ -28939,6 +29076,20 @@ def find_canary_trap(path: str) -> "CanaryTrap | None":
     if not CANARY_TRAPS_ENABLED:
         return None
     return _TRAP_BY_PATH.get(path.lower())
+
+
+def find_system_file(path: str) -> "tuple[str, Callable[[], bytes], str] | None":
+    """The system-file entry answering `path` named by its own absolute
+    name, or None.
+
+    Exact lookup only — no layout walk. The walk exists because a
+    credential file moves with the project it belongs to; an absolute
+    system path does not, and accepting `/app/etc/passwd` would answer
+    a name no filesystem has.
+    """
+    if not SYSTEM_FILE_READS_ENABLED:
+        return None
+    return _VITE_FS_SYSTEM_FILES.get(path.lower())
 
 
 @dataclass(frozen=True)
@@ -29872,6 +30023,25 @@ def _log_context_from_request(request: web.Request, request_id: str, body_bytes_
         "requestId": request_id,
         "method": request.method,
         "host": host,
+        # What the response furniture actually carried, when that is not
+        # what arrived in `Host`. Stamped only on the difference, so the
+        # field's presence is exactly the "a proxy in front of this
+        # server rewrote the name" signal and requests whose own host is
+        # usable keep their existing log shape.
+        #
+        # The difference is not the edge case: where TLS is terminated by
+        # a front end that proxies to a loopback upstream, `Host` and
+        # `X-Forwarded-Host` both arrive as the upstream's own address,
+        # so it is every request on that listener. The renderers have
+        # resolved past it since `_appliance_display_host` landed — the
+        # log had not, which left the deployment a canary was served
+        # from underivable from the row recording that it was served.
+        **(
+            {"effectiveHost": _effective_host}
+            if (_effective_host := _external_host_or_site(host)) != host
+            and _effective_host
+            else {}
+        ),
         "path": path,
         "rawPath": raw_path,
         "rawTarget": raw_target,
@@ -41503,6 +41673,28 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 ),
             )
 
+    # World-readable system files named by their own absolute path.
+    # After the trap lookup so an entry that owns one of these names
+    # keeps its own renderer — `/proc/self/environ` does, and it stays
+    # on the canary-bearing trap rather than moving to this table.
+    #
+    # Needs no issuing key, and is placed where it is for that reason as
+    # much as for priority: none of these bodies carries a canary, so the
+    # surface that makes a read primitive behave like a real one keeps
+    # working on a keyless deployment, where almost nothing else does.
+    system_file = find_system_file(path)
+    if system_file is not None:
+        tag, render_system_file, system_content_type = system_file
+        system_body = render_system_file()
+        append_log({
+            **log_context, "status": 200, "result": tag,
+            "bytes": len(system_body),
+        })
+        return web.Response(
+            status=200, body=system_body,
+            headers={"Content-Type": system_content_type},
+        )
+
     # Webhook deliveries. Late in the chain because the match is a path
     # shape rather than a known address: anything above that wants
     # `/api/...` for itself has already taken it. Needs no Tracebit key —
@@ -41609,6 +41801,9 @@ def main() -> int:
             "flux: TRACEBIT_API_KEY unset — /.env, /.git/*, and canary file traps disabled (all 404)",
             file=sys.stderr,
         )
+    # Keyless surface, so it is listed outside the API_KEY block above.
+    if SYSTEM_FILE_READS_ENABLED:
+        active.append("system-file-reads")
     if TARPIT_ENABLED:
         active.append("tarpit")
     if WEBSHELL_ENABLED:

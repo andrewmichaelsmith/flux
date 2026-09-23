@@ -14,6 +14,7 @@ Every line includes these — they're built in `_handle()` before dispatch.
 | `requestId` | string | UUID4 minted on each request. |
 | `method` | string | `GET` / `HEAD` / `POST`. |
 | `host` | string | `X-Forwarded-Host` or `Host`, lowercased, port stripped. Logged as-is; flux never gates on it. |
+| `effectiveHost` | string | Present only when `host` is not a name a client could have reached this server by — an address literal or loopback, which is what a front end that terminates TLS and proxies to a loopback upstream substitutes for the requested name in both `Host` and `X-Forwarded-Host`. The value is what the response furniture actually carried: `HONEYPOT_SITE_HOST` (or `SENSOR_PRIMARY_DOMAIN`). Absent when `host` is usable as-is, and absent when no better name is configured. Its presence is exactly the "a proxy in front of this server rewrote the name" signal. |
 | `path` | string | Percent-decoded, duplicate-slash collapsed. |
 | `rawPath` | string | Pre-decode path from the request line. |
 | `rawTarget` | string | Full request target (path + query). |
