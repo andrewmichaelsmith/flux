@@ -29119,14 +29119,18 @@ for _trap in CANARY_TRAPS:
 
 
 # --- Java build-layout locations for the Spring config family --------
-# `/application.properties` at bare webroot is the *derived* spelling.
-# The reason a Spring config is readable over HTTP at all is almost
-# always that a project tree or an exploded WAR is being served as
-# static files — and in both of those the file lives at its build-layout
-# path (`src/main/resources/`, `WEB-INF/classes/`), not at the root. So
-# the table answered the less likely half of the same sweep and 404'd
-# the spelling that corresponds to the misconfiguration actually being
-# exploited.
+# A Spring config is readable over HTTP because a project tree or an
+# exploded WAR is being served as static files, and in both of those the
+# file lives at its build-layout path rather than at the webroot. Some of
+# those paths already resolved before this table existed, but only
+# incidentally: the generic app-layout walk strips a leading segment and
+# re-resolves, which happens to cover `/src/main/resources/` and
+# `/target/classes/` and does not cover `/WEB-INF/classes/` or
+# `/BOOT-INF/classes/` — the servlet-container and Spring Boot fat-JAR
+# layouts, which is to say the two that correspond to a deployed
+# artifact rather than a checked-out source tree. Stating the prefixes
+# here makes the coverage a property of the family instead of a
+# side effect of how many segments a path happens to have.
 #
 # Derived from whatever the tables already own, rather than hand-listed,
 # so a profile variant or topic sibling added above cannot go missing

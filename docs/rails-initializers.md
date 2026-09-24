@@ -65,3 +65,30 @@ catch-all 404. Each leaf appeared on every day of the retained window, and
 the directory was answered nowhere — Flux served the Rails *secrets* family
 (`secrets.yml`, `master.key`, `credentials.yml.enc`) while 404ing the
 directory next to it that holds the third-party keys.
+
+## Correction: what the Java build-layout routing actually fixed
+
+The commit that introduced `_JAVA_BUILD_LAYOUT_PREFIXES` described the
+webroot spelling of `application.properties` as the only one answered. That
+is not accurate, and the correction is worth keeping because it changes what
+the change is for.
+
+Probed against a live instance before the change:
+
+| path | before |
+| --- | --- |
+| `/src/main/resources/application.properties` | **200** — resolved incidentally by the generic app-layout walk |
+| `/target/classes/application.properties` | **200** — same |
+| `/WEB-INF/classes/application.properties` | 404 |
+| `/BOOT-INF/classes/application.properties` | 404 |
+| `/database.properties`, `/spring.properties`, `/src/main/resources/{database,secrets,aws,smtp,cloud}.properties` | 404 |
+
+So two of the five prefixes already worked, and they worked by accident: the
+app-layout walk strips a leading segment and re-resolves, which covers the
+source-tree layouts and misses the two deployed-artifact layouts. The real
+unanswered surface was the **topic-named siblings** — the files a JVM
+project splits its config across — at every spelling including the webroot.
+
+Stating the prefixes explicitly is still the right shape: it makes coverage
+a property of the family rather than a side effect of how many path segments
+a spelling happens to have, and it closes `WEB-INF` / `BOOT-INF`.
