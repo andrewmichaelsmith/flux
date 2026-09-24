@@ -519,11 +519,39 @@ def test_webshell_disabled_returns_false_even_for_anchor_path(monkeypatch):
 import pytest_asyncio
 
 
+async def _fake_issue_credentials(*args, **kwargs):
+    """Stand-in for the outbound Tracebit issuance call. Returns the same
+    `FAKE_TRACEBIT` envelope the purpose-built test modules already use, so
+    a canary value asserted in one module means the same thing here."""
+    return FAKE_TRACEBIT
+
+
 @pytest_asyncio.fixture
 async def flux_client(aiohttp_client, monkeypatch, tmp_path):
     """Spin up the real aiohttp app; return a TestClient ready to hit it.
-    Routes LOG_PATH to tmp_path so each test gets its own log file."""
+    Routes LOG_PATH to tmp_path so each test gets its own log file.
+
+    The outbound Tracebit call is stubbed here. Without the stub, every
+    canary-bearing trap exercised through this fixture reached the live
+    Tracebit API with whatever `TRACEBIT_API_KEY` happened to be in the
+    ambient environment: `python -m pytest` spent real canary quota on a
+    host that had a key, and went red on a host that did not, for reasons
+    having nothing to do with the change under test. That made the
+    all-green-before-pushing gate unreliable in both directions — a genuine
+    regression and a missing env var were indistinguishable.
+
+    It is `issue_credentials`, the HTTP layer, that gets replaced and not
+    `_get_or_issue_canary` above it. Stubbing the higher one would also skip
+    the per-IP cache and the issuance-failure handling, which are exactly
+    what several tests here are checking; replacing only the network call
+    leaves all of that running for real. A test that wants a specific
+    issuance behaviour (a timeout, a shaped response) still overrides either
+    function itself — a later `monkeypatch.setattr` in the test body wins
+    over this one.
+    """
     monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "issue_credentials", _fake_issue_credentials)
     app = tbenv.create_app()
     client = await aiohttp_client(app)
     client.log_path = tmp_path / "env-canary.jsonl"

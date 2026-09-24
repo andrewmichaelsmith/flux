@@ -32,6 +32,8 @@ import pytest_asyncio
 
 from flux import server as tbenv
 
+from .test_server import _fake_issue_credentials  # noqa: F401
+
 
 # The canonical Log4Shell probe, and the two spellings sweeps use to
 # keep the literal `jndi` off the wire.
@@ -52,6 +54,12 @@ def enabled(monkeypatch):
 async def flux_client(aiohttp_client, monkeypatch, tmp_path):
     monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
     monkeypatch.setattr(tbenv, "INTERPOLATION_PROBE_ENABLED", True)
+    # Same reason as the shared fixture in test_server.py: without this
+    # the canary-bearing traps reached here go to the live Tracebit API,
+    # so the module passed or failed on an ambient env var rather than on
+    # the code under test.
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "issue_credentials", _fake_issue_credentials)
     client = await aiohttp_client(tbenv.create_app())
     client.log_path = tmp_path / "env-canary.jsonl"
     return client
