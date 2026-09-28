@@ -19849,6 +19849,16 @@ _ENV_LEAF_NAMES: tuple[str, ...] = (
     "secret", "secrets", "keys", "prod", "dev", "staging", "test",
     "uat", "backup", "credentials", "auth", "app", "api", "database",
     "db", "config",
+    # `production` was missing while `prod` and `staging` answered, so a
+    # dictionary walking the deployment tiers in order collected a canary
+    # for two of three and a 404 for the tier most likely to hold live
+    # credentials. A gap in the tier vocabulary, not a new family.
+    "production",
+    # Per-service env split: one file per backing store, the shape
+    # `docker-compose` encourages (`env_file: mysql.env`). Harvesters walk
+    # the service names as their own group because a compose stack keeps
+    # the database password in the service file rather than in the app's.
+    "mysql", "mongodb", "postgres", "postgresql", "redis",
 )
 
 # Group 7 — deeper `<prefix>/<subdir>/env` variants. Same scanner
@@ -19938,6 +19948,11 @@ def _env_production_paths() -> tuple[str, ...]:
     # dictionaries key on the `.env` suffix and grep KEY=VALUE bytes.
     for name in _ENV_LEAF_NAMES:
         paths.append(f"/{name}.env")
+        # Leading-dot spelling of the same file (`/.db.env`). `.env` is
+        # itself a dotfile, so an operator splitting it per service keeps
+        # the dot; dictionaries walk both spellings for that reason. Bare
+        # webroot only — the prefixed dot form is not an observed shape.
+        paths.append(f"/.{name}.env")
         for prefix in _ENV_WEBROOT_PREFIXES + _ENV_DEEP_PREFIXES:
             paths.append(f"/{prefix}/{name}.env")
 
@@ -25704,6 +25719,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/wp-config.php.dist",
             "/wp-config.php.default",
             "/wp-config.php.inc",
+            # The same suffixes with `.php` dropped. The table already
+            # carries `/wp-config.bak`, `.old` and `.txt` in this
+            # spelling; `.inc`, `.save` and `php_bak` were missing from
+            # it while their `.php`-bearing twins answered, splitting one
+            # editor-leftover dictionary across two outcomes.
+            "/wp-config.inc",
+            "/wp-config.save",
+            "/wp-config.php_bak",
             # Absolute-webroot path-traversal variants — scanner
             # dictionaries enumerate the canonical WordPress install
             # paths on Apache/nginx default layouts because a
@@ -28702,6 +28725,16 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/configuration.php~",
             "/settings.php.bak",
             "/settings.php~",
+            # `config.inc.php` is the PHP include-file naming convention
+            # (phpMyAdmin, PrestaShop, many hand-rolled apps), shipped
+            # alongside `.dist` templates that deploys forget to delete.
+            "/config.inc.php",
+            "/config.inc.php.bak",
+            "/config.inc.php.dist",
+            # Drupal's settings file under its multisite layout. `sites`
+            # and `default` are both known parents, so this leaf answers
+            # `/sites/default/local.settings.php`.
+            "/local.settings.php",
             *_app_layout_variants("config.php"),
             *_app_layout_variants("config/config.php"),
         ),
@@ -28718,6 +28751,15 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/config/db.php",
             "/config/connection.php",
             "/application/config/database.php",
+            # Bare connection-script spellings from the pre-framework
+            # shape: a hand-rolled app puts mysqli_connect() and its
+            # literal password in one include. The leaf registration is
+            # what lets the layout walk answer `/includes/db.php`,
+            # `/lib/database.php` and `/inc/database.php` from one entry.
+            "/db.php",
+            "/database.php",
+            "/connect.php",
+            "/connection.php",
             *_app_layout_variants("config/database.php"),
         ),
         ("aws",),
@@ -28862,6 +28904,30 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/core/settings.local.py",
             "/backend/settings.local.py",
             "/config/settings.local.py",
+            # Split-settings package. `settings/` as a directory with a
+            # per-environment module inside it is the layout every Django
+            # project grows into once one settings file stops being
+            # enough, and the tier names are fixed by convention. The
+            # bare leaf is what the layout walk needs: `settings` is
+            # already a known parent, so registering `/local.py` answers
+            # `/settings/local.py`, `/config/settings/local.py` and
+            # `/mysite/settings/local.py` without listing each.
+            "/local.py",
+            "/base.py",
+            "/dev.py",
+            "/production.py",
+            "/prod_settings.py",
+            # Secrets pulled out of settings into their own module — the
+            # `from .secrets import *` convention. Named for what it
+            # holds, which is why dictionaries probe it directly.
+            "/secrets.py",
+            "/credentials.py",
+            # Service configs that carry broker and storage URLs with
+            # inline credentials: Celery's broker URL, gunicorn's hooks,
+            # and Superset's SQLALCHEMY_DATABASE_URI + SECRET_KEY.
+            "/celeryconfig.py",
+            "/gunicorn.conf.py",
+            "/superset_config.py",
         ),
         ("aws",),
         render_python_settings,
@@ -29326,6 +29392,15 @@ _TRAP_WALK_EXTRA_PREFIXES: tuple[str, ...] = (
     "files", "info", "infra", "json", "keys",
     "media", "new", "root", "secret", "secrets", "services", "settings",
     "sql", "srv", "upload", "uploads", "user", "users", "var",
+    # PHP include dirs and framework instance/multisite layouts, each
+    # observed leading a leaf this table renders and declined only for
+    # the parent. `inc` is the abbreviated sibling of `includes` (already
+    # here), and the table already lists `/inc/config.php` by hand.
+    # `instance` is Flask's documented instance folder — the directory
+    # whose whole purpose is holding the config kept out of source
+    # control. `sites` is Drupal multisite, whose settings live at
+    # `sites/default/` (`default` is already in this vocabulary).
+    "inc", "instance", "sites",
     # --- Layout names observed leading a leaf this table already
     # renders, and declined only because the parent was not in this
     # vocabulary. Grouped by the convention that produces them, because
