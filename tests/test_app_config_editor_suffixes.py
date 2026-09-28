@@ -37,7 +37,9 @@ def test_the_family_is_not_empty():
     """Guards every other test here against passing vacuously."""
     bases = _family_bases()
     assert len(bases) > 100, len(bases)
-    assert len(FAMILY) == 9
+    # 10 since `iis-web-config` joined: it had been listing four of the
+    # leftover suffixes by hand and missing the rest.
+    assert len(FAMILY) == 10
 
 
 @pytest.mark.parametrize("suffix", SUFFIXES)

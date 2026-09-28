@@ -180,3 +180,67 @@ async def test_dispatch_serves_the_new_paths(flux_client, monkeypatch, path, res
     body = await resp.read()
     assert FAKE_TRACEBIT["aws"]["awsAccessKeyId"].encode() in body
     assert _log_entries(flux_client.log_path)[-1]["result"] == result
+
+
+# --- editor-leftover suffixes as a family property ----------------------
+#
+# The same sweep walks `.tmp` and `.txt` alongside the leftovers the
+# family already derived, and `iis-web-config` was listing four of them by
+# hand -- so it had `.bak` but not `.swp`, `~`, `.tmp` or `.txt`. Both are
+# fixed at the family level rather than per table.
+
+@pytest.mark.parametrize("suffix", [".bak", ".old", ".save", ".orig", ".swp", "~", ".tmp", ".txt"])
+def test_web_config_carries_the_whole_leftover_set(suffix):
+    trap = tbenv._TRAP_BY_PATH.get(f"/web.config{suffix}")
+    assert trap is not None, f"/web.config{suffix} is not routed"
+    assert trap.name == "iis-web-config"
+
+
+@pytest.mark.parametrize("path", [
+    "/settings.py.tmp",
+    "/config.php.tmp",
+    "/config.yaml.tmp",
+    "/secrets.py.tmp",
+    "/config.php.txt",
+])
+def test_new_suffixes_reach_the_whole_app_config_family(path):
+    assert path in tbenv._TRAP_BY_PATH, f"{path} is not routed"
+
+
+def test_suffix_autofill_never_moves_an_existing_route():
+    """The auto-fill uses setdefault, so a suffix spelling another trap
+    owns keeps its owner. `/wp-config.php.txt` is wp-config's, not the
+    generic PHP config trap's."""
+    assert tbenv._TRAP_BY_PATH["/wp-config.php.txt"].name == "wp-config"
+    assert tbenv._TRAP_BY_PATH["/wp-config.php.bak"].name == "wp-config"
+
+
+def test_leftovers_do_not_stack():
+    """`/config.php.bak.old` is not a shape any scanner sends."""
+    for p in ("/config.php.bak.old", "/web.config.bak.tmp", "/settings.py.tmp.bak"):
+        assert p not in tbenv._TRAP_BY_PATH, p
+
+
+# --- yaml config leaves -------------------------------------------------
+
+@pytest.mark.parametrize("path", [
+    "/settings.yml", "/settings.yaml", "/aws.yml", "/aws.yaml",
+])
+def test_yaml_config_leaves_route(path):
+    trap = tbenv._TRAP_BY_PATH.get(path)
+    assert trap is not None, f"{path} is not routed"
+    assert trap.name == "app-config-yaml"
+
+
+def test_nested_yaml_settings_resolves_through_the_walk():
+    trap, depth = tbenv.resolve_canary_trap("/config/settings.yml")
+    assert trap is not None and trap.name == "app-config-yaml"
+    assert depth == 1
+
+
+def test_config_inc_php_bak_still_answers_after_dedupe():
+    """The explicit `.bak` entry was removed because the family auto-fill
+    derives it. If that mechanism ever changes, this path silently goes
+    back to 404 -- so pin it."""
+    trap = tbenv._TRAP_BY_PATH.get("/config.inc.php.bak")
+    assert trap is not None and trap.name == "app-config-php"

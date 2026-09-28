@@ -28729,7 +28729,9 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # (phpMyAdmin, PrestaShop, many hand-rolled apps), shipped
             # alongside `.dist` templates that deploys forget to delete.
             "/config.inc.php",
-            "/config.inc.php.bak",
+            # `.dist` only -- the editor-leftover suffixes are derived for
+            # this family further down, so listing `.bak` here would be
+            # redundant.
             "/config.inc.php.dist",
             # Drupal's settings file under its multisite layout. `sites`
             # and `default` are both known parents, so this leaf answers
@@ -28943,6 +28945,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/config.yml",
             "/secrets.yml",
             "/secrets.yaml",
+            # `settings.yml` is the same generic app-config leaf as
+            # `config.yml`, and `aws.yml` is the cloud-credential spelling
+            # of it -- the YAML sibling of the `aws.env` file the
+            # dedicated dotenv trap already answers.
+            "/settings.yml",
+            "/settings.yaml",
+            "/aws.yml",
+            "/aws.yaml",
             "/bootstrap.yml",
             "/bootstrap.yaml",
             # `/application.yml` + `/application.yaml` intentionally absent:
@@ -29159,7 +29169,15 @@ for _trap in CANARY_TRAPS:
 # family, not of each path. `setdefault` is load-bearing: a suffix
 # spelling another trap already owns keeps its owner, so this can only
 # ever add a 404-to-answer and never move an existing route.
-_APP_CONFIG_EDITOR_SUFFIXES = (".bak", ".old", ".save", ".orig", ".swp", "~")
+_APP_CONFIG_EDITOR_SUFFIXES = (
+    ".bak", ".old", ".save", ".orig", ".swp", "~",
+    # `.tmp` is the write-then-rename leftover a deploy script or an
+    # editor leaves when it dies mid-write; `.txt` is the rename that
+    # makes a config readable in a browser on purpose. Both were being
+    # probed across this family while only two tables listed `.txt` by
+    # hand -- a property of the family, so it belongs here.
+    ".tmp", ".txt",
+)
 _APP_CONFIG_SUFFIX_FAMILY = frozenset({
     "app-config-php",
     "app-config-php-database",
@@ -29170,6 +29188,11 @@ _APP_CONFIG_SUFFIX_FAMILY = frozenset({
     "app-config-toml",
     "app-config-json",
     "app-config-properties",
+    # `iis-web-config` listed `.bak`/`.old`/`.save`/`.orig` by hand and so
+    # missed `.swp`, `~`, `.tmp` and `.txt`. Joining the family makes the
+    # coverage a property of the family, which is the whole point of this
+    # block.
+    "iis-web-config",
 })
 for _trap in CANARY_TRAPS:
     if _trap.name not in _APP_CONFIG_SUFFIX_FAMILY:
