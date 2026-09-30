@@ -5236,6 +5236,37 @@ def scan_headers(headers: object) -> dict[str, str]:
 _NO_SLASH_TRAVERSAL_RE = re.compile(r"([^/])\.\.(/)")
 
 
+# Characters that cannot appear in an HTTP header value: the C0 controls
+# and DEL. `normalize_path` percent-DECODES the request target before
+# dispatch (so `%2eenv` routes as `.env`), which means a scanner probing
+# the truncation-bypass shapes -- `/.env%00`, `/.env%0d` -- hands a decoded
+# NUL or CR to every handler downstream. Any handler that then reflects
+# the path into a `Location` header produced a header aiohttp refuses to
+# serialise, and the response died with the connection reset rather than
+# sent.
+_HEADER_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def header_safe_path(path: str) -> str:
+    """Re-encode the characters that cannot travel in a header value.
+
+    Percent-encodes rather than strips, for two reasons: the redirect
+    target stays a faithful spelling of what was asked for (so a DNS
+    callback still fingerprints the probe that triggered it), and
+    `%00`/`%0d` is what the scanner sent in the first place, so echoing it
+    back is the reply a normal server gives.
+
+    Only C0 + DEL are touched. Everything else -- including the `$(pwd)/`
+    and `:8443/` prefix-injection shapes that arrive alongside these -- is
+    left verbatim so existing redirect targets are byte-identical.
+    """
+    if not _HEADER_UNSAFE_RE.search(path):
+        return path
+    return _HEADER_UNSAFE_RE.sub(lambda m: f"%{ord(m.group()):02X}", path)
+
+
+
+
 def normalize_path(raw_path: str) -> str:
     """Canonicalise a request URL path before handler dispatch.
 
@@ -14749,7 +14780,7 @@ class DNSCallbackModule(TarpitModule):
     async def run_terminal(self, request, ctx):
         callback_id = str(uuid.uuid4())
         proto = ctx.get("protocol", "https")
-        location = f"{proto}://{callback_id}.{MOD_DNS_CALLBACK_DOMAIN}{ctx['path']}"
+        location = f"{proto}://{callback_id}.{MOD_DNS_CALLBACK_DOMAIN}{header_safe_path(str(ctx['path']))}"
         append_log({
             **ctx["log_context"],
             "status": 302,
@@ -14808,7 +14839,7 @@ class RedirectChainModule(TarpitModule):
 
     async def run_terminal(self, request, ctx):
         chain_id = str(uuid.uuid4())
-        location = f"{ctx['path']}?_hp_chain={chain_id}&_hp_hop=1"
+        location = f"{header_safe_path(str(ctx['path']))}?_hp_chain={chain_id}&_hp_hop=1"
         append_log({
             **ctx["log_context"],
             "status": 302,
@@ -32063,7 +32094,7 @@ async def _handle_webapp_form(
         # credential-stuffing tools interpret the redirect-to-login as
         # "wrong password, try the next pair", which is exactly the
         # follow-on signal we want to elicit.
-        location = f"{path}?error=1"
+        location = f"{header_safe_path(path)}?error=1"
         # Append a fake session cookie so the next request looks like the
         # scanner is "in" enough to keep submitting; logged on subsequent
         # hits via the inbound Cookie header.
@@ -40981,7 +41012,9 @@ async def _send_backup_archive(
     response = web.Response(status=200, body=body)
     response.headers["Content-Type"] = content_type
     response.headers["Cache-Control"] = "no-store"
-    filename = path.lstrip("/").replace('"', '')
+    # Control characters would make the header unserialisable -- same
+    # decoded-`%00` shape that reaches every other reflecting header.
+    filename = header_safe_path(path.lstrip("/").replace('"', ''))
     if filename:
         response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     append_log({
@@ -41042,7 +41075,7 @@ async def _send_fake_git(
         # `Location` comes from the request path, not the canonical lookup
         # key, so a repository probed under a subpath prefix is redirected
         # inside its own prefix.
-        location = f"{path.rstrip('/')}/"
+        location = f"{header_safe_path(path.rstrip('/'))}/"
         append_log({
             **log_context, "status": 301, "result": "fake-git-redirect",
             "commitSha": meta.get("commitSha", ""),
@@ -41220,7 +41253,7 @@ async def _send_fake_svn(
         # something the 200 could not: whether the client follows
         # redirects at all, which most bare-socket dictionary scanners
         # do not.
-        location = f"{path.rstrip('/')}/"
+        location = f"{header_safe_path(path.rstrip('/'))}/"
         append_log({
             **log_context, "status": 301, "result": "fake-svn-redirect",
             "svnKey": svn_key,
@@ -41348,7 +41381,7 @@ async def _send_tarpit(
         chain_id, hop = _parse_chain_params(query)
         if chain_id and MOD_REDIRECT_CHAIN_ENABLED:
             if hop < MOD_REDIRECT_CHAIN_MAX_HOPS:
-                location = f"{path}?_hp_chain={chain_id}&_hp_hop={hop + 1}"
+                location = f"{header_safe_path(path)}?_hp_chain={chain_id}&_hp_hop={hop + 1}"
                 append_log({
                     **log_context,
                     "status": 302,
