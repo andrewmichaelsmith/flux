@@ -19890,6 +19890,20 @@ _ENV_LEAF_NAMES: tuple[str, ...] = (
     # the service names as their own group because a compose stack keeps
     # the database password in the service file rather than in the app's.
     "mysql", "mongodb", "postgres", "postgresql", "redis",
+    # Third-party service names that are not mail providers, so the
+    # dedicated mail renderer does not own them, and that had no route of
+    # their own. Same generic dotenv body: a harvester greps the file for
+    # `AKIA` and `KEY=VALUE` pairs regardless of which service the
+    # filename claims.
+    "stripe", "twilio", "azure", "heroku", "bucket",
+    # `<concern>_config` / `<concern>_credentials` -- the file named after
+    # what it holds. `aws_credentials` already answered while `aws_config`
+    # did not, which split one dictionary pass across two outcomes.
+    "aws_config", "db_config", "db_credentials",
+    # The generic application-level spellings. `/env.env` is the
+    # doubled-suffix shape a dictionary emits when it crosses its leaf
+    # list with its own suffix list.
+    "application", "env",
 )
 
 # Group 7 — deeper `<prefix>/<subdir>/env` variants. Same scanner
@@ -20033,6 +20047,17 @@ def _fake_mail_api_key(service: str) -> str:
         return f"xkeysib-{secrets.token_hex(32)}-{secrets.token_urlsafe(16)}"
     if service == "mailgun":
         return f"key-{secrets.token_hex(16)}"
+    if service == "ses":
+        # SES has no API key of its own: the SMTP credential pair IS an
+        # IAM access key and its derived SMTP password, so the harvester
+        # that collects this file gets something it can test against the
+        # AWS API as well as against the relay.
+        return f"AKIA{secrets.token_hex(8).upper()}"
+    if service == "mandrill":
+        # Mailchimp Transactional keys are a short base62 token.
+        return secrets.token_urlsafe(16)
+    if service == "elasticemail":
+        return secrets.token_hex(32)
     return secrets.token_urlsafe(32)
 
 
@@ -20042,7 +20067,27 @@ _MAIL_SERVICE_CONFIGS: dict[str, tuple[str, str, str, str]] = {
     "mailjet":   ("mailjet",   "MJ_APIKEY_PUBLIC",        "in-v3.mailjet.com",   ""),
     "brevo":     ("brevo",     "BREVO_API_KEY",           "smtp-relay.brevo.com", ""),
     "mailgun":   ("mailgun",   "MAILGUN_API_KEY",         "smtp.mailgun.org",    ""),
+    # Three providers whose `.env` spelling is walked by the same
+    # dictionaries that already collect the five above, and which had no
+    # route at all. Each gets its own credential shape rather than the
+    # generic fallback, because a harvester greps for the provider's own
+    # key name (`MANDRILL_API_KEY`, ...) and a body naming the wrong
+    # provider is a body it discards.
+    "ses":          ("ses",          "AWS_SES_ACCESS_KEY_ID",  "email-smtp.us-east-1.amazonaws.com", ""),
+    "mandrill":     ("mandrill",     "MANDRILL_API_KEY",       "smtp.mandrillapp.com",               ""),
+    "elasticemail": ("elasticemail", "ELASTICEMAIL_API_KEY",   "smtp.elasticemail.com",              ""),
 }
+
+# Vendor-neutral spellings of the same file. A project talking to a relay
+# directly, or one that keeps its provider choice out of the filename,
+# writes `smtp.env` / `mailer.env` / `mail_config.env` instead of naming
+# the service -- and these are walked at least as often as the branded
+# ones. They render the default provider shape, which is what such a file
+# holds in practice.
+_MAIL_GENERIC_LEAF_NAMES: tuple[str, ...] = (
+    "smtp", "smtp_config", "mailer", "mailer_config",
+    "mail", "mail_config", "mailconfig", "email", "email_config",
+)
 
 # Broad-dictionary secret hunters walk `<name>.env` — both bare
 # (`/sendgrid.env`) and under app-layout prefixes (`/config/env/mailjet.env`,
@@ -20076,7 +20121,29 @@ _MAIL_SERVICE_PATH_MAP: dict[str, tuple[str, str, str, str]] = {
 for _svc_name, _svc_cfg in _MAIL_SERVICE_CONFIGS.items():
     for _pfx in _MAIL_SERVICE_LEAF_PREFIXES:
         _MAIL_SERVICE_PATH_MAP.setdefault(f"{_pfx}/{_svc_name}.env", _svc_cfg)
-del _svc_name, _svc_cfg, _pfx
+        # `<service>_config.env` / `<service>_api_key.env` -- the same file
+        # named after what it holds rather than only after the provider.
+        # Dictionaries walk these in the same pass as the bare spelling, so
+        # answering one and 404ing the other splits a single sweep across
+        # two outcomes.
+        for _qual in ("_config", "_api_key", "_credentials", "_key"):
+            _MAIL_SERVICE_PATH_MAP.setdefault(
+                f"{_pfx}/{_svc_name}{_qual}.env", _svc_cfg,
+            )
+    # `/<service>/.env` for the three providers added above; the five
+    # original ones are listed by hand at the top of the map.
+    _MAIL_SERVICE_PATH_MAP.setdefault(f"/{_svc_name}/.env", _svc_cfg)
+
+# Vendor-neutral leaves render the default provider shape.
+_MAIL_DEFAULT_CONFIG = _MAIL_SERVICE_CONFIGS["sendgrid"]
+for _generic in _MAIL_GENERIC_LEAF_NAMES:
+    for _pfx in _MAIL_SERVICE_LEAF_PREFIXES:
+        _MAIL_SERVICE_PATH_MAP.setdefault(f"{_pfx}/{_generic}.env", _MAIL_DEFAULT_CONFIG)
+        # Leading-dot spelling of the same file (`/.smtp.env`): `.env` is
+        # itself a dotfile, so an operator splitting it per concern tends
+        # to keep the dot.
+        _MAIL_SERVICE_PATH_MAP.setdefault(f"{_pfx}/.{_generic}.env", _MAIL_DEFAULT_CONFIG)
+del _svc_name, _svc_cfg, _pfx, _generic
 
 
 def _render_mail_service_env_for(path: str) -> "Callable[[dict[str, object]], bytes]":
