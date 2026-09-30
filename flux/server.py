@@ -12790,6 +12790,212 @@ def render_webapp_config_bundle_json(r: dict[str, object]) -> bytes:
     return json.dumps(env_obj, separators=(",", ":"), indent=2).encode("utf-8")
 
 
+# --- Framework build-config files (next/nuxt/gatsby/bundler) -------------
+# These are the *build-time* config modules a JS framework keeps at repo
+# root, not the runtime bundle `webapp-config-bundle-js` serves. The
+# distinction is the whole reason they get their own renderers: that trap
+# emits a `window.__APP_ENV__` assignment, which is a browser artifact,
+# and a collector that greps a `nuxt.config.ts` for `defineNuxtConfig`
+# would discard it. Each renderer below emits its own framework's module
+# syntax and puts the canary in the slot that framework uses for a
+# server-only secret -- which is also where a real leaked one lives.
+
+
+def _framework_config_slots(r: dict[str, object]) -> dict[str, str]:
+    """Credential + reference slots shared by the framework-config
+    renderers, so the four bodies stay consistent and every
+    credential-shaped value stays per-hit unique."""
+    aws = _aws(r)
+    host = _appliance_display_host(str(r.get("_requestHost", "") or ""), "app")
+    return {
+        "access_key": aws.get("awsAccessKeyId", ""),
+        "secret_key": aws.get("awsSecretAccessKey", ""),
+        "session_token": aws.get("awsSessionToken", ""),
+        "session_secret": secrets.token_hex(32),
+        "host": host,
+        # The referenced chunk. Same per-client hash the build manifest
+        # names, so fetching it lands on the existing
+        # `spa-config-chunk-referenced` tag: a request for this path can
+        # only come from a client that parsed a body we served it, rather
+        # than from a wordlist. Reused rather than given its own path so
+        # there is one chain to reason about; the cost is that a
+        # `referenced` hit does not say which of the two bodies was read.
+        "config_chunk": (
+            f"/assets/env-config-{_spa_chunk_hash(str(r.get('_clientIp', '') or ''))}.js"
+        ),
+    }
+
+
+def render_next_config_js(r: dict[str, object]) -> bytes:
+    """Next.js `next.config.js` and its `.ts`/`.mjs`/`.cjs` spellings.
+
+    `serverRuntimeConfig` is the correct place for a secret in Next --
+    it is not serialised into the client bundle, which is exactly why a
+    developer puts real credentials there and why a collector that
+    understands the framework reads it first. `publicRuntimeConfig` and
+    `env` carry only non-secret values, as they would in a real config,
+    so the body does not read as a file where every field is bait."""
+    s = _framework_config_slots(r)
+    body = f"""/** @type {{import('next').NextConfig}} */
+const nextConfig = {{
+  reactStrictMode: true,
+  poweredByHeader: false,
+  output: 'standalone',
+  serverRuntimeConfig: {{
+    // Server-only. Not exposed to the browser bundle.
+    awsRegion: 'us-east-1',
+    awsAccessKeyId: '{s["access_key"]}',
+    awsSecretAccessKey: '{s["secret_key"]}',
+    awsSessionToken: '{s["session_token"]}',
+    sessionSecret: '{s["session_secret"]}',
+  }},
+  publicRuntimeConfig: {{
+    apiBase: 'https://{s["host"]}/api',
+    runtimeConfigUrl: '{s["config_chunk"]}',
+  }},
+  env: {{
+    NEXT_PUBLIC_API_BASE: 'https://{s["host"]}/api',
+    NEXT_PUBLIC_S3_BUCKET: 'internal-app-uploads-prod',
+  }},
+  images: {{
+    domains: ['{s["host"]}', 'internal-app-uploads-prod.s3.amazonaws.com'],
+  }},
+  async rewrites() {{
+    return [
+      {{ source: '/api/:path*', destination: 'https://{s["host"]}/api/:path*' }},
+    ];
+  }},
+}};
+
+module.exports = nextConfig;
+"""
+    return body.encode("utf-8")
+
+
+def render_nuxt_config_ts(r: dict[str, object]) -> bytes:
+    """Nuxt 3 `nuxt.config.ts` and its `.js`/`.mjs` spellings.
+
+    Nuxt's `runtimeConfig` splits on exactly the line that matters here:
+    top-level keys are server-only, and anything under `public` is
+    shipped to the browser. The canary goes in the server-only half.
+    The `app.head.script` entry naming the config chunk is the idiomatic
+    Nuxt way to inject a script, so the reference sits where a parser
+    expects a URL rather than looking placed."""
+    s = _framework_config_slots(r)
+    body = f"""// https://nuxt.com/docs/api/configuration/nuxt-config
+export default defineNuxtConfig({{
+  ssr: true,
+  devtools: {{ enabled: false }},
+  runtimeConfig: {{
+    // Server-only keys.
+    awsRegion: 'us-east-1',
+    awsAccessKeyId: '{s["access_key"]}',
+    awsSecretAccessKey: '{s["secret_key"]}',
+    awsSessionToken: '{s["session_token"]}',
+    sessionSecret: '{s["session_secret"]}',
+    public: {{
+      apiBase: 'https://{s["host"]}/api',
+      s3Bucket: 'internal-app-uploads-prod',
+    }},
+  }},
+  app: {{
+    head: {{
+      script: [{{ src: '{s["config_chunk"]}', defer: true }}],
+    }},
+  }},
+  nitro: {{
+    preset: 'node-server',
+  }},
+}});
+"""
+    return body.encode("utf-8")
+
+
+def render_gatsby_config_js(r: dict[str, object]) -> bytes:
+    """Gatsby `gatsby-config.js`/`.ts`.
+
+    Gatsby's shape is a `plugins` array, and the reason this file leaks
+    credentials in practice is that source plugins take them as plugin
+    options -- `gatsby-source-s3` wants a key pair inline. So the canary
+    goes in a plugin options block rather than a top-level secret slot,
+    which is where it would actually be."""
+    s = _framework_config_slots(r)
+    body = f"""module.exports = {{
+  siteMetadata: {{
+    title: '{s["host"]}',
+    siteUrl: 'https://{s["host"]}',
+  }},
+  plugins: [
+    'gatsby-plugin-image',
+    'gatsby-plugin-sharp',
+    {{
+      resolve: 'gatsby-source-s3',
+      options: {{
+        bucketName: 'internal-app-uploads-prod',
+        region: 'us-east-1',
+        accessKeyId: '{s["access_key"]}',
+        secretAccessKey: '{s["secret_key"]}',
+        sessionToken: '{s["session_token"]}',
+      }},
+    }},
+    {{
+      resolve: 'gatsby-source-graphql',
+      options: {{
+        typeName: 'CMS',
+        fieldName: 'cms',
+        url: 'https://{s["host"]}/graphql',
+        headers: {{
+          Authorization: 'Bearer {s["session_secret"]}',
+        }},
+      }},
+    }},
+    {{
+      resolve: 'gatsby-plugin-load-script',
+      options: {{ src: '{s["config_chunk"]}' }},
+    }},
+  ],
+}};
+"""
+    return body.encode("utf-8")
+
+
+def render_bundler_config_js(r: dict[str, object]) -> bytes:
+    """Vite / Svelte / Astro / Vue / Webpack / Remix config modules.
+
+    One body for the group because they genuinely converge on a
+    `defineConfig({...})` export, and the credential slot they share is
+    the compile-time `define` block -- which is the thing that makes
+    these files dangerous: a value put in `define` is substituted into
+    the built output, so a developer who puts a key there has published
+    it. `server.proxy` naming an upstream is ordinary in all of them."""
+    s = _framework_config_slots(r)
+    body = f"""import {{ defineConfig }} from 'vite';
+
+export default defineConfig({{
+  build: {{
+    outDir: 'dist',
+    sourcemap: false,
+    rollupOptions: {{
+      output: {{ manualChunks: {{ 'env-config': ['src/env-config.ts'] }} }},
+    }},
+  }},
+  define: {{
+    // Substituted at build time -- ends up in the shipped bundle.
+    'process.env.AWS_REGION': JSON.stringify('us-east-1'),
+    'process.env.AWS_ACCESS_KEY_ID': JSON.stringify('{s["access_key"]}'),
+    'process.env.AWS_SECRET_ACCESS_KEY': JSON.stringify('{s["secret_key"]}'),
+    'process.env.AWS_SESSION_TOKEN': JSON.stringify('{s["session_token"]}'),
+    'process.env.SESSION_SECRET': JSON.stringify('{s["session_secret"]}'),
+    'process.env.RUNTIME_CONFIG_URL': JSON.stringify('{s["config_chunk"]}'),
+  }},
+  server: {{
+    proxy: {{ '/api': {{ target: 'https://{s["host"]}', changeOrigin: true }} }},
+  }},
+}});
+"""
+    return body.encode("utf-8")
+
+
 def render_spa_build_manifest(chunk_hash: str) -> bytes:
     """Vite 5 build manifest (`.vite/manifest.json`).
 
@@ -28754,6 +28960,76 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_webapp_config_bundle_js,
         "application/javascript; charset=utf-8",
     ),
+    # Framework build-config modules. Distinct from the two
+    # webapp-config-bundle traps above, which serve the runtime bundle a
+    # browser loads: these are the repo-root config modules the build
+    # itself reads, and each framework's own syntax and secret slot is
+    # what a collector greps for. Recurring demand across all four
+    # families while every spelling fell through to a 404.
+    #
+    # Prefixes are deliberately narrow. These files live at repo root,
+    # so a plausible deployment exposes them at webroot or one level
+    # under a checked-out app directory — not under `/static/js/`. A
+    # wider cross-product would answer paths no real layout produces,
+    # which is its own fingerprint.
+    CanaryTrap(
+        "next-config-js",
+        tuple(
+            f"{prefix}{leaf}"
+            for prefix in ("/", "/app/", "/src/", "/frontend/", "/web/", "/client/")
+            for leaf in (
+                "next.config.js", "next.config.ts",
+                "next.config.mjs", "next.config.cjs",
+            )
+        ),
+        ("aws",),
+        render_next_config_js,
+        "application/javascript; charset=utf-8",
+    ),
+    CanaryTrap(
+        "nuxt-config-ts",
+        tuple(
+            f"{prefix}{leaf}"
+            for prefix in ("/", "/app/", "/src/", "/frontend/", "/web/", "/client/")
+            for leaf in ("nuxt.config.ts", "nuxt.config.js", "nuxt.config.mjs")
+        ),
+        ("aws",),
+        render_nuxt_config_ts,
+        "application/javascript; charset=utf-8",
+    ),
+    CanaryTrap(
+        "gatsby-config-js",
+        tuple(
+            f"{prefix}{leaf}"
+            for prefix in ("/", "/app/", "/src/", "/frontend/", "/web/", "/client/")
+            for leaf in ("gatsby-config.js", "gatsby-config.ts")
+        ),
+        ("aws",),
+        render_gatsby_config_js,
+        "application/javascript; charset=utf-8",
+    ),
+    # The bundler group shares one body: these configs genuinely converge
+    # on `defineConfig({...})`, and the slot that leaks in all of them is
+    # the compile-time `define` block.
+    CanaryTrap(
+        "bundler-config-js",
+        tuple(
+            f"{prefix}{leaf}"
+            for prefix in ("/", "/app/", "/src/", "/frontend/", "/web/", "/client/")
+            for leaf in (
+                "vite.config.js", "vite.config.ts", "vite.config.mjs",
+                "svelte.config.js", "svelte.config.ts",
+                "astro.config.mjs", "astro.config.ts", "astro.config.js",
+                "vue.config.js", "vue.config.ts",
+                "remix.config.js", "remix.config.ts",
+                "webpack.config.js", "webpack.config.ts",
+                "rollup.config.js", "rollup.config.mjs",
+            )
+        ),
+        ("aws",),
+        render_bundler_config_js,
+        "application/javascript; charset=utf-8",
+    ),
     # JSON sibling of the above — same scanner walks the `.json` form
     # for build pipelines that emit the runtime config as a JSON manifest
     # the SPA fetches at boot. Leaf names excluded from the existing
@@ -40263,6 +40539,12 @@ async def _send_canary_trap(
             **tracebit_response,
             "_requestHost": host,
             "_requestId": request_id,
+            # `_clientIp` is here for renderers that name the per-client
+            # build chunk (`_spa_chunk_hash`), so a config body can carry
+            # a reference only the client that received it could have
+            # learned. Renderers that do not need it ignore it, exactly
+            # as they do the two keys above.
+            "_clientIp": client_ip,
         })
     except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
         append_log({
