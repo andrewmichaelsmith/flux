@@ -750,6 +750,29 @@ def webshell_sweep_observe(src_ip: str, path: str, now: float | None = None) -> 
 # request and it was the one thing not being recorded. Answering them
 # plausibly costs nothing upstream and turns a path count into the
 # operator's actual payload.
+# --- Fake analytics-dashboard pre-auth setup chain (CVE-2023-38646) -----
+# A widely deployed open-source BI dashboard exposes an unauthenticated
+# properties endpoint whose JSON carries a `setup-token` while first-run
+# setup is incomplete. CVE-2023-38646 (CVSS 9.8, CISA KEV) turns that one
+# field into pre-auth RCE: read the token, then POST it to the setup
+# database-validation endpoint with an H2 JDBC URL whose
+# `INIT=RUNSCRIPT FROM '<url>'` clause makes the server fetch and execute
+# SQL from an address the caller chooses.
+#
+# The chain is why this is worth a handler rather than a table entry. The
+# first request is a fingerprint and tells us only that someone asked. The
+# second carries the operator's own payload-hosting URL in its body, which
+# is the single most identifying artifact a scanner hands over, and a 404
+# on the first address means the second request is never made. The first
+# step is also the gate: a deployment whose token field is null is not
+# vulnerable and gets skipped, so answering with a token is what elects us
+# into the rest of the exchange.
+#
+# Costs nothing upstream. The token is a per-address synthetic, not an
+# issued canary, so this runs on keyless deployments like the other
+# payload-capture traps.
+METABASE_SETUP_ENABLED = _env_bool("HONEYPOT_METABASE_SETUP_ENABLED")
+
 CODE_EXEC_API_ENABLED = _env_bool("HONEYPOT_CODE_EXEC_API_ENABLED")
 CODE_EXEC_API_BODY_PREVIEW_LIMIT = max(
     int(
@@ -42051,22 +42074,438 @@ async def _handle_cgi_traversal_rce(
         headers={"Content-Type": "text/plain; charset=utf-8"},
     )
 
+# --- Analytics-dashboard pre-auth setup chain ---------------------------
+
+# Keyed on the address, exactly as the build-manifest chunk hash is: a
+# sweep that reads the properties document and posts the token back over a
+# separate connection still agrees with itself, and the server holds no
+# per-client state a fan-out could grow without bound. Minted per process,
+# so a token does not survive a restart and cannot be shared between
+# sensors — which is what makes a token arriving from an address it was
+# not minted for a reportable event rather than a coincidence.
+_METABASE_SETUP_SECRET = secrets.token_bytes(32)
+
+_METABASE_PROPERTIES_PATHS = frozenset({
+    "/api/session/properties",
+})
+_METABASE_SETUP_VALIDATE_PATHS = frozenset({
+    "/api/setup/validate",
+})
+_METABASE_SETUP_PATHS = frozenset({
+    "/api/setup",
+})
+_METABASE_LOGIN_PATHS = frozenset({
+    "/api/session",
+})
+_METABASE_PATHS = (
+    _METABASE_PROPERTIES_PATHS
+    | _METABASE_SETUP_VALIDATE_PATHS
+    | _METABASE_SETUP_PATHS
+    | _METABASE_LOGIN_PATHS
+)
+
+# `INIT=RUNSCRIPT FROM '<url>'` is the clause that makes the H2 engine
+# fetch and run SQL from somewhere else; it is the payload delivery, and
+# the URL inside it is the operator's own infrastructure. Matched
+# case-insensitively because the connection string is assembled by hand
+# and the casing varies between published proof-of-concepts.
+_METABASE_RUNSCRIPT_RE = re.compile(
+    r"RUNSCRIPT\s+FROM\s+['\"]([^'\"]{1,512})['\"]", re.IGNORECASE
+)
+# `MODE=` selects the SQL dialect the H2 instance emulates. Published
+# chains set it to a value the target is not actually running, so which
+# one a caller picks separates tooling that copied one write-up from
+# tooling that understands the engine.
+_METABASE_JDBC_MODE_RE = re.compile(r"MODE=([A-Za-z0-9_]{1,32})", re.IGNORECASE)
+
+
+def is_metabase_setup_path(path: str) -> bool:
+    return path.lower().split("?", 1)[0] in _METABASE_PATHS
+
+
+def _metabase_setup_token(client_ip: str) -> str:
+    """The setup token this deployment shows to `client_ip`.
+
+    Formatted as a UUID because that is what the real field holds, and a
+    scanner that validates the shape before spending a second request
+    would otherwise stop here.
+    """
+    digest = hmac.new(
+        _METABASE_SETUP_SECRET,
+        (client_ip or "-").encode("utf-8", "replace"),
+        hashlib.sha256,
+    ).hexdigest()
+    return "-".join((
+        digest[0:8], digest[8:12], digest[12:16], digest[16:20], digest[20:32],
+    ))
+
+
+def render_metabase_session_properties(setup_token: str, site_name: str) -> bytes:
+    """The unauthenticated properties document.
+
+    Trimmed to the keys a client reads rather than the full settings dump:
+    the token, the flags that say setup is unfinished, a version old enough
+    to be in range for the chain, and the engine list the next request has
+    to pick from. `has-user-setup: false` is the consistency that matters —
+    a server advertising a live setup token while also reporting a
+    provisioned admin is describing a state that cannot exist.
+    """
+    doc = {
+        "setup-token": setup_token,
+        "has-user-setup": False,
+        "token-features": {
+            "advanced_permissions": False,
+            "audit_app": False,
+            "embedding": False,
+            "sso": False,
+            "whitelabel": False,
+        },
+        "version": {
+            "tag": "v0.46.5",
+            "date": "2023-07-12",
+            "branch": "release-x.46.x",
+            "hash": "f1a1a5e",
+        },
+        "version-info": {},
+        "site-name": site_name,
+        "site-locale": "en",
+        "available-locales": [["en", "English"], ["de", "Deutsch"]],
+        "engines": {
+            "h2": {
+                "source": {"type": "official"},
+                "driver-name": "H2",
+                "superseded-by": None,
+            },
+            "postgres": {
+                "source": {"type": "official"},
+                "driver-name": "PostgreSQL",
+                "superseded-by": None,
+            },
+            "mysql": {
+                "source": {"type": "official"},
+                "driver-name": "MySQL",
+                "superseded-by": None,
+            },
+        },
+        "anon-tracking-enabled": False,
+        "enable-public-sharing": False,
+        "google-auth-client-id": None,
+        "ldap-configured?": False,
+        "password-complexity": {"total": 6, "digit": 1},
+        "setup-started?": True,
+        "custom-formatting": {},
+        "embedding-secret-key": None,
+        "premium-embedding-token": None,
+    }
+    return json.dumps(doc, indent=2).encode("utf-8")
+
+
+def _metabase_jdbc_details(request_body: bytes) -> dict[str, object]:
+    """Pull the interesting fields out of a setup-validation body.
+
+    Returns only what was actually present, so a field's absence in the log
+    means the caller did not send it rather than that parsing failed.
+    """
+    out: dict[str, object] = {}
+    if not request_body:
+        return out
+    try:
+        payload = json.loads(request_body.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        # Not JSON. Still worth saying so: a caller posting a form body or
+        # raw SQL to this address is running something other than the
+        # published chain.
+        out["metabaseBodyParsed"] = False
+        return out
+    out["metabaseBodyParsed"] = True
+    if not isinstance(payload, dict):
+        return out
+
+    token = payload.get("token")
+    if isinstance(token, str) and token:
+        out["metabaseOfferedToken"] = token[:64]
+
+    # The published chain nests the connection details two levels deep
+    # (`details.details`), but variants post them flat. Read both rather
+    # than only the shape one write-up uses.
+    outer = payload.get("details")
+    outer = outer if isinstance(outer, dict) else {}
+    inner = outer.get("details")
+    inner = inner if isinstance(inner, dict) else {}
+
+    engine = outer.get("engine") or payload.get("engine")
+    if isinstance(engine, str) and engine:
+        out["metabaseEngine"] = engine[:32]
+
+    db = inner.get("db") or outer.get("db") or payload.get("db")
+    if isinstance(db, str) and db:
+        out["metabaseJdbcDb"] = db[:512]
+        script = _METABASE_RUNSCRIPT_RE.search(db)
+        if script is not None:
+            # The address the operator chose to host the payload on. This
+            # is the field the trap exists to produce.
+            out["metabaseInitScriptUrl"] = script.group(1)[:512]
+        mode = _METABASE_JDBC_MODE_RE.search(db)
+        if mode is not None:
+            out["metabaseJdbcMode"] = mode.group(1)
+    return out
+
+
+def _metabase_credential_fields(request_body: bytes, prefix: str) -> dict[str, object]:
+    """Identity a caller tried to plant or authenticate with.
+
+    The password is never logged, only whether one was sent and a hash of
+    the pair — the same rule the other credential sinks follow. The address
+    is logged in full because an operator who plants an administrator
+    account chooses an address they can read, which makes it the most
+    durable identifier in the exchange.
+    """
+    out: dict[str, object] = {}
+    if not request_body:
+        return out
+    try:
+        payload = json.loads(request_body.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        return out
+    if not isinstance(payload, dict):
+        return out
+
+    user = payload.get("user")
+    user = user if isinstance(user, dict) else payload
+    email = user.get("email") or user.get("username")
+    password = user.get("password")
+
+    if isinstance(email, str) and email:
+        out[prefix + "Email"] = email[:256]
+    out[prefix + "HasPassword"] = bool(isinstance(password, str) and password)
+    if isinstance(email, str) and isinstance(password, str) and email and password:
+        out[prefix + "CredentialId"] = hashlib.sha256(
+            f"{email}\x00{password}".encode("utf-8", "replace")
+        ).hexdigest()[:32]
+
+    prefs = payload.get("prefs")
+    if isinstance(prefs, dict):
+        site = prefs.get("site_name")
+        if isinstance(site, str) and site:
+            out[prefix + "SiteName"] = site[:128]
+    return out
+
+
+async def _handle_metabase_setup(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Analytics-dashboard pre-auth setup surface. Four routes:
+
+      - properties (`GET`) → the unauthenticated settings document, with a
+        per-address `setup-token`. Tagged `metabase-session-properties`.
+      - setup validation (`POST`) → the step that carries the payload.
+        Tagged `metabase-setup-validate` when the posted token is the one
+        minted for this address, `-foreign` when it is a token this process
+        minted for someone else or never minted at all, and `-untokened`
+        when none was sent. Logs the JDBC string, the extracted
+        `RUNSCRIPT FROM` URL and the emulation mode.
+      - setup completion (`POST`) → the administrator a caller tries to
+        plant. Same token provenance split.
+      - login (`POST`) → credential capture on the ordinary session
+        endpoint, which the same sweeps probe on the way past.
+
+    Responses mirror what the real server returns for a rejected token, so
+    nothing about the outcome tells the caller the token was synthetic: the
+    payload has already been recorded by the time the status is chosen.
+    """
+    lpath = path.lower().split("?", 1)[0]
+    method = request.method
+    client_ip = str(log_context.get("clientIp", ""))
+    host = str(log_context.get("host", ""))
+    expected = _metabase_setup_token(client_ip)
+
+    def _provenance(parsed: dict[str, object]) -> tuple[str, dict[str, object]]:
+        """Did this caller get the token here, or bring it from elsewhere?"""
+        offered = str(parsed.get("metabaseOfferedToken", "") or "")
+        if not offered:
+            return "untokened", {"metabaseTokenMatched": False}
+        matched = hmac.compare_digest(offered, expected)
+        return (
+            ("self" if matched else "foreign"),
+            {"metabaseTokenMatched": matched},
+        )
+
+    # ------------------------------------------------------- properties read
+    if lpath in _METABASE_PROPERTIES_PATHS:
+        if method not in ("GET", "HEAD"):
+            append_log({
+                **log_context, "status": 405,
+                "result": "metabase-session-properties-method-not-allowed",
+            })
+            return web.Response(
+                status=405, body=b'{"errors":{"_error":"method not allowed"}}\n',
+                headers={
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Allow": "GET, HEAD",
+                },
+            )
+        body = render_metabase_session_properties(expected, host or "Analytics")
+        append_log({
+            **log_context, "status": 200,
+            "result": "metabase-session-properties",
+            # The token in short form only. The full value is derivable
+            # from the address, so storing it buys nothing and the short
+            # form is what joins this row to the POST that follows.
+            "metabaseSetupTokenShort": expected.split("-")[0],
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=200, body=body if method == "GET" else b"",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if method != "POST":
+        append_log({
+            **log_context, "status": 405,
+            "result": "metabase-setup-method-not-allowed",
+        })
+        return web.Response(
+            status=405, body=b'{"errors":{"_error":"method not allowed"}}\n',
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Allow": "POST",
+            },
+        )
+
+    # --------------------------------------------------- setup validation
+    if lpath in _METABASE_SETUP_VALIDATE_PATHS:
+        parsed = _metabase_jdbc_details(request_body)
+        kind, prov = _provenance(parsed)
+        suffix = {"self": "", "foreign": "-foreign", "untokened": "-untokened"}[kind]
+        # The real server answers a rejected connection with a 400 naming
+        # the field. Returning that is not a courtesy — a caller that gets
+        # an unexpected success stops, and the next thing we want from this
+        # population is the retry with a different payload host.
+        body = (
+            b'{"errors":{"db":"Cannot open database. '
+            b'Check your connection string."}}\n'
+        )
+        append_log({
+            **log_context, "status": 400,
+            "result": "metabase-setup-validate" + suffix,
+            **parsed, **prov,
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=400, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    # ------------------------------------------------- administrator plant
+    if lpath in _METABASE_SETUP_PATHS:
+        creds = _metabase_credential_fields(request_body, "metabaseAdmin")
+        token_fields = _metabase_jdbc_details(request_body)
+        kind, prov = _provenance(token_fields)
+        suffix = {"self": "", "foreign": "-foreign", "untokened": "-untokened"}[kind]
+        body = b'{"errors":{"token":"Invalid setup token"}}\n'
+        append_log({
+            **log_context, "status": 400,
+            "result": "metabase-setup-admin" + suffix,
+            **creds, **prov,
+            "bytes": len(body),
+        })
+        return web.Response(
+            status=400, body=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    # ----------------------------------------------------------- login post
+    creds = _metabase_credential_fields(request_body, "metabaseLogin")
+    body = (
+        b'{"errors":{"password":"did not match stored password"}}\n'
+    )
+    append_log({
+        **log_context, "status": 401,
+        "result": "metabase-session-login",
+        **creds,
+        "bytes": len(body),
+    })
+    return web.Response(
+        status=401, body=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+
+
+# Sent on both the OPTIONS answer and the 405 refusal, from one place so
+# the two cannot disagree about what this server accepts. `Allow` is
+# required on a 405 by RFC 9110 §15.5.6; the CORS trio is what a browser
+# asking the same question expects to read back, and a permissive answer
+# is the one that keeps a scripted client moving to the request it
+# actually came to make.
+_ALLOW_HEADERS = {
+    "Allow": "GET, HEAD, POST, OPTIONS",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+    "Access-Control-Max-Age": "86400",
+}
+
+
 async def handle(request: web.Request) -> web.StreamResponse:
     method = request.method
     request_id = str(uuid.uuid4())
 
+    if method == "OPTIONS":
+        # Answered rather than refused. The log rows this gate started
+        # collecting say OPTIONS is by a wide margin the most-asked method
+        # outside the big three, and a bare 405 to it is a fingerprint:
+        # every real origin answers OPTIONS, and the ones fronted by a
+        # framework answer it with CORS headers. Refusing the one method a
+        # client sends precisely to ask "what is this server" announces
+        # that the thing answering is not a server.
+        #
+        # 204 with `Allow` is the stock shape — it reveals nothing a probe
+        # could not infer from being served at all, and it keeps the row,
+        # which was the point of logging this class in the first place.
+        append_log({
+            **_log_context_from_request(request, request_id, 0, ""),
+            "status": 204,
+            "result": "options-preflight",
+            "bytes": 0,
+            # Whether the client asked as a browser would (preflight) or
+            # as a scanner does (bare OPTIONS) separates CORS probing from
+            # method enumeration without needing the UA to say so.
+            "optionsRequestMethod": request.headers.get(
+                "Access-Control-Request-Method", "")[:32],
+            "optionsIsPreflight": bool(
+                request.headers.get("Access-Control-Request-Method")
+                and request.headers.get("Origin")
+            ),
+        })
+        return web.Response(status=204, headers=_ALLOW_HEADERS)
+
     if method not in ("GET", "HEAD", "POST"):
-        # The response is unchanged — what is new is that the rejection
-        # leaves a row. This gate sits in front of every trap, so a method
-        # it turns away reaches no handler and, until now, produced no log
-        # line anywhere: that traffic was not merely unhandled, it was
-        # unmeasurable. It matters because some of the CVEs these traps
-        # imitate are delivered by PUT — CVE-2021-36260 ships its command
-        # in a `PUT /SDK/webLanguage` body — so the blind spot is not
-        # evenly spread over noise, it points at exactly the surfaces the
-        # traps exist to watch. Logging first makes the size of the gap
-        # answerable; whether to widen the gate is a separate decision and
-        # should be made from that number rather than from a guess.
+        # The response is unchanged except for the `Allow` header — what
+        # this gate added was that the rejection leaves a row. This gate
+        # sits in front of every trap, so a method it turns away reaches no
+        # handler and, before it existed, produced no log line anywhere:
+        # that traffic was not merely unhandled, it was unmeasurable.
+        # Logging first made the size of the gap answerable; the rest of
+        # this comment is that answer.
+        #
+        # Read off those rows over a recent two-week window, the methods
+        # that arrive are OPTIONS (now answered above), DELETE against one
+        # job-queue framework's webhook addresses, and PROPFIND against
+        # `/`. **Not one PUT** — so CVE-2021-36260's `PUT /SDK/webLanguage`
+        # delivery, the case this gate was widened-to-be-measured for, has
+        # no demand behind it, and the DELETE demand lands on addresses no
+        # trap implements, where widening the gate would turn a 405 into a
+        # 404 and learn nothing. The gate therefore stays where it is.
+        #
+        # What the rows did show is that the rejection was malformed:
+        # RFC 9110 §15.5.6 requires an origin server to generate `Allow`
+        # on a 405, and this one did not. A 405 without `Allow` is a
+        # narrower population than servers in general, which makes the
+        # omission the same kind of fingerprint the empty reply on
+        # truncated paths was.
         body = b"method not allowed\n"
         append_log({
             **_log_context_from_request(request, request_id, 0, ""),
@@ -42074,7 +42513,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
             "result": "method-not-allowed",
             "bytes": len(body),
         })
-        return web.Response(status=405, body=body)
+        return web.Response(status=405, body=body, headers=_ALLOW_HEADERS)
 
     # Some exploitation clients send meaningful bodies on GET (notably
     # PHPUnit eval-stdin probes). Read a capped body for GET/POST, but only
@@ -42335,6 +42774,14 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # whole point of it.
     if API_KEY and is_spa_build_manifest_path(path):
         return await _handle_spa_build_manifest(request, log_context, path)
+
+    # Keyless: the setup token is a per-address synthetic, not an issued
+    # canary, so there is no upstream quota to gate on and a deployment
+    # without a key should still capture the payload this chain posts.
+    if METABASE_SETUP_ENABLED and is_metabase_setup_path(path):
+        return await _handle_metabase_setup(
+            request, log_context, path, request_body
+        )
 
     if API_KEY and is_oidc_discovery_path(path):
         return await _handle_oidc_discovery(request, log_context, path)
@@ -42783,6 +43230,8 @@ def main() -> int:
         active.append("llm-endpoint")
     if MCP_SERVER_ENABLED:
         active.append("mcp-server-endpoint")
+    if METABASE_SETUP_ENABLED:
+        active.append("metabase-setup-chain")
     if SONICWALL_ENABLED:
         active.append("sonicwall-ssl-vpn")
     if CISCO_WEBVPN_ENABLED:
