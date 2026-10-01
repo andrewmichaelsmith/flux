@@ -721,6 +721,13 @@ def test_all_trap_families_default_on():
         "answering it is the only way to observe what a sender does with "
         "a host that accepted an unauthenticated write."
     )
+    assert tbenv.METABASE_SETUP_ENABLED, (
+        "HONEYPOT_METABASE_SETUP_ENABLED should default to True — it issues "
+        "nothing and spends no upstream quota, and the whole value of the "
+        "trap is in a second request that is only ever sent when the "
+        "properties read before it returned a token. A 404 on step one "
+        "means the payload-bearing POST never arrives."
+    )
     assert tbenv.JOLOKIA_PROTOCOL_ENABLED, (
         "HONEYPOT_JOLOKIA_PROTOCOL_ENABLED should default to True — the "
         "MBean listing is already served, so leaving the `read` / `exec` "
