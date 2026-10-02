@@ -788,12 +788,35 @@ _CODE_EXEC_API_PATHS: dict[str, str] = {
     "/api/templates/preview": "template",
     "/api/designer/v1/file-content": "read",
     "/read-document": "read",
+    # The agent-framework node loader. Its argument is not a snippet but a
+    # server *definition* — a program and its arguments that the platform
+    # spawns in order to ask it which tools it offers. That makes the
+    # payload a command line rather than source, so it gets its own family.
+    "/api/v1/node-load-method/custommcp": "mcp",
 }
 # The web-IDE terminal endpoint ships under its own directory and under a
 # webroot install, so the prefix is left open the way the file-upload
 # matchers leave theirs open.
 _CODE_EXEC_API_TERMINAL_RE = re.compile(
     r"^(?:/[^/]+)*/lib/terminal-xhr\.php$", re.IGNORECASE,
+)
+# The same API served from a sub-path. These platforms are routinely put
+# behind a reverse proxy that mounts them under their own name, so the
+# vendor-prefixed spelling is the *same* endpoint, not a different one.
+# Observed arriving at the same rate as the bare address, from the same
+# sources, in the same sweep — matching only the bare spelling answers
+# half of a sweep and 404s the other half, which is itself a tell.
+#
+# Bounded at two segments: an app behind a path-routing proxy sits one or
+# two deep (`/langflow/...`, `/ai/flowise/...`). Deeper is not a mount, and
+# the suffix is exact enough that the bound costs nothing.
+CODE_EXEC_API_MOUNT_MAX_DEPTH = 2
+# Langflow's public-flow build address embeds a flow UUID, so it cannot be
+# an exact-table entry. Reaching it means asking an unauthenticated
+# endpoint to *run* a stored flow, which is the validate family's intent
+# one step further along.
+_CODE_EXEC_API_FLOW_BUILD_RE = re.compile(
+    r"^/api/v1/build(?:_public_tmp)?/[0-9a-f-]{8,36}/flow/?$", re.IGNORECASE,
 )
 # The body keys these endpoints take their argument under.
 _CODE_EXEC_API_ARG_KEYS: tuple[str, ...] = (
@@ -5562,7 +5585,12 @@ def is_file_upload_path(path: str) -> bool:
 
 
 def code_exec_api_family(path: str) -> str:
-    """Return which of the four endpoint kinds this address is, or ``""``."""
+    """Return which of the endpoint kinds this address is, or ``""``.
+
+    Resolves the bare address, the same address under a vendor mount
+    prefix, the web-IDE terminal, and the flow-build shape whose UUID
+    keeps it out of the exact table.
+    """
     if not CODE_EXEC_API_ENABLED or not path:
         return ""
     lp = path.lower().split("?", 1)[0].rstrip("/") or "/"
@@ -5571,6 +5599,21 @@ def code_exec_api_family(path: str) -> str:
         return family
     if _CODE_EXEC_API_TERMINAL_RE.match(lp):
         return "exec"
+    if _CODE_EXEC_API_FLOW_BUILD_RE.match(lp):
+        return "validate"
+    # Drop up to `CODE_EXEC_API_MOUNT_MAX_DEPTH` leading segments and try
+    # the exact table again, so `/langflow/api/v1/validate/code` resolves
+    # onto the same handler as `/api/v1/validate/code`.
+    segments = [seg for seg in lp.split("/") if seg]
+    for depth in range(1, CODE_EXEC_API_MOUNT_MAX_DEPTH + 1):
+        if len(segments) <= depth:
+            break
+        suffix = "/" + "/".join(segments[depth:])
+        family = _CODE_EXEC_API_PATHS.get(suffix)
+        if family:
+            return family
+        if _CODE_EXEC_API_FLOW_BUILD_RE.match(suffix):
+            return "validate"
     return ""
 
 
@@ -5614,6 +5657,65 @@ def _code_exec_api_argument(body: bytes, content_type: str, query_string: str) -
                 return str(values[0])
     # Nothing recognised the shape — the raw body is still the argument.
     return text
+
+
+# The node loader's payload is a server *definition*: a program, its
+# argument vector and an environment, which the platform spawns so it can
+# ask the resulting process what tools it provides. The command line is
+# therefore the whole finding, and it is nested rather than top-level, so
+# the generic argument scan above walks straight past it.
+_CODE_EXEC_API_MCP_CONFIG_KEYS: tuple[str, ...] = (
+    "mcpServerConfig", "mcpserverconfig", "serverConfig", "config",
+)
+# Bound what we reconstruct: an argument vector is attacker-controlled and
+# can be arbitrarily long.
+CODE_EXEC_API_MCP_MAX_ARGS = 32
+
+
+def _code_exec_api_mcp_config(body: bytes, content_type: str) -> dict[str, object]:
+    """Return the nested MCP server definition, or ``{}``.
+
+    The field arrives either as a nested object or as a JSON string that
+    has to be decoded a second time; tooling sends both spellings.
+    """
+    text = body[:CODE_EXEC_API_BODY_PREVIEW_LIMIT].decode("utf-8", errors="replace")
+    if not text:
+        return {}
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    for key in _CODE_EXEC_API_MCP_CONFIG_KEYS:
+        value = doc.get(key)
+        if isinstance(value, str) and value.strip():
+            try:
+                value = json.loads(value)
+            except ValueError:
+                continue
+        if isinstance(value, dict):
+            return value
+    # Some senders inline the definition at the top level.
+    if isinstance(doc.get("command"), str):
+        return doc
+    return {}
+
+
+def code_exec_api_mcp_command_line(config: dict[str, object]) -> str:
+    """Flatten a server definition into the command line it would spawn."""
+    command = config.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return ""
+    parts = [command.strip()]
+    args = config.get("args")
+    if isinstance(args, list):
+        for arg in args[:CODE_EXEC_API_MCP_MAX_ARGS]:
+            if isinstance(arg, (str, int, float)):
+                parts.append(str(arg))
+    elif isinstance(args, str) and args.strip():
+        parts.append(args.strip())
+    return " ".join(parts)
 
 
 def code_exec_api_render_template(template: str) -> tuple[str, bool]:
@@ -40176,6 +40278,35 @@ async def _handle_code_exec_api(
             "valid": True, "errors": [], "warnings": [],
             "language": "javascript", "durationMs": secrets.randbelow(40) + 3,
         }) + "\n").encode("utf-8")
+    elif family == "mcp":
+        # The loader's contract is to spawn the definition and report the
+        # tools it advertises. Answering with a plausible tool list is
+        # what says "your server started" — the one response that invites
+        # the next request, which is where the operator stops probing and
+        # starts using it. Nothing is spawned; the list is static.
+        config = _code_exec_api_mcp_config(request_body, content_type)
+        command_line = code_exec_api_mcp_command_line(config)
+        log_entry["codeExecApiCommand"] = command_line[:400]
+        log_entry["codeExecApiMcpCommandLen"] = len(command_line)
+        if isinstance(config.get("env"), dict):
+            # Operators put their callback host and tokens here.
+            log_entry["codeExecApiMcpEnvKeys"] = sorted(
+                str(k)[:80] for k in list(config["env"])[:32]
+            )
+        body = (json.dumps([
+            {"name": "list_directory",
+             "description": "List the contents of a directory.",
+             "inputSchema": {"type": "object",
+                             "properties": {"path": {"type": "string"}}}},
+            {"name": "read_file",
+             "description": "Read the contents of a file.",
+             "inputSchema": {"type": "object",
+                             "properties": {"path": {"type": "string"}}}},
+            {"name": "run_command",
+             "description": "Execute a shell command and return its output.",
+             "inputSchema": {"type": "object",
+                             "properties": {"command": {"type": "string"}}}},
+        ]) + "\n").encode("utf-8")
     elif family == "template":
         rendered, evaluated = code_exec_api_render_template(argument)
         log_entry["codeExecApiTemplateEvaluated"] = evaluated

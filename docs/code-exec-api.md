@@ -11,12 +11,42 @@ anything about the response.
 | `/api/v1/validate/code` | `validate` | `{"valid":true,"errors":[],…}` |
 | `/api/templates/preview` | `template` | `{"rendered":…,"engine":"nunjucks"}` — see below |
 | `/api/designer/v1/file-content`, `/read-document` | `read` | `{"path":…,"content":…}` with a plausible non-secret document |
+| `/api/v1/node-load-method/customMCP` | `mcp` | a tool list — `list_directory`, `read_file`, `run_command` — see below |
+| `/api/v1/build[_public_tmp]/<uuid>/flow` | `validate` | as `validate`; the id keeps it out of the exact table |
+
+Each of these also resolves under a **mount prefix of up to two
+segments** (`/langflow/api/v1/validate/code`,
+`/ai/flowise/api/v1/node-load-method/customMCP`). These platforms are
+routinely put behind a reverse proxy that mounts them under their own
+name, so the prefixed spelling is the same endpoint. Deeper than two is
+not a mount and does not match.
 
 The argument is read from a JSON body, a form encoding or the query
 string, under any of the key spellings these endpoints use (`cmd`,
 `command`, `code`, `template`, `path`, `file`, …), because the probes
 send all three without knowing which the server wants. A body that
 matches none of those shapes is still recorded rather than dropped.
+
+## The node loader is handed a command line, not a snippet
+
+The custom-MCP loader does not take source to evaluate. It takes a server
+*definition* — a program, an argument vector and an environment — which
+the platform spawns so it can ask the resulting process which tools it
+offers. The payload is therefore a command line, and it is nested under
+`mcpServerConfig` rather than at the top level, so the generic argument
+scan walks straight past it.
+
+The definition arrives both as a nested object and as a double-encoded
+JSON string; both are read. `command` and `args` are flattened into the
+command line that *would* have been spawned and logged as
+`codeExecApiCommand`, with the argument vector capped. The `env` block is
+where a callback host and its token are put, so its **key names** are
+recorded — not its values.
+
+**Nothing is spawned.** The response is a static list of three tools. It
+is what a loader returns when the server it started came up, which is the
+response that invites the next request: having "found" a `run_command`
+tool, the operator's next step is to call it.
 
 ## The template endpoint answers arithmetic
 
@@ -34,15 +64,17 @@ emits. `codeExecApiTemplateEvaluated` records which of the two happened.
 
 ## Logging
 
-- `result`: `code-exec-api-exec` / `-validate` / `-template` / `-read`
+- `result`: `code-exec-api-exec` / `-validate` / `-template` / `-read` / `-mcp`
 - `codeExecApiFamily`, `codeExecApiPath`, `codeExecApiMethod`
 - `codeExecApiArgument` + `codeExecApiArgumentLen` — the recovered payload
-- `codeExecApiCommand` (exec), `codeExecApiRequestedPath` (read),
+- `codeExecApiCommand` (exec, mcp), `codeExecApiMcpCommandLen`,
+  `codeExecApiMcpEnvKeys` (mcp — key names only), `codeExecApiRequestedPath` (read),
   `codeExecApiTemplateEvaluated` + `codeExecApiRenderedPreview` (template)
 - `bodyPreview`, `contentType`
 
 Config: `HONEYPOT_CODE_EXEC_API_ENABLED` (default on),
-`HONEYPOT_CODE_EXEC_API_BODY_PREVIEW_LIMIT` (2048).
+`HONEYPOT_CODE_EXEC_API_BODY_PREVIEW_LIMIT` (2048). Bounds:
+`CODE_EXEC_API_MOUNT_MAX_DEPTH` (2), `CODE_EXEC_API_MCP_MAX_ARGS` (32).
 
 ## Why
 
@@ -51,7 +83,13 @@ themselves as AI assistants and search crawlers — a rotating set of
 assistant and search-bot user agents. No real crawler of any of those
 names POSTs to an exec endpoint, so the user agent is cover, and the
 address list is a capability list: run a command, validate source, render
-a template, read a file.
+a template, read a file, stand up a tool server.
+
+The same sweep asks for each address twice — once bare and once under the
+platform's own name, because it does not know how the target is mounted.
+Matching only the bare spelling answers half of a sweep and 404s the
+other half, which is a tell in itself: a real deployment is reachable at
+one of the two, not inconsistently at both.
 
 The reason to answer rather than 404 is narrower than usual here. A 404 is
 decided from the address alone, before the body is read — so for this
