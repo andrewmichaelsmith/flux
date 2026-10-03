@@ -2596,6 +2596,34 @@ _RDWEB_LOCALE_PATH_RE = re.compile(
 # Server 2019 LTSC build that scanners commonly fingerprint when picking
 # password-spraying targets; matches the broad install base.
 RDWEB_SERVER_BUILD = (os.environ.get("HONEYPOT_RDWEB_SERVER_BUILD") or "10.0.17763").strip()
+# Credential-sink conversion gate for the RDWeb login POST. Before this
+# existed the surface answered every guess with the post-auth resource
+# list, which is the mirror image of the failure the FortiOS gate was
+# built for: a sink that accepts everything records the dictionary and
+# nothing about what an operator does with a credential that works, and
+# "every password is correct" is a tell to any client that submits two
+# guesses for one account. The gate lets a source find exactly one pair
+# after it has burned a per-source number of attempts.
+RDWEB_ACCEPT_ENABLED = _env_bool("HONEYPOT_RDWEB_ACCEPT_ENABLED")
+# Band is wider than the VPN sink's because per-source volume here is
+# heavier — a spraying source works through hundreds of guesses a day, so
+# a threshold low enough to convert on the first few would not look like
+# a brute that found something.
+RDWEB_ACCEPT_MIN_ATTEMPTS = max(
+    int((os.environ.get("HONEYPOT_RDWEB_ACCEPT_MIN_ATTEMPTS") or "60").strip() or "60"), 1,
+)
+RDWEB_ACCEPT_MAX_ATTEMPTS = max(
+    int((os.environ.get("HONEYPOT_RDWEB_ACCEPT_MAX_ATTEMPTS") or "240").strip() or "240"),
+    RDWEB_ACCEPT_MIN_ATTEMPTS,
+)
+RDWEB_BRUTE_STATE_TTL_SECONDS = max(
+    int((os.environ.get("HONEYPOT_RDWEB_BRUTE_STATE_TTL_SECONDS") or "86400").strip() or "86400"),
+    60,
+)
+RDWEB_BRUTE_STATE_MAX_ENTRIES = max(
+    int((os.environ.get("HONEYPOT_RDWEB_BRUTE_STATE_MAX_ENTRIES") or "4096").strip() or "4096"),
+    16,
+)
 
 # --- Fake Microsoft Exchange (OWA / ECP / autodiscover / PSRemoting) ----
 # ProxyShell bait surface: scanners chain
@@ -8259,6 +8287,7 @@ def render_rdweb_site_css() -> bytes:
         b"#header{background:#2672ec;color:#fff;padding:12px 24px}\n"
         b".txtbox{width:240px;padding:3px}\n"
         b".button{padding:4px 24px}\n"
+        b".error{color:#a80000;padding:8px 0}\n"
     )
 
 
@@ -8473,32 +8502,23 @@ def render_fortigate_logincheck_success() -> bytes:
     return b"ret=1,redir=/remote/portal\r\n"
 
 
-def _fortigate_accept_threshold(client_ip: str, host: str = "") -> int:
-    """How many guesses this source must burn before one is accepted.
-
-    Derived from the client address *and* the host being served, so the
-    number differs both per source and per deployment. Keying on the
-    address alone would give one operator the same threshold on every
-    host they hit — which is the fleet-wide constant this is trying to
-    avoid, just measured across hosts instead of across sources.
-    """
-    span = FORTIGATE_VPN_ACCEPT_MAX_ATTEMPTS - FORTIGATE_VPN_ACCEPT_MIN_ATTEMPTS + 1
-    seed = f"{client_ip or ''}\x00{host or ''}".encode("utf-8", errors="replace")
-    digest = hashlib.sha256(seed).digest()
-    return FORTIGATE_VPN_ACCEPT_MIN_ATTEMPTS + (int.from_bytes(digest[:4], "big") % span)
-
-
-def fortigate_credential_id(username: str, password: str) -> str:
+def credential_pair_id(username: str, password: str) -> str:
     """Stable join key for a submitted credential pair.
 
     No structured log field carries the secret value — this hash stands
-    in for it, and gives analysis a way to ask whether the credential
-    this trap accepted from one source later shows up from a *different*
-    source: the remote-access equivalent of watching a planted cloud
-    credential move between the host that harvests it and the host that
-    spends it. (The raw request body still reaches `bodyPreview`, the
-    payload-capture field every trap shares; the point here is that the
-    join key is usable without reading it back out of the body.)
+    in for it, and gives analysis a way to ask whether the credential a
+    conversion gate accepted from one source later shows up from a
+    *different* source: the remote-access equivalent of watching a
+    planted cloud credential move between the host that harvests it and
+    the host that spends it. (The raw request body still reaches
+    `bodyPreview`, the payload-capture field every trap shares; the point
+    here is that the join key is usable without reading it back out of
+    the body.)
+
+    Shared across credential sinks on purpose: the same pair submitted to
+    the VPN surface and to the remote-desktop surface produces the same
+    id, which is what makes "one dictionary, several surfaces" a
+    measurable claim rather than an impression.
     """
     digest = hashlib.sha256(
         username.encode("utf-8", errors="replace")
@@ -8508,52 +8528,79 @@ def fortigate_credential_id(username: str, password: str) -> str:
     return digest.hexdigest()[:32]
 
 
-# Per-source credential-sink state: attempts seen, and which credential
-# (if any) this source has been allowed to "find".
-_FORTIGATE_BRUTE_STATE: dict[str, dict[str, object]] = {}
+def _brute_accept_threshold(
+    scope: str, client_ip: str, host: str, min_attempts: int, max_attempts: int,
+) -> int:
+    """How many guesses this source must burn before one is accepted.
+
+    Derived from the client address *and* the host being served, so the
+    number differs both per source and per deployment. Keying on the
+    address alone would give one operator the same threshold on every
+    host they hit — which is the fleet-wide constant this is trying to
+    avoid, just measured across hosts instead of across sources. `scope`
+    separates the surfaces for the same reason: a source working two
+    credential sinks on one host should not find both of them give way on
+    the same attempt number.
+    """
+    span = max_attempts - min_attempts + 1
+    seed = f"{scope}\x00{client_ip or ''}\x00{host or ''}".encode("utf-8", errors="replace")
+    digest = hashlib.sha256(seed).digest()
+    return min_attempts + (int.from_bytes(digest[:4], "big") % span)
 
 
-def _fortigate_prune_brute_state(now: float) -> None:
+def _prune_brute_state(
+    state: dict[str, dict[str, object]], now: float, max_entries: int,
+) -> None:
+    """Drop expired per-source entries, then cap the table by soonest
+    expiry. Per-source brute state is memory held on a long-lived
+    process; it is bounded the same way the canary cache is."""
     expired = [
-        key for key, entry in _FORTIGATE_BRUTE_STATE.items()
+        key for key, entry in state.items()
         if float(entry.get("expiry", 0.0)) <= now
     ]
     for key in expired:
-        del _FORTIGATE_BRUTE_STATE[key]
-    while len(_FORTIGATE_BRUTE_STATE) >= FORTIGATE_VPN_BRUTE_STATE_MAX_ENTRIES:
-        oldest = min(
-            _FORTIGATE_BRUTE_STATE,
-            key=lambda k: float(_FORTIGATE_BRUTE_STATE[k].get("expiry", 0.0)),
-        )
-        del _FORTIGATE_BRUTE_STATE[oldest]
+        del state[key]
+    while len(state) >= max_entries:
+        oldest = min(state, key=lambda k: float(state[k].get("expiry", 0.0)))
+        del state[oldest]
 
 
-def fortigate_evaluate_credential(
-    client_ip: str, username: str, password: str, host: str = "",
+def _evaluate_brute_credential(
+    state: dict[str, dict[str, object]],
+    scope: str,
+    client_ip: str,
+    username: str,
+    password: str,
+    host: str,
+    *,
+    min_attempts: int,
+    max_attempts: int,
+    ttl_seconds: int,
+    max_entries: int,
 ) -> tuple[bool, bool, int]:
-    """Decide whether this credential POST authenticates.
+    """Decide whether a credential POST authenticates.
 
     Returns `(accepted, newly_accepted, attempts)`.
 
     A source accumulates attempts until it crosses its threshold; the
-    credential it happens to be trying at that point becomes the one
-    that works, and keeps working on replay. Every other pair from that
-    source continues to fail, so the operator sees exactly what a real
+    credential it happens to be trying at that point becomes the one that
+    works, and keeps working on replay. Every other pair from that source
+    continues to fail, so the operator sees exactly what a real
     successful brute-force looks like — one hit in a long run — rather
-    than a portal that waves everything through.
+    than a surface that waves everything through.
     """
     now = time.time()
-    _fortigate_prune_brute_state(now)
+    _prune_brute_state(state, now, max_entries)
 
     # Keyed on (source, host) to match the threshold derivation: one
     # process can serve several hostnames, and a source working through
     # them is running a separate brute against each.
     state_key = f"{client_ip}\x00{host}"
-    entry = _FORTIGATE_BRUTE_STATE.get(state_key)
+    entry = state.get(state_key)
     if entry is None:
         entry = {"attempts": 0, "accepted_id": None}
-        _FORTIGATE_BRUTE_STATE[state_key] = entry
-    entry["expiry"] = now + FORTIGATE_VPN_BRUTE_STATE_TTL_SECONDS
+        state[state_key] = entry
+    entry["expiry"] = now + ttl_seconds
     entry["attempts"] = int(entry.get("attempts", 0)) + 1
     attempts = int(entry["attempts"])
 
@@ -8563,18 +8610,65 @@ def fortigate_evaluate_credential(
     if not username or not password:
         return False, False, attempts
 
-    cred_id = fortigate_credential_id(username, password)
+    cred_id = credential_pair_id(username, password)
     accepted_id = entry.get("accepted_id")
 
     if accepted_id is not None:
         # Already converted: only the found credential keeps working.
         return cred_id == accepted_id, False, attempts
 
-    if attempts >= _fortigate_accept_threshold(client_ip, host):
+    if attempts >= _brute_accept_threshold(
+        scope, client_ip, host, min_attempts, max_attempts,
+    ):
         entry["accepted_id"] = cred_id
         return True, True, attempts
 
     return False, False, attempts
+
+
+def _fortigate_accept_threshold(client_ip: str, host: str = "") -> int:
+    """FortiOS SSL VPN band of the shared conversion gate."""
+    return _brute_accept_threshold(
+        "fortigate-sslvpn", client_ip, host,
+        FORTIGATE_VPN_ACCEPT_MIN_ATTEMPTS, FORTIGATE_VPN_ACCEPT_MAX_ATTEMPTS,
+    )
+
+
+def fortigate_credential_id(username: str, password: str) -> str:
+    """FortiOS alias for the shared credential-pair join key."""
+    return credential_pair_id(username, password)
+
+
+# Per-source credential-sink state: attempts seen, and which credential
+# (if any) this source has been allowed to "find".
+_FORTIGATE_BRUTE_STATE: dict[str, dict[str, object]] = {}
+
+
+def _fortigate_prune_brute_state(now: float) -> None:
+    _prune_brute_state(
+        _FORTIGATE_BRUTE_STATE, now, FORTIGATE_VPN_BRUTE_STATE_MAX_ENTRIES,
+    )
+
+
+def fortigate_evaluate_credential(
+    client_ip: str, username: str, password: str, host: str = "",
+) -> tuple[bool, bool, int]:
+    """FortiOS SSL VPN entry point to the shared conversion gate.
+
+    Returns `(accepted, newly_accepted, attempts)`.
+    """
+    return _evaluate_brute_credential(
+        _FORTIGATE_BRUTE_STATE,
+        "fortigate-sslvpn",
+        client_ip,
+        username,
+        password,
+        host,
+        min_attempts=FORTIGATE_VPN_ACCEPT_MIN_ATTEMPTS,
+        max_attempts=FORTIGATE_VPN_ACCEPT_MAX_ATTEMPTS,
+        ttl_seconds=FORTIGATE_VPN_BRUTE_STATE_TTL_SECONDS,
+        max_entries=FORTIGATE_VPN_BRUTE_STATE_MAX_ENTRIES,
+    )
 
 
 def render_fortigate_portal_html(host: str, version: str) -> bytes:
@@ -9971,7 +10065,9 @@ def _citrix_has_cmd_injection(body_preview: str, path: str, query: str) -> bool:
     return any(needle in haystack for needle in _CITRIX_CMD_INJECTION_INDICATORS)
 
 
-def render_rdweb_login_html(host: str, server_build: str) -> bytes:
+def render_rdweb_login_html(
+    host: str, server_build: str, login_failed: bool = False,
+) -> bytes:
     """Microsoft RDWeb (RD Web Access) login page.
 
     Real Server 2019 RDWeb on `/RDWeb/Pages/en-US/login.aspx` ships an
@@ -9980,9 +10076,20 @@ def render_rdweb_login_html(host: str, server_build: str) -> bytes:
     placeholder VIEWSTATE so the form looks plausible to scanners that
     parse the HTML and submit. The `Server: Microsoft-IIS/10.0` header
     is set by the handler.
+
+    `login_failed` adds the error block a real deployment renders above
+    the form when a credential is rejected. It is the same page either
+    way — a rejection that returned a differently-shaped document would
+    be easier to classify than the real thing, and the point of the
+    distinction is that it is the one a real server makes.
     """
     safe_host = _appliance_display_host(host, "rdweb")
     viewstate = uuid.uuid4().hex
+    error_block = (
+        '\n  <div id="ErrorPane" class="error">'
+        'The user name or password is incorrect. Try typing it again.</div>'
+        if login_failed else ""
+    )
     body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -9995,7 +10102,7 @@ def render_rdweb_login_html(host: str, server_build: str) -> bytes:
   <div id="header">
     <h1>Work Resources</h1>
     <h2>RemoteApp and Desktop Connection</h2>
-  </div>
+  </div>{error_block}
   <form method="post" action="/RDWeb/Pages/en-US/login.aspx" autocomplete="off">
     <input type="hidden" name="__VIEWSTATE" value="{viewstate}" />
     <input type="hidden" name="WorkSpaceID" value="" />
@@ -10286,24 +10393,85 @@ def extract_exchange_form(body: bytes, content_type: str) -> tuple[str, bool]:
     return username, has_password
 
 
-def extract_rdweb_form(body: bytes, content_type: str) -> tuple[str, bool]:
-    """Pull `DomainUserName` and check for `UserPass` presence.
+# Real RDWeb form names are CamelCase; some scanners send lowercased or
+# generic variants. One table, used by both extractors below, so the
+# conversion gate can never key on a field the log does not report.
+_RDWEB_USERNAME_FIELDS = ("DomainUserName", "domainusername", "username", "UserName")
+_RDWEB_PASSWORD_FIELDS = ("UserPass", "userpass", "password", "Password")
 
-    Real RDWeb form names are CamelCase; some scanners send
-    lowercased variants — accept both.
-    """
-    form = parse_form_body(body, content_type)
-    username = ""
-    for key in ("DomainUserName", "domainusername", "username", "UserName"):
+
+def _rdweb_form_value(form: dict[str, list[str]], keys: tuple[str, ...]) -> str:
+    for key in keys:
         values = form.get(key) or form.get(key.lower()) or form.get(key.upper())
         if values and values[0]:
-            username = values[0][:120]
-            break
-    has_password = any(
-        bool((form.get(key) or form.get(key.lower()) or form.get(key.upper()) or [""])[0])
-        for key in ("UserPass", "userpass", "password", "Password")
+            return values[0]
+    return ""
+
+
+def extract_rdweb_credentials(body: bytes, content_type: str) -> tuple[str, str]:
+    """Pull the submitted `DomainUserName` / `UserPass` pair.
+
+    Returned to the handler for the conversion gate only; neither value
+    reaches a structured log field. The username is logged separately
+    (truncated) by `extract_rdweb_form`, and the secret is represented in
+    the log by `rdwebCredentialId`.
+    """
+    form = parse_form_body(body, content_type)
+    return (
+        _rdweb_form_value(form, _RDWEB_USERNAME_FIELDS),
+        _rdweb_form_value(form, _RDWEB_PASSWORD_FIELDS),
     )
-    return username, has_password
+
+
+def extract_rdweb_form(body: bytes, content_type: str) -> tuple[str, bool]:
+    """Pull `DomainUserName` and check for `UserPass` presence."""
+    username, password = extract_rdweb_credentials(body, content_type)
+    return username[:120], bool(password)
+
+
+# Per-source credential-sink state for the RDWeb login POST: attempts
+# seen, and which credential (if any) this source has been allowed to
+# "find". Separate table from the VPN sink so one surface converting
+# cannot move the other's attempt count.
+_RDWEB_BRUTE_STATE: dict[str, dict[str, object]] = {}
+
+
+def _rdweb_accept_threshold(client_ip: str, host: str = "") -> int:
+    """RDWeb band of the shared conversion gate."""
+    return _brute_accept_threshold(
+        "rdweb", client_ip, host,
+        RDWEB_ACCEPT_MIN_ATTEMPTS, RDWEB_ACCEPT_MAX_ATTEMPTS,
+    )
+
+
+def rdweb_credential_id(username: str, password: str) -> str:
+    """RDWeb alias for the shared credential-pair join key."""
+    return credential_pair_id(username, password)
+
+
+def _rdweb_prune_brute_state(now: float) -> None:
+    _prune_brute_state(_RDWEB_BRUTE_STATE, now, RDWEB_BRUTE_STATE_MAX_ENTRIES)
+
+
+def rdweb_evaluate_credential(
+    client_ip: str, username: str, password: str, host: str = "",
+) -> tuple[bool, bool, int]:
+    """RDWeb entry point to the shared conversion gate.
+
+    Returns `(accepted, newly_accepted, attempts)`.
+    """
+    return _evaluate_brute_credential(
+        _RDWEB_BRUTE_STATE,
+        "rdweb",
+        client_ip,
+        username,
+        password,
+        host,
+        min_attempts=RDWEB_ACCEPT_MIN_ATTEMPTS,
+        max_attempts=RDWEB_ACCEPT_MAX_ATTEMPTS,
+        ttl_seconds=RDWEB_BRUTE_STATE_TTL_SECONDS,
+        max_entries=RDWEB_BRUTE_STATE_MAX_ENTRIES,
+    )
 
 
 def extract_aspera_faspex_creds(body: bytes, content_type: str) -> dict[str, str]:
@@ -35158,10 +35326,19 @@ async def _handle_rdweb(
     tb: dict[str, object] | None = None
 
     # Whether the response should embed a Tracebit AWS canary in the
-    # post-auth resource list. True on any landing-path POST ("successful
-    # login") and on direct GETs to Default.aspx (which scanners walk
-    # after harvesting a session cookie from the login POST).
+    # post-auth resource list. True on a login POST the conversion gate
+    # accepted, and on direct GETs to Default.aspx (which scanners walk
+    # after harvesting a session cookie from the login POST). A rejected
+    # credential mints nothing: the canary is the payoff for finding a
+    # credential that works, and issuing it on every guess spent upstream
+    # quota on sources that never came back for the resource list.
     serve_canary = False
+
+    # Conversion-gate bookkeeping, folded into the log entry below.
+    rdweb_credential_id_value = ""
+    rdweb_attempts = 0
+    rdweb_accepted = False
+    rdweb_newly_accepted = False
 
     # Classify the request into three buckets: login form (GET) / credential
     # POST (POST) / post-auth default page (GET). Locale-specific
@@ -35202,18 +35379,51 @@ async def _handle_rdweb(
 
     if is_landing:
         # Scanners commonly POST creds against the short `/RDWeb` path
-        # rather than the full ASP.NET handler URL — we still serve the
-        # same HTML, but log it as a credential POST and mint a session
-        # cookie on any of the landing variants.
+        # rather than the full ASP.NET handler URL, so every landing
+        # variant is treated as a credential POST and runs the same
+        # conversion gate against the same per-source count.
         if method == "POST":
-            result_tag = "rdweb-login-post"
             content_type = "text/html; charset=utf-8"
-            serve_canary = True
-            # TSWAAuthHttpOnlyCookie is the real RDWeb session cookie
-            # name; per-request hex value so replays are attributable.
-            set_cookie_value = (
-                f"TSWAAuthHttpOnlyCookie={uuid.uuid4().hex}; Path=/RDWeb; Secure; HttpOnly"
+            username_submitted, password_submitted = (
+                extract_rdweb_credentials(request_body, content_type_req)
+                if request_body else ("", "")
             )
+            if username_submitted and password_submitted:
+                rdweb_credential_id_value = rdweb_credential_id(
+                    username_submitted, password_submitted,
+                )
+            if RDWEB_ACCEPT_ENABLED:
+                (
+                    rdweb_accepted,
+                    rdweb_newly_accepted,
+                    rdweb_attempts,
+                ) = rdweb_evaluate_credential(
+                    str(log_context.get("clientIp", "")),
+                    username_submitted,
+                    password_submitted,
+                    host,
+                )
+            # Switch off and the sink never converts — the same meaning
+            # the VPN sink's switch has.
+            if rdweb_accepted:
+                result_tag = "rdweb-login-post-accepted"
+                serve_canary = True
+                # TSWAAuthHttpOnlyCookie is the real RDWeb session cookie
+                # name, so it is issued only where a session actually
+                # exists; per-request hex value so replays are
+                # attributable to the issuance event.
+                set_cookie_value = (
+                    f"TSWAAuthHttpOnlyCookie={uuid.uuid4().hex}; Path=/RDWeb; Secure; HttpOnly"
+                )
+            else:
+                # Rejected: the logon page again, with the error block a
+                # real deployment renders, and no session. Shipping a
+                # cookie alongside a rejection told a client keying on
+                # the cookie that every guess had worked.
+                result_tag = "rdweb-login-post"
+                body = render_rdweb_login_html(
+                    host, RDWEB_SERVER_BUILD, login_failed=True,
+                )
         else:
             result_tag = "rdweb-login"
             body = render_rdweb_login_html(host, RDWEB_SERVER_BUILD)
@@ -35245,7 +35455,7 @@ async def _handle_rdweb(
             str(log_context.get("protocol", "http")),
         )
 
-    if result_tag != "rdweb-login":
+    if result_tag in ("rdweb-login-post-accepted", "rdweb-default"):
         body = render_rdweb_default_html(host, tb)
 
     log_entry: dict[str, object] = {
@@ -35256,11 +35466,25 @@ async def _handle_rdweb(
         "rdwebMethod": method,
         "bytes": len(body),
     }
-    if request_body and result_tag == "rdweb-login-post":
+    if request_body and result_tag in (
+        "rdweb-login-post", "rdweb-login-post-accepted",
+    ):
         username, has_password = extract_rdweb_form(request_body, content_type_req)
         if username:
             log_entry["rdwebUsername"] = username
         log_entry["rdwebHasPassword"] = has_password
+        # Hash of the submitted pair, never the pair itself. Logged on
+        # every attempt, and shared with the other credential sinks, so
+        # analysis can ask whether one dictionary is being walked across
+        # several surfaces and whether the pair this source was allowed
+        # to find later turns up from a different source.
+        if rdweb_credential_id_value:
+            log_entry["rdwebCredentialId"] = rdweb_credential_id_value
+        if RDWEB_ACCEPT_ENABLED:
+            log_entry["rdwebAttempt"] = rdweb_attempts
+            log_entry["rdwebAccepted"] = rdweb_accepted
+            if rdweb_newly_accepted:
+                log_entry["rdwebFirstAccept"] = True
     if tb:
         log_entry["canaryTypes"] = [k for k, v in tb.items() if v]
     if body_preview:

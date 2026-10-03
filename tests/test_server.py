@@ -667,6 +667,13 @@ def test_all_trap_families_default_on():
         "nothing about what the operator does with a working credential, "
         "and the gate spends no upstream quota."
     )
+    assert tbenv.RDWEB_ACCEPT_ENABLED, (
+        "HONEYPOT_RDWEB_ACCEPT_ENABLED should default to True — the sink "
+        "used to answer every guess with the post-auth resource list, "
+        "which records the dictionary and nothing about what the operator "
+        "does with a credential that works, and spent an upstream canary "
+        "on guesses that failed."
+    )
     assert tbenv.LARAVEL_DEBUGBAR_ENABLED, (
         "HONEYPOT_LARAVEL_DEBUGBAR_ENABLED should default to True — only "
         "the op=get step spends a canary, so the listing steps cost "
@@ -6494,7 +6501,12 @@ async def test_dispatch_rdweb_login_landing(flux_client):
     assert entry["rdwebPath"] == "/RDWeb/Pages/en-US/login.aspx"
 
 
-async def test_dispatch_rdweb_login_post_logs_username_and_sets_session_cookie(flux_client):
+async def test_dispatch_rdweb_login_post_logs_username_and_rejects_the_first_guess(
+    flux_client,
+):
+    # The conversion gate owns whether a guess works; see
+    # tests/test_rdweb_brute_gate.py. Here: the credential pair is parsed
+    # and logged, and a first guess is rejected without a session.
     resp = await flux_client.post(
         "/RDWeb/Pages/en-US/login.aspx",
         data="DomainUserName=DOMAIN%5Cadmin&UserPass=hunter2&MachineType=private",
@@ -6504,13 +6516,13 @@ async def test_dispatch_rdweb_login_post_logs_username_and_sets_session_cookie(f
         },
     )
     assert resp.status == 200
-    set_cookie = resp.headers.get("Set-Cookie", "")
-    assert "TSWAAuthHttpOnlyCookie=" in set_cookie
+    assert "TSWAAuthHttpOnlyCookie" not in resp.headers.get("Set-Cookie", "")
 
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "rdweb-login-post"
     assert entry["rdwebUsername"] == "DOMAIN\\admin"
     assert entry["rdwebHasPassword"] is True
+    assert entry["rdwebAccepted"] is False
     assert "UserPass" not in entry  # secret value never logged
 
 
@@ -6530,7 +6542,7 @@ async def test_dispatch_rdweb_login_post_on_short_landing_paths(flux_client, pos
     # paths (`/RDWeb`, `/RDWeb/`, `/RDWeb/Pages`, `/RDWeb/Pages/`) and to
     # localized login pages (`/RDWeb/Pages/<xx-yy>/login.aspx`), not just
     # the full `/RDWeb/Pages/en-US/login.aspx` URL. All should be treated
-    # as credential POSTs: parse the form, mint a session cookie, log
+    # as credential POSTs: parse the form, run the conversion gate, log
     # result.
     resp = await flux_client.post(
         post_path,
@@ -6541,8 +6553,6 @@ async def test_dispatch_rdweb_login_post_on_short_landing_paths(flux_client, pos
         },
     )
     assert resp.status == 200
-    set_cookie = resp.headers.get("Set-Cookie", "")
-    assert "TSWAAuthHttpOnlyCookie=" in set_cookie
 
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "rdweb-login-post"
@@ -6596,8 +6606,10 @@ async def test_dispatch_rdweb_localized_default_page_serves_canary(
     assert "aws" in entry.get("canaryTypes", [])
 
 
-async def test_dispatch_rdweb_login_post_cookie_per_request_unique(flux_client):
-    cookies = []
+async def test_dispatch_rdweb_login_post_rejection_carries_no_session(flux_client):
+    # Per-request uniqueness of the cookie an accepted pair is handed is
+    # pinned in tests/test_rdweb_brute_gate.py; what matters here is that
+    # a rejected guess is handed nothing.
     for i in range(2):
         resp = await flux_client.post(
             "/RDWeb/Pages/en-US/login.aspx",
@@ -6608,10 +6620,7 @@ async def test_dispatch_rdweb_login_post_cookie_per_request_unique(flux_client):
             },
         )
         assert resp.status == 200
-        cookies.append(resp.headers.get("Set-Cookie", ""))
-    assert cookies[0] != cookies[1]
-    assert "TSWAAuthHttpOnlyCookie=" in cookies[0]
-    assert "TSWAAuthHttpOnlyCookie=" in cookies[1]
+        assert "TSWAAuthHttpOnlyCookie" not in resp.headers.get("Set-Cookie", "")
 
 
 async def test_dispatch_rdweb_default_without_api_key_returns_empty_resource_list(
@@ -6650,9 +6659,12 @@ async def test_dispatch_rdweb_default_with_canary_embeds_aws_keys(
     assert "aws" in entry["canaryTypes"]
 
 
-async def test_dispatch_rdweb_post_with_canary_embeds_aws_keys_and_sets_cookie(
+async def test_dispatch_rdweb_rejected_post_serves_no_canary(
     flux_client, monkeypatch,
 ):
+    # The resource list, the session and the canary are the payoff for a
+    # credential the gate accepted — see
+    # tests/test_rdweb_brute_gate.py for the accepted path.
     monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
     monkeypatch.setattr(tbenv, "_get_or_issue_canary", _fake_canary)
     resp = await flux_client.post(
@@ -6665,12 +6677,12 @@ async def test_dispatch_rdweb_post_with_canary_embeds_aws_keys_and_sets_cookie(
     )
     assert resp.status == 200
     text = await resp.text()
-    assert "AKIAFAKEEXAMPLE01" in text
-    assert "TSWAAuthHttpOnlyCookie=" in resp.headers.get("Set-Cookie", "")
+    assert "AKIAFAKEEXAMPLE01" not in text
+    assert "TSWAAuthHttpOnlyCookie" not in resp.headers.get("Set-Cookie", "")
     entry = _log_entries(flux_client.log_path)[-1]
     assert entry["result"] == "rdweb-login-post"
     assert entry["rdwebUsername"] == "DOMAIN\\admin"
-    assert "aws" in entry["canaryTypes"]
+    assert "canaryTypes" not in entry
 
 
 def test_render_rdweb_default_html_no_canary_omits_credentials():

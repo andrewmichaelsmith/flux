@@ -346,6 +346,11 @@ No Tracebit key required.
 | `HONEYPOT_RDWEB_ENABLED` | on | Master switch. |
 | `HONEYPOT_RDWEB_PATHS_CSV` | *(built-in — `/RDWeb`, `/RDWeb/`, `/RDWeb/Pages/`, `/RDWeb/Pages/en-US/login.aspx`, `/RDWeb/Pages/en-US/Default.aspx`)* | Exact, case-insensitive. The Server 2019 RD Web Access landing + login + post-auth resource list. |
 | `HONEYPOT_RDWEB_SERVER_BUILD` | `10.0.17763` | Windows Server build advertised in the RDWeb logon HTML footer. Server 2019 LTSC build matches the broad install base password-spraying scanners target. |
+| `HONEYPOT_RDWEB_ACCEPT_ENABLED` | on | Credential-sink conversion gate. Lets a source find exactly one working credential after enough attempts, so post-authentication behaviour becomes observable. Off ⇒ every guess is rejected. See [docs](./docs/fake-rdweb.md#the-conversion-gate). |
+| `HONEYPOT_RDWEB_ACCEPT_MIN_ATTEMPTS` | `60` | Lower bound of the per-source acceptance threshold band. |
+| `HONEYPOT_RDWEB_ACCEPT_MAX_ATTEMPTS` | `240` | Upper bound of the band. The threshold is derived from the client address and host so it is not a fleet-wide constant. |
+| `HONEYPOT_RDWEB_BRUTE_STATE_TTL_SECONDS` | `86400` | How long per-source gate state survives. |
+| `HONEYPOT_RDWEB_BRUTE_STATE_MAX_ENTRIES` | `4096` | Bound on the per-source gate state table. |
 
 The `__VIEWSTATE` value embedded in the login HTML and the
 `TSWAAuthHttpOnlyCookie` minted on `/RDWeb/Pages/en-US/login.aspx`
