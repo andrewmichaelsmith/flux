@@ -33,7 +33,7 @@ The route accepts `json` and `xml`, mirroring core's own format enum.
 The handler logs `wpOembedRoute`, `wpOembedRequestedUrl`,
 `wpOembedUrlOnHost`, `wpOembedMatchedSlug`, `wpOembedFormat` and, on a
 hit, `wpOembedAuthor`. The author named is read out of the same roster
-the user-enumeration trap lists, resolved from the matched post's own
+the user-enumeration trap lists, resolved from the matched item's own
 author, so the two surfaces cannot disagree about who exists. Nothing
 credential-shaped is fixed: the `data-secret` nonce in core's embed
 markup is minted per response.
@@ -55,9 +55,17 @@ the URL, which is the username source that still works after the core
 user list has been locked down. That name is the input to a run against
 the login form, where that trap records the submitted pair — the same
 enumerate / brute / capture chain the user-enumeration trap drives, on
-the vector that survives hardening. The slot disclosed here is
-deliberately not the one the user list leads with, so a credential run
-opening on that name says which surface the operator trusted.
+the vector that survives hardening.
+
+The name disclosed is the resolved item's own author, because that is
+what core does. An earlier revision instead disclosed a slot the user
+list does not lead with, so that a credential run opening on it would
+say which surface the operator had read. The fidelity fix removed that:
+controlling which slot got named required answering URLs resolving to
+nothing, which is exactly what that fix stopped doing. What remains is
+narrower and still useful — the fake posts have different authors, so
+the disclosed name identifies which item the caller knew to ask for,
+alongside `wpOembedMatchedSlug`.
 
 `proxy` is the server-side fetcher core adds for the block editor, and
 it draws probes as a request-forgery primitive. Core gates it behind a

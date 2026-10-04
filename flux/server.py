@@ -1506,13 +1506,20 @@ WP_OEMBED_ENABLED = _env_bool("HONEYPOT_WP_OEMBED_ENABLED")
 _WP_OEMBED_NAMESPACE = "oembed/1.0"
 _WP_OEMBED_EMBED_ROUTE = f"/{_WP_OEMBED_NAMESPACE}/embed"
 _WP_OEMBED_PROXY_ROUTE = f"/{_WP_OEMBED_NAMESPACE}/proxy"
-# Which roster slot the embed route discloses. Deliberately not the slot
-# the user list leads with: a credential run that opens on this name found
-# it here rather than there, which separates the two enumeration
-# populations without anything having to be inferred. It stays plausible
-# either way, because this route discloses the author of one post, which
-# on a real site is routinely not the first user.
-_WP_OEMBED_AUTHOR_SLUG = "webmaster"
+# Fallback roster slot for a render with no resolved item. Dispatch no
+# longer reaches it — an unresolvable URL gets core's Not Found — so this
+# only covers direct renderer calls, and nothing about it is a signal.
+#
+# An earlier revision made this slot the point of the trap: disclose a
+# name the user list does NOT lead with, so a credential run opening on
+# it would say which surface the operator read. Fidelity took that away.
+# Core names the author of the resolved item, the first fake post is
+# authored by the same slot the user list leads with, and imitating core
+# matters more than a separation signal that required not imitating it.
+# What survives is narrower and real: the two fake posts have different
+# authors, so the name disclosed still identifies WHICH item the caller
+# knew to ask for, alongside `wpOembedMatchedSlug`.
+_WP_OEMBED_AUTHOR_FALLBACK_SLUG = "webmaster"
 # Formats core's oEmbed controller accepts. Anything else is a parameter
 # error there and here; recording which one was asked for is free.
 _WP_OEMBED_FORMATS: frozenset[str] = frozenset({"json", "xml"})
@@ -14625,7 +14632,7 @@ def _wp_oembed_author(host: str, author_id: str | None = None) -> tuple[str, str
     own author is the one named, which is what core does; otherwise the
     front-page slot above answers."""
     base = _external_base_url(host)
-    wanted = _WP_OEMBED_AUTHOR_SLUG
+    wanted = _WP_OEMBED_AUTHOR_FALLBACK_SLUG
     if author_id is not None:
         for slot in _WP_USER_ENUM_FAKE_USERS:
             if slot["id"] == author_id:

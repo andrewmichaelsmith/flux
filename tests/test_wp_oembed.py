@@ -117,12 +117,34 @@ def test_disclosed_author_comes_from_the_user_roster():
     assert url.endswith(f"/author/{roster[name]}/")
 
 
-def test_disclosed_author_is_not_the_one_the_user_list_leads_with():
-    """The separation this trap buys: a credential run opening on this
-    name found it here rather than on the user list. If the two ever
-    name the same slot first, that signal is gone."""
-    name, _ = tbenv._wp_oembed_author("shop.example.com")
-    assert name != tbenv._WP_USER_ENUM_FAKE_USERS[0]["name"]
+def test_disclosed_author_is_the_resolved_items_own_author():
+    """Core names the author of the item behind the URL, so this must
+    follow the item rather than a fixed choice.
+
+    This replaced a test asserting the disclosed name was never the one
+    the user list leads with. That property was real when written and
+    was removed by the fidelity fix: once an unresolvable URL returns
+    Not Found, every answered embed names its item's author, and the
+    first fake post happens to share the user list's first slot. The
+    old test kept passing because it called the renderer with no
+    resolved item — exercising a fallback dispatch can no longer reach,
+    while reading as a guarantee about live behaviour."""
+    for slot in tbenv._WP_REST_FAKE_POSTS:
+        name, url = tbenv._wp_oembed_author(
+            "shop.example.com", str(slot["author"]))
+        expected = next(u for u in tbenv._WP_USER_ENUM_FAKE_USERS
+                        if u["id"] == str(slot["author"]))
+        assert name == expected["name"]
+        assert url.endswith(f"/author/{expected['slug']}/")
+
+
+def test_the_fake_posts_do_not_all_share_one_author():
+    """What is left of the separation signal: the disclosed name tells
+    you which item the caller knew to ask for. If every post gained the
+    same author, the embed route would stop distinguishing them and
+    `wpOembedMatchedSlug` would be carrying that alone."""
+    authors = {str(s["author"]) for s in tbenv._WP_REST_FAKE_POSTS}
+    assert len(authors) > 1
 
 
 # --- local-URL resolution (pure) --------------------------------------
