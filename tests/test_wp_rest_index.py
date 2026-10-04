@@ -15,6 +15,7 @@ the actuator index uses, for the same reason.
 """
 
 import json
+from urllib.parse import urlencode
 
 import pytest
 import pytest_asyncio
@@ -204,6 +205,17 @@ def _last_entry(log_path):
     return json.loads(log_path.read_text().splitlines()[-1])
 
 
+# Routes whose required parameters have to be supplied before the guard
+# below can reach their success path. The value comes from the index
+# document itself, so the guard stays correct whatever the external-host
+# fallback resolves to behind the test transport. Without this the guard
+# would have to accept a 400 from any route, which is most of what it is
+# for.
+_REQUIRED_PARAMS = {
+    "/oembed/1.0/embed": lambda doc: {"url": doc["url"]},
+}
+
+
 async def test_following_the_index_reaches_every_route(flux_client):
     """The guard. Fetch the index, then fetch everything it advertises
     over the real dispatch path. An advertised route that falls through
@@ -215,6 +227,9 @@ async def test_following_the_index_reaches_every_route(flux_client):
     for route, entry in doc["routes"].items():
         href = entry["_links"]["self"][0]["href"]
         target = "/" + href.split("/", 3)[3] if href.count("/") > 2 else "/wp-json"
+        params = _REQUIRED_PARAMS.get(route)
+        if params is not None:
+            target += "?" + urlencode(params(doc))
         follow = await flux_client.get(target)
         # The invariant is "a trap answered", not a particular status:
         # `/batch/v1` advertises POST only, and WordPress's own answer to

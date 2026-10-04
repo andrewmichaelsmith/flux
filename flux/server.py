@@ -1473,6 +1473,57 @@ _WP_REST_AUTH_REQUIRED: dict[str, tuple[str, str]] = {
 # what a fingerprinting client reads to confirm the install is real.
 _WP_REST_DESCRIPTORS: tuple[str, ...] = ("types", "taxonomies", "statuses")
 
+# --- Fake WordPress oEmbed namespace --------------------------------------
+# `oembed/1.0` is one of the three namespaces WordPress core registers, and
+# the discovery document above has named it since the index trap shipped.
+# Nothing served it. A namespace that appears in the index and 404s
+# underneath is precisely the drift the index trap exists to remove, and it
+# is a tell no real install produces, because core registers both of this
+# namespace's routes unconditionally on every site.
+#
+# Both routes earn an answer on their own behaviour, not just for the sake
+# of consistency:
+#
+#   `/oembed/1.0/embed?url=<permalink>` is a public author-disclosure
+#   surface: it names the author of the post behind the URL. That makes it
+#   the username source that still works after the core user list has been
+#   locked down, which is why credential tooling reaches for it. The name
+#   it discloses is the input to a run against the login form, where that
+#   trap records the submitted pair — the same enumerate / brute / capture
+#   chain the user-enumeration trap drives, on the vector that survives
+#   hardening.
+#
+#   `/oembed/1.0/proxy?url=<target>` is the server-side fetcher core adds
+#   for the block editor. Core gates it behind an `edit_posts` capability
+#   check that runs before parameter validation, so an anonymous caller
+#   gets a flat 401 — and 401 is what this serves, because the only other
+#   option is to make the outbound request the caller asked for. The
+#   refusal is both the authentic response and the one that still records
+#   the target: a caller testing a server-side fetcher has to name the host
+#   it wants contacted, and that name is infrastructure attribution
+#   available from no other surface here.
+WP_OEMBED_ENABLED = _env_bool("HONEYPOT_WP_OEMBED_ENABLED")
+_WP_OEMBED_NAMESPACE = "oembed/1.0"
+_WP_OEMBED_EMBED_ROUTE = f"/{_WP_OEMBED_NAMESPACE}/embed"
+_WP_OEMBED_PROXY_ROUTE = f"/{_WP_OEMBED_NAMESPACE}/proxy"
+# Which roster slot the embed route discloses. Deliberately not the slot
+# the user list leads with: a credential run that opens on this name found
+# it here rather than there, which separates the two enumeration
+# populations without anything having to be inferred. It stays plausible
+# either way, because this route discloses the author of one post, which
+# on a real site is routinely not the first user.
+_WP_OEMBED_AUTHOR_SLUG = "webmaster"
+# Formats core's oEmbed controller accepts. Anything else is a parameter
+# error there and here; recording which one was asked for is free.
+_WP_OEMBED_FORMATS: frozenset[str] = frozenset({"json", "xml"})
+# The namespaces the index names. Kept as an ordered display constant
+# because WordPress's own ordering is not the order the routes table
+# happens to be built in — a guard test ties this set to the set the
+# advertised routes actually cover, so the drift above cannot return.
+_WP_REST_NAMESPACES: tuple[str, ...] = (
+    _WP_OEMBED_NAMESPACE, "batch/v1", _WP_REST_NAMESPACE,
+)
+
 # Fake published content. Non-credential filler, so it may be fixed across
 # hosts (see the design principle in the README) — nothing here is
 # secret-shaped, and the per-host halves (site name, links) are derived
@@ -6330,6 +6381,30 @@ def _wp_rest_split_indexed(route: str) -> tuple[str, int] | None:
     if not item or not item.isdigit():
         return None
     return name, int(item)
+
+
+def wp_oembed_route_of(path: str) -> str | None:
+    """Return the oEmbed route a path names, or None if it names neither.
+
+    Built on `wp_rest_route_of`, so every spelling the REST layer already
+    normalises arrives here for nothing: the install-subdirectory
+    prefixes, the `?rest_route=` query form permalink-less installs use,
+    and the percent-encoded separators `normalize_path` decodes before
+    dispatch. That last one is not hypothetical — this namespace has been
+    asked for with the dot in `1.0` encoded, which is a WAF-rule bypass
+    shape rather than a typo."""
+    route = wp_rest_route_of(path)
+    if route is None:
+        return None
+    if route in {_WP_OEMBED_EMBED_ROUTE, _WP_OEMBED_PROXY_ROUTE}:
+        return route
+    return None
+
+
+def is_wp_oembed_path(path: str) -> bool:
+    if not WP_OEMBED_ENABLED:
+        return False
+    return wp_oembed_route_of(path) is not None
 
 
 def is_wp_rest_index_path(path: str) -> bool:
@@ -14450,6 +14525,8 @@ def _wp_rest_route_entry(
     namespace = "" if route == "/" else _WP_REST_NAMESPACE
     if route.startswith("/batch/"):
         namespace = "batch/v1"
+    elif route.startswith(f"/{_WP_OEMBED_NAMESPACE}/"):
+        namespace = _WP_OEMBED_NAMESPACE
     return {
         "namespace": namespace,
         "methods": list(methods),
@@ -14476,6 +14553,8 @@ def _wp_rest_advertised_routes() -> tuple[tuple[str, tuple[str, ...]], ...]:
     for name in _WP_REST_AUTH_REQUIRED:
         routes.append((f"/{_WP_REST_NAMESPACE}/{name}", ("GET",)))
     routes.append(("/batch/v1", ("POST",)))
+    routes.append((_WP_OEMBED_EMBED_ROUTE, ("GET",)))
+    routes.append((_WP_OEMBED_PROXY_ROUTE, ("GET",)))
     return tuple(routes)
 
 
@@ -14498,7 +14577,7 @@ def render_wp_rest_index(host: str) -> bytes:
         "home": f"{base}/",
         "gmt_offset": 0,
         "timezone_string": "",
-        "namespaces": ["oembed/1.0", "batch/v1", _WP_REST_NAMESPACE],
+        "namespaces": list(_WP_REST_NAMESPACES),
         "authentication": {},
         "routes": routes,
         "site_logo": 0,
@@ -14507,6 +14586,156 @@ def render_wp_rest_index(host: str) -> bytes:
         "_links": {"help": [{"href": "https://developer.wordpress.org/rest-api/"}]},
     }
     return json.dumps(doc, separators=(",", ":")).encode("utf-8")
+
+
+def _wp_oembed_author(host: str, author_id: str | None = None) -> tuple[str, str]:
+    """The author name and archive URL the embed document discloses.
+
+    Read out of the user-enumeration roster rather than restated, so the
+    two surfaces cannot disagree about who exists — a scanner that reads
+    both and finds two different rosters has learned the site is not
+    real. When the requested URL resolved to a known post, that post's
+    own author is the one named, which is what core does; otherwise the
+    front-page slot above answers."""
+    base = _external_base_url(host)
+    wanted = _WP_OEMBED_AUTHOR_SLUG
+    if author_id is not None:
+        for slot in _WP_USER_ENUM_FAKE_USERS:
+            if slot["id"] == author_id:
+                wanted = slot["slug"]
+                break
+    for slot in _WP_USER_ENUM_FAKE_USERS:
+        if slot["slug"] == wanted:
+            return slot["name"], f"{base}/author/{slot['slug']}/"
+    first = _WP_USER_ENUM_FAKE_USERS[0]
+    return first["name"], f"{base}/author/{first['slug']}/"
+
+
+def _wp_oembed_url_is_local(host: str, url: str) -> bool:
+    """Whether the requested URL names this site.
+
+    Core resolves the `url` parameter to a post on the current site and
+    returns Not Found when it cannot, so the host comparison is the whole
+    test. Scheme-relative and bare-authority spellings are accepted
+    because tooling emits both; anything naming a different authority is
+    somebody else's URL."""
+    if not url:
+        return False
+    candidate = url.strip()
+    for prefix in ("https://", "http://", "//"):
+        if candidate.lower().startswith(prefix):
+            candidate = candidate[len(prefix):]
+            break
+    authority = candidate.split("/", 1)[0].split("?", 1)[0]
+    authority = authority.rpartition("@")[2]
+    if authority.startswith("["):
+        authority = authority.partition("]")[0] + "]"
+    else:
+        authority = authority.split(":", 1)[0]
+    authority = authority.rstrip(".").lower()
+    if not authority:
+        # A path-only `url=` is relative to this site by construction.
+        return True
+    mine = _external_base_url(host).split("://", 1)[-1].split("/", 1)[0]
+    mine = mine.split(":", 1)[0].rstrip(".").lower()
+    if not mine:
+        return False
+    return authority == mine or authority.endswith("." + mine)
+
+
+def _wp_oembed_matched_slug(host: str, url: str) -> str | None:
+    """Which fake post the requested URL points at, if any.
+
+    A URL on this host that names a known slug is a caller that read the
+    content index first; one that does not is a caller probing the route
+    blind. Both get an answer — a real front page oEmbeds too — but the
+    distinction is worth keeping in the row."""
+    tail = url.split("://", 1)[-1]
+    _, _, path_part = tail.partition("/")
+    path_part = "/" + path_part.split("?", 1)[0].split("#", 1)[0]
+    for slot in _WP_REST_FAKE_POSTS:
+        if f"/{slot['slug']}" in path_part:
+            return str(slot["slug"])
+    return None
+
+
+def render_wp_oembed_embed(
+    host: str, url: str = "", *, slug: str | None = None, fmt: str = "json",
+) -> bytes:
+    """The oEmbed document core returns for a post on this site.
+
+    `type: rich` with the `wp-embedded-content` blockquote is what core's
+    own provider emits, and the `author_name` / `author_url` pair is the
+    disclosure the route is asked for."""
+    base = _external_base_url(host)
+    title = _wp_rest_site_name(host)
+    author_id: str | None = None
+    for slot in _WP_REST_FAKE_POSTS:
+        if slug is not None and str(slot["slug"]) == slug:
+            title = str(slot["title"])
+            author_id = str(slot["author"])
+            break
+    author_name, author_url = _wp_oembed_author(host, author_id)
+    permalink = url or f"{base}/"
+    # Core's embed markup carries a `secret` in both the blockquote
+    # attribute and the iframe fragment; it is the nonce the embed's
+    # postMessage handshake checks, not a credential. It is minted per
+    # response here regardless, because a fixed value would be the same
+    # string on every host running this software — a fleet fingerprint,
+    # which is the failure mode the per-hit rule exists to prevent.
+    secret = secrets.token_hex(5)
+    html = (
+        f'<blockquote class="wp-embedded-content" data-secret="{secret}">'
+        f'<a href="{_wp_oembed_escape(permalink)}">'
+        f'{_wp_oembed_escape(title)}</a></blockquote>'
+        f'<iframe sandbox="allow-scripts" security="restricted" '
+        f'title="&#8220;{_wp_oembed_escape(title)}&#8221; &#8212; '
+        f'{_wp_oembed_escape(_wp_rest_site_name(host))}" '
+        f'src="{_wp_oembed_escape(permalink)}embed/#?secret={secret}" '
+        f'data-secret="{secret}" '
+        f'width="600" height="338" frameborder="0" '
+        f'marginwidth="0" marginheight="0" scrolling="no" '
+        f'class="wp-embedded-content"></iframe>'
+    )
+    fields: tuple[tuple[str, object], ...] = (
+        ("version", "1.0"),
+        ("provider_name", _wp_rest_site_name(host)),
+        ("provider_url", base),
+        ("author_name", author_name),
+        ("author_url", author_url),
+        ("title", title),
+        ("type", "rich"),
+        ("width", 600),
+        ("height", 338),
+        ("html", html),
+    )
+    if fmt == "xml":
+        parts = ["<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>",
+                 "<oembed>"]
+        for key, value in fields:
+            parts.append(f"<{key}>{_wp_oembed_escape(str(value))}</{key}>")
+        parts.append("</oembed>")
+        return "".join(parts).encode("utf-8")
+    return json.dumps(dict(fields), separators=(",", ":")).encode("utf-8")
+
+
+def _wp_oembed_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+def render_wp_oembed_error(
+    code: str, message: str, status: int, *, params: object = None,
+) -> bytes:
+    """A stock WP-REST error envelope. The envelope, not the status, is
+    what tells the caller the route is registered at all."""
+    data: dict[str, object] = {"status": status}
+    if params is not None:
+        data["params"] = params
+    body = {"code": code, "message": message, "data": data}
+    return json.dumps(body, separators=(",", ":")).encode("utf-8")
 
 
 def render_wp_rest_namespace_index(host: str) -> bytes:
@@ -33376,6 +33605,124 @@ async def _handle_wp_user_enum(
     )
 
 
+async def _handle_wp_oembed(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+) -> web.Response:
+    """Serve the two routes of the `oembed/1.0` namespace.
+
+    The embed route discloses an author, which is the input to a
+    credential run against the login form. The proxy route refuses an
+    anonymous caller the way core does, which is the response that
+    records the host the caller wanted this server to contact without
+    this server contacting it."""
+    route = wp_oembed_route_of(path)
+    host = str(log_context.get("host", "") or "")
+    method = request.method
+    query = request.rel_url.query
+    requested_url = (query.get("url") or "").strip()
+    fmt = (query.get("format") or "json").strip().lower()
+
+    extra: dict[str, object] = {
+        "wpOembedRoute": "proxy" if route == _WP_OEMBED_PROXY_ROUTE else "embed",
+        "wpOembedFormat": fmt[:16],
+    }
+    if requested_url:
+        extra["wpOembedRequestedUrl"] = requested_url[:512]
+
+    def _respond(
+        body: bytes, status: int, result: str, content_type: str,
+        fields: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> web.Response:
+        append_log({
+            **log_context, **extra, **(fields or {}),
+            "result": result, "status": status, "bytes": len(body),
+        })
+        out = {"Content-Type": content_type, **(headers or {})}
+        return web.Response(
+            status=status, body=b"" if method == "HEAD" else body, headers=out,
+        )
+
+    json_ct = "application/json; charset=utf-8"
+
+    # Core registers both routes for GET only. A wrong method is a 405
+    # with the Allow header the status requires, not a 404 — the 404
+    # would say the route does not exist, which is the one thing a
+    # registered route must never say.
+    if method not in {"GET", "HEAD"}:
+        return _respond(
+            render_wp_oembed_error(
+                "rest_invalid_method",
+                f'The requested route does not support method "{method}".',
+                405,
+            ),
+            405, "wp-oembed-method-not-allowed", json_ct,
+            headers={"Allow": "GET, HEAD"},
+        )
+
+    # The proxy route's capability check runs ahead of parameter
+    # validation in core, so the refusal is flat: it does not matter
+    # whether a URL was supplied, and the URL is recorded either way.
+    if route == _WP_OEMBED_PROXY_ROUTE:
+        return _respond(
+            render_wp_oembed_error(
+                "rest_forbidden",
+                "Sorry, you are not allowed to make proxied oEmbed requests.",
+                401,
+            ),
+            401, "wp-oembed-proxy-unauthorized", json_ct,
+        )
+
+    if not requested_url:
+        return _respond(
+            render_wp_oembed_error(
+                "rest_missing_callback_param",
+                "Missing parameter(s): url", 400, params=["url"],
+            ),
+            400, "wp-oembed-embed-missing-url", json_ct,
+        )
+
+    if fmt not in _WP_OEMBED_FORMATS:
+        return _respond(
+            render_wp_oembed_error(
+                "rest_invalid_param", "Invalid parameter(s): format", 400,
+                params={"format": "format is not one of json and xml."},
+            ),
+            400, "wp-oembed-embed-invalid-format", json_ct,
+        )
+
+    on_host = _wp_oembed_url_is_local(host, requested_url)
+    extra["wpOembedUrlOnHost"] = on_host
+    if not on_host:
+        # Core resolves the URL to a local post and 404s when it cannot.
+        # A caller that brings somebody else's URL here is testing the
+        # route rather than reading this site, and that is worth its own
+        # tag.
+        return _respond(
+            render_wp_oembed_error("oembed_invalid_url", "Not Found", 404),
+            404, "wp-oembed-embed-foreign-url", json_ct,
+        )
+
+    slug = _wp_oembed_matched_slug(host, requested_url)
+    if slug:
+        extra["wpOembedMatchedSlug"] = slug
+    body = render_wp_oembed_embed(host, requested_url, slug=slug, fmt=fmt)
+    author_name, _ = _wp_oembed_author(
+        host,
+        next((str(s["author"]) for s in _WP_REST_FAKE_POSTS
+              if slug is not None and str(s["slug"]) == slug), None),
+    )
+    content_type = (
+        "text/xml; charset=utf-8" if fmt == "xml" else json_ct
+    )
+    return _respond(
+        body, 200, "wp-oembed-embed", content_type,
+        fields={"wpOembedAuthor": author_name},
+    )
+
+
 async def _handle_wp_rest_index(
     request: web.Request,
     log_context: dict[str, object],
@@ -43295,6 +43642,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_wp_batch_path(path):
         return await _handle_wp_batch(request, log_context, path, request_body)
 
+    if is_wp_oembed_path(path):
+        return await _handle_wp_oembed(request, log_context, path)
+
     # After user-enum and batch: those two own their routes, and the
     # index only fills in what nothing else answers.
     if is_wp_rest_index_path(path):
@@ -43657,6 +44007,8 @@ def main() -> int:
         active.append("wp-user-enum")
     if WP_REST_INDEX_ENABLED:
         active.append("wp-rest-index")
+    if WP_OEMBED_ENABLED:
+        active.append("wp-oembed")
     if WP_XMLRPC_ENABLED:
         active.append("wp-xmlrpc")
     if WP_WLW_MANIFEST_ENABLED:

@@ -654,6 +654,13 @@ def test_all_trap_families_default_on():
         "layout-vocabulary walk cannot cover."
     )
     assert tbenv.CLOUD_IMDS_ENABLED
+    assert tbenv.WP_OEMBED_ENABLED, (
+        "HONEYPOT_WP_OEMBED_ENABLED should default to True — the REST "
+        "discovery document names the oembed/1.0 namespace unconditionally, "
+        "so a deployment with the index on and this off advertises a "
+        "namespace it 404s, which is the drift the namespace guard exists "
+        "to prevent."
+    )
     assert tbenv.SYSTEM_FILE_READS_ENABLED, (
         "HONEYPOT_SYSTEM_FILE_READS_ENABLED should default to True — the "
         "system-file table is the oracle a read primitive is confirmed "
