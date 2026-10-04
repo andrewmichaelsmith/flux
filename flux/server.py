@@ -14671,16 +14671,17 @@ def _wp_oembed_url_is_local(host: str, url: str) -> bool:
 
 
 def _wp_oembed_matched_slug(host: str, url: str) -> str | None:
-    """Which fake post the requested URL points at, if any.
+    """Which published item the requested URL points at, or None.
 
-    A URL on this host that names a known slug is a caller that read the
-    content index first; one that does not is a caller probing the route
-    blind. Both get an answer — a real front page oEmbeds too — but the
-    distinction is worth keeping in the row."""
+    Core resolves `url` to a post or page and returns Not Found when it
+    cannot, so this is the whole test for whether the embed route
+    answers. A caller that names a known slug read the content index
+    first; a caller that does not is probing the route blind, and gets
+    the same Not Found a real install gives it."""
     tail = url.split("://", 1)[-1]
     _, _, path_part = tail.partition("/")
     path_part = "/" + path_part.split("?", 1)[0].split("#", 1)[0]
-    for slot in _WP_REST_FAKE_POSTS:
+    for slot in (*_WP_REST_FAKE_POSTS, *_WP_REST_FAKE_PAGES):
         if f"/{slot['slug']}" in path_part:
             return str(slot["slug"])
     return None
@@ -14697,7 +14698,7 @@ def render_wp_oembed_embed(
     base = _external_base_url(host)
     title = _wp_rest_site_name(host)
     author_id: str | None = None
-    for slot in _WP_REST_FAKE_POSTS:
+    for slot in (*_WP_REST_FAKE_POSTS, *_WP_REST_FAKE_PAGES):
         if slug is not None and str(slot["slug"]) == slug:
             title = str(slot["title"])
             author_id = str(slot["author"])
@@ -33746,13 +33747,25 @@ async def _handle_wp_oembed(
         )
 
     slug = _wp_oembed_matched_slug(host, requested_url)
-    if slug:
-        extra["wpOembedMatchedSlug"] = slug
+    if slug is None:
+        # On this host but resolving to nothing. Core requires the URL to
+        # name a post or page and returns Not Found otherwise, including
+        # for a posts front page — so answering here would be a
+        # difference from a real install, which is the fingerprint this
+        # whole trap exists to remove. Separate tag from the off-host
+        # refusal: both are 404s, but "read our content index first" and
+        # "fired blind at the route" are different callers.
+        return _respond(
+            render_wp_oembed_error("oembed_invalid_url", "Not Found", 404),
+            404, "wp-oembed-embed-unknown-post", json_ct,
+        )
+    extra["wpOembedMatchedSlug"] = slug
     body = render_wp_oembed_embed(host, requested_url, slug=slug, fmt=fmt)
     author_name, _ = _wp_oembed_author(
         host,
-        next((str(s["author"]) for s in _WP_REST_FAKE_POSTS
-              if slug is not None and str(s["slug"]) == slug), None),
+        next((str(e["author"]) for e in (*_WP_REST_FAKE_POSTS,
+                                         *_WP_REST_FAKE_PAGES)
+              if str(e["slug"]) == slug), None),
     )
     content_type = (
         "text/xml; charset=utf-8" if fmt == "xml" else json_ct

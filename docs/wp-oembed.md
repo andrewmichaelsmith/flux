@@ -5,9 +5,10 @@ WordPress core registers on every site.
 
 | Path | Method | Response | Result tag |
 |---|---|---|---|
-| `/wp-json/oembed/1.0/embed?url=<local>` | GET, HEAD | `200` oEmbed document naming an author | `wp-oembed-embed` |
+| `/wp-json/oembed/1.0/embed?url=<a published item>` | GET, HEAD | `200` oEmbed document naming that item's author | `wp-oembed-embed` |
 | `/wp-json/oembed/1.0/embed` (no `url`) | GET, HEAD | `400` `rest_missing_callback_param` | `wp-oembed-embed-missing-url` |
-| `/wp-json/oembed/1.0/embed?url=<foreign>` | GET, HEAD | `404` `oembed_invalid_url` | `wp-oembed-embed-foreign-url` |
+| `/wp-json/oembed/1.0/embed?url=<foreign host>` | GET, HEAD | `404` `oembed_invalid_url` | `wp-oembed-embed-foreign-url` |
+| `/wp-json/oembed/1.0/embed?url=<on host, no such item>` | GET, HEAD | `404` `oembed_invalid_url` | `wp-oembed-embed-unknown-post` |
 | `/wp-json/oembed/1.0/embed?format=<other>` | GET, HEAD | `400` `rest_invalid_param` | `wp-oembed-embed-invalid-format` |
 | `/wp-json/oembed/1.0/proxy` | GET, HEAD | `401` `rest_forbidden` | `wp-oembed-proxy-unauthorized` |
 | either route | other | `405` `rest_invalid_method` + `Allow: GET, HEAD` | `wp-oembed-method-not-allowed` |
@@ -19,8 +20,17 @@ form permalink-less installs use, and percent-encoded separators the
 path normaliser decodes before dispatch — the dot in `1.0` has been seen
 encoded, which is a rule-bypass shape rather than a typo.
 
-The embed route accepts `json` and `xml`, mirroring core's own format
-enum. The handler logs `wpOembedRoute`, `wpOembedRequestedUrl`,
+The embed route answers only a URL that resolves to one of this
+server's published posts or pages — core requires that and returns Not
+Found otherwise, including for the site root of a posts front page, so
+answering an arbitrary on-host URL would itself be a difference from a
+real install. The two 404s carry separate tags on purpose: an off-host
+URL means a caller testing the route with somebody else's address, while
+an unresolvable on-host URL means one firing blind rather than reading
+the content index first.
+
+The route accepts `json` and `xml`, mirroring core's own format enum.
+The handler logs `wpOembedRoute`, `wpOembedRequestedUrl`,
 `wpOembedUrlOnHost`, `wpOembedMatchedSlug`, `wpOembedFormat` and, on a
 hit, `wpOembedAuthor`. The author named is read out of the same roster
 the user-enumeration trap lists, resolved from the matched post's own

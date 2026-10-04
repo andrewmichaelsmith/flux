@@ -212,7 +212,13 @@ def _last_entry(log_path):
 # would have to accept a 400 from any route, which is most of what it is
 # for.
 _REQUIRED_PARAMS = {
-    "/oembed/1.0/embed": lambda doc: {"url": doc["url"]},
+    # The URL has to resolve to a published item, because core 404s an
+    # oEmbed request for anything else — including the site root of a
+    # posts front page.
+    "/oembed/1.0/embed": lambda doc: {
+        "url": doc["url"].rstrip("/")
+               + f"/2026/{tbenv._WP_REST_FAKE_POSTS[0]['slug']}/",
+    },
 }
 
 

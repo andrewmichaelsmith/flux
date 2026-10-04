@@ -144,10 +144,13 @@ def test_url_locality(url, expected):
     assert tbenv._wp_oembed_url_is_local("shop.example.com", url) is expected
 
 
-def test_matched_slug_resolves_a_known_post():
+def test_matched_slug_resolves_a_known_post_or_page():
     slug = tbenv._wp_oembed_matched_slug(
         "shop.example.com", "https://shop.example.com/2026/hello-world/")
     assert slug == "hello-world"
+    assert tbenv._wp_oembed_matched_slug(
+        "shop.example.com", "https://shop.example.com/sample-page/") == \
+        "sample-page"
     assert tbenv._wp_oembed_matched_slug(
         "shop.example.com", "https://shop.example.com/nothing-here/") is None
 
@@ -182,7 +185,8 @@ def test_embed_names_the_matched_posts_own_author():
 
 def test_xml_format_renders_an_oembed_element():
     body = tbenv.render_wp_oembed_embed(
-        "shop.example.com", "https://shop.example.com/", slug=None, fmt="xml")
+        "shop.example.com", "https://shop.example.com/2026/hello-world/",
+        slug="hello-world", fmt="xml")
     text = body.decode()
     assert text.startswith("<?xml")
     assert "<oembed>" in text and "</oembed>" in text
@@ -278,6 +282,35 @@ async def test_embed_records_a_foreign_url_and_refuses_it(flux_client):
     assert entry["wpOembedUrlOnHost"] is False
 
 
+async def test_embed_refuses_an_on_host_url_that_resolves_to_nothing(flux_client):
+    """The fingerprint this trap exists to remove, applied to itself:
+    core requires the URL to name a post or page and returns Not Found
+    otherwise — including for a posts front page — so answering an
+    arbitrary on-host URL would be a visible difference from a real
+    install. Distinct tag from the off-host refusal: both are 404s, but
+    one caller read our content index and the other did not."""
+    base = await _site_url(flux_client)
+    for target in (f"{base}/", f"{base}/no-such-post/"):
+        resp = await flux_client.get(
+            f"/wp-json/oembed/1.0/embed?url={target}")
+        assert resp.status == 404, target
+        assert json.loads(await resp.read())["code"] == "oembed_invalid_url"
+        entry = _last_entry(flux_client.log_path)
+        assert entry["result"] == "wp-oembed-embed-unknown-post"
+        assert entry["wpOembedUrlOnHost"] is True
+        assert "wpOembedMatchedSlug" not in entry
+
+
+async def test_embed_answers_a_page_as_well_as_a_post(flux_client):
+    base = await _site_url(flux_client)
+    resp = await flux_client.get(
+        f"/wp-json/oembed/1.0/embed?url={base}/sample-page/")
+    assert resp.status == 200
+    assert json.loads(await resp.read())["title"] == "Sample Page"
+    assert _last_entry(flux_client.log_path)["wpOembedMatchedSlug"] == \
+        "sample-page"
+
+
 async def test_embed_without_a_url_returns_the_missing_param_envelope(flux_client):
     resp = await flux_client.get("/wp-json/oembed/1.0/embed")
     assert resp.status == 400
@@ -289,9 +322,11 @@ async def test_embed_without_a_url_returns_the_missing_param_envelope(flux_clien
 
 
 async def test_embed_rejects_an_unsupported_format(flux_client):
+    """Core validates parameters before resolving the URL, so the format
+    error wins even over a URL that would resolve."""
     base = await _site_url(flux_client)
     resp = await flux_client.get(
-        f"/wp-json/oembed/1.0/embed?url={base}/&format=yaml")
+        f"/wp-json/oembed/1.0/embed?url={base}/2026/hello-world/&format=yaml")
     assert resp.status == 400
     assert json.loads(await resp.read())["code"] == "rest_invalid_param"
     entry = _last_entry(flux_client.log_path)
@@ -351,7 +386,8 @@ async def test_methods_the_server_never_accepts_stop_at_the_global_gate(
 
 async def test_head_sends_headers_without_a_body(flux_client):
     base = await _site_url(flux_client)
-    resp = await flux_client.head(f"/wp-json/oembed/1.0/embed?url={base}/")
+    resp = await flux_client.head(
+        f"/wp-json/oembed/1.0/embed?url={base}/2026/hello-world/")
     assert resp.status == 200
     assert await resp.read() == b""
 
@@ -359,7 +395,7 @@ async def test_head_sends_headers_without_a_body(flux_client):
 async def test_install_subdirectory_spelling_reaches_the_trap(flux_client):
     base = await _site_url(flux_client)
     resp = await flux_client.get(
-        f"/blog/wp-json/oembed/1.0/embed?url={base}/")
+        f"/blog/wp-json/oembed/1.0/embed?url={base}/2026/hello-world/")
     assert resp.status == 200
     assert _last_entry(flux_client.log_path)["result"] == "wp-oembed-embed"
 
