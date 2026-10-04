@@ -6179,16 +6179,41 @@ def _nextauth_csrf_known(client_ip: str, token: str) -> bool:
     return token in entry[1]
 
 
+def wp_install_prefix(path: str) -> tuple[str, str]:
+    """Split a WordPress install subdirectory off the front of `path`.
+
+    Returns `("/blog", "/wp-login.php")` for `/blog/wp-login.php`, and
+    `("", <path>)` when no install prefix matched. The dictionary is the
+    one the REST aliaser and the setup wizard already walk, so the three
+    surfaces agree on where an install may live.
+
+    Only a single leading segment from that dictionary counts. That
+    matters: scanners also walk `wp-login.php` under *asset* directories
+    (`/wp-includes/images/`, `/wp-content/uploads/`, `/wp-admin/css/`)
+    and those are not install roots — they are hunts for a webshell
+    somebody else already dropped, expecting a previously-uploaded file
+    rather than a login form. Answering them with a login page would
+    assert a deployment shape no install has, so they keep their 404."""
+    lp = path.lower()
+    for prefix in _WP_REST_ALIAS_SUBDIRS:
+        head = f"/{prefix}"
+        if lp.startswith(head + "/"):
+            return head, lp[len(head):]
+    return "", lp
+
+
 def is_wp_login_path(path: str) -> bool:
     if not WP_LOGIN_ENABLED:
         return False
-    return path.lower() in WP_LOGIN_PATHS
+    _, tail = wp_install_prefix(path)
+    return tail in WP_LOGIN_PATHS
 
 
 def is_wp_admin_path(path: str) -> bool:
     if not WP_LOGIN_ENABLED:
         return False
-    return path.lower() in WP_LOGIN_ADMIN_PATHS
+    _, tail = wp_install_prefix(path)
+    return tail in WP_LOGIN_ADMIN_PATHS
 
 
 def is_wp_user_enum_path(path: str) -> bool:
@@ -13884,7 +13909,9 @@ def render_nextauth_error_html(error: str) -> bytes:
 """.encode("utf-8")
 
 
-def render_wp_login_html(*, nonce: str, redirect_to: str) -> bytes:
+def render_wp_login_html(
+    *, nonce: str, redirect_to: str, base_path: str = "",
+) -> bytes:
     safe_nonce = nonce.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
     safe_redirect = redirect_to.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
     body = f"""<!DOCTYPE html>
@@ -13898,7 +13925,7 @@ def render_wp_login_html(*, nonce: str, redirect_to: str) -> bytes:
 <body class="login login-action-login wp-core-ui">
 <div id="login">
 <h1><a href="https://wordpress.org/">Powered by WordPress</a></h1>
-<form name="loginform" id="loginform" action="/wp-login.php" method="post">
+<form name="loginform" id="loginform" action="{base_path}/wp-login.php" method="post">
 <p>
 <label for="user_login">Username or Email Address</label>
 <input type="text" name="log" id="user_login" class="input" value="" size="20" autocapitalize="off" autocomplete="username" required="required" />
@@ -13915,7 +13942,7 @@ def render_wp_login_html(*, nonce: str, redirect_to: str) -> bytes:
 <input type="hidden" name="_wpnonce" value="{safe_nonce}" />
 </p>
 </form>
-<p id="nav"><a href="/wp-login.php?action=lostpassword">Lost your password?</a></p>
+<p id="nav"><a href="{base_path}/wp-login.php?action=lostpassword">Lost your password?</a></p>
 </div>
 </body>
 </html>
@@ -33458,6 +33485,10 @@ async def _handle_wp_login(
     cookies = parse_cookies(cookie_header)
     client_ip = str(log_context["clientIp"])
     nonce = uuid.uuid4().hex[:10]
+    # Which install answered. Every address this page emits has to stay
+    # inside it, or a form served from a subdirectory install posts back
+    # to the root one and the shape stops being a deployment anyone runs.
+    install_prefix, _ = wp_install_prefix(path)
 
     if method == "POST":
         fields = extract_wp_login_creds(request_body, content_type_req)
@@ -33476,6 +33507,7 @@ async def _handle_wp_login(
             "wpLoginNonceMatch": nonce_match,
             "wpLoginTestcookiePresent": "wordpress_test_cookie" in cookies,
             "wpLoginRedirectTo": fields.get("redirect_to", "")[:200],
+            "wpLoginInstallPrefix": install_prefix,
             "bytes": 0,
             "contentType": content_type_req[:120],
         }
@@ -33486,14 +33518,16 @@ async def _handle_wp_login(
         return web.Response(
             status=302, body=b"",
             headers={
-                "Location": "/wp-login.php?reauth=1",
+                "Location": f"{install_prefix}/wp-login.php?reauth=1",
                 "Set-Cookie": f"wordpress_test_cookie=WP+Cookie+check; Path=/; HttpOnly; SameSite=Lax",
                 "Cache-Control": "no-store",
             },
         )
 
-    redirect_to = "/wp-admin/"
-    body = render_wp_login_html(nonce=nonce, redirect_to=redirect_to)
+    redirect_to = f"{install_prefix}/wp-admin/"
+    body = render_wp_login_html(
+        nonce=nonce, redirect_to=redirect_to, base_path=install_prefix,
+    )
     _wp_login_nonce_store(client_ip, nonce)
     response_body = b"" if method == "HEAD" else body
     log_entry = {
@@ -33501,6 +33535,7 @@ async def _handle_wp_login(
         "result": "wp-login-probe",
         "status": 200,
         "wpLoginNonceIssued": nonce,
+        "wpLoginInstallPrefix": install_prefix,
         "bytes": len(body),
     }
     append_log(log_entry)
@@ -33520,17 +33555,22 @@ async def _handle_wp_admin_redirect(
     log_context: dict[str, object],
     path: str,
 ) -> web.Response:
+    install_prefix, _ = wp_install_prefix(path)
     append_log({
         **log_context,
         "result": "wp-admin-redirect",
         "status": 302,
+        "wpLoginInstallPrefix": install_prefix,
         "bytes": 0,
     })
     encoded_path = quote(path, safe="")
     return web.Response(
         status=302, body=b"",
         headers={
-            "Location": f"/wp-login.php?redirect_to={encoded_path}&reauth=1",
+            "Location": (
+                f"{install_prefix}/wp-login.php"
+                f"?redirect_to={encoded_path}&reauth=1"
+            ),
             "Cache-Control": "no-store",
         },
     )
