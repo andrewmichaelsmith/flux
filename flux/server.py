@@ -27,7 +27,7 @@ import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 from urllib.parse import parse_qs, parse_qsl, quote, unquote, unquote_plus
 
 import aiohttp
@@ -1928,6 +1928,32 @@ VITE_FS_MAX_SUFFIX_WALK = max(
 # list of files carrying no secret; this is not an answer-everything
 # switch, which would be its own obvious tell.
 VITE_FS_SYSTEM_FILES_ENABLED = _env_bool("HONEYPOT_VITE_FS_SYSTEM_FILES_ENABLED")
+
+# The React-Server-Components source-map lookup the Vite RSC plugin mounts
+# on the dev server. It takes a `file://` URL in a query parameter and is
+# the second file-read primitive on the same dev surface `/@fs/` exposes —
+# so it is the same question as a `/@fs/` read, asked with a different
+# spelling.
+#
+# Scanners walking it ask for exactly the files the `/@fs/` dictionary
+# already asks for: the app `.env`, cloud credential files, an SSH private
+# key, `/proc/self/environ`. Answering one spelling and 404ing the other
+# is the drift `FsReadTarget` exists to prevent: the same filename would
+# resolve on one surface and not the other, which both loses the
+# credential hand-off and marks the host as furnishing its read primitives
+# inconsistently.
+#
+# Resolution and response therefore go through the shared read path, so a
+# file read here is byte-identical to the same file read through `/@fs/`,
+# and the result tag keeps the two populations separable.
+VITE_RSC_SOURCEMAP_ENABLED = _env_bool("HONEYPOT_VITE_RSC_SOURCEMAP_ENABLED")
+# Exact path the plugin mounts. Lowercase compare; no prefix matching —
+# this is one endpoint, not a namespace.
+_VITE_RSC_SOURCEMAP_PATH = "/__vite_rsc_findSourceMapURL"
+# Query parameters observed carrying the target. `filename` is what the
+# plugin itself uses; the others are the spellings a hand-rolled probe
+# reaches for when it is guessing at the parameter name.
+_VITE_RSC_SOURCEMAP_PARAMS = ("filename", "file", "url", "source")
 
 # The same fixed list of system files, answered when the request names
 # one by its own absolute path rather than behind the `/@fs/` prefix.
@@ -30680,16 +30706,71 @@ def resolve_vite_fs(path: str) -> "ViteFsResolution | None":
     )
 
 
+def _vite_rsc_sourcemap_filename(query: "Mapping[str, str]") -> str:
+    """Pull the requested filename out of an RSC source-map query.
+
+    Returns "" when no recognised parameter carried one. The plugin sends
+    a `file://` URL; a hand-rolled probe may send a bare absolute path,
+    and either is accepted because both are the same request. Anything
+    naming a different scheme (`http://`, `data:`) is refused rather than
+    coerced — a client asking this endpoint to fetch a URL is probing for
+    request forgery, not for a file read, and must not be answered off
+    the filesystem table as though it had asked for a local file.
+    """
+    for param in _VITE_RSC_SOURCEMAP_PARAMS:
+        raw = (query.get(param) or "").strip()
+        if not raw:
+            continue
+        candidate = unquote(raw)
+        lowered = candidate.lower()
+        if lowered.startswith("file://"):
+            # `file:///app/.env` -> `/app/.env`. A `file://host/path`
+            # form leaves the host in place as the first segment, which
+            # the read walk then strips like any other unknown prefix.
+            candidate = candidate[len("file://"):]
+        elif "://" in candidate or candidate.startswith("data:"):
+            continue
+        if not candidate:
+            continue
+        return candidate
+    return ""
+
+
+def resolve_vite_rsc_sourcemap(
+    path: str, query: "Mapping[str, str]"
+) -> "FsReadTarget | None":
+    """Resolve an RSC source-map lookup to whatever answers the read.
+
+    Returns None when `path` is not the source-map endpoint, or when the
+    request named no filename — a bare hit on the endpoint is a
+    reachability check, not a read, and is left to fall through so it is
+    not logged as a miss against a file nobody asked for.
+
+    Otherwise the filename goes through the same walk `/@fs/` uses, so
+    the two spellings of one read cannot diverge.
+    """
+    if path.lower() != _VITE_RSC_SOURCEMAP_PATH.lower():
+        return None
+    requested = _vite_rsc_sourcemap_filename(query)
+    if not requested:
+        return None
+    return resolve_fs_read(requested)
+
+
 @dataclass(frozen=True)
 class FsReadTarget:
     """What answers a read of one absolute on-disk path.
 
     Shared by every trap that hands an attacker an arbitrary-file-read
-    primitive, whichever way the path arrives — in the request target
-    (`/@fs/<path>`) or in a request body (the CRL-client traversal). The
-    resolution is the same question in both cases, and keeping one
-    implementation is what stops the two surfaces from answering the
-    same filename differently.
+    primitive, whichever way the path arrives — as a path prefix
+    (`/@fs/<path>`), in a query parameter (the RSC source-map lookup's
+    `filename=file://<path>`), inside a stream wrapper
+    (`php://filter/...`), or in a request body (the CRL-client
+    traversal). The resolution is the same question in every case, and
+    keeping one implementation is what stops these surfaces from
+    answering the same filename differently — a scanner that walks one
+    dictionary across several of them would otherwise see the same file
+    resolve on one spelling and 404 on the next.
     """
 
     requested_path: str      # absolute FS path after traversal collapse
@@ -41899,6 +41980,54 @@ async def _send_vite_fs(
     )
 
 
+async def _send_vite_rsc_sourcemap(
+    request: web.Request,
+    target: "FsReadTarget",
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.Response:
+    """Answer an RSC source-map lookup that named a file.
+
+    Delegates to the shared read path, so the body for a given filename
+    is byte-identical to the same file read through `/@fs/` and tagged
+    `vite-rsc-sourcemap-<trap>` to keep this surface's population
+    separable from that one. The two spellings are walked by the same
+    population, and the separate tag is what lets us tell whether a
+    source knows only the older prefix or both.
+
+    The body is the file, not a source map wrapping it. The endpoint's
+    real response shape is a source map, but every filename this surface
+    is asked for is a credential file with no source map to return, so a
+    real server answers those with a 404 and the wrapper would be
+    fidelity to a code path that is never the one being exercised. What
+    is being probed is whether the parameter is a read primitive, and a
+    read primitive returns the file — wrapping the bytes in JSON would
+    only add an encoding layer between the credential and the client
+    that came to harvest it.
+
+    Miss: 404, which is what the endpoint returns for a file it cannot
+    map. The requested path is logged either way.
+    """
+    extra_log: dict[str, object] = {
+        # The absolute path the client named, after `file://` strip and
+        # traversal collapse — the same field name the `/@fs/` surface
+        # uses, so one query answers "what layout does this population
+        # believe in" across both spellings.
+        "viteRscSourcemapRequestedPath": target.requested_path[:512],
+        "viteRscSourcemapMatchDepth": target.match_depth,
+    }
+    return await _send_fs_read(
+        request, target, request_id, path,
+        client_ip, host, user_agent, proto, log_context,
+        result_prefix="vite-rsc-sourcemap-", extra_log=extra_log,
+    )
+
+
 async def _send_fs_read(
     request: web.Request,
     target: "FsReadTarget | ViteFsResolution",
@@ -43743,6 +43872,20 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # for a held connection on the one surface that also tells us the
     # attacker's assumed filesystem layout. With the trap disabled (or no
     # API key) the branch falls through and those paths tarpit as before.
+    # Ahead of the tarpit for the same reason the `/@fs/` branch below is,
+    # and immediately beside it because it is the same read resolved from a
+    # different spelling. Gated on the API key too: the files this surface
+    # resolves to are canary-bearing, so a keyless deployment must fall
+    # through rather than serve a credential-shaped body with no canary
+    # behind it.
+    if API_KEY and VITE_RSC_SOURCEMAP_ENABLED:
+        rsc_map = resolve_vite_rsc_sourcemap(path, request.query)
+        if rsc_map is not None:
+            return await _send_vite_rsc_sourcemap(
+                request, rsc_map, request_id, path,
+                client_ip, host, user_agent, proto, log_context,
+            )
+
     if API_KEY and VITE_FS_ENABLED:
         vite_fs = resolve_vite_fs(path)
         if vite_fs is not None:

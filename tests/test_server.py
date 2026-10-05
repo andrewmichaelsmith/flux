@@ -654,6 +654,12 @@ def test_all_trap_families_default_on():
         "layout-vocabulary walk cannot cover."
     )
     assert tbenv.CLOUD_IMDS_ENABLED
+    assert tbenv.VITE_RSC_SOURCEMAP_ENABLED, (
+        "HONEYPOT_VITE_RSC_SOURCEMAP_ENABLED should default to True — the "
+        "RSC source-map lookup is the same arbitrary read `/@fs/` serves, "
+        "asked for in a query parameter, and answering one spelling while "
+        "404ing the other is the drift the shared read path exists to stop"
+    )
     assert tbenv.WP_OEMBED_ENABLED, (
         "HONEYPOT_WP_OEMBED_ENABLED should default to True — the REST "
         "discovery document names the oembed/1.0 namespace unconditionally, "
