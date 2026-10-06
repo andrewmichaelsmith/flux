@@ -252,6 +252,201 @@ INTERPOLATION_PROBE_SAMPLE_LIMIT = max(
     int((os.environ.get("HONEYPOT_INTERPOLATION_PROBE_SAMPLE_LIMIT") or "180").strip() or "180"), 32
 )
 
+SOFT404_PROBE_ENABLED = _env_bool("HONEYPOT_SOFT404_PROBE_ENABLED")
+
+# Characters of the extracted token kept. A calibration token is short by
+# construction -- it has to fit in a URL the scanner generates -- so this
+# is a bound against a pathological path, not a working limit.
+SOFT404_PROBE_TOKEN_LIMIT = max(
+    int((os.environ.get("HONEYPOT_SOFT404_PROBE_TOKEN_LIMIT") or "64").strip() or "64"), 16
+)
+
+# Words that say outright that the sender does not expect the file to
+# exist. A request carrying one of these is a control, whatever else is
+# in the path -- nobody deploys a file called `doesnotexist`.
+_SOFT404_MARKERS = (
+    "nonexistent", "non-existent", "non_existent",
+    "doesnotexist", "doesntexist", "notexist", "noexist",
+    "notfound", "not-found", "not_found",
+    "thisfiledoesnotexist", "thispagedoesnotexist",
+    "randomstring", "random-string",
+    "catchall", "catch-all",
+)
+# Weaker words. On their own these are ordinary route names (`/probe`,
+# `/baseline`, `/404.html`), so they only count alongside a token --
+# which is what distinguishes a health check from a calibration probe.
+_SOFT404_WEAK_MARKERS = ("probe", "baseline", "404", "test", "check", "scan")
+
+# Extensions a content-hashed build artefact uses. A hashed asset name is
+# the one common filename that is legitimately high-entropy, so the
+# entropy rules below skip these unless a strong marker is also present.
+_SOFT404_ASSET_EXTS = (
+    ".js", ".mjs", ".cjs", ".css", ".map", ".png", ".jpg", ".jpeg",
+    ".gif", ".svg", ".ico", ".webp", ".avif", ".woff", ".woff2", ".ttf",
+    ".eot", ".otf", ".mp4", ".webm", ".wasm",
+)
+
+# Wrapped token: `__<tag>_<hex>__`. The wrapper is itself the tell.
+_SOFT404_WRAPPED_RE = re.compile(r"^__([a-z][a-z0-9_-]{1,23})_([0-9a-f]{12,40})__$")
+# A whole-name UUID. Checked before the part split, because a UUID's own
+# hyphens would otherwise read as a tag plus a token.
+_SOFT404_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+# A tag and a token run together with no separator, which is how the
+# longest-running of these families spells it.
+_SOFT404_GLUED_HEX_RE = re.compile(r"^([a-z]{3,24})([0-9a-f]{8,40})$")
+_SOFT404_GLUED_NUM_RE = re.compile(r"^([a-z]{3,24})([0-9]{9,16})$")
+# A bare token with no tag at all: long hex, or long mixed alphanumeric.
+_SOFT404_BARE_HEX_RE = re.compile(r"^[0-9a-f]{20,40}$")
+_SOFT404_BARE_ALNUM_RE = re.compile(r"^(?=[a-z0-9]*[0-9])(?=[a-z0-9]*[a-z])[a-z0-9]{18,40}$")
+# Separators a generated name uses between its tag and its token.
+_SOFT404_PART_SPLIT_RE = re.compile(r"[-_.]+")
+_SOFT404_HEX_PART_RE = re.compile(r"^[0-9a-f]{8,40}$")
+_SOFT404_NUM_PART_RE = re.compile(r"^[0-9]{9,16}$")
+# Longest tag part tolerated beside a token. A name whose non-token parts
+# run longer than this is prose, not a generated probe name.
+_SOFT404_MAX_TAG_PART = 24
+
+
+def _soft404_token_part(stem: str) -> tuple[str, str]:
+    """Find the generated token inside a hyphen/underscore-separated name.
+
+    Returns `(token, kind)`, or `("", "")` when no part of the name reads
+    as one. A hex token must carry a letter or be long: an eight-digit
+    part is far more likely an order number or a date than a probe token,
+    and flagging those would put ordinary routes in the signal.
+    """
+    parts = [part for part in _SOFT404_PART_SPLIT_RE.split(stem) if part]
+    if len(parts) < 2:
+        return "", ""
+    token = ""
+    kind = ""
+    for part in parts:
+        if _SOFT404_HEX_PART_RE.match(part) and (
+            any(c in "abcdef" for c in part) or len(part) >= 16
+        ):
+            if len(part) > len(token):
+                token, kind = part, "tagged-hex"
+        elif _SOFT404_NUM_PART_RE.match(part) and not token:
+            token, kind = part, "tagged-counter"
+    if not token:
+        return "", ""
+    # Every other part has to look like a tag, or this is a real path
+    # that happens to contain a long hex segment.
+    for part in parts:
+        if part is token:
+            continue
+        if len(part) > _SOFT404_MAX_TAG_PART or not part.isalnum():
+            return "", ""
+    return token, kind
+
+
+def _soft404_leaf_and_stem(path: str) -> tuple[str, str, str]:
+    """Return (leaf, stem, ext) of a path, case-folded. `ext` keeps its
+    dot and is empty when the leaf has none."""
+    leaf = (path.rstrip("/") or "/").rsplit("/", 1)[-1].lower()
+    dot = leaf.rfind(".")
+    if dot <= 0:
+        return leaf, leaf, ""
+    return leaf, leaf[:dot], leaf[dot:]
+
+
+def soft404_control_probe_scan(path: str) -> dict[str, object]:
+    """Recognise a request whose only purpose is to learn what this host's
+    404 looks like, and describe its shape. Returns `{}` when there is
+    nothing.
+
+    A scanner that will act on a 200 has to know what a miss looks like
+    first, because a host that answers everything makes every hit
+    worthless. So it asks for a name nothing could be serving -- a random
+    token, or a word that says so outright -- and keeps the response as
+    its baseline. That request is the most informative one in a sweep and
+    the least visible: it is a 404 among 404s, indistinguishable from the
+    rest of the dictionary in any log keyed on status.
+
+    Naming it separates the senders who validate their baseline from the
+    ones who do not, which is the difference between a sweep whose 200s
+    mean something to its operator and a sweep that would have recorded
+    our answer the same way whatever we served.
+
+    Path only. A calibration probe carries its signal in the name it
+    chose, and reading the body or the headers would add cost on every
+    request for nothing. The response is not consulted: the caller merges
+    this into the log context *before* dispatch, so a probe is answered
+    byte-for-byte as it would have been unrecognised. See the module
+    comment.
+    """
+    if not SOFT404_PROBE_ENABLED:
+        return {}
+
+    leaf, stem, ext = _soft404_leaf_and_stem(path)
+    if not leaf or leaf == "/":
+        return {}
+
+    shapes: list[str] = []
+    token = ""
+    kind = ""
+
+    # Longest match, so `/thisfiledoesnotexist` reports the whole phrase
+    # rather than the substring that happens to be listed first.
+    strong = max((m for m in _SOFT404_MARKERS if m in leaf), key=len, default="")
+    if strong:
+        shapes.append("declared-absent")
+
+    # Entropy rules only apply to a root-level name. Every calibration
+    # family observed so far asks at the root, and a deep path is where
+    # the legitimate high-entropy names live (an object key, a cache
+    # shard, a content-addressed blob).
+    depth1 = path.count("/") == 1
+    hashed_asset = ext in _SOFT404_ASSET_EXTS
+    if depth1 and (strong or not hashed_asset):
+        wrapped = _SOFT404_WRAPPED_RE.match(stem)
+        glued_hex = _SOFT404_GLUED_HEX_RE.match(stem)
+        glued_num = _SOFT404_GLUED_NUM_RE.match(stem)
+        if wrapped:
+            token, kind = wrapped.group(2), "wrapped-token"
+        elif _SOFT404_UUID_RE.match(stem):
+            token, kind = stem, "bare-uuid"
+        elif glued_num:
+            # Checked before the hex spelling: digits are hex digits, so
+            # an all-numeric token would otherwise be read as one.
+            token, kind = glued_num.group(2), "tagged-counter"
+        elif glued_hex:
+            token, kind = glued_hex.group(2), "tagged-hex"
+        elif _SOFT404_BARE_HEX_RE.match(stem):
+            token, kind = stem, "bare-hex"
+        elif _SOFT404_BARE_ALNUM_RE.match(stem):
+            token, kind = stem, "bare-alnum"
+        else:
+            token, kind = _soft404_token_part(stem)
+        if kind:
+            shapes.append(kind)
+
+    if not shapes:
+        return {}
+
+    # A weak marker next to a token is a calibration probe; on its own it
+    # is an ordinary route name, so it never promotes by itself.
+    if token or strong:
+        weak = sorted(m for m in _SOFT404_WEAK_MARKERS if m in leaf)
+        if weak and not strong:
+            shapes.append("hinted")
+
+    fields: dict[str, object] = {
+        "soft404ProbeShapes": sorted(set(shapes)),
+    }
+    if strong:
+        fields["soft404ProbeMarker"] = strong
+    if token:
+        # The token itself, so a value reused across addresses is
+        # countable. A per-run random token groups by nothing; a token
+        # hardcoded in a tool groups the whole fleet that runs it.
+        fields["soft404ProbeToken"] = token[:SOFT404_PROBE_TOKEN_LIMIT]
+        fields["soft404ProbeTokenKind"] = kind
+    return fields
+
+
 # `${::-j}` and `${lower:j}` are the two standard ways of spelling a
 # single character so that a literal `jndi` never appears on the wire.
 # Both collapse to that character; applying them repeatedly recovers the
@@ -43498,6 +43693,15 @@ async def handle(request: web.Request) -> web.StreamResponse:
         if (CANARY_ECHO_ENABLED or INTERPOLATION_PROBE_ENABLED)
         else None
     )
+
+    # Third observer, same contract as the two below: stamped before
+    # dispatch, read by no branch, so a calibration probe is answered
+    # byte-for-byte as it would have been unrecognised. Path only, so it
+    # does not need the scanned headers.
+    if SOFT404_PROBE_ENABLED:
+        soft404 = soft404_control_probe_scan(str(log_context["path"]))
+        if soft404:
+            log_context.update(soft404)
 
     if CANARY_ECHO_ENABLED:
         echo = canary_echo_scan(

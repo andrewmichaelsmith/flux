@@ -720,6 +720,12 @@ def test_all_trap_families_default_on():
         "cheapest possible moment; the 401 is what turns a path probe into "
         "a credential attempt."
     )
+    assert tbenv.SOFT404_PROBE_ENABLED, (
+        "HONEYPOT_SOFT404_PROBE_ENABLED should default to True — it issues "
+        "nothing, spends no upstream quota, reads only the path and changes "
+        "no response byte. Off, the one request in a sweep that says whether "
+        "the sender validates its baseline is a 404 among 404s."
+    )
     assert tbenv.INTERPOLATION_PROBE_ENABLED, (
         "HONEYPOT_INTERPOLATION_PROBE_ENABLED should default to True — it "
         "serves no route, issues nothing, spends no upstream quota and never "
