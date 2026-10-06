@@ -37,9 +37,10 @@ def test_the_family_is_not_empty():
     """Guards every other test here against passing vacuously."""
     bases = _family_bases()
     assert len(bases) > 100, len(bases)
-    # 10 since `iis-web-config` joined: it had been listing four of the
-    # leftover suffixes by hand and missing the rest.
-    assert len(FAMILY) == 10
+    # 34 since the credential-bearing config traps joined: each had been
+    # hand-listing between zero and three of the leftover suffixes, so
+    # `/web.config.bak` answered while `/appsettings.json.bak` 404ed.
+    assert len(FAMILY) == 34
 
 
 @pytest.mark.parametrize("suffix", SUFFIXES)
@@ -151,3 +152,69 @@ def test_the_fill_is_idempotent_and_order_independent():
                 tbenv._TRAP_BY_PATH.setdefault(low + suffix, trap)
     after = {p: t.name for p, t in tbenv._TRAP_BY_PATH.items()}
     assert before == after
+
+
+@pytest.mark.parametrize("path,expected", [
+    # The long spellings of the three leftovers this family was missing.
+    # `.tmp` answered and `.temp` 404ed on the same base, from the same
+    # dictionary — the split is what identified the gap.
+    ("/web.config.temp", "iis-web-config"),
+    ("/web.config.backup", "iis-web-config"),
+    ("/web.config.copy", "iis-web-config"),
+    ("/config.php.backup", "app-config-php"),
+    ("/settings.py.copy", "app-config-python"),
+    # Bases whose own tables listed no leftover spelling at all, so every
+    # suffix 404ed while a sibling framework's answered.
+    ("/appsettings.json.bak", "appsettings-json"),
+    ("/appsettings.json.backup", "appsettings-json"),
+    ("/auth.json.backup", "composer-auth-json"),
+    ("/.npmrc.backup", "npmrc"),
+    ("/.pypirc.copy", "pypirc"),
+    ("/application.properties.backup", "application-properties"),
+    ("/application.yml.copy", "application-yml"),
+    ("/database.yml.backup", "rails-database-yml"),
+    # Credential files: the leftover copy is the whole point here, since
+    # an operator renames one aside before rotating the key inside it.
+    ("/.aws/credentials.copy", "aws-credentials-file"),
+    ("/firebase.json.backup", "firebase-json"),
+    ("/gcp-credentials.json.copy", "gcp-credentials-json"),
+])
+def test_long_leftover_spellings_route_to_their_family(path, expected):
+    trap = tbenv._TRAP_BY_PATH.get(path)
+    assert trap is not None, f"{path} is not routed"
+    assert trap.name == expected
+
+
+def test_no_sibling_renders_a_different_document_than_its_base():
+    """A leftover whose base is owned by another trap in this family is a
+    split: the same file answered two ways depending on how it was asked
+    for. `/config.json` (config-json) once had its `.bak` hand-listed on
+    `app-config-json`, which is exactly that.
+    """
+    split = []
+    for trap in tbenv.CANARY_TRAPS:
+        if trap.name not in FAMILY:
+            continue
+        for path in trap.paths:
+            low = path.lower()
+            for suffix in SUFFIXES:
+                if not low.endswith(suffix):
+                    continue
+                owner = tbenv._TRAP_BY_PATH.get(low[: -len(suffix)])
+                if owner is not None and owner.name != trap.name:
+                    split.append((low, trap.name, owner.name))
+                break
+    assert not split, split
+
+
+def test_the_long_and_short_leftover_spellings_agree():
+    """`.tmp`/`.temp` and `.bak`/`.backup` are the same leftover. Any base
+    that answers one must answer the other, or a dictionary walking both
+    gets two outcomes for one file."""
+    for short, long in ((".tmp", ".temp"), (".bak", ".backup")):
+        for base in _family_bases():
+            a = tbenv._TRAP_BY_PATH.get(base + short)
+            b = tbenv._TRAP_BY_PATH.get(base + long)
+            assert (a is None) == (b is None), f"{base}: {short}/{long} disagree"
+            if a is not None:
+                assert a.name == b.name, f"{base}: {a.name} vs {b.name}"

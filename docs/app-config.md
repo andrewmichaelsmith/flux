@@ -22,7 +22,7 @@ greps raw bytes for `AKIA`, and the per-format log tags separate them.
 
 | Family | Path(s) | Renderer | Canary slot |
 | --- | --- | --- | --- |
-| `app-config-php` | `/config.php`, `/configuration.php`, `/settings.php`, `/local.config.php`, `/config/config.php`, `/includes/config.php`, `/inc/config.php`, `/include/config.php`, `/application/config/config.php`, plus the family-wide editor/backup sibling set (`.bak`, `.old`, `.save`, `.orig`, `.swp`, `~`) and `.txt` and the `_app_layout_variants` webroot-prefix matrix | `render_php_config` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` `define()` constants |
+| `app-config-php` | `/config.php`, `/configuration.php`, `/settings.php`, `/local.config.php`, `/config/config.php`, `/includes/config.php`, `/inc/config.php`, `/include/config.php`, `/application/config/config.php`, plus the family-wide editor/backup sibling set (`.bak`, `.old`, `.save`, `.orig`, `.swp`, `~`, `.tmp`, `.txt`, `.temp`, `.backup`, `.copy`) and the `_app_layout_variants` webroot-prefix matrix | `render_php_config` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` `define()` constants |
 | `app-config-php-database` | `/config/database.php`, `/config/db.php`, `/config/connection.php`, `/application/config/database.php`, plus backup and webroot-prefix variants | `render_php_database_config` | `connections.backups.key` / `secret` / `token` |
 | `app-config-php-mail` | `/config/mail.php`, `/config/mailer.php`, `/config/email.php`, `/config/smtp.php`, plus backup and webroot-prefix variants | `render_php_mail_config` | `mailers.ses.key` / `secret` / `token` |
 | `app-config-php-services` | `/config/services.php`, `/config/api.php`, `/config/keys.php`, `/config/credentials.php`, `/config/app.php`, `/config/secrets.php`, plus backup and webroot-prefix variants | `render_php_services_config` | `aws.key` / `secret` / `token` |
@@ -118,8 +118,25 @@ the same sweep asking for `/config.php.swp` and `/settings.php.swp` got a
 config from the first and a 404 from the second.
 
 The set is now filled by a rule over the whole family, so a path added
-later gets its siblings without anyone remembering to. Two properties
-keep it safe, both pinned by tests:
+later gets its siblings without anyone remembering to.
+
+**The family is every trap that answers a config file holding a
+credential**, not only the format-grouped generic ones. The leftover copy
+is a property of that: an operator renames a config aside before editing
+it whatever format the config is in, and a harvester walks the rename on
+every one of them in a single pass. Membership therefore covers the .NET
+/ PHP / Python / Ruby / JVM application configs, the cloud and
+service-account credential files, and the deploy / registry / transfer
+configs that carry a login in the file body. Keeping those out is what
+let `/web.config.bak` answer while `/appsettings.json.bak` 404ed.
+
+**Both spellings of a leftover are the same leftover.** `.tmp` and
+`.temp`, `.bak` and `.backup` differ only in how the operator typed it,
+so the set carries both; a test pins the pairs together. The short
+spellings alone once meant `/web.config.tmp` answered and
+`/web.config.temp` 404ed.
+
+Two properties keep the fill safe, both pinned by tests:
 
 - **It can only add.** The fill uses `setdefault`, so a suffix spelling a
   framework-specific trap already owns (`/wp-config.php.bak`,

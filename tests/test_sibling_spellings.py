@@ -58,8 +58,12 @@ def test_sibling_spellings_dispatch(path, expected_trap):
     "/myecosystem.config.js",
     "/settings.local.pyc",
     "/settings.locale.py",
-    "/gcp.json.bak",
+    # `/gcp.json.bak` was listed here until the editor-leftover family
+    # widened. It is not a near-miss: `/gcp.json` is a path this trap
+    # owns, so its backup spelling is the same file and belongs to the
+    # same renderer. The genuine near-miss is the prefix confusion below.
     "/mygcp.json",
+    "/mygcp.json.bak",
 ])
 def test_near_misses_are_not_swallowed(path):
     trap = tbenv._TRAP_BY_PATH.get(path.lower())

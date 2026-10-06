@@ -16127,7 +16127,10 @@ APP_CONFIG_DISPATCH_CASES = [
     # JSON — files plus the runtime-introspection endpoints.
     ("/env.json", "app-config-json"),
     ("/local.settings.json", "app-config-json"),
-    ("/config.json.bak", "app-config-json"),
+    # `config-json`, not `app-config-json`: `/config.json` is owned by
+    # `config-json`, and the leftover spelling of a file has to render
+    # the document its base renders.
+    ("/config.json.bak", "config-json"),
     ("/api/config", "app-config-json"),
     ("/api/v1/config", "app-config-json"),
     ("/api/v2/config", "app-config-json"),

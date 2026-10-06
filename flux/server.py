@@ -29981,8 +29981,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         (
             "/env.json",
             "/local.settings.json",
-            "/config.json.bak",
-            # `/settings.json` intentionally absent: owned by `config-json`.
+            # `/config.json`, `/settings.json` and their editor-leftover
+            # spellings are all intentionally absent: owned by
+            # `config-json`. `/config.json.bak` used to be listed here,
+            # which meant `/config.json` rendered one document and
+            # `/config.json.bak` rendered a different one — the same
+            # caller handed two different configs for one file, which is
+            # a tell rather than a trap. The family leftover fill gives
+            # the sibling to the base's owner instead.
             # Runtime-introspection variant: SPA backends that serve their
             # resolved settings unauthenticated. Probed by the same sweep
             # as the on-disk files, so it renders the same body.
@@ -30134,7 +30140,21 @@ _APP_CONFIG_EDITOR_SUFFIXES = (
     # probed across this family while only two tables listed `.txt` by
     # hand -- a property of the family, so it belongs here.
     ".tmp", ".txt",
+    # `.temp`, `.backup` and `.copy` are the same three leftovers spelled
+    # the long way, and the `.env` suffix table has carried all three for
+    # months. This one stopped at `.tmp`, so one dictionary got
+    # `/web.config.tmp` answered and `/web.config.temp` 404ed — the exact
+    # split this block exists to close, reappearing because the two
+    # tables were maintained separately. All three are probed across this
+    # family today, `.backup` the most widely of any leftover spelling.
+    ".temp", ".backup", ".copy",
 )
+# Membership rule: a trap belongs here when it answers a *config file that
+# holds a credential*. The leftover copy is a property of that — an
+# operator renames a config before editing it whatever format the config
+# is in — so a table that hand-lists two or three spellings is a table
+# that will drift again. Everything below was hand-listing some subset
+# (or none) while the same dictionary walked all of them in one pass.
 _APP_CONFIG_SUFFIX_FAMILY = frozenset({
     "app-config-php",
     "app-config-php-database",
@@ -30150,6 +30170,40 @@ _APP_CONFIG_SUFFIX_FAMILY = frozenset({
     # coverage a property of the family, which is the whole point of this
     # block.
     "iis-web-config",
+    # .NET / PHP / Python / Ruby / JVM application configs whose own
+    # tables listed between zero and three of the leftover spellings.
+    # `appsettings-json` listed none at all, so `/appsettings.json.bak`
+    # 404ed while `/web.config.bak` answered — same framework, same
+    # sweep, opposite outcome.
+    "appsettings-json",
+    "wp-config",
+    "config-json",
+    "rails-database-yml",
+    "symfony-parameters-yml",
+    "application-properties",
+    "application-yml",
+    "airflow-cfg",
+    # Cloud / service-account credential files. These are the names the
+    # leftover spellings are actually walked on: a credentials file is
+    # exactly the file an operator copies aside before rotating it.
+    "aws-credentials-file",
+    "aws-credentials-json",
+    "azure-credentials-json",
+    "azure-node-json",
+    "gcp-credentials-json",
+    "firebase-json",
+    "kubeconfig",
+    "openstack-clouds-yaml",
+    "s3cfg",
+    "rclone-conf",
+    # Deploy / registry / transfer configs that carry a login in the file
+    # body rather than referencing one.
+    "composer-auth-json",
+    "npmrc",
+    "pypirc",
+    "sftp-config",
+    "docker-compose",
+    "serverless-config",
 })
 for _trap in CANARY_TRAPS:
     if _trap.name not in _APP_CONFIG_SUFFIX_FAMILY:

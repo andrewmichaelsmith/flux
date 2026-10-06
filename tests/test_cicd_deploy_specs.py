@@ -48,8 +48,12 @@ def test_deploy_spec_paths_dispatch(path, expected_trap):
 
 @pytest.mark.parametrize("path", [
     # Near-misses that must not be swallowed by the new entries.
-    "/azure.json.bak",
+    # `/azure.json.bak` used to be listed here. It is not a near-miss —
+    # `/azure.json` is a path `azure-node-json` owns, and the leftover
+    # spelling of an owned base is the same file. Prefix confusion is the
+    # real near-miss, so it is what this guard pins.
     "/myazure.json",
+    "/myazure.json.bak",
     "/buildspec",
     "/buildspec.json",
     "/appspec.txt",
