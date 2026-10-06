@@ -261,6 +261,17 @@ SOFT404_PROBE_TOKEN_LIMIT = max(
     int((os.environ.get("HONEYPOT_SOFT404_PROBE_TOKEN_LIMIT") or "64").strip() or "64"), 16
 )
 
+# Longest name examined. A generated calibration name is short by
+# construction -- it has to be a URL the tool builds and recognises again,
+# and the longest family observed runs to about 46 characters. Past this
+# the name is not one, so the work stops rather than scaling with whatever
+# length a sender chooses to send. Without the cap a 64 KB path costs
+# ~2.3 ms of marker scanning against ~5 us for an ordinary route, which is
+# a cheap amplification lever to hand a sender on a small host.
+SOFT404_PROBE_MAX_LEAF = max(
+    int((os.environ.get("HONEYPOT_SOFT404_PROBE_MAX_LEAF") or "256").strip() or "256"), 64
+)
+
 # Words that say outright that the sender does not expect the file to
 # exist. A request carrying one of these is a control, whatever else is
 # in the path -- nobody deploys a file called `doesnotexist`.
@@ -345,7 +356,13 @@ def _soft404_token_part(stem: str) -> tuple[str, str]:
 def _soft404_leaf_and_stem(path: str) -> tuple[str, str, str]:
     """Return (leaf, stem, ext) of a path, case-folded. `ext` keeps its
     dot and is empty when the leaf has none."""
-    leaf = (path.rstrip("/") or "/").rsplit("/", 1)[-1].lower()
+    leaf = (path.rstrip("/") or "/").rsplit("/", 1)[-1]
+    # Length-checked before case-folding, so an overlong name costs the
+    # split and nothing else -- folding 64 KB is itself the bulk of the
+    # work once the marker scan is skipped.
+    if len(leaf) > SOFT404_PROBE_MAX_LEAF:
+        return leaf[:SOFT404_PROBE_MAX_LEAF + 1], "", ""
+    leaf = leaf.lower()
     dot = leaf.rfind(".")
     if dot <= 0:
         return leaf, leaf, ""
@@ -381,7 +398,7 @@ def soft404_control_probe_scan(path: str) -> dict[str, object]:
         return {}
 
     leaf, stem, ext = _soft404_leaf_and_stem(path)
-    if not leaf or leaf == "/":
+    if not leaf or leaf == "/" or len(leaf) > SOFT404_PROBE_MAX_LEAF:
         return {}
 
     shapes: list[str] = []

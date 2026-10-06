@@ -125,11 +125,42 @@ def test_the_token_is_reported_so_a_reused_one_is_countable():
 
 
 def test_the_token_is_bounded():
-    out = tbenv.soft404_control_probe_scan("/tag" + "a" * 4000 + "1")
+    out = tbenv.soft404_control_probe_scan("/tag" + "a" * 200 + "1")
     # Either it does not match at all or the reported token is capped;
     # what must not happen is an unbounded field reaching the log.
     if out:
         assert len(out["soft404ProbeToken"]) <= tbenv.SOFT404_PROBE_TOKEN_LIMIT
+
+
+@pytest.mark.parametrize("length", [1000, 8192, 65536])
+def test_an_overlong_name_is_not_examined(length):
+    """The work must not scale with a length the sender picks. A
+    calibration name is short by construction, so past the cap the scan
+    stops instead of handing a sender ~460x the CPU of an ordinary route
+    per request."""
+    assert tbenv.soft404_control_probe_scan("/" + "a7f3" * (length // 4)) == {}
+    # Including one that would otherwise match on every rule it has.
+    long_marker = "/nonexistent-" + "0" * length + "-4f1a9c7e22b1"
+    assert tbenv.soft404_control_probe_scan(long_marker) == {}
+
+
+def test_the_cap_does_not_cut_any_observed_family():
+    """Every shape this observer exists for has to fit under the cap, or
+    the cap is a silent coverage hole rather than a bound."""
+    observed = [
+        "/__ss_probe_c93bfb6126b36888b64c4def78fdf901__",
+        "/kmonbaseqtb28219f5",
+        "/odinhttpcall1791241960",
+        "/7f13c0a9d8644f3ca0a563b6b56e49d7",
+        "/e7iyk7mdsz5t8d80e465",
+        "/cmsd-4f1a9c7e22b1-404.html",
+        "/pscan-bf821f4b-nonexistent.txt",
+        "/netbot-catchall-baseline-9f3a2c7d.nonexistent",
+    ]
+    for path in observed:
+        leaf = path.rsplit("/", 1)[-1]
+        assert len(leaf) <= tbenv.SOFT404_PROBE_MAX_LEAF, path
+        assert tbenv.soft404_control_probe_scan(path), path
 
 
 def test_disabled_by_env(monkeypatch):
