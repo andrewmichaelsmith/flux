@@ -654,6 +654,13 @@ def test_all_trap_families_default_on():
         "layout-vocabulary walk cannot cover."
     )
     assert tbenv.CLOUD_IMDS_ENABLED
+    assert tbenv.JAVA_DESCRIPTOR_READ_ENABLED, (
+        "HONEYPOT_JAVA_DESCRIPTOR_READ_ENABLED should default to True — the "
+        "deployment descriptors under WEB-INF/META-INF are what a scanner "
+        "reads to pick its next, version-specific request, and the bypass "
+        "spelling that carries most of that traffic rotates its prefix, so "
+        "an off-by-default switch leaves the whole family 404ing"
+    )
     assert tbenv.VITE_RSC_SOURCEMAP_ENABLED, (
         "HONEYPOT_VITE_RSC_SOURCEMAP_ENABLED should default to True — the "
         "RSC source-map lookup is the same arbitrary read `/@fs/` serves, "
