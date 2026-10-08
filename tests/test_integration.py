@@ -1081,3 +1081,86 @@ async def test_integration_phpinfo_nested_under_unknown_parent(live_server):
     assert len(got) == 3, [e.get("result") for e in entries]
     # `trapWalkDepth` is the "arrived nested" signal and must be stamped.
     assert [e.get("trapWalkDepth") for e in got] == [1, 1, 2]
+
+
+async def test_integration_terraform_hcl_tree_walk(live_server):
+    """Real socket → dispatch → the `.tf` source tree.
+
+    Walks the tree the way a reader of a leaked checkout would: the source
+    files first, then the two value files their contents name. Asserts the
+    chain is actually traversable end to end, that each member logs its own
+    result tag, and that the structural/provider credential split holds on
+    the wire rather than only in the renderer.
+    """
+    base, log_path = live_server
+    key_id = FAKE_TRACEBIT["aws"]["awsAccessKeyId"]
+
+    structural = {
+        "/variables.tf": "terraform-hcl-variables",
+        "/main.tf": "terraform-hcl-main",
+        "/backend.tf": "terraform-hcl-backend",
+        "/outputs.tf": "terraform-hcl-outputs",
+        "/versions.tf": "terraform-hcl-versions",
+        "/infra/variables.tf": "terraform-hcl-variables",
+    }
+    provider = {
+        "/providers.tf": "terraform-hcl-providers",
+        "/aws.tf": "terraform-hcl-providers",
+        "/ovh.tf": "terraform-hcl-provider-ovh",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        for path in list(structural) + list(provider):
+            async with session.get(
+                f"{base}{path}", headers={"X-Forwarded-For": "203.0.113.70"},
+            ) as resp:
+                assert resp.status == 200, path
+                body = (await resp.read()).decode("utf-8")
+            if path in structural:
+                assert key_id not in body, f"{path} leaked canary material"
+            else:
+                assert key_id in body, f"{path} served no canary"
+
+        # The files the tree's contents point at must both answer, or the
+        # chain the source tree exists to open dead-ends.
+        for path in ("/terraform.tfvars", "/terraform.tfstate"):
+            async with session.get(
+                f"{base}{path}", headers={"X-Forwarded-For": "203.0.113.70"},
+            ) as resp:
+                assert resp.status == 200, path
+                assert key_id in (await resp.read()).decode("utf-8"), path
+
+        # An arbitrary parent is still not part of the tree.
+        async with session.get(
+            f"{base}/wp-content/uploads/variables.tf",
+            headers={"X-Forwarded-For": "203.0.113.70"},
+        ) as resp:
+            assert resp.status == 404
+
+    tags = {e["result"] for e in
+            (json.loads(l) for l in log_path.read_text().splitlines())}
+    for expected in set(structural.values()) | set(provider.values()):
+        assert expected in tags, expected
+
+
+async def test_integration_undotted_ovh_conf_and_its_leftovers(live_server):
+    """The undotted OVH spellings and the editor/backup siblings that the
+    suffix family had been withholding from the provider-CLI table."""
+    base, log_path = live_server
+    key_id = FAKE_TRACEBIT["aws"]["awsAccessKeyId"]
+
+    async with aiohttp.ClientSession() as session:
+        for path in ("/.ovh.conf", "/ovh.conf", "/etc/ovh.conf",
+                     "/config/ovh.conf", "/conf/ovh.conf",
+                     "/.ovh.conf.bak", "/ovh.conf.bak", "/.ovh.conf~"):
+            async with session.get(
+                f"{base}{path}", headers={"X-Forwarded-For": "203.0.113.71"},
+            ) as resp:
+                assert resp.status == 200, path
+                body = (await resp.read()).decode("utf-8")
+            assert key_id in body, path
+            assert "application_key" in body, path
+
+    tags = {e["result"] for e in
+            (json.loads(l) for l in log_path.read_text().splitlines())}
+    assert "ovh-conf" in tags

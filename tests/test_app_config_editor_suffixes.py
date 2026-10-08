@@ -37,13 +37,18 @@ def test_the_family_is_not_empty():
     """Guards every other test here against passing vacuously."""
     bases = _family_bases()
     assert len(bases) > 100, len(bases)
-    # 34 since the credential-bearing config traps joined: each had been
+    # 57 since the provider-CLI and IaC credential traps joined. Before
+    # that the niche-cloud-provider table had only two members in the
+    # family, so `/.ovh.conf` answered while `/.ovh.conf.bak` 404ed — the
+    # same canonical-answers/leftover-404s split that first motivated this
+    # block, recurring in a table added later. 34 was the count when the
+    # credential-bearing *app* config traps joined; each had been
     # hand-listing between zero and three of the leftover suffixes, so
     # `/web.config.bak` answered while `/appsettings.json.bak` 404ed.
-    # 44 since the key-material, dump, CI-pipeline and provider-CLI
-    # traps joined on the same rule — a credential-bearing file gets
-    # copied aside before it is edited whatever format it is in.
-    assert len(FAMILY) == 44
+    # 66 since the key-material, dump, CI-pipeline, provider-CLI and
+    # IaC credential traps joined on the same rule — a credential-bearing
+    # file gets copied aside before it is edited whatever format it is in.
+    assert len(FAMILY) == 66
 
 
 @pytest.mark.parametrize("suffix", SUFFIXES)

@@ -23384,6 +23384,263 @@ def render_terraform_tfvars_json(r: dict[str, object]) -> bytes:
     return json.dumps(payload, indent=2).encode("utf-8")
 
 
+# --- Terraform HCL *source* tree -------------------------------------------
+#
+# Flux already answers the two files that hold Terraform's *values* —
+# `terraform.tfstate` and `terraform.tfvars` — but 404ed every `.tf`
+# source file that declares and references them. That is backwards from
+# how a leaked project tree is actually read: the `.tf` files are what a
+# webroot checkout exposes first, and they are what tell the reader which
+# provider is in use and what the value files are called. Answering the
+# values while 404ing the source is also a fingerprint — no real checkout
+# has `terraform.tfvars` without a `variables.tf` beside it.
+#
+# The tree below is internally consistent on purpose: `variables.tf`
+# declares the names, `main.tf` references them, `backend.tf` names the
+# remote state object, `providers.tf`/`versions.tf` pin the providers and
+# `outputs.tf` marks the sensitive outputs. A reader that parses rather
+# than greps gets a project that hangs together, and the file it is
+# steered to next (`terraform.tfvars`, `terraform.tfstate`) is a path
+# Flux already serves a canary from.
+#
+# Credential placement follows real practice rather than spreading canaries
+# evenly: a correct `variables.tf` declares `sensitive = true` variables and
+# holds *no* values, so these renderers spend no canary and the secrets stay
+# in the value files. The provider blocks are the exception — inlining the
+# key pair into `provider "aws" {}` instead of leaving it to the environment
+# is the classic committed-credential mistake, and it is the one place in a
+# `.tf` tree where a raw key plausibly sits.
+
+
+def render_tf_variables(r: dict[str, object]) -> bytes:
+    # Declarations only — no `default` on anything secret, which is both
+    # correct HCL style and the reason this file spends no canary. Its
+    # value to a reader is the *names*: it says the project has an AWS key
+    # pair, a DB password and an OVH consumer key, and that they are
+    # supplied from a tfvars file.
+    return b'''variable "aws_access_key" {
+  type        = string
+  description = "AWS access key id for the deploy role"
+  sensitive   = true
+}
+
+variable "aws_secret_key" {
+  type        = string
+  description = "AWS secret access key for the deploy role"
+  sensitive   = true
+}
+
+variable "aws_session_token" {
+  type        = string
+  description = "STS session token for the deploy role"
+  sensitive   = true
+  default     = ""
+}
+
+variable "aws_region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "environment" {
+  type    = string
+  default = "production"
+}
+
+variable "db_password" {
+  type        = string
+  description = "Master password for the primary database"
+  sensitive   = true
+}
+
+variable "db_host" {
+  type    = string
+  default = "db.internal"
+}
+
+variable "db_user" {
+  type    = string
+  default = "prod_rw"
+}
+
+variable "db_name" {
+  type    = string
+  default = "prod"
+}
+
+variable "ovh_application_key" {
+  type      = string
+  sensitive = true
+}
+
+variable "ovh_application_secret" {
+  type      = string
+  sensitive = true
+}
+
+variable "ovh_consumer_key" {
+  type      = string
+  sensitive = true
+}
+
+variable "vpc_cidr" {
+  type    = string
+  default = "10.0.0.0/16"
+}
+
+variable "allowed_admin_cidrs" {
+  type    = list(string)
+  default = ["10.0.0.0/8"]
+}
+'''
+
+
+def render_tf_main(r: dict[str, object]) -> bytes:
+    # Resource blocks that reference `var.*` rather than holding values.
+    # The bucket and database names are plausible non-credential filler,
+    # the kind that may stay fixed; nothing secret-shaped is here.
+    return b'''resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_hostnames = true
+}
+
+resource "aws_s3_bucket" "artifacts" {
+  bucket = "acme-${var.environment}-artifacts"
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_db_instance" "primary" {
+  identifier          = "${var.environment}-primary"
+  engine              = "postgres"
+  engine_version      = "15.5"
+  instance_class      = "db.t3.medium"
+  allocated_storage   = 100
+  db_name             = var.db_name
+  username            = var.db_user
+  password            = var.db_password
+  skip_final_snapshot = false
+}
+
+resource "aws_security_group" "admin" {
+  name        = "${var.environment}-admin"
+  description = "Administrative access"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_admin_cidrs
+  }
+}
+'''
+
+
+def render_tf_providers(r: dict[str, object]) -> bytes:
+    # The one `.tf` file where a raw key pair plausibly sits: inlining the
+    # credentials into the provider block instead of taking them from the
+    # environment is the committed-credential mistake this file is walked
+    # for. Canary-bearing, per-hit unique.
+    aws = _aws(r)
+    return (
+        'provider "aws" {\n'
+        '  region     = var.aws_region\n'
+        f'  access_key = "{aws.get("awsAccessKeyId", "")}"\n'
+        f'  secret_key = "{aws.get("awsSecretAccessKey", "")}"\n'
+        f'  token      = "{aws.get("awsSessionToken", "")}"\n'
+        '\n'
+        '  default_tags {\n'
+        '    tags = {\n'
+        '      ManagedBy = "terraform"\n'
+        '    }\n'
+        '  }\n'
+        '}\n'
+    ).encode("utf-8")
+
+
+def render_tf_ovh(r: dict[str, object]) -> bytes:
+    # Provider-named `.tf` file. Same inlined-credential shape as
+    # `providers.tf`; the OVH key triple reuses the canary fields as opaque
+    # strings, matching how `render_ovh_conf` already presents them.
+    aws = _aws(r)
+    return (
+        'provider "ovh" {\n'
+        '  endpoint           = "ovh-eu"\n'
+        f'  application_key    = "{aws.get("awsAccessKeyId", "")}"\n'
+        f'  application_secret = "{aws.get("awsSecretAccessKey", "")}"\n'
+        f'  consumer_key       = "{aws.get("awsSessionToken", "")}"\n'
+        '}\n'
+        '\n'
+        'resource "ovh_cloud_project_user" "deploy" {\n'
+        '  service_name = "acme-prod"\n'
+        '  description  = "terraform deploy user"\n'
+        '}\n'
+    ).encode("utf-8")
+
+
+def render_tf_backend(r: dict[str, object]) -> bytes:
+    # Names the remote state object, which is the file a reader goes to
+    # next and which Flux already answers a canary from. No credentials:
+    # a real backend block takes them from the provider chain.
+    return b'''terraform {
+  backend "s3" {
+    bucket         = "acme-terraform-state"
+    key            = "production/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "terraform-state-lock"
+    encrypt        = true
+  }
+}
+'''
+
+
+def render_tf_outputs(r: dict[str, object]) -> bytes:
+    # Outputs marked sensitive. Values are references, not literals, so
+    # this file holds nothing secret — but it confirms to a reader that the
+    # state object the backend names carries the DB endpoint and password.
+    return b'''output "vpc_id" {
+  value = aws_vpc.main.id
+}
+
+output "db_endpoint" {
+  value = aws_db_instance.primary.endpoint
+}
+
+output "db_password" {
+  value     = var.db_password
+  sensitive = true
+}
+
+output "artifacts_bucket" {
+  value = aws_s3_bucket.artifacts.bucket
+}
+'''
+
+
+def render_tf_versions(r: dict[str, object]) -> bytes:
+    # Provider pins. Structural, no credentials; it tells a reader which
+    # providers the rest of the tree is written against.
+    return b'''terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.31"
+    }
+    ovh = {
+      source  = "ovh/ovh"
+      version = "~> 0.36"
+    }
+  }
+}
+'''
+
+
 def render_phpinfo(r: dict[str, object]) -> bytes:
     aws = _aws(r)
     ak = aws.get("awsAccessKeyId", "")
@@ -26843,6 +27100,111 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_terraform_tfvars_json,
         "application/json; charset=utf-8",
     ),
+    # The `.tf` source tree that declares and references the two value
+    # files above. Split by role rather than served from one renderer so
+    # each file's result tag names which part of the tree was read — that
+    # is what makes a walk through the tree legible as a sequence instead
+    # of one undifferentiated `terraform` hit.
+    CanaryTrap(
+        "terraform-hcl-variables",
+        (
+            # Declarations only, so no canary is spent here.
+            "/variables.tf",
+            "/variable.tf",
+            "/vars.tf",
+            "/terraform/variables.tf",
+            "/infra/variables.tf",
+            "/infrastructure/variables.tf",
+            "/ops/variables.tf",
+            "/deploy/variables.tf",
+        ),
+        (),
+        render_tf_variables,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "terraform-hcl-main",
+        (
+            "/main.tf",
+            "/terraform/main.tf",
+            "/infra/main.tf",
+            "/infrastructure/main.tf",
+            "/ops/main.tf",
+            "/deploy/main.tf",
+        ),
+        (),
+        render_tf_main,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "terraform-hcl-providers",
+        (
+            # Canary-bearing: the inlined provider key pair.
+            "/providers.tf",
+            "/provider.tf",
+            "/aws.tf",
+            "/terraform/providers.tf",
+            "/infra/providers.tf",
+            "/infrastructure/providers.tf",
+            "/ops/providers.tf",
+            "/deploy/providers.tf",
+        ),
+        ("aws",),
+        render_tf_providers,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "terraform-hcl-provider-ovh",
+        (
+            # Provider-named member of the same tree, walked in its own
+            # right. Canary-bearing for the same reason `providers.tf` is.
+            "/ovh.tf",
+            "/terraform/ovh.tf",
+            "/infra/ovh.tf",
+        ),
+        ("aws",),
+        render_tf_ovh,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "terraform-hcl-backend",
+        (
+            # Names the remote state object the tfstate trap answers.
+            "/backend.tf",
+            "/state.tf",
+            "/terraform/backend.tf",
+            "/infra/backend.tf",
+            "/infrastructure/backend.tf",
+        ),
+        (),
+        render_tf_backend,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "terraform-hcl-outputs",
+        (
+            "/outputs.tf",
+            "/output.tf",
+            "/terraform/outputs.tf",
+            "/infra/outputs.tf",
+            "/infrastructure/outputs.tf",
+        ),
+        (),
+        render_tf_outputs,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "terraform-hcl-versions",
+        (
+            "/versions.tf",
+            "/version.tf",
+            "/terraform/versions.tf",
+            "/infra/versions.tf",
+        ),
+        (),
+        render_tf_versions,
+        "text/plain; charset=utf-8",
+    ),
     # GCP service-account JSON at generic webroot paths. The existing
     # `firebase-json` trap covers the canonical GCP/Firebase filenames
     # (`/firebase-adminsdk.json`, `/.config/gcloud/...`); these are the
@@ -29634,6 +29996,15 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/root/.ovh.conf",
             "/home/ubuntu/.ovh.conf",
             "/home/runner/.ovh.conf",
+            # Dotless spelling. The OVHcloud CLI reads `~/.ovh.conf`, but
+            # it also reads `./ovh.conf` from the working directory and
+            # `/etc/ovh.conf` system-wide, which is why a sweep walks the
+            # undotted name at the webroot and under `etc/`/`config/` as
+            # well as the home-directory dotfile.
+            "/ovh.conf",
+            "/etc/ovh.conf",
+            "/config/ovh.conf",
+            "/conf/ovh.conf",
         ),
         ("aws",),
         render_ovh_conf,
@@ -30767,6 +31138,39 @@ _APP_CONFIG_SUFFIX_FAMILY = frozenset({
     # bundle is not a file an operator renames before editing, which is
     # the behaviour the rule describes. If that spelling earns a
     # response it belongs on the trap, not inherited from here.
+    # Provider-CLI and IaC credential files. The family comment above
+    # already states the rule these satisfy — "a credentials file is
+    # exactly the file an operator copies aside before rotating it" — but
+    # when the niche-cloud-provider table landed only two of its members
+    # (`openstack-clouds-yaml`, `s3cfg`) were admitted, so the other
+    # twenty-odd answered the canonical name and 404ed every leftover
+    # spelling. That is the same split this block was written to end, and
+    # the undotted/backup spellings are walked in the same sweep as the
+    # canonical one.
+    "oci-config",
+    "hcloud-cli",
+    "civo-cli",
+    "exoscale-cli",
+    "scaleway-cli",
+    "fly-cli",
+    "doctl-config",
+    "linode-cli",
+    "pulumi-credentials",
+    "terraform-credentials-tfrc",
+    "terraformrc",
+    "passwd-s3fs",
+    "cargo-credentials",
+    "gem-credentials",
+    "gh-hosts-yml",
+    "1password-config",
+    "cloudflared-config",
+    "wireguard-conf",
+    "headscale-config",
+    # Terraform value files. `terraform-tfstate` listed `.backup` by hand
+    # (it is a real Terraform-written sibling) and nothing else.
+    "terraform-tfstate",
+    "terraform-tfvars",
+    "terraform-tfvars-json",
 })
 for _trap in CANARY_TRAPS:
     if _trap.name not in _APP_CONFIG_SUFFIX_FAMILY:
