@@ -134,6 +134,23 @@ Requires `TRACEBIT_API_KEY`, same as the git tree. See
 | `FAKE_SVN_AUTHOR` | `ops` | Commit author recorded in `entries` and in `wc.db` `NODES`. |
 | `FAKE_SVN_REVISION` | `1487` | Revision the working copy claims to be at. |
 
+## Backup archives and embedded databases
+
+Two pattern traps over the same scanner dictionary: one answers the
+compressed/dump column (`<base>.zip`, `.tar.gz`, `.sql.gz`, `.dump`,
+…), the other the database column (`<base>.db`, `.sqlite`,
+`.sqlite3`). Both run after the exact-path canary lookup, so a path
+with its own renderer keeps it, and both need a Tracebit key —
+keyless deployments 404.
+
+See [`docs/backup-archive.md`](./docs/backup-archive.md) and
+[`docs/sqlite-db.md`](./docs/sqlite-db.md).
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_BACKUP_ARCHIVE_ENABLED` | on | Master switch for the archive column. Serves a real archive in the requested format containing `.env` + `backup.sql` with the AWS canary. Covers the dictionary cross-product, one directory of nesting, backup-word compounds, month/date decoration, and filename synthesis from the target's IP or hostname. |
+| `HONEYPOT_SQLITE_DB_ENABLED` | on | Master switch for the database column. Serves a real, openable SQLite file — `users` / `settings` / `sessions` / `migrations`, with the AWS canary in `settings` — or the gcloud CLI's own schema for `credentials.db` / `access_tokens.db`. |
+
 ## SSRF relay onto the metadata tree
 
 Requires a Tracebit key, and requires `HONEYPOT_CLOUD_IMDS_ENABLED` —

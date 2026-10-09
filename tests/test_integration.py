@@ -1164,3 +1164,150 @@ async def test_integration_undotted_ovh_conf_and_its_leftovers(live_server):
     tags = {e["result"] for e in
             (json.loads(l) for l in log_path.read_text().splitlines())}
     assert "ovh-conf" in tags
+async def test_integration_sqlite_db_serves_a_real_openable_database(live_server):
+    """Over a real socket: `/database.sqlite` comes back as a SQLite file
+    that opens, with the canary readable through a SQL query rather than
+    only present in the bytes."""
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/database.sqlite",
+            headers={"X-Forwarded-For": "203.0.113.70"},
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("application/vnd.sqlite3")
+            assert "database.sqlite" in resp.headers["Content-Disposition"]
+            body = await resp.read()
+
+    assert body.startswith(b"SQLite format 3\x00")
+    handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    handle.write(body)
+    handle.close()
+    connection = sqlite3.connect(Path(handle.name))
+    try:
+        settings = dict(connection.execute("SELECT key, value FROM settings"))
+    finally:
+        connection.close()
+    assert settings["aws_access_key_id"] == "AKIAFAKEINTEG01"
+
+    entries = [
+        json.loads(line)
+        for line in log_path.read_text().splitlines()
+        if line.strip()
+    ]
+    served = [e for e in entries if e.get("result") == "sqlite-db"]
+    assert served, "no sqlite-db log line"
+    assert served[-1]["dbFlavour"] == "sqlite"
+    assert served[-1]["bytes"] == len(body)
+
+
+async def test_integration_gcloud_credentials_db_uses_the_cli_schema(live_server):
+    """The two gcloud filenames resolve to gcloud's own schema, not the
+    generic application one."""
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/.config/gcloud/credentials.db",
+            headers={"X-Forwarded-For": "203.0.113.71"},
+        ) as resp:
+            assert resp.status == 200
+            body = await resp.read()
+
+    handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    handle.write(body)
+    handle.close()
+    connection = sqlite3.connect(Path(handle.name))
+    try:
+        rows = list(connection.execute("SELECT account_id, value FROM credentials"))
+    finally:
+        connection.close()
+    assert len(rows) == 1
+    assert '"refresh_token"' in rows[0][1]
+
+
+async def test_integration_backup_archive_shapes_the_matcher_gained(live_server):
+    """Shapes that used to 404: a base compounded with a backup word, a
+    separated date, a month name, an engine name, and the name one
+    directory down under a dictionary directory.
+
+    `/sql/db.sql` is deliberately absent — the app-layout walk already
+    strips the leading segment and resolves it to the `sql-dump`
+    renderer, which is the better answer and must keep the path.
+    """
+    base, log_path = live_server
+    paths = (
+        "/database-backup.zip",
+        "/backup-2026-09.zip",
+        "/april-2026.zip",
+        "/mysql.sql",
+        "/credentials.zip",
+        "/wp-content/mysql.sql",
+    )
+    for path in paths:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{base}{path}",
+                headers={"X-Forwarded-For": "203.0.113.72"},
+            ) as resp:
+                assert resp.status == 200, path
+                await resp.read()
+
+    entries = [
+        json.loads(line)
+        for line in log_path.read_text().splitlines()
+        if line.strip()
+    ]
+    served = {
+        e.get("path") for e in entries if e.get("result") == "backup-archive"
+    }
+    assert served == set(paths), sorted(served)
+
+
+async def test_integration_subdirectory_sql_keeps_the_sql_dump_renderer(live_server):
+    """The archive matcher accepts `/<dir>/<base>.sql`, but the walk gets
+    there first and answers with the dedicated dump renderer. Pinned so a
+    later priority change cannot silently downgrade it to a tarball."""
+    base, log_path = live_server
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/sql/db.sql",
+            headers={"X-Forwarded-For": "203.0.113.74"},
+        ) as resp:
+            assert resp.status == 200
+            await resp.read()
+
+    entries = [
+        json.loads(line)
+        for line in log_path.read_text().splitlines()
+        if line.strip()
+    ]
+    served = [e for e in entries if e.get("path") == "/sql/db.sql"]
+    assert served and served[-1]["result"] == "sql-dump", served
+
+
+async def test_integration_host_derived_archive_name(live_server):
+    """`/<host>.zip` is served only to the host that names it — the
+    domain-shaped sibling of the IP synthesis."""
+    base, log_path = live_server
+    host = "example.net"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{base}/example.net.zip",
+            headers={"X-Forwarded-For": "203.0.113.73", "Host": host},
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("application/zip")
+        # A different Host makes the same name meaningless, so it 404s.
+        async with session.get(
+            f"{base}/example.net.zip",
+            headers={"X-Forwarded-For": "203.0.113.73", "Host": "unrelated.test"},
+        ) as resp:
+            assert resp.status == 404

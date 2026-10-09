@@ -5307,6 +5307,13 @@ _BACKUP_ARCHIVE_BASES = frozenset({
     "tmp", "uploads", "user", "users", "var", "web", "website",
     "website-backup", "website_backup", "wordpress", "wp", "wp-admin",
     "wp-backup", "wp-content", "wp-includes", "www", "www-backup",
+    # Engine and tool names a dump is named after, the webroot spellings
+    # that sit beside `htdocs` / `public_html`, and the generic leaf
+    # names walked in the same column as `backup` / `full` / `old`.
+    "accounts", "all", "assets", "credentials", "dbadmin", "dbase",
+    "etc", "html", "images", "latest", "logs", "mongodump", "mysql",
+    "pgsql", "postgres", "postgresql", "psql", "schema", "sql",
+    "sqldump", "srv", "upload", "webroot", "wwwroot",
 })
 
 # Longest-first so we strip `.tar.gz` before `.gz` when peeling the
@@ -5317,41 +5324,324 @@ _BACKUP_ARCHIVE_EXTS = (
     "tar", "sql",
     "gz", "bz2", "xz",
     "zip", "7z", "rar", "zst",
+    # Uncompressed dump spellings walked in the same column as `.sql`:
+    # `pg_dump -Fc` writes `.dump`, Oracle/`mysqldump` redirections write
+    # `.dmp`, and `.pgsql` / `.psql` are the Postgres spellings. A Redis
+    # `.rdb` is binary rather than text, but a harvester greps the raw
+    # bytes either way, so it belongs with the dumps rather than 404ing.
+    "dump", "dmp", "pgsql", "psql", "rdb",
 )
+# `.bak` is deliberately NOT here. A `.bak` is the leftover copy of
+# whatever file it names, and the app-config leftover family already
+# answers it with that file's own renderer -- serving a tarball for
+# `/config.php.bak` would replace a correct answer with a wrong one.
+# `.db` / `.sqlite` / `.sqlite3` are likewise owned by the embedded-
+# database trap, which serves a real database instead of an archive.
+
+# Month names, bare and with a year, are how a rotated backup is named
+# when the operator does it by hand rather than on a timer. A dictionary
+# walks `/apr.zip`, `/april.zip`, `/april-2026.zip` and
+# `/backup-april-2026.zip` in one pass with the numeric stems below.
+_BACKUP_ARCHIVE_MONTHS = frozenset({
+    "jan", "feb", "mar", "apr", "may", "jun",
+    "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "january", "february", "march", "april", "june",
+    "july", "august", "september", "october", "november", "december",
+})
+# `database-backup`, `db_dump`, `backupdb` — a base name glued to a
+# backup word, in either order and with any of the three separators the
+# dictionaries use. Derived rather than listed so a new base name picks
+# up its compounds for free.
+_BACKUP_ARCHIVE_COMPOUND_WORDS = frozenset({
+    "backup", "backups", "bak", "dump", "dumps", "archive", "export",
+    "full", "old", "new", "latest", "copy", "snapshot", "save",
+})
+# The single directory segment allowed in front of the filename. Drawn
+# from the base list (a backup lives in a directory named like a backup)
+# minus the stems that are only ever filenames, plus `sql`, which is a
+# directory name in the dictionaries but not a backup base.
+_BACKUP_ARCHIVE_DIRS = frozenset({
+    "admin", "api", "app", "application", "archive", "archives", "backup",
+    "backups", "bak", "build", "config", "configs", "content", "data",
+    "database", "databases", "db", "dist", "dump", "dumps", "export",
+    "exports", "files", "home", "htdocs", "media", "private", "public",
+    "public_html", "sites", "source", "sql", "src", "storage", "temp",
+    "tmp", "uploads", "var", "web", "website", "wp-admin", "wp-content",
+    "wp-includes", "www",
+})
 _BACKUP_ARCHIVE_STEM_RE = re.compile(r"^[A-Za-z0-9._\-]{1,80}$")
 _BACKUP_ARCHIVE_IP_STEM_RE = re.compile(r"^(?:\d{1,3}\.){0,3}\d{1,3}$")
-_BACKUP_ARCHIVE_DATE_STEM_RE = re.compile(r"^(?:19|20)\d{2}(?:\d{2}){0,2}$")
+# `2026`, `202610`, `20261009`, and the separated spellings `2026-10`,
+# `2026_10_09`, `2026.10` that the numeric-only form was missing.
+_BACKUP_ARCHIVE_DATE_STEM_RE = re.compile(
+    r"^(?:19|20)\d{2}(?:[-_.]?\d{2}){0,2}$"
+)
+# A month stem on its own or with a year on either side:
+# `apr`, `april-2026`, `2026-april`.
+_BACKUP_ARCHIVE_MONTH_STEM_RE = re.compile(
+    r"^(?:(?:19|20)\d{2}[-_.])?([a-z]{3,9})(?:[-_.](?:19|20)\d{2})?$"
+)
 
 
-def _backup_archive_match(path: str) -> str:
+def _split_dir_leaf(stem: str) -> tuple[str, str] | None:
+    """Split a stem into (directory, leaf), or None if it is not a shape
+    we accept.
+
+    The directory is everything before the last separator, so a caller
+    whose directory list holds a nested path (`sites/default/files`) can
+    match it; the caller decides which directories it accepts. Every
+    segment must be non-empty: `//backup.zip` and `/a//b.zip` are the
+    double-slash spellings a normaliser leaves behind, and a trap that
+    answered them would be answering a path no server would route.
+    """
+    segments = stem.split("/")
+    if any(not segment for segment in segments):
+        return None
+    return "/".join(segments[:-1]), segments[-1]
+
+
+def _backup_archive_stem_part(part: str) -> bool:
+    """Is this one separator-delimited piece of a compound stem something
+    we recognise -- a base name, a month, a year, or a 1-2 digit day or
+    month number? Used only inside the compound rule, so a piece on its
+    own is not enough to accept a stem."""
+    if part in _BACKUP_ARCHIVE_BASES or part in _BACKUP_ARCHIVE_MONTHS:
+        return True
+    # A whole date (`2026`, `202610`, `20261009`) when the dictionary
+    # wrote it unseparated, or a bare day / month number when it split
+    # the date across separators.
+    if _BACKUP_ARCHIVE_DATE_STEM_RE.match(part):
+        return True
+    return bool(re.fullmatch(r"\d{1,2}", part))
+
+
+def _backup_archive_stem_accepted(stem: str, host: str = "") -> bool:
+    """Does this bare stem (no directory, no extension) name a backup?
+
+    Accepted shapes, each one a column a dictionary walks:
+      * a known dictionary base name (`backup`, `db`, `www`);
+      * that base name compounded with a backup word in either order and
+        any separator (`database-backup`, `db_dump`, `backupdb`);
+      * an IP-octet chain (`84`, `84.180`, `65.20.84.180`);
+      * a date (`2026`, `202610`, `2026-10`, `20261009`);
+      * a month name, bare or with a year (`apr`, `april-2026`);
+      * the requested host, or its first label (`example.net`,
+        `example`) -- the domain-shaped sibling of the IP synthesis, for
+        scanners that build the filename from the target's identity.
+    """
+    if stem in _BACKUP_ARCHIVE_BASES:
+        return True
+    if _BACKUP_ARCHIVE_IP_STEM_RE.match(stem):
+        return True
+    if _BACKUP_ARCHIVE_DATE_STEM_RE.match(stem):
+        return True
+    month = _BACKUP_ARCHIVE_MONTH_STEM_RE.match(stem)
+    if month and month.group(1) in _BACKUP_ARCHIVE_MONTHS:
+        return True
+    # Compound: split on the separators the dictionaries use and require
+    # every part to be a part we recognise, with at least one of them a
+    # backup word. That is what makes `backup-april-2026`,
+    # `backup-2026-09` and `database-backup` one rule instead of a
+    # cross-product table. Also covers the glued spelling (`backupdb`).
+    parts = [part for part in re.split(r"[-_.]", stem) if part]
+    if len(parts) > 1:
+        words = [part in _BACKUP_ARCHIVE_COMPOUND_WORDS for part in parts]
+        if any(words) and all(
+            word or _backup_archive_stem_part(part)
+            for word, part in zip(words, parts)
+        ):
+            return True
+    for word in _BACKUP_ARCHIVE_COMPOUND_WORDS:
+        for glued in (stem.removeprefix(word), stem.removesuffix(word)):
+            if glued != stem and glued and glued in _BACKUP_ARCHIVE_BASES:
+                return True
+    if host:
+        bare_host = host.split(":", 1)[0].strip(".").lower()
+        if bare_host and stem in {bare_host, bare_host.split(".", 1)[0]}:
+            return True
+    return False
+
+
+def _backup_archive_match(path: str, host: str = "") -> str:
     """Return the lowercase extension family (e.g. 'tar.gz', 'zip') if
-    `path` matches a backup-archive shape, else ''. The matcher accepts
-    three stem shapes: a known dictionary base name, an IP-octet chain
-    (`84`, `84.180`, `65.20.84.180`), or a year / yearmonth / yearmonthday."""
+    `path` matches a backup-archive shape, else ''.
+
+    A single directory segment is allowed in front of the filename when
+    that segment is itself a dictionary base name (`/backup/db.sql`,
+    `/sql/dump.sql`, `/admin/backup.zip`). That is the same cross product
+    the base list already describes, asked for one level down: a sweep
+    that finds nothing at the webroot tries the directory a backup would
+    really be written to, and those were 404ing while the root-level
+    spelling answered.
+    """
     if not BACKUP_ARCHIVE_ENABLED:
         return ""
-    if not path.startswith("/") or path.count("/") != 1:
+    if not path.startswith("/"):
         return ""
     lowered = path[1:].lower()
     if not lowered:
         return ""
     for ext in _BACKUP_ARCHIVE_EXTS:
-        if lowered.endswith("." + ext):
-            stem = lowered[: -(len(ext) + 1)]
-            if not stem or not _BACKUP_ARCHIVE_STEM_RE.match(stem):
-                continue
-            if stem in _BACKUP_ARCHIVE_BASES:
-                return ext
-            if _BACKUP_ARCHIVE_IP_STEM_RE.match(stem):
-                return ext
-            if _BACKUP_ARCHIVE_DATE_STEM_RE.match(stem):
-                return ext
+        if not lowered.endswith("." + ext):
+            continue
+        stem = lowered[: -(len(ext) + 1)]
+        if not stem:
             return ""
+        split = _split_dir_leaf(stem)
+        if split is None:
+            return ""
+        directory, leaf = split
+        if directory and directory not in _BACKUP_ARCHIVE_DIRS:
+            return ""
+        if not _BACKUP_ARCHIVE_STEM_RE.match(leaf):
+            return ""
+        return ext if _backup_archive_stem_accepted(leaf, host) else ""
     return ""
 
 
-def is_backup_archive_path(path: str) -> bool:
-    return bool(_backup_archive_match(path))
+def is_backup_archive_path(path: str, host: str = "") -> bool:
+    return bool(_backup_archive_match(path, host))
+
+
+# --- SQLite application-database canary trap ----------------------------
+# The same dredging dictionaries that walk `<base>.<archive ext>` also walk
+# `<base>.db` / `.sqlite` / `.sqlite3`, because an embedded database left in
+# the webroot is the one file that carries the user table and the service
+# credentials together. Those spellings were 404ing: the archive matcher
+# deliberately owns only compressed/dump extensions, and serving a database
+# as a tarball would be a tell rather than a trap.
+#
+# The stem vocabulary is derived from the archive trap's base list rather
+# than hand-written, because the two dictionaries are the same dictionary
+# with a different suffix column -- a second hand-list is a second thing to
+# drift. Only the names that are specifically database filenames are added
+# on top.
+#
+# A real, well-formed database is what makes this worth serving. The
+# GCP-credential table above declined `credentials.db` on the grounds that
+# "a malformed SQLite is more revealing than a 404" -- true of a stub, but
+# the 1.7+ `wc.db` route already builds a genuine database with
+# `sqlite3.connect(":memory:")` + `serialize()`, so the premise no longer
+# holds. A client that opens this one gets a schema its queries survive,
+# and the credential rows sit where an application would really keep them.
+SQLITE_DB_ENABLED = _env_bool("HONEYPOT_SQLITE_DB_ENABLED")
+
+# Longest-first, same reason as the archive list: strip `.sqlite3` before
+# `.sqlite` would match a prefix of it.
+_SQLITE_DB_EXTS = ("sqlite3", "sqlite", "db")
+
+_SQLITE_DB_EXTRA_BASES = frozenset({
+    # Names that only ever appear as a database filename, so they are not
+    # in the archive base list.
+    "accounts", "analytics", "auth", "cache", "core", "customers",
+    "default", "identifier", "inventory", "jobs", "local", "mail", "main",
+    "master", "metrics", "orders", "products", "queue", "sessions",
+    "settings", "sqlite", "store", "wp",
+})
+
+# `<base>.db` under a directory an application really keeps its database
+# in. Root-level is covered without a prefix; these are the spellings a
+# sweep walks once the root-level names 404.
+_SQLITE_DB_DIRS = (
+    "db", "data", "database", "databases", "storage", "var", "private",
+    "backup", "backups", "sqlite", "app", "application", "writable",
+    "sites/default/files", "protected/data", "storage/app",
+)
+
+
+def _sqlite_db_bases() -> frozenset[str]:
+    """The archive dictionary's stems plus the database-only names.
+
+    Shared so a stem added for one dictionary cannot go missing from the
+    other; `.env` is dropped because a leading-dot stem is a config-file
+    name the canary table already owns, not a database name.
+    """
+    return frozenset(_BACKUP_ARCHIVE_BASES - {".env", "env"}) | _SQLITE_DB_EXTRA_BASES
+
+
+_SQLITE_DB_BASES = _sqlite_db_bases()
+
+# The gcloud CLI keeps OAuth material in two real SQLite files beside the
+# ADC JSON the credential table already answers. Named explicitly because
+# their schemas are specific and the client reading them is a credential
+# harvester that knows exactly which column it wants.
+_SQLITE_GCLOUD_CREDENTIALS = "credentials.db"
+_SQLITE_GCLOUD_ACCESS_TOKENS = "access_tokens.db"
+_SQLITE_GCLOUD_LEAVES = (
+    _SQLITE_GCLOUD_CREDENTIALS,
+    _SQLITE_GCLOUD_ACCESS_TOKENS,
+)
+# The dotted, undotted and bare-directory spellings, plus the absolute
+# home-directory variants the credential table already lifts for the ADC
+# JSON sibling. Resolved on first use because `_home_dir_variants` is
+# defined with the canary table, further down the module.
+_SQLITE_GCLOUD_DIRS = (".config/gcloud", "gcloud", ".gcloud", "config/gcloud")
+_SQLITE_GCLOUD_PATHS_CACHE: frozenset[str] | None = None
+
+
+def _sqlite_gcloud_paths() -> frozenset[str]:
+    global _SQLITE_GCLOUD_PATHS_CACHE
+    if _SQLITE_GCLOUD_PATHS_CACHE is None:
+        paths = {
+            f"/{directory}/{leaf}"
+            for directory in _SQLITE_GCLOUD_DIRS
+            for leaf in _SQLITE_GCLOUD_LEAVES
+        }
+        # `_home_dir_variants` already returns an absolute path.
+        paths |= {
+            variant.lower()
+            for leaf in _SQLITE_GCLOUD_LEAVES
+            for variant in _home_dir_variants(f".config/gcloud/{leaf}")
+        }
+        _SQLITE_GCLOUD_PATHS_CACHE = frozenset(paths)
+    return _SQLITE_GCLOUD_PATHS_CACHE
+
+
+def _sqlite_db_match(path: str) -> str:
+    """Return the database flavour this path asks for, else ''.
+
+    `'gcloud-credentials'` / `'gcloud-tokens'` for the two named gcloud
+    files, otherwise the lowercase extension (`'db'`, `'sqlite'`,
+    `'sqlite3'`) for a generic application database.
+    """
+    if not SQLITE_DB_ENABLED:
+        return ""
+    if not path.startswith("/"):
+        return ""
+    lowered = path[1:].lower()
+    if not lowered:
+        return ""
+    if ("/" + lowered) in _sqlite_gcloud_paths():
+        if lowered.endswith(_SQLITE_GCLOUD_ACCESS_TOKENS):
+            return "gcloud-tokens"
+        return "gcloud-credentials"
+    for ext in _SQLITE_DB_EXTS:
+        if not lowered.endswith("." + ext):
+            continue
+        stem = lowered[: -(len(ext) + 1)]
+        if not stem:
+            return ""
+        split = _split_dir_leaf(stem)
+        if split is None:
+            return ""
+        directory, leaf = split
+        if directory and directory not in _SQLITE_DB_DIRS:
+            return ""
+        if not _BACKUP_ARCHIVE_STEM_RE.match(leaf):
+            return ""
+        if leaf in _SQLITE_DB_BASES:
+            return ext
+        # `db1` / `db2` / `app2` — a trailing index on a base name is how
+        # a second database on the same box gets named.
+        trimmed = leaf.rstrip("0123456789")
+        if trimmed != leaf and trimmed in _SQLITE_DB_BASES:
+            return ext
+        return ""
+    return ""
+
+
+def is_sqlite_db_path(path: str) -> bool:
+    return bool(_sqlite_db_match(path))
 
 
 def utc_now() -> str:
@@ -43299,6 +43589,208 @@ def _build_backup_archive_body(r: dict[str, object], ext_family: str) -> tuple[b
     return _make_tar("w:gz"), "application/gzip"
 
 
+def _fake_oauth_blob(length: int) -> str:
+    """Per-hit random body for an OAuth token, to `length` characters.
+
+    Google's refresh and access tokens are opaque strings whose prefix
+    (`1//0g`, `ya29.`) is the part a harvester greps for; the remainder
+    only has to be the right shape and length. Random per hit for the
+    same reason every other filler here is: a fixed literal would be one
+    string shared by every host serving this trap.
+    """
+    alphabet = string.ascii_letters + string.digits + "-_"
+    return "".join(secrets.choice(alphabet) for _ in range(max(length, 1)))
+
+
+def _build_sqlite_db_body(r: dict[str, object], flavour: str) -> tuple[bytes, str]:
+    """Build a real SQLite database for a `.db` / `.sqlite` trap hit.
+
+    Returns (body_bytes, content_type). Built in memory and serialized, so
+    what ships is a genuine database file: a harvester that opens it with
+    `sqlite3` gets a schema its queries survive, and the credential rows
+    sit in the table an application would really keep them in. The two
+    gcloud flavours use that CLI's own schemas, because the client asking
+    for those filenames knows which column it wants.
+
+    Every secret-shaped value is per-hit: the AWS triple is the issued
+    canary, and the password / hash / token fillers are freshly random.
+    """
+    aws = _aws(r)
+    connection = sqlite3.connect(":memory:")
+    try:
+        if flavour in ("gcloud-credentials", "gcloud-tokens"):
+            account = "deploy@prod.iam.gserviceaccount.com"
+            if flavour == "gcloud-tokens":
+                connection.executescript(
+                    """
+                    CREATE TABLE access_tokens (
+                      account_id TEXT PRIMARY KEY,
+                      access_token TEXT,
+                      token_expiry TIMESTAMP,
+                      rapt_token TEXT,
+                      id_token TEXT
+                    );
+                    """
+                )
+                expiry = (datetime.now(UTC) + timedelta(minutes=47)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                connection.execute(
+                    "INSERT INTO access_tokens VALUES (?, ?, ?, ?, ?)",
+                    (
+                        account,
+                        f"ya29.{_fake_oauth_blob(132)}",
+                        expiry,
+                        None,
+                        None,
+                    ),
+                )
+            else:
+                connection.executescript(
+                    """
+                    CREATE TABLE credentials (
+                      account_id TEXT PRIMARY KEY,
+                      value TEXT
+                    );
+                    """
+                )
+                # `value` is the serialized oauth2client blob gcloud
+                # writes; the refresh token is the field a harvester
+                # reads out of it.
+                value = json.dumps(
+                    {
+                        "client_id": "32555940559.apps.googleusercontent.com",
+                        "client_secret": "ZmssLNjJy2998hD4CTg2ejr2",
+                        "refresh_token": f"1//0g{_fake_oauth_blob(96)}",
+                        "type": "authorized_user",
+                        "scopes": [
+                            "https://www.googleapis.com/auth/cloud-platform"
+                        ],
+                    },
+                    sort_keys=True,
+                )
+                connection.execute(
+                    "INSERT INTO credentials VALUES (?, ?)", (account, value)
+                )
+        else:
+            connection.executescript(
+                """
+                CREATE TABLE users (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  username TEXT UNIQUE NOT NULL,
+                  email TEXT,
+                  password_hash TEXT,
+                  role TEXT,
+                  created_at TIMESTAMP
+                );
+                CREATE TABLE settings (
+                  key TEXT PRIMARY KEY,
+                  value TEXT
+                );
+                CREATE TABLE sessions (
+                  id TEXT PRIMARY KEY,
+                  user_id INTEGER,
+                  payload TEXT,
+                  last_activity INTEGER
+                );
+                CREATE TABLE migrations (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  migration TEXT NOT NULL,
+                  batch INTEGER NOT NULL
+                );
+                """
+            )
+            created = (datetime.now(UTC) - timedelta(days=412)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            connection.executemany(
+                "INSERT INTO users (username, email, password_hash, role, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (
+                    ("admin", "admin@internal.lan", _fake_bcrypt_hash(), "admin", created),
+                    ("deploy", "deploy@internal.lan", _fake_bcrypt_hash(), "service", created),
+                    ("svc_reports", "reports@internal.lan", _fake_bcrypt_hash(), "service", created),
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO settings (key, value) VALUES (?, ?)",
+                (
+                    ("aws_access_key_id", aws.get("awsAccessKeyId", "")),
+                    ("aws_secret_access_key", aws.get("awsSecretAccessKey", "")),
+                    ("aws_session_token", aws.get("awsSessionToken", "")),
+                    ("aws_default_region", "us-east-1"),
+                    ("s3_backup_bucket", "prod-backups"),
+                    ("db_host", "db.internal"),
+                    ("db_user", "appuser"),
+                    ("db_name", "prod"),
+                    ("db_password", _fake_db_password()),
+                    ("smtp_host", "smtp.internal"),
+                    ("smtp_user", "no-reply@internal.lan"),
+                    ("smtp_password", _fake_db_password()),
+                    ("app_key", f"base64:{_fake_app_secret_key()}="),
+                    ("app_env", "production"),
+                    ("app_debug", "false"),
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO migrations (migration, batch) VALUES (?, ?)",
+                (
+                    ("2023_01_14_000000_create_users_table", 1),
+                    ("2023_02_02_000000_create_settings_table", 1),
+                    ("2024_06_19_000000_add_role_to_users", 2),
+                ),
+            )
+        connection.commit()
+        return connection.serialize(), "application/vnd.sqlite3"
+    finally:
+        connection.close()
+
+
+async def _send_sqlite_db(
+    request: web.Request,
+    request_id: str,
+    path: str,
+    client_ip: str,
+    host: str,
+    user_agent: str,
+    proto: str,
+    log_context: dict[str, object],
+) -> web.Response:
+    """SQLite application-database canary trap. Dispatch is gated on
+    `API_KEY` and `SQLITE_DB_ENABLED`; the pattern match runs first via
+    `is_sqlite_db_path`."""
+    flavour = _sqlite_db_match(path)
+    tracebit_response = await _get_or_issue_canary(
+        ("aws",), client_ip, request_id, host, user_agent, path, proto,
+    )
+    if tracebit_response is None:
+        append_log({**log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": "sqlite-db-error"})
+        return _credential_failure_response()
+    try:
+        body, content_type = _build_sqlite_db_body(tracebit_response, flavour)
+    except Exception as exc:  # noqa: BLE001 — render bugs shouldn't crash the sensor
+        append_log({
+            **log_context, "status": CREDENTIAL_FAILURE_STATUS, "result": "sqlite-db-render-error",
+            "error": _exc_detail(exc)[:400],
+        })
+        return _credential_failure_response()
+    response = web.Response(status=200, body=body)
+    response.headers["Content-Type"] = content_type
+    response.headers["Cache-Control"] = "no-store"
+    filename = header_safe_path(path.lstrip("/").replace('"', ''))
+    if filename:
+        response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    append_log({
+        **log_context,
+        "status": 200,
+        "result": "sqlite-db",
+        "dbFlavour": flavour,
+        "canaryTypes": [k for k, v in tracebit_response.items() if v],
+        "bytes": len(body),
+    })
+    return response
+
+
 async def _send_backup_archive(
     request: web.Request,
     request_id: str,
@@ -43312,7 +43804,7 @@ async def _send_backup_archive(
     """Backup-archive canary trap. Dispatch is gated on `API_KEY` and
     `BACKUP_ARCHIVE_ENABLED`; pattern match runs first via
     `is_backup_archive_path`."""
-    ext_family = _backup_archive_match(path)
+    ext_family = _backup_archive_match(path, host)
     tracebit_response = await _get_or_issue_canary(
         ("aws",), client_ip, request_id, host, user_agent, path, proto,
     )
@@ -45100,12 +45592,22 @@ async def handle(request: web.Request) -> web.StreamResponse:
     ):
         return await _handle_payment_api(request, log_context, path, request_body)
 
+    # Embedded-database trap runs on the same terms as the archive trap
+    # below: after the exact-path canary lookup, so the named databases
+    # that already have a dedicated renderer (the 1.7+ `/.svn/wc.db`
+    # working copy) keep it, and only a `<base>.db` / `.sqlite` shape no
+    # other route claimed reaches here.
+    if API_KEY and SQLITE_DB_ENABLED and is_sqlite_db_path(path):
+        return await _send_sqlite_db(
+            request, request_id, path, client_ip, host, user_agent, proto, log_context,
+        )
+
     # Backup-archive pattern trap runs after exact-path canary lookup so
     # that explicit entries (e.g. `/backup.sql` -> sql-dump trap) keep
     # their dedicated renderer. Anything matching the broader
     # `<base>.<ext>` shape (including IP-octet / date synthesis stems)
     # lands here.
-    if API_KEY and BACKUP_ARCHIVE_ENABLED and is_backup_archive_path(path):
+    if API_KEY and BACKUP_ARCHIVE_ENABLED and is_backup_archive_path(path, host):
         return await _send_backup_archive(
             request, request_id, path, client_ip, host, user_agent, proto, log_context,
         )

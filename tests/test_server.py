@@ -692,6 +692,14 @@ def test_all_trap_families_default_on():
         "the op=get step spends a canary, so the listing steps cost "
         "nothing upstream."
     )
+    assert tbenv.SQLITE_DB_ENABLED, (
+        "HONEYPOT_SQLITE_DB_ENABLED should default to True — the same "
+        "dictionary that walks `<base>.<archive ext>` walks "
+        "`<base>.db` / `.sqlite` in the same pass, and a database is the "
+        "one file that carries the user table and the service credential "
+        "together, so answering the archive column while 404ing this one "
+        "splits a single sweep across two outcomes."
+    )
     assert tbenv.SSRF_RELAY_ENABLED
     assert tbenv.CODE_EXEC_API_ENABLED, (
         "HONEYPOT_CODE_EXEC_API_ENABLED should default to True — it issues "
@@ -12881,6 +12889,50 @@ def test_backup_archive_enabled_by_default():
     ("/2025.zip", "zip"),
     ("/202603.tar.gz", "tar.gz"),
     ("/20260310.zip", "zip"),
+    # Separated date spellings — the numeric-only form was missing these
+    # while the same dictionary pass walked both.
+    ("/2026-09.zip", "zip"),
+    ("/2026-10.sql", "sql"),
+    ("/2026_10_09.tar.gz", "tar.gz"),
+    # Month names, bare and with a year on either side. A hand-rotated
+    # backup is named after the month, not the epoch.
+    ("/apr.zip", "zip"),
+    ("/april.sql", "sql"),
+    ("/april-2026.zip", "zip"),
+    ("/2026-april.zip", "zip"),
+    ("/sept.tar.gz", "tar.gz"),
+    # Compound stems: a base name glued to a backup word, in either
+    # order and with any separator, optionally carrying a date.
+    ("/database-backup.zip", "zip"),
+    ("/db_dump.sql", "sql"),
+    ("/backupdb.zip", "zip"),
+    ("/dbdump.sql", "sql"),
+    ("/backup-april-2026.zip", "zip"),
+    ("/backup-2026-09.zip", "zip"),
+    ("/backup-202610.zip", "zip"),
+    ("/config_backup.zip", "zip"),
+    # Uncompressed dump spellings walked in the same column as `.sql`.
+    ("/backup.dump", "dump"),
+    ("/db.dmp", "dmp"),
+    ("/database.pgsql", "pgsql"),
+    ("/dump.psql", "psql"),
+    ("/dump.rdb", "rdb"),
+    # One directory segment, when that segment is itself a base name:
+    # the same cross product asked for one level down.
+    ("/sql/db.sql", "sql"),
+    ("/backup/dump.sql", "sql"),
+    ("/backups/db.sql", "sql"),
+    ("/admin/backup.sql", "sql"),
+    ("/wp-content/mysql.sql", "sql"),
+    ("/backup/backup.tar.gz", "tar.gz"),
+    # Engine / webroot / generic leaf names walked beside `backup`.
+    ("/mysql.sql", "sql"),
+    ("/postgres.sql", "sql"),
+    ("/schema.sql", "sql"),
+    ("/wwwroot.zip", "zip"),
+    ("/webroot.tar.gz", "tar.gz"),
+    ("/latest.zip", "zip"),
+    ("/credentials.zip", "zip"),
 ])
 def test_is_backup_archive_path_matches(path, ext):
     assert tbenv.is_backup_archive_path(path), f"expected match: {path}"
@@ -12901,6 +12953,28 @@ def test_is_backup_archive_path_matches(path, ext):
     "/.tar.gz",
     "/",
     "//backup.zip",  # double-slash isn't accepted by the regex
+    "/backup//db.sql",  # same, with the empty segment in the middle
+    # More than one directory segment, or a directory a backup would not
+    # be written to. The one allowed segment has to be a base name.
+    "/a/b/c.zip",
+    "/wp-content/uploads/backup.zip",
+    "/vendor/backup.zip",
+    "/assets/backup.zip",
+    # `.bak` belongs to the app-config leftover family, which answers it
+    # with the named file's own renderer. Claiming it here would replace
+    # a correct answer with a tarball.
+    "/config.php.bak",
+    "/web.config.bak",
+    # `.db` / `.sqlite` belong to the embedded-database trap, which
+    # serves a real database rather than an archive.
+    "/database.sqlite",
+    "/app.db",
+    # A compound needs at least one backup word — two bare base names
+    # glued together is not a backup filename.
+    "/www-site.zip",
+    # A month-shaped stem that is not a month.
+    "/aprz.zip",
+    "/banana.zip",
 ])
 def test_is_backup_archive_path_non_match(path):
     assert not tbenv.is_backup_archive_path(path), f"unexpected match: {path}"
@@ -12909,6 +12983,24 @@ def test_is_backup_archive_path_non_match(path):
 def test_is_backup_archive_path_disabled_returns_false(monkeypatch):
     monkeypatch.setattr(tbenv, "BACKUP_ARCHIVE_ENABLED", False)
     assert not tbenv.is_backup_archive_path("/backup.tar.gz")
+
+
+@pytest.mark.parametrize("path", [
+    "/example.net.zip",
+    "/example.net.tar.gz",
+    "/example.zip",
+    "/example.7z",
+])
+def test_host_derived_stem_matches_only_the_requested_host(path):
+    """The domain-shaped sibling of the IP synthesis: a scanner builds
+    the filename from the target's identity. Scoped to the host on the
+    request, so it cannot turn into a wildcard on dotted stems."""
+    assert tbenv.is_backup_archive_path(path, "example.net"), path
+    assert tbenv.is_backup_archive_path(path, "example.net:8443"), path
+    # Another host's name is not a backup filename here.
+    assert not tbenv.is_backup_archive_path(path, "unrelated.test"), path
+    # And without a host there is nothing to compare against.
+    assert not tbenv.is_backup_archive_path(path), path
 
 
 def test_build_backup_archive_body_zip_is_valid_zip():
