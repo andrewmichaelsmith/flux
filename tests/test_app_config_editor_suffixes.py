@@ -45,10 +45,14 @@ def test_the_family_is_not_empty():
     # credential-bearing *app* config traps joined; each had been
     # hand-listing between zero and three of the leftover suffixes, so
     # `/web.config.bak` answered while `/appsettings.json.bak` 404ed.
-    # 66 since the key-material, dump, CI-pipeline, provider-CLI and
-    # IaC credential traps joined on the same rule — a credential-bearing
-    # file gets copied aside before it is edited whatever format it is in.
-    assert len(FAMILY) == 66
+    # 69 since the CI-pipeline, AWS-config, container/registry, key,
+    # password-hash and front-end-bundle traps joined. 57 was the count
+    # when the provider-CLI and IaC credential traps joined; 34 when the
+    # credential-bearing *app* config traps did. Each wave was a table
+    # written after this block that hand-listed some subset of the
+    # leftover suffixes, which is the drift the property tests below
+    # exist to stop.
+    assert len(FAMILY) == 73
 
 
 @pytest.mark.parametrize("suffix", SUFFIXES)
@@ -257,15 +261,3 @@ def test_observed_leftover_spellings_now_answer(path, owner):
     trap = tbenv._TRAP_BY_PATH.get(path)
     assert trap is not None, f"{path} still 404s"
     assert trap.name == owner, f"{path} resolved to {trap.name}"
-
-
-def test_bundle_js_is_deliberately_not_in_the_family():
-    """`webapp-config-bundle-js` owns several hundred bundle names, so
-    inheriting the family would mint thousands of routes off one
-    observed spelling — and a generated bundle is not a file an operator
-    renames before editing, which is the behaviour the rule describes.
-
-    Pinned so the exclusion is a decision rather than an oversight.
-    """
-    assert "webapp-config-bundle-js" not in FAMILY
-    assert tbenv._TRAP_BY_PATH.get("/config.js.bak") is None

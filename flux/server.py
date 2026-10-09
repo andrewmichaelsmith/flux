@@ -31131,13 +31131,6 @@ _APP_CONFIG_SUFFIX_FAMILY = frozenset({
     # Provider-CLI credential file, same rule as `s3cfg` / `rclone-conf`
     # which are already here.
     "ovh-conf",
-    # Deliberately NOT joined: `webapp-config-bundle-js`. Its one
-    # observed leftover spelling is real, but that trap owns several
-    # hundred bundle names, so inheriting the family would mint
-    # thousands of routes off a single spelling — and a generated
-    # bundle is not a file an operator renames before editing, which is
-    # the behaviour the rule describes. If that spelling earns a
-    # response it belongs on the trap, not inherited from here.
     # Provider-CLI and IaC credential files. The family comment above
     # already states the rule these satisfy — "a credentials file is
     # exactly the file an operator copies aside before rotating it" — but
@@ -31171,6 +31164,37 @@ _APP_CONFIG_SUFFIX_FAMILY = frozenset({
     "terraform-tfstate",
     "terraform-tfvars",
     "terraform-tfvars-json",
+    # CI pipeline definitions. These carry the deploy credential inline --
+    # a registry login, a cloud key, a signing token -- which is the whole
+    # reason a sweep asks for them, and a pipeline file is hand-edited far
+    # more often than an application config. Each was answering its own
+    # name and 404ing its leftover copy, so a dictionary walking
+    # `<ci file>` and `<ci file>.bak` in one pass split across two
+    # outcomes: the drift this block exists to close, reappearing because
+    # these tables were written after it.
+    "gitlab-ci",
+    "bitbucket-pipelines",
+    "generic-ci-config",
+    # Cloud / container / package-registry credential files whose own
+    # tables listed no leftover spelling at all. (`ovh-conf` and the rest
+    # of the provider-CLI table are already here.)
+    "aws-config-file",
+    "docker-config",
+    "codex-auth",
+    "yarnrc",
+    "yarnrc-yml",
+    # Secret-bearing files that are not INI-shaped but get copied aside
+    # for exactly the same reason: a key file and a password-hash file are
+    # the two an operator backs up before rotating them. Both answer with
+    # an issued canary, so the leftover copy is replay-detectable on the
+    # same terms as the original.
+    "ssh-private-key",
+    "authorized-keys",
+    "htpasswd",
+    # A front-end config bundle is generated, but it is also hand-patched
+    # on the box when a key changes, and the leftover is what then sits
+    # next to the original as readable plain text.
+    "webapp-config-bundle-js",
 })
 for _trap in CANARY_TRAPS:
     if _trap.name not in _APP_CONFIG_SUFFIX_FAMILY:
