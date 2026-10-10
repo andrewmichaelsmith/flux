@@ -21,7 +21,8 @@ from tests.test_server import flux_client, _log_entries  # noqa: F401
     "/config.ini", "/conf.ini", "/settings.ini", "/app.ini",
     "/database.ini", "/db.ini", "/secrets.ini", "/credentials.ini",
     "/config/config.ini", "/config/database.ini", "/config/settings.ini",
-    "/app.config",
+    "/dbconfig.ini", "/config/dbconfig.ini", "/inc/config.ini",
+    "/includes/config.ini", "/app.config",
 ])
 def test_ini_paths_resolve_to_the_ini_family(path):
     trap = tbenv._TRAP_BY_PATH.get(path)

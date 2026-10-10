@@ -30574,6 +30574,11 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/config/config.ini",
             "/config/database.ini",
             "/config/settings.ini",
+            # Probed beside the others in the same sweeps.
+            "/dbconfig.ini",
+            "/config/dbconfig.ini",
+            "/inc/config.ini",
+            "/includes/config.ini",
             # `.NET`'s own name for the same file. XML rather than INI on
             # disk, but it is walked in the same pass as `config.ini` by
             # the same dictionaries and the credential slots are
