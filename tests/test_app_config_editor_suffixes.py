@@ -40,7 +40,7 @@ def test_the_family_is_not_empty():
     # 34 since the credential-bearing config traps joined: each had been
     # hand-listing between zero and three of the leftover suffixes, so
     # `/web.config.bak` answered while `/appsettings.json.bak` 404ed.
-    assert len(FAMILY) == 34
+    assert len(FAMILY) == 36
 
 
 @pytest.mark.parametrize("suffix", SUFFIXES)

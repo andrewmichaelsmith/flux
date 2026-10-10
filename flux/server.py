@@ -5606,6 +5606,95 @@ def scan_headers(headers: object) -> dict[str, str]:
 _NO_SLASH_TRAVERSAL_RE = re.compile(r"([^/])\.\.(/)")
 
 
+# Path-generator leakage: the first segment is not a directory the sender
+# believes in, it is a fragment of the context the dictionary was expanded
+# in. Four shapes arrive, all from a template that was meant to build a
+# URL and instead pasted in its surroundings:
+#
+#   * `/~/...`          -- a home-directory reference that was never
+#                          expanded by a shell, so `~` travelled as a
+#                          literal path segment.
+#   * `/$(pwd)/...`     -- command substitution that was single-quoted (or
+#                          fed to a tool that does not invoke a shell), so
+#                          the substitution text itself became a segment.
+#   * `/localhost/...`  -- a host that belonged in the authority component
+#                          and was concatenated into the path instead.
+#   * `/:443/...`       -- the same mistake one component further on: a
+#                          port, colon included, left in the path.
+#
+# The port form is a closed set of the web ports these dictionaries
+# actually carry, not a `\d{1,5}` range, and that is deliberate: a colon
+# port in the path is *meaningful* to the traps that model an SSRF reach
+# onto a service port -- the daemon-API trap reads `:2375` as the whole
+# point of the request. Stripping every port would delete that signal in
+# order to recover a credential path nobody probes on those ports. A
+# closed set cannot collide with a service port a handler gives meaning
+# to; add a port here only when a dictionary is seen carrying it.
+#
+# None of them is a directory any server would have. Stripping the segment
+# recovers the path the sender was actually asking for, which is the whole
+# point: these spellings arrive on credential-file dictionaries, and
+# answering them turns a 404 into an issued canary on a family that is
+# already built. The raw spelling is kept verbatim in the log (`rawPath`),
+# and the stripped segment is stamped as its own field, because *which*
+# leak a sweep carries is a property of its path generator and so
+# separates tooling families that otherwise share a dictionary.
+#
+# Deliberately narrow. `~` matches only as a whole segment, so a real
+# per-user webroot (`/~alice/...`) is untouched; the port form requires a
+# leading colon and digits only. A plausible subdirectory is never
+# stripped -- `/blog/.env` keeps routing as the subdirectory request it
+# might really be.
+_INJECTED_WEB_PORTS = ("80", "443", "8080", "8443")
+_INJECTED_PATH_PREFIX_RE = re.compile(
+    r"^/(?:~|\$\(pwd\)|localhost|:(?:"
+    + "|".join(_INJECTED_WEB_PORTS)
+    + r"))(?=/)"
+)
+_INJECTED_PREFIX_MAX_STRIPS = 3
+
+
+def strip_injected_path_prefix(path: str) -> tuple[str, str]:
+    """Split `path` into (injected prefix, remaining path).
+
+    Returns `("", path)` when nothing was injected. Bounded, because a
+    sender can stack the segments (`/~/$(pwd)/.env` is one template
+    pasting twice) and an unbounded loop over attacker-chosen input is a
+    cost we do not need to take.
+    """
+    stripped = path
+    removed: list[str] = []
+    for _ in range(_INJECTED_PREFIX_MAX_STRIPS):
+        m = _INJECTED_PATH_PREFIX_RE.match(stripped)
+        if not m:
+            break
+        removed.append(m.group()[1:])
+        stripped = stripped[m.end():]
+        if not stripped.startswith("/"):
+            stripped = "/" + stripped
+    if not removed:
+        return "", path
+    return "/".join(removed), (stripped or "/")
+
+
+def _injected_prefix_of(raw_path: str) -> str:
+    """The injected segment(s) `normalize_path` would strip from a raw
+    request target, or `""`. Decodes first for the same reason
+    `normalize_path` does: the segment arrives percent-encoded as often
+    as it arrives literally, and a log field that only sees one spelling
+    reports the sweep that used the other as having no leak at all."""
+    decoded = raw_path or "/"
+    for _ in range(4):
+        nxt = unquote(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+    collapsed = re.sub(r"/+", "/", decoded)
+    if not collapsed.startswith("/"):
+        collapsed = "/" + collapsed
+    return strip_injected_path_prefix(collapsed)[0]
+
+
 # Characters that cannot appear in an HTTP header value: the C0 controls
 # and DEL. `normalize_path` percent-DECODES the request target before
 # dispatch (so `%2eenv` routes as `.env`), which means a scanner probing
@@ -5648,6 +5737,9 @@ def normalize_path(raw_path: str) -> str:
          Capped at 4 passes so a pathological `%2525252525…` chain can't
          spin.
       2. Collapse runs of `/`
+      2a. Strip an injected first segment that is not a directory -- `~`,
+         `$(pwd)`, `localhost`, `:<port>`. See
+         `strip_injected_path_prefix`.
       3. Repair the no-slash traversal-bypass shape: `xxx../yyy` →
          `xxx/../yyy`. Scanners use this against parsers that treat
          `..` as a path-up token even without a leading slash; without
@@ -5670,6 +5762,13 @@ def normalize_path(raw_path: str) -> str:
     collapsed = re.sub(r"/+", "/", decoded)
     if not collapsed.startswith("/"):
         collapsed = "/" + collapsed
+    # Drop path-generator leakage (`/~/`, `/$(pwd)/`, `/localhost/`,
+    # `/:443/`) before dispatch, so the credential-file families already
+    # in the table answer these spellings instead of 404ing. After the
+    # decode, because the segment arrives percent-encoded as often as not
+    # (`/%24%28pwd%29/.env`); before the traversal repair, so a stripped
+    # path still gets `..` resolved normally.
+    _, collapsed = strip_injected_path_prefix(collapsed)
     repaired = _NO_SLASH_TRAVERSAL_RE.sub(r"\1/..\2", collapsed)
     while repaired != collapsed:
         collapsed = repaired
@@ -20749,6 +20848,11 @@ _ENV_FILE_SUFFIXES: tuple[str, ...] = (
     ".dist", ".override", ".private", ".remote",
     ".json", ".yaml", ".yml", ".txt", ".toml",
     "1", "2",
+    # Dotted spelling of the same rotation counter. `1`/`2` covered
+    # `/.env1` while the dictionaries walk `/.env.1` and `/.env.2`, so
+    # the separator -- not the counter -- decided whether a canary was
+    # served; the dotted form fell through to the generic tarpit.
+    ".1", ".2", ".3",
     "_bak", "_old", "_orig", "_copy", "_priv", "_example",
     # Editor scratch / operator rename-workflow variants harvesters walk
     # alongside `.bak` / `.old`. Distinct paths, same render — the missing
@@ -20959,6 +21063,13 @@ def _env_production_paths() -> tuple[str, ...]:
         paths.append(f"/.env{suffix}")
     # `/.environ` (no separator) is a recurring entry in newer harvesters.
     paths.append("/.environ")
+    # Flask's own dotenv filename. `python-dotenv` reads `.flaskenv` for
+    # non-secret config and `.env` for secrets, but projects routinely put
+    # both in either file, which is why credential dictionaries walk it
+    # beside `.env`. Same KEY=VALUE body, so it takes the same renderer.
+    paths.append("/.flaskenv")
+    for prefix in _ENV_WEBROOT_PREFIXES:
+        paths.append(f"/{prefix}/.flaskenv")
 
     # Group 2 — webroot-prefix cross-product. Each prefix gets every
     # suffix variant so the scanner's per-prefix dictionary walk lands
@@ -26098,6 +26209,99 @@ def render_generic_config_toml(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_generic_config_ini(r: dict[str, object]) -> bytes:
+    """`config.ini` -- the oldest spelling of the same generic app config.
+
+    The family already answers the PHP, Python, YAML, TOML, JSON and
+    Java-properties spellings of this file; INI was the one format
+    missing, which is why a dictionary walking all seven got six canaries
+    and one 404. Section syntax rather than properties' flat `key=value`,
+    because `configparser` is what reads this file and a harvester that
+    actually loads the file should get something that parses.
+    """
+    aws = _aws(r)
+    return (
+        "; Application configuration -- production.\n"
+        "[app]\n"
+        "name = app\n"
+        "env = production\n"
+        f"secret_key = {_fake_app_secret_key()}\n"
+        "debug = false\n"
+        "\n"
+        "[database]\n"
+        "host = db.internal\n"
+        "port = 5432\n"
+        "name = app_production\n"
+        "user = app_prod\n"
+        f"password = {_fake_db_password()}\n"
+        "sslmode = require\n"
+        "\n"
+        "[redis]\n"
+        "host = redis.internal\n"
+        "port = 6379\n"
+        f"password = {_fake_db_password()}\n"
+        "\n"
+        "[aws]\n"
+        "region = us-east-1\n"
+        "bucket = app-assets-prod\n"
+        f'aws_access_key_id = {aws.get("awsAccessKeyId", "")}\n'
+        f'aws_secret_access_key = {aws.get("awsSecretAccessKey", "")}\n'
+        f'aws_session_token = {aws.get("awsSessionToken", "")}\n'
+        "\n"
+        "[smtp]\n"
+        "host = smtp.internal\n"
+        "port = 587\n"
+        "user = no-reply@app.internal\n"
+        f"password = {_fake_db_password()}\n"
+    ).encode("utf-8")
+
+
+def render_htaccess(r: dict[str, object]) -> bytes:
+    """`.htaccess` -- Apache per-directory config.
+
+    Worth a canary rather than a 404 because of what operators put in it:
+    `SetEnv` is the documented way to hand an application a credential
+    without a `.env` file, so a harvester that greps this file for key
+    material is not being unreasonable. The rewrite rules and the
+    `.htpasswd` reference are the furniture that makes the file read as a
+    real one -- and the `AuthUserFile` line names the sibling the family
+    already answers, so the file suggests its own next request.
+    """
+    aws = _aws(r)
+    return (
+        "# Apache per-directory configuration.\n"
+        "Options -Indexes +FollowSymLinks\n"
+        "\n"
+        "<IfModule mod_rewrite.c>\n"
+        "  RewriteEngine On\n"
+        "  RewriteBase /\n"
+        "  RewriteCond %{REQUEST_FILENAME} !-f\n"
+        "  RewriteCond %{REQUEST_FILENAME} !-d\n"
+        "  RewriteRule ^ index.php [L]\n"
+        "</IfModule>\n"
+        "\n"
+        "# Application environment. Set here so the app does not need a\n"
+        "# .env file on this host.\n"
+        "<IfModule mod_env.c>\n"
+        "  SetEnv APP_ENV production\n"
+        f'  SetEnv AWS_ACCESS_KEY_ID {aws.get("awsAccessKeyId", "")}\n'
+        f'  SetEnv AWS_SECRET_ACCESS_KEY {aws.get("awsSecretAccessKey", "")}\n'
+        f'  SetEnv AWS_SESSION_TOKEN {aws.get("awsSessionToken", "")}\n'
+        "  SetEnv AWS_DEFAULT_REGION us-east-1\n"
+        f"  SetEnv DB_PASSWORD {_fake_db_password()}\n"
+        "</IfModule>\n"
+        "\n"
+        "AuthType Basic\n"
+        "AuthName \"Restricted\"\n"
+        "AuthUserFile /var/www/.htpasswd\n"
+        "Require valid-user\n"
+        "\n"
+        "<FilesMatch \"^\\.(env|git)\">\n"
+        "  Require all denied\n"
+        "</FilesMatch>\n"
+    ).encode("utf-8")
+
+
 def render_app_config_json(r: dict[str, object]) -> bytes:
     """`env.json` / `local.settings.json` / `/api/config` — the JSON
     config blob. `/api/config` is the runtime-introspection variant:
@@ -30228,6 +30432,33 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # `webapp-config-bundle-json` / `appsettings-json`.
             "/app-config.json",
             "/push_config.json",
+            # Short spelling of the base name. A dictionary that walks
+            # `/config.json` walks `/conf.json` in the same pass, and only
+            # the long form was answered.
+            "/conf.json",
+            "/conf.js",
+            # Topic-split JSON configs. An app that does not keep one
+            # config file splits it by concern, so the sweep that asks for
+            # `/config/database.json` asks for the mail and smtp siblings
+            # seconds later -- same credential slots, same body, and
+            # answering one while 404ing the rest splits one sweep across
+            # two outcomes. Mirrors how the properties family already
+            # generates its topic stems.
+            *(
+                f"/config/{stem}.json"
+                for stem in (
+                    # Generic app concerns only. The cloud-credential
+                    # filenames under this directory -- `aws.json`,
+                    # `credentials.json`, `s3.json` -- are deliberately
+                    # absent: they belong to the dedicated cloud families
+                    # (`aws-credentials-json`, `firebase-json`), and
+                    # claiming them here would shadow the layout walk that
+                    # resolves `/admin/config/aws.json` to the AWS
+                    # renderer.
+                    "database", "db", "mail", "smtp", "redis",
+                    "services", "auth", "session", "cache", "queue",
+                )
+            ),
         ),
         ("aws",),
         render_app_config_json,
@@ -30323,6 +30554,57 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_java_properties,
         "text/plain; charset=utf-8",
     ),
+    # The INI spelling of the generic app config. Every other spelling of
+    # this same file -- `.php`, `.py`, `.yaml`, `.toml`, `.json`,
+    # `.properties` -- already answers; `.ini` was the gap, so a single
+    # dictionary pass over the format set got six canaries and one 404 on
+    # the most conventional extension of the seven. Sustained demand
+    # across months and a wide source population, not a one-off spelling.
+    CanaryTrap(
+        "app-config-ini",
+        (
+            "/config.ini",
+            "/conf.ini",
+            "/settings.ini",
+            "/app.ini",
+            "/database.ini",
+            "/db.ini",
+            "/secrets.ini",
+            "/credentials.ini",
+            "/config/config.ini",
+            "/config/database.ini",
+            "/config/settings.ini",
+            # `.NET`'s own name for the same file. XML rather than INI on
+            # disk, but it is walked in the same pass as `config.ini` by
+            # the same dictionaries and the credential slots are
+            # identical; `web.config` proper is owned by `iis-web-config`.
+            "/app.config",
+            *_app_layout_variants("config.ini"),
+        ),
+        ("aws",),
+        render_generic_config_ini,
+        "text/plain; charset=utf-8",
+    ),
+    # Apache per-directory config. `SetEnv` is the documented way to hand
+    # an app a credential without a `.env` file, so this is a credential
+    # file in practice however it is classified -- and it is walked by the
+    # same secrets-dredge dictionaries that ask for `.env` and
+    # `wp-config.php`. The sibling `.htpasswd` already answers; this one
+    # 404ed, across months and a wide source population.
+    CanaryTrap(
+        "htaccess",
+        (
+            "/.htaccess",
+            "/.htaccess.bak",
+            "/.htaccess.old",
+            "/.htaccess.txt",
+            "/.htaccess~",
+            *_app_layout_variants(".htaccess"),
+        ),
+        ("aws",),
+        render_htaccess,
+        "text/plain; charset=utf-8",
+    ),
 )
 
 _TRAP_BY_PATH: dict[str, CanaryTrap] = {}
@@ -30416,6 +30698,12 @@ _APP_CONFIG_SUFFIX_FAMILY = frozenset({
     "sftp-config",
     "docker-compose",
     "serverless-config",
+    # Both join on the same membership rule as the rest: a config file
+    # that holds a credential gets copied aside before it is edited, so
+    # the leftover spellings are a property of the family rather than
+    # something each new table should re-list by hand.
+    "app-config-ini",
+    "htaccess",
 })
 for _trap in CANARY_TRAPS:
     if _trap.name not in _APP_CONFIG_SUFFIX_FAMILY:
@@ -31905,6 +32193,16 @@ def _log_context_from_request(request: web.Request, request_id: str, body_bytes_
         ),
         "path": path,
         "rawPath": raw_path,
+        # Present only when the request carried path-generator leakage,
+        # so the field's presence is exactly that signal and every other
+        # request keeps its existing log shape. Which leak a sweep
+        # carries is a property of its generator, so this separates
+        # tooling families that share a credential dictionary.
+        **(
+            {"injectedPathPrefix": _injected_prefix}
+            if (_injected_prefix := _injected_prefix_of(raw_path))
+            else {}
+        ),
         "rawTarget": raw_target,
         "query": query_string,
         "clientIp": client_ip,

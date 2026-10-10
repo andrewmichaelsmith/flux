@@ -16242,6 +16242,7 @@ def test_app_config_family_covers_expected_formats():
         "app-config-yaml",
         "app-config-toml",
         "app-config-json",
+        "app-config-ini",
         "app-config-properties",
     }
     canary_less = {"app-config-php-structural"}
