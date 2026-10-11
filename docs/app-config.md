@@ -149,11 +149,14 @@ spelling was observed 404ing while the original answered:
 `jenkinsfile` is pointedly **not** in the family: it curates its own
 single `.bak` spelling and a test asserts it keeps doing so, so it stays
 opt-out until a leftover spelling of it is actually observed.
-`webapp-config-bundle-js` is excluded on a different ground — a
-generated bundle is not a file an operator renames before editing, and
-the trap owns enough bundle names that inheriting the family would mint
-thousands of routes off one observed spelling. Both exclusions are
-pinned by tests so they read as decisions rather than oversights.
+`webapp-config-bundle-js`, by contrast, *is* in the family. It was
+argued both ways: a generated bundle is not obviously a file anyone
+renames before editing, and the trap owns enough bundle names that
+inheriting the family mints several thousand routes off it. The
+inclusion won on the narrower point that a front-end config bundle is
+hand-patched on the box when a key changes, and the leftover is what
+then sits next to the original as readable plain text — which is the
+behaviour the rule describes, generated or not.
 
 **Both spellings of a leftover are the same leftover.** `.tmp` and
 `.temp`, `.bak` and `.backup` differ only in how the operator typed it,
