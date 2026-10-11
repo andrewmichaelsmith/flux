@@ -153,3 +153,40 @@ def test_json_identifiers_are_per_hit_unique(path, field):
 def test_deploy_specs_are_disabled_with_the_canary_trap_master_switch(monkeypatch):
     monkeypatch.setattr(tbenv, "CANARY_TRAPS_ENABLED", False)
     assert not tbenv.CANARY_TRAPS_ENABLED
+
+
+# --- The environment-named GitHub Actions workflows -------------------
+# The workflow table answered every *stage* name a pipeline uses
+# (`deploy`, `release`, `cd`, `publish`) and none of the *environment*
+# names. The environment file is the one that holds the production push
+# credential — a `deploy.yml` usually calls a reusable workflow, while
+# `production.yml` is where the account-level secret gets referenced —
+# and the production spelling has the widest source population of
+# anything this directory is probed for and 404s.
+@pytest.mark.parametrize("path", [
+    "/.github/workflows/production.yml",
+    "/.github/workflows/production.yaml",
+    "/.github/workflows/staging.yml",
+    "/.github/workflows/staging.yaml",
+    "/.github/workflows/prod.yml",
+    "/.github/workflows/prod.yaml",
+    "/.github/workflows/dev.yml",
+    "/.github/workflows/dev.yaml",
+    "/.github/workflows/s3.yml",
+    "/.github/workflows/s3.yaml",
+    "/.github/workflows/tests.yml",
+    "/.github/workflows/tests.yaml",
+])
+def test_environment_named_workflows_resolve_to_the_workflow_trap(path):
+    trap = tbenv._TRAP_BY_PATH.get(path)
+    assert trap is not None, f"{path} still 404s"
+    assert trap.name == "github-actions-workflow", trap.name
+
+
+def test_the_stage_named_workflows_did_not_move():
+    """The names that already answered keep their owner — the additions
+    are new routes, not a re-route of existing ones."""
+    for name in ("deploy", "main", "ci", "build", "test", "docker",
+                 "release", "cd", "publish"):
+        trap = tbenv._TRAP_BY_PATH.get(f"/.github/workflows/{name}.yml")
+        assert trap is not None and trap.name == "github-actions-workflow", name

@@ -27338,6 +27338,32 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             # that walk this directory ask for it alongside `release`.
             "/.github/workflows/publish.yml",
             "/.github/workflows/publish.yaml",
+            # The environment-named deploy workflows. This list already
+            # answered every *stage* name a pipeline uses (`deploy`,
+            # `release`, `cd`, `publish`) but none of the *environment*
+            # names, and the environment file is the one that carries the
+            # production push credential — a `deploy.yml` usually calls a
+            # reusable workflow, while `production.yml` is where the
+            # account-level secret is actually referenced. Of everything
+            # this directory is probed for and 404s, the production
+            # spelling has the widest source population by a wide margin.
+            "/.github/workflows/production.yml",
+            "/.github/workflows/production.yaml",
+            "/.github/workflows/staging.yml",
+            "/.github/workflows/staging.yaml",
+            "/.github/workflows/prod.yml",
+            "/.github/workflows/prod.yaml",
+            "/.github/workflows/dev.yml",
+            "/.github/workflows/dev.yaml",
+            # Cloud-target spelling in the same walk; same reason as
+            # `docker.yml`, which is already here.
+            "/.github/workflows/s3.yml",
+            "/.github/workflows/s3.yaml",
+            # Plural of a name this list already owns. A dictionary
+            # cycling the set should not stop one spelling short of the
+            # issuance, which is the same reason `publish` was added.
+            "/.github/workflows/tests.yml",
+            "/.github/workflows/tests.yaml",
         ),
         ("aws",),
         render_github_actions_workflow,

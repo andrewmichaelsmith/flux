@@ -9,7 +9,7 @@ Pipelines files were all present in recent config-leak dictionaries.
 
 | Family | Paths |
 | --- | --- |
-| GitHub Actions | `/.github/workflows/deploy.yml`, `main.yml`, `ci.yml`, `build.yml`, `test.yml`, `docker.yml`, `release.yml`, `cd.yml`, `publish.yml` plus `.yaml` variants |
+| GitHub Actions | pipeline *stage* names `/.github/workflows/deploy.yml`, `main.yml`, `ci.yml`, `build.yml`, `test.yml`, `tests.yml`, `docker.yml`, `release.yml`, `cd.yml`, `publish.yml` and *environment* names `production.yml`, `staging.yml`, `prod.yml`, `dev.yml`, plus `s3.yml`; `.yaml` spellings and the editor/backup sibling set throughout |
 | GitLab CI | `/.gitlab-ci.yml`, `/.gitlab-ci.yaml`, `/.gitlab/.gitlab-ci.yml` |
 | Jenkins | `/Jenkinsfile`, `/Jenkinsfile.bak` |
 | Bitbucket | `/bitbucket-pipelines.yml`, `/bitbucket-pipelines.yaml` |
@@ -50,6 +50,15 @@ which nobody added. Travis was exactly that — `appveyor`, `drone` and
 pass split across served and unserved names for no reason a scanner could
 see. `publish.yml` was the same gap inside the GitHub Actions list, and it
 is the workflow most likely to hold registry and cloud push credentials.
+
+The same rot had a second axis. The list named every pipeline *stage*
+(`deploy`, `release`, `cd`, `publish`) and no *environment*
+(`production`, `staging`, `prod`, `dev`) — which inverts where the
+credential actually is, because a `deploy.yml` usually calls a reusable
+workflow while the environment file is where the account-level secret
+gets referenced. Of everything this directory is probed for and 404s,
+the production spelling had the widest source population by a wide
+margin.
 
 The `.env`-shaped sibling of these files (`/.github/secrets.env`) is not
 served here — it is owned by the `env-production` trap, which generates the
