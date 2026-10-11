@@ -109,3 +109,61 @@ async def test_all_zero_object_sha_stays_a_miss(flux_client, monkeypatch):
         headers={"X-Forwarded-For": "203.0.113.34"}, allow_redirects=False,
     )
     assert resp.status == 404
+
+
+# --- The all-zero object id must keep 404ing --------------------------
+# `0000000000000000000000000000000000000000` is git's null object id: a
+# sentinel the reflog uses for "no commit yet", never a real entry in an
+# object store. A genuinely exposed `.git` therefore 404s it, and a
+# server that fabricates object responses answers it — which makes the
+# request a cheap test of whether the host is making its tree up.
+#
+# So the 404 here is the *correct* response and the whole point of
+# serving a convincing tree. It is pinned as a test because it reads
+# like a coverage gap in the miss log: the path arrives under `.git`,
+# gets classified a fake-git miss, and sits near the top of any
+# ranking of unanswered git paths by source count. Answering it to
+# close that apparent gap would hand every sender a reliable
+# this-is-not-a-real-repo signal.
+@pytest.mark.parametrize("prefix", ["", "/app", "/api", "/wp-content"])
+async def test_null_object_id_is_not_served(flux_client, monkeypatch, prefix):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "issue_credentials", _fake_canary)
+    tbenv._FAKE_GIT_CACHE.clear()
+
+    null_sha = "0" * 40
+    resp = await flux_client.get(
+        f"{prefix}/.git/objects/{null_sha[:2]}/{null_sha[2:]}",
+        headers={"X-Forwarded-For": "203.0.113.41"}, allow_redirects=False,
+    )
+    assert resp.status == 404
+
+
+async def test_a_real_object_path_still_resolves(flux_client, monkeypatch):
+    """Guards the test above against passing because object serving is
+    broken outright rather than because the null id is special-cased.
+
+    The object ids depend on the canary minted for the caller, so the
+    probe is derived by following the ref the server itself served
+    rather than by rebuilding the repo here.
+    """
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "issue_credentials", _fake_canary)
+    tbenv._FAKE_GIT_CACHE.clear()
+
+    caller = {"X-Forwarded-For": "203.0.113.42"}
+    ref = await flux_client.get(
+        "/.git/refs/heads/main", headers=caller, allow_redirects=False,
+    )
+    assert ref.status == 200
+    sha = (await ref.text()).strip()
+    assert len(sha) == 40 and set(sha) <= set("0123456789abcdef"), sha
+    assert set(sha) != {"0"}, "ref points at the null id"
+
+    resp = await flux_client.get(
+        f"/.git/objects/{sha[:2]}/{sha[2:]}",
+        headers=caller, allow_redirects=False,
+    )
+    assert resp.status == 200
