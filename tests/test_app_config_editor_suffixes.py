@@ -40,7 +40,10 @@ def test_the_family_is_not_empty():
     # 34 since the credential-bearing config traps joined: each had been
     # hand-listing between zero and three of the leftover suffixes, so
     # `/web.config.bak` answered while `/appsettings.json.bak` 404ed.
-    assert len(FAMILY) == 36
+    # 44 since the key-material, dump, CI-pipeline and provider-CLI
+    # traps joined on the same rule — a credential-bearing file gets
+    # copied aside before it is edited whatever format it is in.
+    assert len(FAMILY) == 44
 
 
 @pytest.mark.parametrize("suffix", SUFFIXES)
@@ -218,3 +221,46 @@ def test_the_long_and_short_leftover_spellings_agree():
             assert (a is None) == (b is None), f"{base}: {short}/{long} disagree"
             if a is not None:
                 assert a.name == b.name, f"{base}: {a.name} vs {b.name}"
+
+
+# --- The leftover spellings that were observed 404ing ------------------
+# Each of these is a credential-bearing file whose original answered with
+# a canary while the copy an operator leaves beside it did not, so one
+# dictionary pass over a name and its leftover split across two
+# outcomes. Pinned as paths (not just as family membership) because the
+# membership is the fix and these are the spellings that proved it was
+# missing.
+@pytest.mark.parametrize("path,owner", [
+    # Key material: the file *is* the credential.
+    ("/.ssh/id_rsa~", "ssh-private-key"),
+    ("/.ssh/id_dsa~", "ssh-private-key"),
+    ("/server.pem.bak", "ssh-private-key"),
+    # Provider CLI / SDK credential files.
+    ("/.aws/config.bak", "aws-config-file"),
+    ("/.ovh.conf.bak", "ovh-conf"),
+    # A dump is the credential-bearing file a deploy leaves behind.
+    ("/dump.sql.old", "sql-dump"),
+    ("/backup.sql.old", "sql-dump"),
+    # CI pipeline definitions, whose bodies carry deploy credentials.
+    ("/.gitlab-ci.yml.bak", "gitlab-ci"),
+    ("/.travis.yml.bak", "generic-ci-config"),
+    ("/.drone.yml.bak", "generic-ci-config"),
+    ("/bitbucket-pipelines.yml.bak", "bitbucket-pipelines"),
+    ("/.github/workflows/main.yml.bak", "github-actions-workflow"),
+])
+def test_observed_leftover_spellings_now_answer(path, owner):
+    trap = tbenv._TRAP_BY_PATH.get(path)
+    assert trap is not None, f"{path} still 404s"
+    assert trap.name == owner, f"{path} resolved to {trap.name}"
+
+
+def test_bundle_js_is_deliberately_not_in_the_family():
+    """`webapp-config-bundle-js` owns several hundred bundle names, so
+    inheriting the family would mint thousands of routes off one
+    observed spelling — and a generated bundle is not a file an operator
+    renames before editing, which is the behaviour the rule describes.
+
+    Pinned so the exclusion is a decision rather than an oversight.
+    """
+    assert "webapp-config-bundle-js" not in FAMILY
+    assert tbenv._TRAP_BY_PATH.get("/config.js.bak") is None

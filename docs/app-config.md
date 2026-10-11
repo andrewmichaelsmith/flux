@@ -130,6 +130,31 @@ service-account credential files, and the deploy / registry / transfer
 configs that carry a login in the file body. Keeping those out is what
 let `/web.config.bak` answer while `/appsettings.json.bak` 404ed.
 
+Membership also covers two classes the rule reaches that are not
+"config files" in the narrow sense, each added because the leftover
+spelling was observed 404ing while the original answered:
+
+- **Files that *are* the credential** — SSH/TLS private keys, the AWS
+  CLI config, a provider-CLI credential file, a SQL dump. A key file is
+  the limiting case of "a config file holding a credential": the copy
+  comes from the same editor and the same pre-rotation rename, which is
+  why `/.ssh/id_rsa~`, `/server.pem.bak`, `/.aws/config.bak`,
+  `/.ovh.conf.bak` and `/dump.sql.old` are probed in the same pass as
+  their originals.
+- **CI pipeline definitions** — `.gitlab-ci.yml`, GitHub Actions
+  workflows, `bitbucket-pipelines.yml` and the generic CI set
+  (`.travis.yml`, `.drone.yml`, …). Their bodies carry deploy
+  credentials, so they meet the rule directly.
+
+`jenkinsfile` is pointedly **not** in the family: it curates its own
+single `.bak` spelling and a test asserts it keeps doing so, so it stays
+opt-out until a leftover spelling of it is actually observed.
+`webapp-config-bundle-js` is excluded on a different ground — a
+generated bundle is not a file an operator renames before editing, and
+the trap owns enough bundle names that inheriting the family would mint
+thousands of routes off one observed spelling. Both exclusions are
+pinned by tests so they read as decisions rather than oversights.
+
 **Both spellings of a leftover are the same leftover.** `.tmp` and
 `.temp`, `.bak` and `.backup` differ only in how the operator typed it,
 so the set carries both; a test pins the pairs together. The short

@@ -30735,6 +30735,38 @@ _APP_CONFIG_SUFFIX_FAMILY = frozenset({
     # something each new table should re-list by hand.
     "app-config-ini",
     "htaccess",
+    # Secret material that *is* the credential rather than a config
+    # referencing one. The membership rule reads "a config file that
+    # holds a credential", and a key file is the limiting case of it:
+    # the leftover copy comes from the same editor and the same
+    # pre-rotation rename, which is why the `~` and `.bak` spellings of
+    # these names get probed in the same pass as the originals while
+    # only the originals answered.
+    "ssh-private-key",
+    "aws-config-file",
+    # A database dump is the credential-bearing file a deploy leaves
+    # behind, and `.old` is how it gets left behind.
+    "sql-dump",
+    # CI pipeline definitions. All five answer a file whose body carries
+    # deploy credentials, so they meet the rule, and each was being
+    # probed on a leftover spelling it 404ed. `jenkinsfile` is pointedly
+    # NOT here: it curates its own single `.bak` spelling and a test
+    # asserts it keeps doing so, so it stays an opt-out until a
+    # leftover spelling of it is actually observed.
+    "gitlab-ci",
+    "github-actions-workflow",
+    "bitbucket-pipelines",
+    "generic-ci-config",
+    # Provider-CLI credential file, same rule as `s3cfg` / `rclone-conf`
+    # which are already here.
+    "ovh-conf",
+    # Deliberately NOT joined: `webapp-config-bundle-js`. Its one
+    # observed leftover spelling is real, but that trap owns several
+    # hundred bundle names, so inheriting the family would mint
+    # thousands of routes off a single spelling — and a generated
+    # bundle is not a file an operator renames before editing, which is
+    # the behaviour the rule describes. If that spelling earns a
+    # response it belongs on the trap, not inherited from here.
 })
 for _trap in CANARY_TRAPS:
     if _trap.name not in _APP_CONFIG_SUFFIX_FAMILY:
