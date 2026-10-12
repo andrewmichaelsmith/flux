@@ -9,8 +9,8 @@ an alert regardless of which provider the scanner thinks the token is for.
 
 | Trap name | Paths | Format |
 | --- | --- | --- |
-| `oci-config` | `/.oci/config` | INI — OCI CLI config with canary in `pass_phrase` |
-| `oci-api-key-pem` | `/.oci/oci_api_key.pem` | PEM — RSA private key with canary in key material |
+| `oci-config` | `/.oci/config`, plus the undotted spellings the CLI also reads (`/oci/config`, `/oci_config`, `/oracle/config`) | INI — OCI CLI config with canary in `pass_phrase` |
+| `oci-api-key-pem` | `/.oci/oci_api_key.pem` — the file `oci-config` names in `key_file=` — plus the two other names the same key is given (`/.oci/api_key.pem`, `/.oci/private_key.pem`) and the undotted spellings (`/oci/oci_api_key.pem`, `/oci_api_key.pem`, `/oracle/oci_api_key.pem`) | PEM — RSA private key with canary in key material |
 | `hcloud-cli` | `/.config/hcloud/cli.toml`, `/.hcloud.toml`, `/hcloud.yml`, `/root/…`, `/home/ubuntu/…` | TOML — Hetzner Cloud CLI with canary as `token` |
 | `civo-cli` | `/.config/civo/civo.json`, `/root/…` | JSON — Civo CLI with canary as API key |
 | `exoscale-cli` | `/.config/exoscale/exoscale.toml`, `/root/…` | TOML — Exoscale CLI with canary as `key`+`secret` |
@@ -42,3 +42,18 @@ Fly.io, OVH, OpenStack, Terraform Cloud, Pulumi, and DigitalOcean
 CLI configs in a single dictionary pass. Covering these paths turns
 every probe into a canary issuance opportunity and gives visibility
 into which providers attackers prioritize for credential theft.
+
+## A chain, not two files
+
+`oci-config`'s rendered body names `key_file=~/.oci/oci_api_key.pem`, so
+the key file is the *second* read the config sets up — and the one that
+actually carries the credential. Answering the config while 404ing the
+key it points at dead-ends the walk on that second step, and the same
+sweeps ask for the key under three different names and on its backup
+spelling. All of those now resolve, and the key file is in the
+editor-leftover family on the same rule as `ssh-private-key`: a key file
+is exactly what an operator copies aside before rotating it.
+
+Scanner-invented suffixes (`/oci_config.json`, `/oci_config.yaml`) are
+deliberately left 404ing. The file is INI; answering INI at a `.json`
+name is a tell, not a trap.

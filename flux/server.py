@@ -25477,6 +25477,151 @@ def render_vastai_credentials_json(r: dict[str, object]) -> bytes:
     }, indent=2).encode("utf-8")
 
 
+# --- Inference / GPU-cloud credential files ------------------------------
+#
+# The credential files that sit on a box running a self-hosted LLM stack:
+# the GPU and serverless-compute providers that stack rents capacity from
+# (RunPod, Modal, Lambda Labs, Paperspace), the chat front-end that holds
+# the upstream provider keys (LibreChat), and the edge-runtime secrets
+# file a deployed inference proxy keeps beside its config (Cloudflare
+# Workers `.dev.vars`).
+#
+# These differ from the AI-IDE table above in what they buy a thief. An
+# IDE config yields an inference key — metered, per-token, revocable. A
+# GPU-cloud credential yields the ability to *start instances*, billed by
+# the GPU-hour, which is why credential sweeps that used to stop at
+# `/.aws/credentials` now carry this tail. Same canary contract as the
+# rest of the table: the Tracebit AWS canary occupies the field a
+# credential extractor grabs, so replay is visible at the provider no
+# matter which vendor the reader thought the token was for.
+
+
+_LLM_SELF_HOST_FALLBACK = "llm.internal"
+
+
+def _llm_self_base_url(r: dict[str, object]) -> str:
+    """OpenAI-compatible base URL this same server answers on.
+
+    Same purpose and the same host test as `_mcp_self_endpoint`: a
+    credential file whose endpoints all point at a vendor's real API is a
+    dead end, because nothing a remote reader does with it is observable
+    here. Flux already serves `/v1/models` and `/v1/chat/completions`, so
+    naming this host as a custom endpoint turns a parsed config into a
+    second request we log — and the canary travels as that endpoint's
+    `apiKey`, which joins the two hits.
+    """
+    host = str(r.get("_requestHost") or "").strip().lower().split(":", 1)[0]
+    if not _host_is_externally_plausible(host):
+        host = (
+            SITE_HOST
+            if _host_is_externally_plausible(SITE_HOST)
+            else _LLM_SELF_HOST_FALLBACK
+        )
+    return f"https://{host}/v1"
+
+
+def render_runpod_config_toml(r: dict[str, object]) -> bytes:
+    # RunPod `~/.runpod/config.toml` as `runpodctl config` writes it. The
+    # key is account-scoped: it can start and stop GPU pods, so it bills.
+    aws = _aws(r)
+    return (
+        "[default]\n"
+        f'api_key = "{aws.get("awsSecretAccessKey", "")}"\n'
+    ).encode("utf-8")
+
+
+def render_modal_toml(r: dict[str, object]) -> bytes:
+    # Modal `~/.modal.toml`. Token pair, one profile per workspace, the
+    # active one flagged — the shape `modal token set` leaves behind.
+    aws = _aws(r)
+    return (
+        "[prod]\n"
+        f'token_id = "{aws.get("awsAccessKeyId", "")}"\n'
+        f'token_secret = "{aws.get("awsSecretAccessKey", "")}"\n'
+        "active = true\n"
+    ).encode("utf-8")
+
+
+def render_lambda_cloud_keys(r: dict[str, object]) -> bytes:
+    # Lambda Labs `~/.lambda_cloud/lambda_keys` — a bare `api_key` line,
+    # no section header, which is how the Lambda CLI writes it.
+    aws = _aws(r)
+    return (
+        f"api_key = {aws.get('awsSecretAccessKey', '')}\n"
+    ).encode("utf-8")
+
+
+def render_paperspace_config_json(r: dict[str, object]) -> bytes:
+    # Paperspace / Gradient CLI `~/.paperspace/config.json`.
+    aws = _aws(r)
+    return json.dumps({
+        "apiKey": aws.get("awsSecretAccessKey", ""),
+        "name": "default",
+    }, indent=2).encode("utf-8")
+
+
+def render_librechat_yaml(r: dict[str, object]) -> bytes:
+    """LibreChat `librechat.yaml` — the self-hosted chat front-end's config.
+
+    Worth answering for the same reason the AI-gateway admin API is: this
+    file is where a self-hosted deployment collects *several* upstream
+    provider keys in one place, so it is the single highest-yield read in
+    an LLM-stack sweep.
+
+    The `custom` endpoint block is the part a remote reader can act on.
+    Its `baseURL` is this host's own OpenAI-compatible surface and its
+    `apiKey` is the per-hit canary, so a reader that parses the file
+    rather than grepping it is steered into the inference trap, and the
+    token presented there joins that request back to this exact config
+    read.
+    """
+    aws = _aws(r)
+    return (
+        "version: 1.2.8\n"
+        "cache: true\n"
+        "\n"
+        "endpoints:\n"
+        "  custom:\n"
+        '    - name: "internal-gateway"\n'
+        f'      apiKey: "{aws.get("awsSessionToken", "")}"\n'
+        f'      baseURL: "{_llm_self_base_url(r)}"\n'
+        "      models:\n"
+        "        default: [\"gpt-4o-mini\", \"llama-3.1-70b-instruct\"]\n"
+        "        fetch: true\n"
+        '      titleModel: "gpt-4o-mini"\n'
+        "      modelDisplayLabel: \"Internal Gateway\"\n"
+        '    - name: "openrouter"\n'
+        f'      apiKey: "{aws.get("awsAccessKeyId", "")}"\n'
+        '      baseURL: "https://openrouter.ai/api/v1"\n'
+        "      models:\n"
+        "        default: [\"anthropic/claude-3.5-sonnet\"]\n"
+        "\n"
+        "fileConfig:\n"
+        "  endpoints:\n"
+        "    default:\n"
+        "      totalSizeLimit: 20\n"
+    ).encode("utf-8")
+
+
+def render_cloudflare_dev_vars(r: dict[str, object]) -> bytes:
+    """`.dev.vars` — Cloudflare Workers' local secrets file.
+
+    Workers keep deployed secrets out of `wrangler.toml` and in this
+    dotenv-shaped sibling, which is `.gitignore`d in the template and
+    therefore routinely present on a box and absent from the repo. It is
+    dotenv-shaped but it is not `/.env`, so the generic dotenv tarpit
+    never saw this spelling.
+    """
+    aws = _aws(r)
+    return (
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"OPENAI_API_KEY={aws.get('awsSessionToken', '')}\n"
+        f"DATABASE_URL=postgres://workers:{_fake_db_password()}@db.internal:5432/app\n"
+        "ACCOUNT_ID=a1b2c3d4e5f60718293a4b5c6d7e8f90\n"
+    ).encode("utf-8")
+
+
 def render_nerve_config_yaml(r: dict[str, object]) -> bytes:
     # Nerve agent runtime `~/.nerve/config.yaml` — provider + key.
     aws = _aws(r)
@@ -29708,7 +29853,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "continue-config",
-        ("/.continue/config.json",),
+        (
+            # Continue's config moved from JSON to YAML; answering only
+            # the legacy spelling 404s the name a current install
+            # actually has on disk.
+            "/.continue/config.json",
+            "/.continue/config.yaml",
+            "/.continue/config.yml",
+        ),
         ("aws",),
         render_continue_config_json,
         "application/json; charset=utf-8",
@@ -29741,6 +29893,13 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/litellm_config.yaml",
             "/litellm/config.yaml",
             "/proxy_config.yaml",
+            # `.yml` is the same file. A dictionary that walks both
+            # spellings in one pass was being split across two outcomes,
+            # which is the drift the editor-leftover block exists to end,
+            # here in its plainest form: one file, two extensions.
+            "/litellm_config.yml",
+            "/litellm/config.yml",
+            "/proxy_config.yml",
         ),
         ("aws",),
         render_litellm_config_yaml,
@@ -29921,6 +30080,49 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_vastai_credentials_json,
         "application/json; charset=utf-8",
+    ),
+    # ---- Inference / GPU-cloud credential files ------------------------
+    CanaryTrap(
+        "runpod-config",
+        ("/.runpod/config.toml",),
+        ("aws",),
+        render_runpod_config_toml,
+        "application/toml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "modal-config",
+        ("/.modal.toml",),
+        ("aws",),
+        render_modal_toml,
+        "application/toml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "lambda-cloud-keys",
+        ("/.lambda_cloud/lambda_keys",),
+        ("aws",),
+        render_lambda_cloud_keys,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "paperspace-config",
+        ("/.paperspace/config.json",),
+        ("aws",),
+        render_paperspace_config_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "librechat-config",
+        ("/librechat.yaml", "/librechat.yml"),
+        ("aws",),
+        render_librechat_yaml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "cloudflare-dev-vars",
+        ("/.dev.vars",),
+        ("aws",),
+        render_cloudflare_dev_vars,
+        "text/plain; charset=utf-8",
     ),
     CanaryTrap(
         "nerve-config",
@@ -30431,14 +30633,37 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     # the Tracebit AWS canary in the field a credential extractor grabs.
     CanaryTrap(
         "oci-config",
-        ("/.oci/config",),
+        (
+            "/.oci/config",
+            # The undotted spellings the CLI also reads, on the same rule
+            # already applied to `ovh-conf`. Scanner-invented `.json` /
+            # `.yaml` suffixes are deliberately NOT here: this file is
+            # INI, and answering INI at a `.json` name is a tell.
+            "/oci/config",
+            "/oci_config",
+            "/oracle/config",
+        ),
         ("aws",),
         render_oci_config,
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(
         "oci-api-key-pem",
-        ("/.oci/oci_api_key.pem",),
+        (
+            # `render_oci_config` names `key_file=~/.oci/oci_api_key.pem`,
+            # so this is the second read in the chain the config sets up.
+            "/.oci/oci_api_key.pem",
+            # The two other names the same key file is given, both asked
+            # for in the same pass as the config. Answering the config and
+            # 404ing the key it points at dead-ends the chain on the read
+            # that actually carries the credential.
+            "/.oci/api_key.pem",
+            "/.oci/private_key.pem",
+            # Undotted spellings, matching the `oci-config` set above.
+            "/oci/oci_api_key.pem",
+            "/oci_api_key.pem",
+            "/oracle/oci_api_key.pem",
+        ),
         ("aws",),
         render_oci_api_key_pem,
         "application/x-pem-file; charset=utf-8",
@@ -31700,6 +31925,21 @@ _APP_CONFIG_SUFFIX_FAMILY = frozenset({
     "ssh-private-key",
     "authorized-keys",
     "htpasswd",
+    # The OCI API key is a private key file on exactly the terms the
+    # comment above states, but it was left out when the niche-cloud table
+    # was admitted — `oci-config` went in and the key file it names did
+    # not, so the config answered its backup copy while the key answered
+    # only its canonical name. Observed asked for on both spellings in one
+    # pass.
+    "oci-api-key-pem",
+    # Inference / GPU-cloud credential files, same rule as the rest of the
+    # provider-CLI table they sit beside.
+    "runpod-config",
+    "modal-config",
+    "lambda-cloud-keys",
+    "paperspace-config",
+    "librechat-config",
+    "cloudflare-dev-vars",
     # A front-end config bundle is generated, but it is also hand-patched
     # on the box when a key changes, and the leftover is what then sits
     # next to the original as readable plain text.

@@ -52,7 +52,13 @@ def test_the_family_is_not_empty():
     # written after this block that hand-listed some subset of the
     # leftover suffixes, which is the drift the property tests below
     # exist to stop.
-    assert len(FAMILY) == 73
+    # 80 since the OCI API key file and the inference/GPU-cloud credential
+    # traps joined. The OCI one is the clearest instance yet of the split
+    # this block exists to end: `oci-config` was admitted here and the key
+    # file its own rendered body names in `key_file=` was not, so the
+    # config answered its backup copy while the key — the read that
+    # actually carries the credential — answered only its canonical name.
+    assert len(FAMILY) == 80
 
 
 @pytest.mark.parametrize("suffix", SUFFIXES)
