@@ -996,6 +996,14 @@ CODE_EXEC_API_BODY_PREVIEW_LIMIT = max(
 # Exact addresses, grouped by what the endpoint claims to do with the body.
 _CODE_EXEC_API_PATHS: dict[str, str] = {
     "/api/fs/exec": "exec",
+    # The read sibling of the same filesystem API. Probed steadily
+    # alongside the exec spelling, and answering one while 404ing the
+    # other tells a scanner the platform is half-present — a shape no
+    # real deployment has.
+    "/api/fs/read": "read",
+    # Two more file-read / console endpoints walked in the same sweeps.
+    "/api/system/fileview": "read",
+    "/api/console/api_server": "read",
     "/api/v1/validate/code": "validate",
     "/api/templates/preview": "template",
     "/api/designer/v1/file-content": "read",
@@ -27841,6 +27849,17 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         "aws-config-file",
         (
             "/.aws/config",
+            # The undotted spelling, on the same rule already applied to
+            # `oci-config` and `ovh-conf`: a webroot leak of a home dir
+            # drops the leading dot, and the body stays INI, so there is
+            # no format tell in answering it. (The scanner-invented
+            # `.json` / `.yaml` suffixes are deliberately NOT added here,
+            # for the reason the oci-config trap states.) The undotted
+            # `credentials` spelling was already reachable through the
+            # app-layout prefix walk while `config` was not, so the sweep
+            # that asks for both under one account got an answer for one
+            # and a 404 for the other.
+            "/aws/config",
             # `~/.aws/config` webroot-prefix variants — same rationale
             # as the credentials-file trap. Home-dir and app-layout
             # prefixes. The sweep asks for `config` and `credentials`
@@ -28062,6 +28081,21 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         (
             "/terraform.tfvars",
             "/.terraform/terraform.tfvars",
+            # The environment-named spellings. `terraform.tfvars` is the
+            # auto-loaded default, but a repo that keeps secrets in a
+            # tfvars file almost never uses that name for them — it uses a
+            # per-environment or explicitly-secret one, passed with
+            # `-var-file`. Those are the spellings the sweeps ask for, and
+            # they are the ones with the credential in them.
+            "/secrets.tfvars",
+            "/secret.tfvars",
+            "/prod.tfvars",
+            "/production.tfvars",
+            "/staging.tfvars",
+            "/dev.tfvars",
+            "/terraform.auto.tfvars",
+            "/vars.tfvars",
+            "/variables.tfvars",
         ),
         ("aws",),
         render_terraform_tfvars,
@@ -31700,6 +31734,16 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/config/config.php",
             "/includes/config.php",
             "/inc/config.php",
+            # The osCommerce/Zen-Cart-lineage name for the same file. It
+            # is `define()`-shaped exactly like the spellings above —
+            # `DB_SERVER`, `DB_SERVER_USERNAME`, `DB_SERVER_PASSWORD` —
+            # so the format matches and the renderer needs no variant.
+            # Observed walked on all three spellings in one pass,
+            # including the `.orig` / `.txt` leftovers that the
+            # editor-suffix family membership already covers.
+            "/configure.php",
+            "/includes/configure.php",
+            "/admin/includes/configure.php",
             "/include/config.php",
             "/application/config/config.php",
             # Editor/backup rotation siblings — harvester dictionaries walk

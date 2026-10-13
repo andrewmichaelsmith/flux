@@ -360,3 +360,70 @@ async def test_ray_jobs_disabled_returns_404(flux_client, monkeypatch):
 
 def test_ray_jobs_defaults_on():
     assert tbenv.RAY_JOBS_ENABLED
+
+
+# --------------------------------------------------------------------------
+# Missed routes found in the dispatch log's own not-handled rows
+# --------------------------------------------------------------------------
+#
+# These are not new traps. Each is a spelling that an already-shipped trap
+# should have claimed and did not, found by reading the highest-volume
+# `not-handled` rows rather than by guessing. Answering one spelling of a
+# pair while 404ing the other is the drift these pin.
+
+@pytest.mark.parametrize("path,trap", [
+    # The sweep asks for `config` and `credentials` under one account in a
+    # single pass. The undotted `credentials` was already reachable through
+    # the app-layout prefix walk; `config` was not.
+    ("/aws/config", "aws-config-file"),
+    ("/aws/credentials", "aws-credentials-file"),
+    # A repo that keeps secrets in a tfvars file does not use the
+    # auto-loaded default name for them.
+    ("/secrets.tfvars", "terraform-tfvars"),
+    ("/prod.tfvars", "terraform-tfvars"),
+    ("/production.tfvars", "terraform-tfvars"),
+    ("/terraform.tfvars", "terraform-tfvars"),
+    # The osCommerce-lineage name for a `define()`-shaped PHP DB config.
+    ("/includes/configure.php", "app-config-php"),
+    ("/admin/includes/configure.php", "app-config-php"),
+    ("/configure.php", "app-config-php"),
+])
+async def test_missed_route_now_claimed(flux_client, path, trap):
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.40"})
+    assert resp.status == 200, path
+    entries = _log_entries(flux_client.log_path)
+    assert entries[-1]["result"] == trap, entries[-1]["result"]
+
+
+@pytest.mark.parametrize("path", [
+    "/includes/configure.php.orig",
+    "/includes/configure.php.txt",
+])
+async def test_configure_php_leftovers_are_claimed(flux_client, path):
+    """Both leftover spellings were probed alongside the canonical name;
+    they come free with the editor-suffix family, and this pins it."""
+    resp = await flux_client.get(path, headers={"X-Forwarded-For": "203.0.113.41"})
+    assert resp.status == 200, path
+
+
+@pytest.mark.parametrize("path,family", [
+    # The read sibling of the exec endpoint already served. Answering one
+    # and 404ing the other is a half-present platform, a shape no real
+    # deployment has.
+    ("/api/fs/read", "read"),
+    ("/api/fs/exec", "exec"),
+    ("/api/system/fileView", "read"),
+    ("/api/console/api_server", "read"),
+])
+def test_filesystem_api_read_sibling_is_routed(path, family):
+    assert tbenv.code_exec_api_family(path) == family, path
+
+
+def test_oci_config_keeps_its_deliberate_format_exclusions():
+    """`/oci_config.json` and `/oci_config.yaml` show up in the
+    not-handled rows and are deliberately left there: the file is INI, and
+    answering INI at a `.json` name is a tell. Pinned so a later
+    missed-route pass does not 'fix' it."""
+    for path in ("/oci_config.json", "/oci_config.yaml"):
+        assert path not in tbenv._TRAP_BY_PATH, path
+    assert "/oci_config" in tbenv._TRAP_BY_PATH
