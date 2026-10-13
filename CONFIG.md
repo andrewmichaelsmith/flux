@@ -266,6 +266,17 @@ canary responses; without it the trap still serves the JSON-RPC
 | `HONEYPOT_MCP_SERVER_PATHS_CSV` | *(built-in — `/mcp`, `/mcp/`, `/mcp/messages`, `/sse`)* | Exact, case-insensitive. Override to add MCP transport paths without a code change. On-disk config files (`/mcp.json`, `/.cursor/mcp.json`, …) stay with the `mcp-config` CanaryTrap. |
 | `HONEYPOT_MCP_SERVER_BODY_DECODE_LIMIT` | `2048` | Max chars of the JSON-serialised `params.arguments` written to `mcpToolArgsPreview`. |
 
+## Ray dashboard job-submission API
+
+The second step the GPU-cluster launcher config sets up. Mints no canary,
+so it answers with or without `TRACEBIT_API_KEY` — a cluster config
+naming a dashboard this server 404s is a dead end. Nothing submitted is
+executed. See [`docs/ray-jobs-api.md`](./docs/ray-jobs-api.md).
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `HONEYPOT_RAY_JOBS_ENABLED` | on | Master switch. Turning it off while the cluster-scheduler file traps stay on leaves those configs advertising a dashboard that 404s. |
+
 ## Fake GraphQL endpoint
 
 `TRACEBIT_API_KEY` required for the credential-field and auth-mutation

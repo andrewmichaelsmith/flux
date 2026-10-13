@@ -6207,6 +6207,86 @@ def is_webshell_path(path: str) -> bool:
     return False
 
 
+# Ray dashboard job-submission API.
+#
+# The second step the cluster-launcher config sets up. Ray's job submission
+# API requires no authentication by default — public since 2023 and tracked
+# as CVE-2023-48022, which Anyscale disputes as intended behaviour, so the
+# default has not changed and scanners treat an exposed dashboard as
+# directly actionable. Public reporting has it abused for compute theft on
+# clusters found this way.
+#
+# That makes it the rare surface where the attacker's *next* action is to
+# hand us a command line: a job submission carries an `entrypoint`, which is
+# a captured payload rather than another path in a dictionary.
+#
+# Default-on like the rest: no canary is minted here, so there is no quota
+# to protect, and a cluster config naming a dashboard this server 404s is a
+# dead end that gives the game away.
+RAY_JOBS_ENABLED = _env_bool("HONEYPOT_RAY_JOBS_ENABLED")
+
+# Exact spellings, plus the two prefixed forms below. `/api/version` is
+# deliberately NOT claimed here: Ollama's version endpoint already answers
+# it on the inference surface, and the job-submission walk does not need it.
+_RAY_JOBS_LIST_PATHS = frozenset({
+    "/api/jobs",
+    "/api/jobs/",
+})
+_RAY_JOBS_CLUSTER_PATHS = frozenset({
+    "/api/cluster_status",
+    "/api/ray/version",
+    "/api/serve/applications",
+    "/api/serve/applications/",
+})
+# A job id is what the submit response hands back; the status and log reads
+# address it. Ray's own ids are `raysubmit_` + 16 url-safe chars, but a
+# scanner replaying a captured id or guessing one is just as interesting, so
+# the shape is kept permissive rather than pinned to that prefix.
+_RAY_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+
+def ray_jobs_kind(path: str) -> str:
+    """Return the Ray dashboard API family for `path`, or '' if none.
+
+    Families: 'list' (GET: running jobs, POST: submit), 'status' (a single
+    job), 'logs' (a job's stdout), 'cluster' (cluster/version/serve
+    metadata).
+
+    Resolves under a mount prefix of up to two segments, the same rule the
+    code-exec surface uses: a dashboard put behind a reverse proxy is
+    routinely mounted under its own name (`/ray/api/jobs/`), and the
+    prefixed spelling is the same endpoint.
+    """
+    if not RAY_JOBS_ENABLED:
+        return ""
+    lpath = path.lower().split("?", 1)[0]
+    segments = [seg for seg in lpath.split("/") if seg]
+    # Try the bare path first, then strip up to two leading mount segments.
+    for drop in range(0, 3):
+        if drop > len(segments):
+            break
+        candidate = "/" + "/".join(segments[drop:])
+        if candidate in _RAY_JOBS_LIST_PATHS:
+            return "list"
+        if candidate in _RAY_JOBS_CLUSTER_PATHS:
+            return "cluster"
+        rest = segments[drop:]
+        if len(rest) >= 3 and rest[0] == "api" and rest[1] == "jobs":
+            # `/api/jobs/<id>` and `/api/jobs/<id>/logs`.
+            job_id = rest[2]
+            if not _RAY_JOB_ID_RE.match(job_id):
+                continue
+            if len(rest) == 3:
+                return "status"
+            if len(rest) == 4 and rest[3] == "logs":
+                return "logs"
+    return ""
+
+
+def is_ray_jobs_path(path: str) -> bool:
+    return bool(ray_jobs_kind(path))
+
+
 def is_llm_endpoint_path(path: str) -> bool:
     if not LLM_ENDPOINT_ENABLED:
         return False
@@ -25603,6 +25683,291 @@ def render_librechat_yaml(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def _ray_dashboard_base_url(r: dict[str, object]) -> str:
+    """The Ray dashboard address this same server answers on.
+
+    Same purpose and the same host test as the OpenAI-compatible and MCP
+    self-endpoint helpers: a cluster-launcher config whose head node is a
+    private address is a dead end, because nothing a remote reader does
+    with it is observable here. Flux answers the dashboard's
+    job-submission API, so naming this host as the head node turns a
+    parsed config into a second request we log.
+    """
+    host = str(r.get("_requestHost") or "").strip().lower().split(":", 1)[0]
+    if not _host_is_externally_plausible(host):
+        host = (
+            SITE_HOST
+            if _host_is_externally_plausible(SITE_HOST)
+            else _LLM_SELF_HOST_FALLBACK
+        )
+    return f"https://{host}"
+
+
+def render_ray_cluster_yaml(r: dict[str, object]) -> bytes:
+    """`ray.yaml` — a Ray cluster-launcher config.
+
+    The highest-yield read in a GPU-cluster sweep: one file carrying the
+    cloud provider credentials the autoscaler uses to add nodes, the SSH
+    key it reaches workers with, and the head node's address.
+
+    Two parts a remote reader can act on:
+
+    - `provider` holds the Tracebit AWS canary, because the autoscaler
+      authenticates to the cloud API to scale the cluster. That is the
+      primary alerting surface and the slot a harvester grepping for
+      `AKIA` lands on.
+    - the head node's dashboard address is **this host**, and the
+      `ssh_private_key` names a path this server also answers with an
+      issued SSH canary. A reader that parses the file rather than
+      grepping it therefore has two observable next steps, and the job
+      submitted at the first one is a captured payload.
+
+    Ray's job-submission API takes no authentication by default, which is
+    public and long-documented (CVE-2023-48022), so a reader that reaches
+    the dashboard has a well-known next request to make.
+    """
+    aws = _aws(r)
+    base = _ray_dashboard_base_url(r)
+    cluster_id = secrets.token_hex(3)
+    return (
+        f"cluster_name: gpu-train-{cluster_id}\n"
+        "max_workers: 16\n"
+        "upscaling_speed: 1.0\n"
+        "idle_timeout_minutes: 10\n"
+        "\n"
+        "provider:\n"
+        "  type: aws\n"
+        "  region: us-east-1\n"
+        "  availability_zone: us-east-1a,us-east-1b\n"
+        "  cache_stopped_nodes: false\n"
+        f"  aws_access_key_id: {aws.get('awsAccessKeyId', '')}\n"
+        f"  aws_secret_access_key: {aws.get('awsSecretAccessKey', '')}\n"
+        f"  aws_session_token: {aws.get('awsSessionToken', '')}\n"
+        "\n"
+        "auth:\n"
+        "  ssh_user: ubuntu\n"
+        "  ssh_private_key: /keys/gpu-key.pem\n"
+        "\n"
+        "head_node_type: head_default\n"
+        "available_node_types:\n"
+        "  head_default:\n"
+        "    resources: {}\n"
+        "    node_config:\n"
+        "      InstanceType: m6i.2xlarge\n"
+        "  gpu_worker:\n"
+        "    min_workers: 2\n"
+        "    max_workers: 16\n"
+        "    resources: {\"GPU\": 4}\n"
+        "    node_config:\n"
+        "      InstanceType: g5.12xlarge\n"
+        "\n"
+        "head_start_ray_commands:\n"
+        "  - ray stop\n"
+        "  - >-\n"
+        "    ray start --head --port=6379 --dashboard-host=0.0.0.0\n"
+        "    --dashboard-port=8265\n"
+        "\n"
+        "worker_start_ray_commands:\n"
+        "  - ray stop\n"
+        "  - ray start --address=$RAY_HEAD_IP:6379\n"
+        "\n"
+        "# Submit against the head node's dashboard:\n"
+        f"#   ray job submit --address {base} -- python train.py\n"
+        ).encode("utf-8")
+
+
+def render_slurm_conf(r: dict[str, object]) -> bytes:
+    """`slurm.conf` — the Slurm controller config for a GPU cluster.
+
+    Not itself a credential file: `slurm.conf` is world-readable by
+    design, because every compute node needs it. It earns an answer
+    because of what it *names* — the accounting-database host and the
+    `slurmdbd.conf` beside it, which is the file that does hold a
+    password. A reader walking the scheduler lane reads this one first
+    and uses it to decide the next filename, so answering it and 404ing
+    the sibling truncates the walk one request before the credential.
+
+    Everything here is plausible non-secret cluster topology, so it is
+    allowed to be stable across hits; the node names and GRES layout are
+    the sort an A100 partition actually declares.
+    """
+    return (
+        "ClusterName=gpu-prod\n"
+        "SlurmctldHost=slurm-ctl-01\n"
+        "SlurmUser=slurm\n"
+        "SlurmdUser=root\n"
+        "AuthType=auth/munge\n"
+        "CredType=cred/munge\n"
+        "StateSaveLocation=/var/spool/slurmctld\n"
+        "SlurmdSpoolDir=/var/spool/slurmd\n"
+        "SwitchType=switch/none\n"
+        "MpiDefault=pmix\n"
+        "ProctrackType=proctrack/cgroup\n"
+        "TaskPlugin=task/cgroup,task/affinity\n"
+        "ReturnToService=2\n"
+        "\n"
+        "# Scheduling\n"
+        "SchedulerType=sched/backfill\n"
+        "SelectType=select/cons_tres\n"
+        "SelectTypeParameters=CR_Core_Memory\n"
+        "GresTypes=gpu\n"
+        "\n"
+        "# Accounting — credentials live in slurmdbd.conf on the dbd host\n"
+        "AccountingStorageType=accounting_storage/slurmdbd\n"
+        "AccountingStorageHost=slurm-dbd-01\n"
+        "AccountingStoragePort=6819\n"
+        "AccountingStorageTRES=gres/gpu\n"
+        "JobAcctGatherType=jobacct_gather/cgroup\n"
+        "\n"
+        "# Logging\n"
+        "SlurmctldLogFile=/var/log/slurm/slurmctld.log\n"
+        "SlurmdLogFile=/var/log/slurm/slurmd.log\n"
+        "\n"
+        "# Compute nodes\n"
+        "NodeName=gpu-[01-08] Gres=gpu:a100:8 CPUs=128 RealMemory=1031000 "
+        "Sockets=2 CoresPerSocket=32 ThreadsPerCore=2 State=UNKNOWN\n"
+        "NodeName=cpu-[01-04] CPUs=64 RealMemory=257000 State=UNKNOWN\n"
+        "\n"
+        "PartitionName=gpu Nodes=gpu-[01-08] Default=YES MaxTime=48:00:00 "
+        "State=UP\n"
+        "PartitionName=cpu Nodes=cpu-[01-04] MaxTime=72:00:00 State=UP\n"
+    ).encode("utf-8")
+
+
+def render_slurmdbd_conf(r: dict[str, object]) -> bytes:
+    """`slurmdbd.conf` — the Slurm accounting daemon's config.
+
+    This is the credential half of the pair `slurm.conf` points at: it
+    carries `StoragePass`, the password slurmdbd uses against its
+    accounting database. Real deployments chmod it 600 for exactly that
+    reason, which is also why a webroot leak of it is worth answering.
+
+    `StoragePass` is a per-hit synthetic rather than a Tracebit canary:
+    the replay would be a MySQL login against a host that is not
+    Tracebit's, so no alert would fire either way, and the thing that
+    must not happen is shipping a fixed literal that fingerprints every
+    sensor with one string. The AWS canary rides along in the
+    `ArchiveScript` S3 credentials, which is a slot that does alert.
+    """
+    aws = _aws(r)
+    return (
+        "AuthType=auth/munge\n"
+        "AuthInfo=/var/run/munge/munge.socket.2\n"
+        "DbdHost=slurm-dbd-01\n"
+        "DbdPort=6819\n"
+        "SlurmUser=slurm\n"
+        "DebugLevel=info\n"
+        "LogFile=/var/log/slurm/slurmdbd.log\n"
+        "PidFile=/var/run/slurmdbd.pid\n"
+        "\n"
+        "StorageType=accounting_storage/mysql\n"
+        "StorageHost=db.internal\n"
+        "StoragePort=3306\n"
+        "StorageUser=slurm_acct\n"
+        f"StoragePass={_fake_db_password()}\n"
+        "StorageLoc=slurm_acct_db\n"
+        "\n"
+        "# Nightly purge archives to object storage before trimming\n"
+        "ArchiveJobs=yes\n"
+        "ArchiveDir=/var/spool/slurm/archive\n"
+        "PurgeJobAfter=12months\n"
+        "PurgeStepAfter=2months\n"
+        "ArchiveScript=/usr/local/sbin/slurm-archive-to-s3.sh\n"
+        f"# AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"# AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+    ).encode("utf-8")
+
+
+def render_talosconfig(r: dict[str, object]) -> bytes:
+    """`talosconfig` — the Talos Linux cluster client config.
+
+    The Talos equivalent of a kubeconfig, and a materially bigger prize:
+    the certificate it carries is the `os:admin` client cert for the
+    machine API, which reads and writes node configuration rather than
+    cluster objects.
+
+    No second step is served for it. The Talos API is gRPC over mTLS on
+    its own port, which this server does not answer, so unlike the
+    cluster-launcher config there is nothing a reader can do here that we
+    would see. It is answered as a static credential file because the
+    filename is walked in the same breath as the kubeconfig and a 404 on
+    it is a free negative signal to the scanner. The cert blobs are
+    per-hit random so the file is not a cross-sensor fingerprint.
+    """
+    ca_b64 = secrets.token_urlsafe(1024).replace("_", "").replace("-", "")
+    crt_b64 = secrets.token_urlsafe(1024).replace("_", "").replace("-", "")
+    key_b64 = secrets.token_urlsafe(64).replace("_", "").replace("-", "")
+    cluster_id = secrets.token_hex(3)
+    return (
+        f"context: talos-prod-{cluster_id}\n"
+        "contexts:\n"
+        f"    talos-prod-{cluster_id}:\n"
+        "        endpoints:\n"
+        "            - 10.4.12.11\n"
+        "            - 10.4.12.12\n"
+        "            - 10.4.12.13\n"
+        "        nodes:\n"
+        "            - 10.4.12.21\n"
+        "            - 10.4.12.22\n"
+        f"        ca: {ca_b64}\n"
+        f"        crt: {crt_b64}\n"
+        f"        key: {key_b64}\n"
+    ).encode("utf-8")
+
+
+def render_cloud_init_user_data(r: dict[str, object]) -> bytes:
+    """`cloud-init.yaml` / `user-data` — a node's bootstrap config.
+
+    The last file in the scheduler lane and the one that most often
+    actually leaks: user-data is handed to the instance in the clear, is
+    readable from the metadata service by anything on the box, and is
+    routinely written into a webroot by a bootstrap script that untars
+    into the wrong directory.
+
+    It is a credential file in practice because bootstrap is where
+    secrets are injected: `write_files` lands the cloud credentials the
+    node needs, and the canary occupies that slot. The authorized key is
+    per-hit random — a fixed public key across every sensor would be a
+    single fleet-wide fingerprint, exactly what the dotfile traps avoid.
+    """
+    aws = _aws(r)
+    key_b64 = secrets.token_urlsafe(400).replace("_", "").replace("-", "")
+    return (
+        "#cloud-config\n"
+        "hostname: gpu-worker-07\n"
+        "manage_etc_hosts: true\n"
+        "\n"
+        "users:\n"
+        "  - name: ubuntu\n"
+        "    sudo: ALL=(ALL) NOPASSWD:ALL\n"
+        "    shell: /bin/bash\n"
+        "    ssh_authorized_keys:\n"
+        f"      - ssh-ed25519 {key_b64} cluster-bootstrap\n"
+        "\n"
+        "write_files:\n"
+        "  - path: /etc/profile.d/cluster-env.sh\n"
+        "    permissions: '0600'\n"
+        "    content: |\n"
+        f"      export AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"      export AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"      export AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        "      export AWS_DEFAULT_REGION=us-east-1\n"
+        "  - path: /etc/ray/head.env\n"
+        "    permissions: '0600'\n"
+        "    content: |\n"
+        "      RAY_HEAD_IP=10.4.12.11\n"
+        "      RAY_DASHBOARD_PORT=8265\n"
+        "\n"
+        "packages:\n"
+        "  - nvidia-driver-550\n"
+        "  - nvidia-container-toolkit\n"
+        "\n"
+        "runcmd:\n"
+        "  - [ systemctl, enable, --now, ray-worker ]\n"
+        "  - [ systemctl, enable, --now, slurmd ]\n"
+    ).encode("utf-8")
+
+
 def render_cloudflare_dev_vars(r: dict[str, object]) -> bytes:
     """`.dev.vars` — Cloudflare Workers' local secrets file.
 
@@ -28945,6 +29310,10 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/kubeconfig",
             "/kubeconfig.yaml",
             "/kubeconfig.yml",
+            # A kubeconfig is YAML, but YAML is a JSON superset and the
+            # client reads either, so the `.json` spelling is a real file
+            # on disk and a real dictionary entry.
+            "/kubeconfig.json",
             "/config.kubeconfig",
             # Home-dir prefixes — matches the `.aws/credentials`,
             # `.docker/config.json`, `.bash_history` webroot-prefix
@@ -29275,6 +29644,25 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/private.key",
             "/deploy_key",
             "/deploy.key",
+            # Cluster-node access keys. A GPU/HPC cluster's launcher config
+            # names the private key it uses to reach the worker nodes by an
+            # arbitrary filename rather than an `id_*` one, and `gpu-key` /
+            # `ray-key` are the spellings the scheduler-config lane walks
+            # alongside the canonical names. Same body, same canary type —
+            # and the cluster-launcher renderer points `ssh_private_key` at
+            # one of these, so a reader that parses the config instead of
+            # grepping it lands on an issued key.
+            "/keys/gpu-key.pem",
+            "/gpu.pem",
+            "/gpu-key.pem",
+            "/keys/ray-key.pem",
+            "/ray-key.pem",
+            "/keys/cluster.pem",
+            # The no-dot-dir spelling of the private keys, probed beside the
+            # `/.ssh/` ones by the same dictionaries.
+            "/ssh/id_ed25519",
+            "/ssh/id_ecdsa",
+            "/ssh/id_dsa",
             # Tracebit issues ed25519, so the id_ed25519 filename is the
             # most literal match; id_dsa / id_ecdsa covered because
             # scanner dictionaries probe every algo by convention.
@@ -29400,14 +29788,28 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "ssh-public-key",
-        ("/id_rsa.pub", "/.ssh/id_rsa.pub"),
+        (
+            "/id_rsa.pub",
+            "/.ssh/id_rsa.pub",
+            # The other algorithms' public halves. Dictionaries probe every
+            # algo by convention, exactly as the private-key table does, so
+            # answering only the RSA spelling 404s most of the sweep.
+            "/.ssh/id_ed25519.pub",
+            "/.ssh/id_ecdsa.pub",
+            "/.ssh/id_dsa.pub",
+            "/id_ed25519.pub",
+            "/id_ecdsa.pub",
+            "/id_dsa.pub",
+            "/ssh/id_rsa.pub",
+            "/ssh/id_ed25519.pub",
+        ),
         ("ssh",),
         render_ssh_public_key,
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(
         "ssh-config",
-        ("/.ssh/config",),
+        ("/.ssh/config", "/ssh/config"),
         ("ssh",),
         render_ssh_config,
         "text/plain; charset=utf-8",
@@ -29432,6 +29834,7 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/authorized_keys",
             "/.ssh/authorized_keys",
             "/.ssh/authorized_keys2",
+            "/ssh/authorized_keys",
             # Webroot-prefix variants — common scanner pattern where a
             # directory (e.g. the CMS upload area) is assumed to sit atop
             # an unexpected ``.ssh/`` leak.
@@ -30116,6 +30519,92 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_librechat_yaml,
         "application/x-yaml; charset=utf-8",
+    ),
+    # --- GPU/HPC cluster-scheduler lane -------------------------------
+    #
+    # The credential files of an on-prem GPU cluster, as distinct from the
+    # rented-capacity providers the inference-cloud table covers: the
+    # cluster launcher's cloud credentials, the batch scheduler's
+    # accounting-database password, the machine-API client cert, and the
+    # bootstrap user-data that injects all of it. Credential sweeps walk
+    # this lane as one dictionary pass alongside the kubeconfig and SSH
+    # key filenames, and it is the lane that asks for *cluster access*
+    # rather than for an API key.
+    CanaryTrap(
+        "ray-cluster-config",
+        (
+            "/ray.yaml",
+            "/ray.yml",
+            "/ray-cluster.yaml",
+            "/ray-cluster.yml",
+            "/ray_cluster.yaml",
+            "/cluster/ray.yaml",
+            "/config/ray.yaml",
+            # The file the launcher itself writes onto the head node, so
+            # it is present on a real cluster under this exact name.
+            "/ray_bootstrap_config.json",
+            "/.ray/ray_bootstrap_config.json",
+            "/root/ray_bootstrap_config.json",
+        ),
+        ("aws",),
+        render_ray_cluster_yaml,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "slurm-config",
+        (
+            "/slurm.conf",
+            "/slurm/slurm.conf",
+            "/etc/slurm/slurm.conf",
+            "/etc/slurm-llnl/slurm.conf",
+        ),
+        ("aws",),
+        render_slurm_conf,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "slurmdbd-config",
+        (
+            "/slurmdbd.conf",
+            "/slurm/slurmdbd.conf",
+            "/etc/slurm/slurmdbd.conf",
+            "/etc/slurm-llnl/slurmdbd.conf",
+        ),
+        ("aws",),
+        render_slurmdbd_conf,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "talosconfig",
+        (
+            "/talosconfig",
+            "/talosconfig.yaml",
+            "/.talos/config",
+            "/talos/config",
+            "/root/.talos/config",
+            "/home/ubuntu/.talos/config",
+        ),
+        ("aws",),
+        render_talosconfig,
+        "application/x-yaml; charset=utf-8",
+    ),
+    CanaryTrap(
+        "cloud-init-user-data",
+        (
+            "/cloud-init.yaml",
+            "/cloud-init.yml",
+            "/cloud-config.yaml",
+            "/cloud-config.yml",
+            "/user-data",
+            "/user_data",
+            "/userdata",
+            # Where cloud-init keeps the instance's own copy on disk.
+            "/var/lib/cloud/instance/user-data.txt",
+            "/var/lib/cloud/instance/user-data.txt.i",
+        ),
+        ("aws",),
+        render_cloud_init_user_data,
+        "text/plain; charset=utf-8",
     ),
     CanaryTrap(
         "cloudflare-dev-vars",
@@ -31940,6 +32429,17 @@ _APP_CONFIG_SUFFIX_FAMILY = frozenset({
     "paperspace-config",
     "librechat-config",
     "cloudflare-dev-vars",
+    # The GPU/HPC cluster-scheduler lane, on the same rule. The observed
+    # sweeps ask for the backup sibling of a cluster config in the same
+    # pass as the canonical name (`<kubeconfig>.old` beside
+    # `<kubeconfig>`), and a scheduler config is exactly the file an
+    # operator copies aside before editing a node list or rotating the
+    # accounting password.
+    "ray-cluster-config",
+    "slurm-config",
+    "slurmdbd-config",
+    "talosconfig",
+    "cloud-init-user-data",
     # A front-end config bundle is generated, but it is also hand-patched
     # on the box when a key changes, and the leftover is what then sits
     # next to the original as readable plain text.
@@ -32078,8 +32578,18 @@ _VITE_FS_SYSTEM_FILES: "dict[str, tuple[str, Callable[[], bytes], str]]" = {
     # `/run` on every systemd host, so the same file has two absolute
     # names and dictionaries carry both.
     **{
-        f"{root}/secrets/kubernetes.io/serviceaccount/{leaf}": entry
-        for root in ("/var/run", "/run")
+        f"{prefix}/serviceaccount/{leaf}": entry
+        # The projected-volume path has two absolute spellings (`/var/run`
+        # is a symlink to `/run` on every systemd host), and dictionaries
+        # also carry the bare `/serviceaccount/<leaf>` short form a reader
+        # walks when it has given up on the absolute path and is guessing
+        # at a webroot leak of the same mount.
+        for prefix in (
+            "/var/run/secrets/kubernetes.io",
+            "/run/secrets/kubernetes.io",
+            "/secrets/kubernetes.io",
+            "",
+        )
         for leaf, entry in (
             (
                 "token",
@@ -34478,6 +34988,204 @@ async def _handle_agent_card(
             "Cache-Control": "public, max-age=300",
             "Server": "nginx/1.24.0",
         },
+    )
+
+
+RAY_JOBS_BODY_DECODE_LIMIT = 65536
+
+
+def _ray_submission_fields(request_body: bytes) -> dict[str, object]:
+    """Pull the interesting fields out of a job-submission body.
+
+    The `entrypoint` is the whole point of this trap: it is a command line
+    the submitter chose, so it is recorded in full (bounded) rather than
+    only hashed. `runtime_env` is the other half — `working_dir` and `pip`
+    name where the code is fetched from, which is how a submission that
+    stages a remote payload differs from one that runs an inline command.
+    """
+    fields: dict[str, object] = {}
+    try:
+        doc = json.loads(request_body[:RAY_JOBS_BODY_DECODE_LIMIT] or b"{}")
+    except (ValueError, UnicodeDecodeError):
+        return fields
+    if not isinstance(doc, dict):
+        return fields
+    entrypoint = doc.get("entrypoint")
+    if isinstance(entrypoint, str) and entrypoint:
+        fields["rayEntrypoint"] = entrypoint[:2048]
+    for key, name in (
+        ("submission_id", "raySubmissionIdRequested"),
+        ("job_id", "rayJobIdRequested"),
+        ("entrypoint_num_cpus", "rayEntrypointNumCpus"),
+        ("entrypoint_num_gpus", "rayEntrypointNumGpus"),
+    ):
+        value = doc.get(key)
+        if value is not None:
+            fields[name] = str(value)[:120]
+    env = doc.get("runtime_env")
+    if isinstance(env, dict):
+        working_dir = env.get("working_dir")
+        if isinstance(working_dir, str) and working_dir:
+            fields["rayWorkingDir"] = working_dir[:512]
+        pip = env.get("pip")
+        if isinstance(pip, list):
+            fields["rayPipPackages"] = [str(x)[:120] for x in pip[:20]]
+        elif isinstance(pip, str) and pip:
+            fields["rayPipPackages"] = [pip[:120]]
+        env_vars = env.get("env_vars")
+        if isinstance(env_vars, dict):
+            # Names only. The values can carry the submitter's own
+            # credentials, and this trap has no reason to retain them.
+            fields["rayEnvVarNames"] = sorted(str(k)[:80] for k in list(env_vars)[:20])
+    return fields
+
+
+def _ray_job_entry(submission_id: str, entrypoint: str, status: str) -> dict[str, object]:
+    now_ms = int(time.time() * 1000)
+    return {
+        "type": "SUBMISSION",
+        "submission_id": submission_id,
+        "job_id": None if status == "PENDING" else f"{secrets.randbelow(90000000) + 10000000:08d}",
+        "status": status,
+        "entrypoint": entrypoint,
+        "message": (
+            "Job has not started yet."
+            if status == "PENDING"
+            else "Job is currently running."
+        ),
+        "error_type": None,
+        "start_time": now_ms - 1000,
+        "end_time": None,
+        "metadata": {},
+        "runtime_env": {},
+        "driver_agent_http_address": None,
+        "driver_node_id": None,
+        "driver_exit_code": None,
+    }
+
+
+async def _handle_ray_jobs(
+    request: web.Request,
+    log_context: dict[str, object],
+    request_id: str,
+    path: str,
+    request_body: bytes,
+) -> web.StreamResponse:
+    """Answer the Ray dashboard's job-submission API.
+
+    The second step the cluster-launcher config sets up, and the one place
+    in the scheduler lane where the scanner's next action is to send us a
+    command line instead of another path.
+
+    - `GET /api/jobs/` returns a short list of plausible running jobs. A
+      cluster with GPU work on it is one worth submitting to, and an empty
+      list reads as a cluster that is not really there.
+    - `POST /api/jobs/` accepts the submission, records the `entrypoint`
+      and `runtime_env`, and returns a submission id. The job never runs;
+      nothing is executed here.
+    - `GET /api/jobs/<id>` reports that id as RUNNING, so a submitter that
+      polls (the CLI does) keeps a consistent story.
+    - `GET /api/jobs/<id>/logs` returns driver output that looks like the
+      job started and says nothing about the entrypoint, because echoing
+      the submitted command back is how a reader learns it was not run.
+    - the cluster/version/serve reads answer the metadata the CLI fetches
+      before it submits.
+    """
+    kind = ray_jobs_kind(path)
+    method = request.method
+    log_base: dict[str, object] = {**log_context, "rayApiKind": kind}
+
+    def _json(status: int, payload: object, result: str,
+              extra: "dict[str, object] | None" = None) -> web.Response:
+        append_log({**log_base, **(extra or {}), "status": status, "result": result})
+        return web.Response(
+            status=status,
+            body=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    if kind == "cluster":
+        lpath = path.lower().split("?", 1)[0].rstrip("/")
+        if lpath.endswith("/ray/version"):
+            return _json(200, {"version": "2.37.0", "ray_commit": secrets.token_hex(20)},
+                         "ray-jobs-version")
+        if lpath.endswith("/serve/applications"):
+            return _json(200, {"applications": {}, "proxies": {},
+                               "deploy_mode": "MULTI_APP"},
+                         "ray-jobs-serve-applications")
+        return _json(200, {
+            "result": True,
+            "msg": "",
+            "data": {
+                "clusterStatus": {
+                    "loadMetricsReport": {
+                        "usageByNodeType": {
+                            "head_default": {"CPU": [2.0, 8.0], "memory": [0, 33554432000]},
+                            "gpu_worker": {"GPU": [6.0, 8.0], "CPU": [24.0, 96.0]},
+                        },
+                    },
+                    "autoscalerReport": {
+                        "activeNodes": {"head_default": 1, "gpu_worker": 2},
+                        "pendingNodes": [],
+                        "failedNodes": [],
+                    },
+                },
+            },
+        }, "ray-jobs-cluster-status")
+
+    if kind == "list":
+        if method == "POST":
+            fields = _ray_submission_fields(request_body)
+            submission_id = f"raysubmit_{secrets.token_urlsafe(12).replace('-', '').replace('_', '')[:16]}"
+            # A submission that named its own id keeps that id, because the
+            # caller will poll the id it chose.
+            requested = fields.get("raySubmissionIdRequested")
+            if isinstance(requested, str) and _RAY_JOB_ID_RE.match(requested):
+                submission_id = requested
+            return _json(
+                200,
+                {"submission_id": submission_id},
+                "ray-jobs-submit",
+                {**fields, "raySubmissionIdIssued": submission_id},
+            )
+        if method not in ("GET", "HEAD"):
+            return _json(405, {"detail": "Method Not Allowed"},
+                         "ray-jobs-method-not-allowed")
+        return _json(200, [
+            _ray_job_entry(
+                f"raysubmit_{secrets.token_urlsafe(12).replace('-', '').replace('_', '')[:16]}",
+                "python -m train.sft --config configs/sft_8b.yaml",
+                "RUNNING",
+            ),
+            _ray_job_entry(
+                f"raysubmit_{secrets.token_urlsafe(12).replace('-', '').replace('_', '')[:16]}",
+                "python -m eval.harness --suite internal",
+                "SUCCEEDED",
+            ),
+        ], "ray-jobs-list")
+
+    # `status` and `logs` both address a specific id.
+    segments = [seg for seg in path.lower().split("?", 1)[0].split("/") if seg]
+    job_id = ""
+    for index, seg in enumerate(segments):
+        if seg == "jobs" and index + 1 < len(segments):
+            job_id = segments[index + 1]
+            break
+    log_base["raySubmissionIdRead"] = job_id[:128]
+
+    if kind == "logs":
+        return _json(200, {
+            "logs": (
+                "2026-01-01 00:00:00,000\tINFO job_manager.py:531 -- Runtime env is "
+                "setting up.\n"
+                "(raylet) Starting worker on node gpu-worker-01\n"
+            ),
+        }, "ray-jobs-logs")
+
+    return _json(
+        200,
+        _ray_job_entry(job_id or "raysubmit_unknown", "python -m train.sft", "RUNNING"),
+        "ray-jobs-status",
     )
 
 
@@ -45611,6 +46319,15 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_agent_card_path(path):
         return await _handle_agent_card(request, log_context, path)
 
+    # Ray dashboard job-submission API. Placed before the MCP branch for
+    # readability only: both are exact-matched on disjoint path sets, so
+    # neither can shadow the other. No canary is minted, so unlike the
+    # canary-backed traps this needs no API_KEY gate.
+    if is_ray_jobs_path(path):
+        return await _handle_ray_jobs(
+            request, log_context, request_id, path, request_body,
+        )
+
     if is_mcp_server_endpoint_path(path):
         return await _handle_mcp_server_endpoint(
             request, log_context, request_id, path,
@@ -46329,6 +47046,8 @@ def main() -> int:
         active.append("gravity-smtp")
     if TELESCOPE_ENABLED:
         active.append("telescope")
+    if RAY_JOBS_ENABLED:
+        active.append("ray-jobs")
     print(
         f"flux: listening on 127.0.0.1:18081 (aiohttp), active traps: {', '.join(active) or 'none'}",
         file=sys.stderr,

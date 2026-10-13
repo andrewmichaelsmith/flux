@@ -889,6 +889,14 @@ def test_all_trap_families_default_on():
     )
     assert tbenv.GRAPHQL_ENABLED
     assert tbenv.TELESCOPE_ENABLED
+    assert tbenv.RAY_JOBS_ENABLED, (
+        "HONEYPOT_RAY_JOBS_ENABLED should default to True — the cluster "
+        "launcher config in the scheduler lane names this host's own "
+        "dashboard, so a deployment serving that config with the dashboard "
+        "off advertises an endpoint it 404s, the same "
+        "config-names-a-dead-endpoint drift the namespace guards exist to "
+        "stop. It mints no canary, so there is no quota to protect."
+    )
     assert tbenv.OIDC_DISCOVERY_ENABLED
     assert tbenv.OIDC_ENDPOINTS_ENABLED, (
         "HONEYPOT_OIDC_ENDPOINTS_ENABLED should default to True — the "

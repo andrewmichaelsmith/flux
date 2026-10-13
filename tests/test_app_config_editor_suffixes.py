@@ -58,7 +58,14 @@ def test_the_family_is_not_empty():
     # file its own rendered body names in `key_file=` was not, so the
     # config answered its backup copy while the key — the read that
     # actually carries the credential — answered only its canonical name.
-    assert len(FAMILY) == 80
+    # 85 since the GPU/HPC cluster-scheduler lane joined (the cluster
+    # launcher, batch scheduler, accounting daemon, machine-API client
+    # config and bootstrap user-data). Admitted as one wave rather than
+    # drip-fed because the observed sweeps walk the lane as a single
+    # dictionary pass and ask for a backup sibling of a cluster config in
+    # the same breath as the canonical name — the exact split the rest of
+    # this comment is a history of.
+    assert len(FAMILY) == 85
 
 
 @pytest.mark.parametrize("suffix", SUFFIXES)
