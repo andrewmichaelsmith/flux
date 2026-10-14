@@ -20463,6 +20463,123 @@ def render_amplify_config_json(r: dict[str, object]) -> bytes:
     }, indent=2).encode("utf-8")
 
 
+def render_amplify_outputs_json(r: dict[str, object]) -> bytes:
+    """`amplify_outputs.json` — the current-generation Amplify client
+    config, which replaced `aws-exports.js` and is emitted into the web
+    root by the build rather than being hand-written.
+
+    Answered because the previous generation's two spellings are already
+    answered here: a project tree that returns the old names and 404s the
+    one a current build actually ships describes a deployment that cannot
+    exist.
+    """
+    aws = _aws(r)
+    return json.dumps({
+        "version": "1.3",
+        "auth": {
+            "aws_region": "us-east-1",
+            "user_pool_id": "us-east-1_QK2mTvJ8x",
+            "user_pool_client_id": "5r8t2m1nqf7dvkc9j3hbu0e6al",
+            "identity_pool_id": "us-east-1:8f3c21a6-4d7e-4b19-9c84-2ea5d7f10b63",
+            "username_attributes": ["email"],
+            "unauthenticated_identities_enabled": True,
+        },
+        "storage": {
+            "aws_region": "us-east-1",
+            "bucket_name": "internal-tools-prod-userfiles",
+            "access_key_id": aws.get("awsAccessKeyId", ""),
+            "secret_access_key": aws.get("awsSecretAccessKey", ""),
+            "session_token": aws.get("awsSessionToken", ""),
+        },
+        "data": {
+            "aws_region": "us-east-1",
+            "url": "https://ikzvbn4htrd2xp0qmc9sle6uyg.appsync-api.us-east-1.amazonaws.com/graphql",
+            "default_authorization_type": "API_KEY",
+            # Per-hit synthetic, never a fixed literal: an AppSync key is
+            # a credential and a shared one would be the same string on
+            # every host running this.
+            "api_key": "da2-" + secrets.token_hex(13)[:26],
+        },
+    }, indent=2).encode("utf-8")
+
+
+def render_amplify_local_aws_info(r: dict[str, object]) -> bytes:
+    """`amplify/.config/local-aws-info.json` — where the CLI caches the
+    AWS identity a project was initialised with.
+
+    This is the file in the Amplify tree that actually holds keys: with
+    project-level configuration the CLI writes them here rather than
+    referencing a named profile, and the directory is not excluded by the
+    generated `.gitignore`, so it is committed routinely.
+    """
+    aws = _aws(r)
+    env = {
+        "configLevel": "project",
+        "useProfile": False,
+        "config": {
+            "accessKeyId": aws.get("awsAccessKeyId", ""),
+            "secretAccessKey": aws.get("awsSecretAccessKey", ""),
+            "region": "us-east-1",
+        },
+    }
+    if aws.get("awsSessionToken"):
+        env["config"]["sessionToken"] = aws.get("awsSessionToken", "")
+    return json.dumps({"prod": env, "dev": env}, indent=2).encode("utf-8")
+
+
+def render_amplify_team_provider_info(r: dict[str, object]) -> bytes:
+    """`amplify/team-provider-info.json` — the per-environment backend
+    record the CLI writes for the whole team.
+
+    Carries the stack and deployment-bucket names, which is the inventory
+    half, and under project-level configuration the same credential block
+    the CLI caches locally — which is why this file being committed is a
+    recurring source of published AWS keys.
+    """
+    aws = _aws(r)
+    env = {
+        "awscloudformation": {
+            "AuthRoleName": "amplify-internaltools-prod-114238-authRole",
+            "UnauthRoleName": "amplify-internaltools-prod-114238-unauthRole",
+            "AuthRoleArn": "arn:aws:iam::417203948811:role/amplify-internaltools-prod-114238-authRole",
+            "UnauthRoleArn": "arn:aws:iam::417203948811:role/amplify-internaltools-prod-114238-unauthRole",
+            "Region": "us-east-1",
+            "DeploymentBucketName": "amplify-internaltools-prod-114238-deployment",
+            "StackName": "amplify-internaltools-prod-114238",
+            "StackId": (
+                "arn:aws:cloudformation:us-east-1:417203948811:stack/"
+                "amplify-internaltools-prod-114238/7c41b5e0-3a9d-11ee-8f21-0e3b7d2a4c15"
+            ),
+            "AmplifyAppId": "d2k9xqn5rw8ut3",
+            "accessKeyId": aws.get("awsAccessKeyId", ""),
+            "secretAccessKey": aws.get("awsSecretAccessKey", ""),
+        },
+        "categories": {
+            "storage": {"userfiles": {"bucketName": "internal-tools-prod-userfiles"}},
+        },
+    }
+    return json.dumps({"prod": env}, indent=2).encode("utf-8")
+
+
+def render_aws_credentials_properties(r: dict[str, object]) -> bytes:
+    """`AwsCredentials.properties` — the Java-SDK property file shape.
+
+    The INI credentials file is already answered here; this is the same
+    secret under the name the Java toolchain and Elastic Beanstalk give
+    it, and a sweep that asks for one asks for the other.
+    """
+    aws = _aws(r)
+    lines = [
+        "# AWS credentials for the deployment toolchain",
+        "accessKey=" + str(aws.get("awsAccessKeyId", "")),
+        "secretKey=" + str(aws.get("awsSecretAccessKey", "")),
+    ]
+    if aws.get("awsSessionToken"):
+        lines.append("sessionToken=" + str(aws.get("awsSessionToken", "")))
+    lines += ["region=us-east-1", ""]
+    return "\n".join(lines).encode("utf-8")
+
+
 def render_serverless_yml(r: dict[str, object]) -> bytes:
     """Serverless Framework service definition.
 
@@ -28577,6 +28694,51 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_aws_exports_js,
         "application/javascript; charset=utf-8",
+    ),
+    # The rest of the Amplify project tree. The two previous-generation
+    # client configs were answered while the directory that holds the
+    # credentials, and the file a current build actually ships, were not
+    # — so a sweep walking the tree read one real answer surrounded by
+    # 404s, which describes no deployment that exists.
+    CanaryTrap(
+        "aws-amplify-outputs-json",
+        (
+            "/amplify_outputs.json",
+            "/src/amplify_outputs.json",
+            "/public/amplify_outputs.json",
+            "/assets/amplify_outputs.json",
+        ),
+        ("aws",),
+        render_amplify_outputs_json,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "aws-amplify-local-aws-info",
+        ("/amplify/.config/local-aws-info.json",),
+        ("aws",),
+        render_amplify_local_aws_info,
+        "application/json; charset=utf-8",
+    ),
+    CanaryTrap(
+        "aws-amplify-team-provider-info",
+        ("/amplify/team-provider-info.json",),
+        ("aws",),
+        render_amplify_team_provider_info,
+        "application/json; charset=utf-8",
+    ),
+    # Same secret as the INI credentials file already answered here,
+    # under the name the Java toolchain gives it.
+    CanaryTrap(
+        "aws-credentials-properties",
+        (
+            "/AwsCredentials.properties",
+            "/aws/AwsCredentials.properties",
+            "/WEB-INF/AwsCredentials.properties",
+            "/WEB-INF/classes/AwsCredentials.properties",
+        ),
+        ("aws",),
+        render_aws_credentials_properties,
+        "text/plain; charset=utf-8",
     ),
     CanaryTrap(
         "aws-amplify-config-json",
