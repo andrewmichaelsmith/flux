@@ -985,6 +985,54 @@ def webshell_sweep_observe(src_ip: str, path: str, now: float | None = None) -> 
 # payload-capture traps.
 METABASE_SETUP_ENABLED = _env_bool("HONEYPOT_METABASE_SETUP_ENABLED")
 
+# --- Self-hosted AI / MLOps control-plane login sinks -------------------
+# Argo CD, RAGFlow and MaxKB are three control planes that turn up inside
+# one credential pass: a GitOps delivery controller that holds cluster
+# credentials and repository deploy keys, and two self-hosted RAG/LLM
+# platforms that hold model-provider API keys plus whatever corpus was
+# loaded into them. All three ship a documented JSON login endpoint, all
+# three are routinely published without an authenticating proxy in front,
+# and the value behind each is cluster or model-provider access rather
+# than one more web shell.
+#
+# Flux already answered a fourth member of that set — the analytics
+# surface at `/api/session` — so a pass walking all four reached a
+# plausible answer on one and a 404 on the rest. That is the worst of
+# both: the sender learns the host does not run them and stops, and the
+# one surface that did answer looks anomalous beside three dead ones.
+#
+# These are credential *sinks*, not banner pages: the interesting half is
+# the POST body. Each login endpoint runs the shared conversion gate, so
+# a source that keeps trying eventually finds exactly one pair that
+# works and lands on an authenticated surface — the application list, the
+# tenant document — where what it reaches for next becomes observable.
+# Without the gate every guess fails identically and the dictionary is
+# all we ever learn.
+#
+# Keyless: every token minted here is a per-request synthetic, so there
+# is no upstream quota to gate on and a deployment without an API key
+# still captures the bodies.
+AIPLATFORM_LOGIN_ENABLED = _env_bool("HONEYPOT_AIPLATFORM_LOGIN_ENABLED")
+# A much lower band than the VPN sinks. Those face dictionary runs tens
+# of thousands of guesses long; a control-plane pass tries a handful of
+# product defaults per host and moves on, so a 40-attempt floor would
+# mean this surface never converts for the traffic it was built for.
+AIPLATFORM_LOGIN_ACCEPT_MIN_ATTEMPTS = max(
+    int((os.environ.get("HONEYPOT_AIPLATFORM_LOGIN_ACCEPT_MIN_ATTEMPTS") or "8").strip() or "8"), 1,
+)
+AIPLATFORM_LOGIN_ACCEPT_MAX_ATTEMPTS = max(
+    int((os.environ.get("HONEYPOT_AIPLATFORM_LOGIN_ACCEPT_MAX_ATTEMPTS") or "32").strip() or "32"),
+    AIPLATFORM_LOGIN_ACCEPT_MIN_ATTEMPTS,
+)
+AIPLATFORM_LOGIN_BRUTE_STATE_TTL_SECONDS = max(
+    int((os.environ.get("HONEYPOT_AIPLATFORM_LOGIN_BRUTE_STATE_TTL_SECONDS") or "86400").strip() or "86400"),
+    60,
+)
+AIPLATFORM_LOGIN_BRUTE_STATE_MAX_ENTRIES = max(
+    int((os.environ.get("HONEYPOT_AIPLATFORM_LOGIN_BRUTE_STATE_MAX_ENTRIES") or "4096").strip() or "4096"),
+    16,
+)
+
 CODE_EXEC_API_ENABLED = _env_bool("HONEYPOT_CODE_EXEC_API_ENABLED")
 CODE_EXEC_API_BODY_PREVIEW_LIMIT = max(
     int(
@@ -46139,6 +46187,576 @@ async def _handle_metabase_setup(
     )
 
 
+
+
+# --- Self-hosted AI / MLOps control-plane login sinks -------------------
+#
+# One route table rather than three traps: the products differ in their
+# envelope and nothing else, and a source walking all three is running
+# one pass. Keeping them together is what makes "the same dictionary
+# reached three control planes" a single readable line.
+#
+# `surface` names the step, not the path, so the log groups by what the
+# caller was trying to do across products: `login` is the credential
+# sink, `userinfo` the cheap post-authentication check a client makes to
+# confirm a token, and `inventory` the surface worth having a token for.
+_AIPLATFORM_LOGIN_ROUTES: dict[str, tuple[str, str]] = {
+    # GitOps delivery controller.
+    "/api/v1/session": ("argocd", "login"),
+    "/api/v1/session/userinfo": ("argocd", "userinfo"),
+    "/api/v1/applications": ("argocd", "inventory"),
+    "/api/v1/repositories": ("argocd", "repositories"),
+    # Self-hosted RAG platform.
+    "/v1/user/login": ("ragflow", "login"),
+    "/v1/user/info": ("ragflow", "userinfo"),
+    "/v1/user/tenant_info": ("ragflow", "inventory"),
+    # Self-hosted knowledge-base / agent platform.
+    "/api/user/login": ("maxkb", "login"),
+    "/api/user/profile": ("maxkb", "userinfo"),
+}
+
+# Field names each product's login endpoint reads the identity out of.
+# Checked in order; the first present wins. RAGFlow keys on `email`,
+# the other two on `username`, and tooling that posts one shape to all
+# three is itself worth seeing — which is why every product accepts
+# every spelling rather than only its own.
+_AIPLATFORM_USER_FIELDS = ("username", "email", "user", "account", "login")
+
+_AIPLATFORM_SESSION_SECRET = secrets.token_bytes(32)
+
+
+def is_aiplatform_login_path(path: str) -> tuple[str, str] | None:
+    """`(product, surface)` for a control-plane route, or None."""
+    return _AIPLATFORM_LOGIN_ROUTES.get(path.lower().split("?", 1)[0])
+
+
+def _aiplatform_session_token(product: str, client_ip: str, host: str) -> str:
+    """The opaque half of the session this deployment would issue.
+
+    Derived from a per-process secret plus the source and host, so it is
+    stable for a source that replays its own token — a session that stops
+    working on the next request is not a session — while differing across
+    sources and across deployments. Never a fixed literal: a shared token
+    string would be the same value on every host running this, which is a
+    fleet-wide fingerprint and gives a replay nothing to detect.
+    """
+    digest = hmac.new(
+        _AIPLATFORM_SESSION_SECRET,
+        f"{product}\x00{client_ip or '-'}\x00{host or '-'}".encode("utf-8", "replace"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest
+
+
+def _aiplatform_provider_key() -> str:
+    """Per-hit synthetic model-provider API key.
+
+    Shaped like the provider keys a RAG platform's tenant document holds,
+    because that document is the reason the tenant surface is worth
+    reaching. Per-hit random rather than a Tracebit-issued canary: this
+    runs on keyless deployments. Per-hit is the part that matters — a
+    fixed literal here would ship one string across every host.
+    """
+    return "sk-" + secrets.token_urlsafe(32)[:40]
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _aiplatform_argocd_jwt(username: str, token: str) -> str:
+    """A session JWT with the claim set the real controller issues.
+
+    Clients routinely decode this before spending it — the payload is how
+    a client learns which account it has and when the session expires —
+    so a token that does not parse as a JWT ends the exchange at the
+    first thing the caller does with it.
+    """
+    now = int(time.time())
+    header = _b64url(b'{"alg":"HS256","typ":"JWT"}')
+    payload = _b64url(json.dumps({
+        "iss": "argocd",
+        "sub": f"{username or 'admin'}:login",
+        "iat": now,
+        "exp": now + 86400,
+        "nbf": now,
+        "jti": token[:32],
+    }, separators=(",", ":")).encode("utf-8"))
+    signature = _b64url(hmac.new(
+        _AIPLATFORM_SESSION_SECRET,
+        f"{header}.{payload}".encode("ascii"),
+        hashlib.sha256,
+    ).digest())
+    return f"{header}.{payload}.{signature}"
+
+
+def _aiplatform_presented_token(headers, product: str) -> str:
+    """The session credential the caller is presenting, if any.
+
+    Three spellings because the three products differ: a bearer header, a
+    bare `Authorization` value with no scheme, and the controller's own
+    session cookie. Accepting all three means a client that got its token
+    from our login endpoint is recognised whichever way its library
+    chooses to send it back.
+    """
+    auth = ""
+    try:
+        auth = str(headers.get("Authorization") or "").strip()
+    except Exception:
+        auth = ""
+    if auth:
+        lowered = auth.lower()
+        if lowered.startswith("bearer "):
+            return auth[7:].strip()
+        if not lowered.startswith(("basic ", "digest ", "negotiate ")):
+            return auth
+    try:
+        cookie = str(headers.get("Cookie") or "")
+    except Exception:
+        cookie = ""
+    if cookie and product == "argocd":
+        match = re.search(r"argocd\.token=([^;]+)", cookie)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _aiplatform_opaque_token(token: str) -> str:
+    """The short form the two platform products hand back.
+
+    One place, because the login handler and the validator have to agree
+    on it: issuing a truncated token and then checking the full digest
+    means a client that spends the session we just gave it is refused,
+    and the post-authentication surfaces are never reached by anybody.
+    """
+    return token[:48]
+
+
+def _aiplatform_token_is_ours(presented: str, product: str, token: str, username: str) -> bool:
+    """Whether this caller holds a session this server issued.
+
+    Accepts every form the login endpoints hand out — the opaque short
+    token, the full digest, and the signed JWT — because which one comes
+    back depends on the product and on what the client's library chose
+    to store.
+    """
+    if not presented:
+        return False
+    if presented in (token, _aiplatform_opaque_token(token)):
+        return True
+    return product == "argocd" and presented == _aiplatform_argocd_jwt(username, token)
+
+
+def _aiplatform_credential_fields(
+    request_body: bytes, product: str,
+) -> tuple[dict[str, object], str, str]:
+    """Identity and credential shape from a control-plane login body.
+
+    The password is never logged — only its length, and the shared
+    credential-pair hash, which is what lets one dictionary be tracked
+    across the VPN sinks and these without storing anybody's guesses.
+    """
+    out: dict[str, object] = {"aiplatformProduct": product}
+    if not request_body:
+        return out, "", ""
+    text = request_body[:8192].decode("utf-8", "replace")
+    username = ""
+    password = ""
+    parsed_json = False
+    try:
+        payload = json.loads(text)
+        parsed_json = isinstance(payload, dict)
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    if parsed_json:
+        for field in _AIPLATFORM_USER_FIELDS:
+            value = payload.get(field)
+            if isinstance(value, str) and value:
+                username = value
+                out["aiplatformUserField"] = field
+                break
+        raw_password = payload.get("password") or payload.get("passwd")
+        if isinstance(raw_password, str):
+            password = raw_password
+    else:
+        # Some tooling posts the form encoding to a JSON endpoint. Worth
+        # reading rather than discarding: a sender that gets the content
+        # type wrong is usually replaying a recipe written for a
+        # different product, which is itself a grouping signal.
+        try:
+            form = parse_qs(text, keep_blank_values=True)
+        except (ValueError, UnicodeDecodeError):
+            form = {}
+        for field in _AIPLATFORM_USER_FIELDS:
+            if form.get(field):
+                username = form[field][0]
+                out["aiplatformUserField"] = field
+                break
+        if form.get("password"):
+            password = form["password"][0]
+    out["aiplatformBodyParsedJson"] = parsed_json
+    if username:
+        out["aiplatformUsername"] = username[:256]
+    out["aiplatformHasPassword"] = bool(password)
+    if password:
+        out["aiplatformPasswordLen"] = len(password)
+    if username and password:
+        out["aiplatformCredentialId"] = credential_pair_id(username, password)
+    return out, username, password
+
+
+_AIPLATFORM_BRUTE_STATE: dict[str, dict[str, object]] = {}
+
+
+def aiplatform_evaluate_credential(
+    client_ip: str, username: str, password: str, host: str = "",
+) -> tuple[bool, bool, int]:
+    """Control-plane entry point to the shared conversion gate.
+
+    One scope for all three products on purpose: a pass that walks Argo
+    CD, then the RAG platform, then the knowledge base is one operator
+    working one host, and making them share a budget means the surface
+    converts on the pass rather than on the product.
+    """
+    return _evaluate_brute_credential(
+        _AIPLATFORM_BRUTE_STATE,
+        "aiplatform-login",
+        client_ip,
+        username,
+        password,
+        host,
+        min_attempts=AIPLATFORM_LOGIN_ACCEPT_MIN_ATTEMPTS,
+        max_attempts=AIPLATFORM_LOGIN_ACCEPT_MAX_ATTEMPTS,
+        ttl_seconds=AIPLATFORM_LOGIN_BRUTE_STATE_TTL_SECONDS,
+        max_entries=AIPLATFORM_LOGIN_BRUTE_STATE_MAX_ENTRIES,
+    )
+
+
+def render_argocd_applications(host: str) -> bytes:
+    """The application list — the reason a token is worth having.
+
+    Each entry names a repository, a path inside it and a destination
+    namespace, which is the inventory an operator who reaches this point
+    is actually after. No credential appears here: the real controller
+    does not return one from this endpoint, and inventing one would be
+    the inconsistency a reader checks for.
+    """
+    safe = _appliance_display_host(host, "cluster.local").split(":", 1)[0]
+    apps = [
+        ("platform-api", "apps/platform-api", "production", "Synced", "Healthy"),
+        ("ingest-workers", "apps/ingest-workers", "production", "Synced", "Healthy"),
+        ("model-gateway", "apps/model-gateway", "ml", "OutOfSync", "Progressing"),
+        ("observability", "charts/observability", "monitoring", "Synced", "Healthy"),
+    ]
+    items = [{
+        "metadata": {"name": name, "namespace": "argocd", "project": "default"},
+        "spec": {
+            "source": {
+                "repoURL": f"https://git.{safe}/platform/deploy.git",
+                "path": path,
+                "targetRevision": "HEAD",
+            },
+            "destination": {
+                "server": "https://kubernetes.default.svc",
+                "namespace": namespace,
+            },
+            "project": "default",
+        },
+        "status": {
+            "sync": {"status": sync},
+            "health": {"status": health},
+        },
+    } for name, path, namespace, sync, health in apps]
+    doc = {"metadata": {"resourceVersion": str(int(time.time()))}, "items": items}
+    return json.dumps(doc, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def render_argocd_repositories(host: str) -> bytes:
+    """Configured repositories and their connection state.
+
+    Usernames and connection status only — the controller redacts the
+    credential on this endpoint, so returning one would be wrong in the
+    direction that gets noticed.
+    """
+    safe = _appliance_display_host(host, "cluster.local").split(":", 1)[0]
+    items = [{
+        "repo": f"https://git.{safe}/platform/deploy.git",
+        "username": "argocd-deploy",
+        "type": "git",
+        "project": "default",
+        "connectionState": {"status": "Successful", "message": ""},
+    }, {
+        "repo": f"https://git.{safe}/platform/charts.git",
+        "username": "argocd-deploy",
+        "type": "helm",
+        "project": "default",
+        "connectionState": {"status": "Successful", "message": ""},
+    }]
+    return json.dumps({"items": items}, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def render_ragflow_tenant_info() -> bytes:
+    """Tenant document for the RAG platform.
+
+    Carries the model-provider key, which is the asset behind this
+    product: a reader that reaches here and then spends the key has told
+    us the whole chain. Per-hit synthetic, never a fixed literal.
+    """
+    doc = {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "tenant_id": uuid.uuid4().hex,
+            "name": "default",
+            "llm_id": "gpt-4o-mini@OpenAI",
+            "embd_id": "text-embedding-3-small@OpenAI",
+            "asr_id": "",
+            "img2txt_id": "",
+            "parser_ids": "naive:General,qa:Q&A,paper:Paper",
+            "role": "owner",
+            "api_key": _aiplatform_provider_key(),
+        },
+    }
+    return json.dumps(doc, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def _aiplatform_account_domain(host: str) -> str:
+    """Mail domain for the administrator account these surfaces report.
+
+    Behind a proxy that rewrites `Host` the arriving value is a loopback
+    literal, so a document built straight from it prints
+    `admin@127.0.0.1` — identical on every host running this, which is a
+    fleet fingerprint rather than a cosmetic slip. Same guard the
+    appliance pages use, for the same reason.
+    """
+    return _appliance_display_host(host, "cluster.local").split(":", 1)[0]
+
+
+def _aiplatform_json(status: int, doc: object) -> web.Response:
+    body = json.dumps(doc, separators=(",", ":")).encode("utf-8") + b"\n"
+    return web.Response(
+        status=status, body=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+
+
+# Per-product envelopes. The three disagree about almost everything —
+# whether a failed login is an HTTP error or a 200 carrying an error
+# code, what the code is called, where the token goes — and getting any
+# of it wrong is what a client notices first.
+def _aiplatform_login_failure(product: str) -> web.Response:
+    if product == "argocd":
+        return _aiplatform_json(401, {
+            "error": "Invalid username or password",
+            "code": 16,
+            "message": "Invalid username or password",
+        })
+    if product == "ragflow":
+        # 200 with a non-zero `code` is this platform's failure shape;
+        # returning an HTTP error instead is the tell.
+        return _aiplatform_json(200, {
+            "code": 102,
+            "message": "Email and password do not match!",
+            "data": False,
+        })
+    return _aiplatform_json(200, {
+        "code": 400,
+        "message": "The username or password is incorrect",
+        "data": None,
+    })
+
+
+def _aiplatform_unauthorized(product: str) -> web.Response:
+    if product == "argocd":
+        return _aiplatform_json(401, {
+            "error": "no session information",
+            "code": 16,
+            "message": "no session information",
+        })
+    if product == "ragflow":
+        return _aiplatform_json(401, {
+            "code": 401, "message": "<Unauthorized>", "data": False,
+        })
+    return _aiplatform_json(401, {
+        "code": 401,
+        "message": "Not logged in, please log in first",
+        "data": None,
+    })
+
+
+async def _handle_aiplatform_login(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+    product: str,
+    surface: str,
+) -> web.Response:
+    """Credential sink and post-authentication surface for the
+    self-hosted AI / MLOps control planes.
+
+    Result tags:
+      `aiplatform-login`            — a guess, refused.
+      `aiplatform-login-accepted`   — the conversion gate gave way; the
+                                      pair in this request is the one
+                                      that now works for this source.
+      `aiplatform-login-replay`     — the found pair, sent again.
+      `aiplatform-<surface>`        — an authenticated surface, with
+                                      `aiplatformTokenValid` saying
+                                      whether the caller held a session
+                                      this server issued.
+    """
+    client_ip = str(log_context.get("clientIp") or "")
+    host = str(log_context.get("host") or "")
+    method = request.method.upper()
+    token = _aiplatform_session_token(product, client_ip, host)
+
+    if surface == "login":
+        if method not in ("POST", "PUT"):
+            # A GET on a login endpoint is a reachability check, not an
+            # attempt. Answering 405 keeps the endpoint's existence
+            # confirmed without spending a conversion-gate attempt on a
+            # request that carried no credential.
+            response = _aiplatform_json(405, {
+                "error": "method not allowed", "code": 12,
+                "message": "method not allowed",
+            } if product == "argocd" else {
+                "code": 405, "message": "Method Not Allowed", "data": None,
+            })
+            append_log({
+                **log_context, "status": 405,
+                "result": "aiplatform-login-method-not-allowed",
+                "aiplatformProduct": product,
+                "bytes": len(response.body or b""),
+            })
+            return response
+
+        creds, username, password = _aiplatform_credential_fields(request_body, product)
+        accepted, newly_accepted, attempts = aiplatform_evaluate_credential(
+            client_ip, username, password, host,
+        )
+        creds["aiplatformAttempts"] = attempts
+        creds["aiplatformAccepted"] = accepted
+
+        if not accepted:
+            response = _aiplatform_login_failure(product)
+            append_log({
+                **log_context, "status": response.status,
+                "result": "aiplatform-login",
+                **creds,
+                "bytes": len(response.body or b""),
+            })
+            return response
+
+        # Converted. From here the source holds a session, and what it
+        # does with it is the measurement this trap exists for.
+        if product == "argocd":
+            doc: object = {"token": _aiplatform_argocd_jwt(username, token)}
+            response = _aiplatform_json(200, doc)
+        elif product == "ragflow":
+            response = _aiplatform_json(200, {
+                "code": 0,
+                "message": "success",
+                "data": {
+                    "access_token": _aiplatform_opaque_token(token),
+                    "email": username[:256],
+                    "nickname": (username.split("@", 1)[0] or "admin")[:64],
+                    "is_superuser": True,
+                },
+            })
+            # This platform hands the session back in a response header
+            # as well as the body, and clients read it from there.
+            response.headers["Authorization"] = _aiplatform_opaque_token(token)
+        else:
+            response = _aiplatform_json(200, {
+                "code": 200, "message": "success", "data": _aiplatform_opaque_token(token),
+            })
+        append_log({
+            **log_context, "status": 200,
+            "result": "aiplatform-login-accepted" if newly_accepted else "aiplatform-login-replay",
+            **creds,
+            "bytes": len(response.body or b""),
+        })
+        return response
+
+    # ------------------------------------------ authenticated surfaces
+    presented = _aiplatform_presented_token(request.headers, product)
+    username = ""
+    valid = _aiplatform_token_is_ours(presented, product, token, username)
+    fields: dict[str, object] = {
+        "aiplatformProduct": product,
+        "aiplatformSurface": surface,
+        "aiplatformTokenPresented": bool(presented),
+        "aiplatformTokenValid": valid,
+    }
+
+    if not valid:
+        if surface == "userinfo" and product == "argocd":
+            # The controller answers this one without a session — it is
+            # how a UI decides whether to show a login form — so a 401
+            # here would be the inconsistency.
+            response = _aiplatform_json(200, {"loggedIn": False})
+            append_log({
+                **log_context, "status": 200,
+                "result": "aiplatform-userinfo-anonymous",
+                **fields, "bytes": len(response.body or b""),
+            })
+            return response
+        response = _aiplatform_unauthorized(product)
+        append_log({
+            **log_context, "status": response.status,
+            "result": "aiplatform-" + surface + "-unauthenticated",
+            **fields, "bytes": len(response.body or b""),
+        })
+        return response
+
+    if product == "argocd" and surface == "userinfo":
+        response = _aiplatform_json(200, {
+            "loggedIn": True, "username": "admin", "iss": "argocd", "groups": [],
+        })
+    elif product == "argocd" and surface == "inventory":
+        response = web.Response(
+            status=200, body=render_argocd_applications(host),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+    elif product == "argocd" and surface == "repositories":
+        response = web.Response(
+            status=200, body=render_argocd_repositories(host),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+    elif product == "ragflow" and surface == "userinfo":
+        response = _aiplatform_json(200, {
+            "code": 0, "message": "success",
+            "data": {
+                "email": "admin@" + _aiplatform_account_domain(host),
+                "nickname": "admin", "is_superuser": True,
+                "login_channel": "password", "status": "1",
+            },
+        })
+    elif product == "ragflow" and surface == "inventory":
+        response = web.Response(
+            status=200, body=render_ragflow_tenant_info(),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+    else:
+        response = _aiplatform_json(200, {
+            "code": 200, "message": "success",
+            "data": {
+                "id": uuid.uuid4().hex, "username": "admin",
+                "email": "admin@" + _aiplatform_account_domain(host),
+                "is_active": True, "role": "ADMIN",
+                "permissions": ["APPLICATION:READ", "DATASET:READ", "SETTING:READ"],
+            },
+        })
+
+    append_log({
+        **log_context, "status": 200,
+        "result": "aiplatform-" + surface,
+        **fields, "bytes": len(response.body or b""),
+    })
+    return response
+
+
 # Sent on both the OPTIONS answer and the 405 refusal, from one place so
 # the two cannot disagree about what this server accepts. `Allow` is
 # required on a 405 by RFC 9110 §15.5.6; the CORS trio is what a browser
@@ -46505,6 +47123,18 @@ async def handle(request: web.Request) -> web.StreamResponse:
         return await _handle_metabase_setup(
             request, log_context, path, request_body
         )
+
+    # Keyless for the same reason as the analytics surface above: every
+    # token this mints is a per-request synthetic, so there is no
+    # upstream quota to gate on and a deployment without an API key
+    # still captures the credential bodies.
+    if AIPLATFORM_LOGIN_ENABLED:
+        _aiplatform_route = is_aiplatform_login_path(path)
+        if _aiplatform_route is not None:
+            return await _handle_aiplatform_login(
+                request, log_context, path, request_body,
+                _aiplatform_route[0], _aiplatform_route[1],
+            )
 
     if API_KEY and is_oidc_discovery_path(path):
         return await _handle_oidc_discovery(request, log_context, path)

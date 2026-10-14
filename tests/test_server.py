@@ -654,6 +654,13 @@ def test_all_trap_families_default_on():
         "layout-vocabulary walk cannot cover."
     )
     assert tbenv.CLOUD_IMDS_ENABLED
+    assert tbenv.AIPLATFORM_LOGIN_ENABLED, (
+        "HONEYPOT_AIPLATFORM_LOGIN_ENABLED should default to True — the "
+        "self-hosted AI/MLOps control planes are probed in one pass with "
+        "the analytics surface flux already answers, and answering one "
+        "member of that set while 404ing the rest tells the sender the "
+        "host does not run them"
+    )
     assert tbenv.JAVA_DESCRIPTOR_READ_ENABLED, (
         "HONEYPOT_JAVA_DESCRIPTOR_READ_ENABLED should default to True — the "
         "deployment descriptors under WEB-INF/META-INF are what a scanner "

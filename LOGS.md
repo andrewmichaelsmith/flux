@@ -486,6 +486,38 @@ target, taken from the body or the query string. An off-host value names
 their infrastructure rather than guessing at ours, which is why it is
 lifted out of `bodyPreview` into its own field.
 
+### Self-hosted AI / MLOps control-plane login sinks
+
+Every line carries `aiplatformProduct` (which control plane) and, on the
+authenticated surfaces, `aiplatformSurface`. The login lines carry
+`aiplatformAttempts` — how many guesses this source has spent against
+this host, across all three products, since they share one conversion
+budget — and `aiplatformAccepted`.
+
+The password value is never recorded. `aiplatformPasswordLen` and
+`aiplatformCredentialId` stand in for it; the pair hash is the **same**
+one the VPN and remote-desktop sinks emit, so a dictionary reaching
+several surfaces can be joined without reading anybody's guesses back out
+of the body. See [docs](./docs/aiplatform-login.md).
+
+| `result` | `status` | Extras | Meaning |
+| --- | --- | --- | --- |
+| `aiplatform-login` | 401 / 200 | `aiplatformUsername: str<=256`, `aiplatformUserField`, `aiplatformBodyParsedJson: bool`, `aiplatformHasPassword: bool`, `aiplatformPasswordLen: int`, `aiplatformCredentialId: str32`, `aiplatformAttempts: int`, `aiplatformAccepted: bool`, `bytes: int` | A guess, refused. Status is the product's own failure shape — an HTTP 401 for the delivery controller, a 200 carrying a non-zero `code` for the two platforms. |
+| `aiplatform-login-accepted` | 200 | as above | The conversion gate gave way. The pair in this request is the one that now works for this source, and only that pair. |
+| `aiplatform-login-replay` | 200 | as above | The found pair, sent again. |
+| `aiplatform-login-method-not-allowed` | 405 | `aiplatformProduct`, `bytes: int` | A reachability check on a login endpoint. **No** conversion-gate attempt is charged — it carried no credential. |
+| `aiplatform-userinfo-anonymous` | 200 | `aiplatformTokenPresented: bool`, `aiplatformTokenValid: bool`, `bytes: int` | The delivery controller answers its own `userinfo` route without a session; a 401 there would be the inconsistency. |
+| `aiplatform-<surface>-unauthenticated` | 401 | as above | An authenticated surface reached without a session this server issued. |
+| `aiplatform-<surface>` | 200 | as above | An authenticated surface served. `inventory` is the application list / tenant document, `repositories` the repository list. |
+
+`aiplatformTokenValid` is the field that separates a client following the
+chain it was given from one replaying a session harvested elsewhere: it
+is true only for a token this deployment issued to this source. A
+`aiplatform-login-accepted` followed by an `aiplatform-inventory` with
+`aiplatformTokenValid=true` from the same source is the completed
+exchange — a caller that spent the session rather than stopping at the
+login response.
+
 ### SSRF relay onto the metadata tree
 
 The same documents, reached through a URL-taking parameter on a
