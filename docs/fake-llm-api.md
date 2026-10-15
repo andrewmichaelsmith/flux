@@ -1,13 +1,44 @@
 # Fake LLM-API endpoint
 
-Matches these paths (exact, case-insensitive; configurable via
+Matches these routes (case-insensitive; configurable via
 `HONEYPOT_LLM_ENDPOINT_PATHS_CSV`):
 
-| Family | Paths | Response |
+| Family | Routes | Response |
 | --- | --- | --- |
-| Ollama | `/v1/models`, `/api/tags`, `/api/version`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate` | Ollama-native JSON with a fixed list of plausible model IDs |
+| Ollama | `/api/tags`, `/api/version`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate` | Ollama-native JSON with a fixed list of plausible model IDs |
 | OpenAI | `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | OpenAI-compatible JSON |
 | Anthropic | `/v1/messages`, `/anthropic/v1/models`, `/anthropic/v1/messages` | Anthropic Messages-API JSON |
+| Google | `/v1beta/models` | Generative Language API JSON — a `models` array of `models/<id>` entries with token limits and `supportedGenerationMethods` |
+| Un-versioned | `/models`, `/chat/completions`, `/completions`, `/embeddings` | Same renderers as the `/v1/` spellings above |
+
+## Gateway mount prefixes
+
+A route also matches under one leading mount segment, so a gateway
+whose API is rooted at a namespace is answered without enumerating
+every prefix x route pair:
+
+```
+/api/v1/models        -> /v1/models
+/openai/v1/models     -> /v1/models
+/api/models           -> /models
+/api/v1/chat/completions -> /v1/chat/completions
+```
+
+The prefix set is `api`, `openai`, `azure`, `azure-openai`,
+`openrouter`, `zen`, `litellm`, `vllm`, `ollama` — configurable via
+`HONEYPOT_LLM_MOUNT_PREFIXES_CSV`. Rules that keep the match tight:
+
+- **Exact routes win before any stripping**, so a vendor spelling that
+  needs its own envelope keeps it — `/anthropic/v1/models` returns the
+  Anthropic shape rather than being read as a stripped `/v1/models`.
+- **Only one segment is stripped.** `/api/openai/v1/models` does not
+  match; stacked prefixes are not an observed shape, and allowing them
+  would let the rule claim arbitrarily deep application paths.
+- **Only known prefixes are stripped**, so `/unknownvendor/v1/models`
+  does not match.
+
+The log keeps the spelling the client actually sent (`llmPath`), not the
+canonical route, so which mounts are being probed stays measurable.
 
 On POST the trap extracts `model`, a prompt-ish field, and the
 `"stream"` flag from the JSON body (handles OpenAI / Ollama /
@@ -79,6 +110,27 @@ See [`../LOGS.md`](../LOGS.md) for the `llm-endpoint-*` result tags
 and the `llmModel` / `llmPromptPreview` / `llmHasAuth` /
 `llmAuthTokenSha256` / `llmAuthTokenPreview` /
 `llmStreamRequested` / `llmStreamChunks` fields.
+
+## Why the mount prefixes were added
+
+Model listing is the entry point of this chain: a client that gets a
+404 there never sends the completion POST, which is where the prompt
+and the bearer token are. The trap originally matched an exact path
+list, so a gateway spelling of the listing route 404'd while the bare
+one answered — and recurring probe traffic showed the mounted spelling
+carrying *more* distinct sources than the bare one, alongside sources
+that went on to POST completions once something answered. Anchoring on
+the route and stripping one mount segment closes the whole prefix grid
+rather than the one spelling that happened to be noticed.
+
+The un-versioned spellings travel with the same traffic: a proxy that
+roots its API at a mount point tends to drop the `/v1` segment too, and
+sweeps send the bare route beside the versioned one rather than picking.
+
+The Google listing route is separate because it carries its own version
+segment (`/v1beta`) instead of `/v1`, and its response is structurally
+unlike the OpenAI list — returning the OpenAI envelope there would tell
+a client probing for Gemini that it is not talking to Gemini.
 
 The gateway's *control* plane — model registry, key minting, spend
 reporting — is a separate trap with a separate population walking it:

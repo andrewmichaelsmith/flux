@@ -1851,11 +1851,54 @@ _LLM_ENDPOINT_DEFAULT_PATHS = ",".join([
     "/v1/messages",
     "/anthropic/v1/models",
     "/anthropic/v1/messages",
+    # Google Generative Language API. Its listing route carries its own
+    # version segment rather than `/v1`, so it needs its own entry and its
+    # own response shape; the payload is structurally unlike the OpenAI
+    # list, which makes a wrong shape here an obvious tell.
+    "/v1beta/models",
+    # Un-versioned gateway spellings. A proxy that roots its API at a mount
+    # point tends to drop the `/v1` segment as well, and probe traffic sends
+    # the bare route beside the versioned one.
+    "/models",
+    "/chat/completions",
+    "/completions",
+    "/embeddings",
 ])
 LLM_ENDPOINT_PATHS = {
     value.strip().lower()
     for value in (os.environ.get("HONEYPOT_LLM_ENDPOINT_PATHS_CSV") or _LLM_ENDPOINT_DEFAULT_PATHS).split(",")
     if value.strip()
+}
+# Mount prefixes stripped before the route lookup above. Gateways expose the
+# same OpenAI-compatible routes under a namespace segment — one rooted at
+# `/api`, a multi-upstream proxy namespacing per provider — and the observed
+# sweeps walk those mounts as siblings of the bare route rather than picking
+# one. Anchoring on the route and stripping one known mount segment covers
+# the whole prefix x route grid instead of enumerating pairs, which is what
+# left the most-probed listing spelling in this family unanswered.
+#
+# `anthropic` is deliberately absent: its routes are exact members above
+# because they need the Anthropic response shape, and an exact member is
+# matched before any stripping, so adding it here could only route one of
+# its routes to the wrong renderer.
+_LLM_MOUNT_DEFAULT_PREFIXES = ",".join([
+    "api",
+    "openai",
+    "azure",
+    "azure-openai",
+    "openrouter",
+    "zen",
+    "litellm",
+    "vllm",
+    "ollama",
+])
+LLM_MOUNT_PREFIXES = {
+    value.strip().lower().strip("/")
+    for value in (
+        os.environ.get("HONEYPOT_LLM_MOUNT_PREFIXES_CSV")
+        or _LLM_MOUNT_DEFAULT_PREFIXES
+    ).split(",")
+    if value.strip().strip("/")
 }
 # Cap how much of the prompt body we decode into the log line. Scanners that
 # find the endpoint may POST large system prompts or tool definitions; we want
@@ -6343,10 +6386,36 @@ def is_ray_jobs_path(path: str) -> bool:
     return bool(ray_jobs_kind(path))
 
 
+def llm_endpoint_route(path: str) -> str | None:
+    """Canonical LLM route for `path`, or None if `path` isn't one.
+
+    An exact member of `LLM_ENDPOINT_PATHS` wins before any stripping, so a
+    vendor spelling that needs its own response shape (`/anthropic/v1/models`)
+    keeps it. Otherwise one leading mount segment from `LLM_MOUNT_PREFIXES` is
+    removed and the remainder re-checked, which is what lets a gateway mounted
+    under `/api` or a per-provider namespace reach the same renderer as the
+    bare route.
+
+    Returns the route to render, which is what the handler dispatches on —
+    not a bool — so the caller never has to re-derive the stripping.
+    """
+    p = path.lower().split("?", 1)[0]
+    if len(p) > 1:
+        p = p.rstrip("/")
+    if p in LLM_ENDPOINT_PATHS:
+        return p
+    head, _, tail = p.lstrip("/").partition("/")
+    if tail and head in LLM_MOUNT_PREFIXES:
+        candidate = "/" + tail
+        if candidate in LLM_ENDPOINT_PATHS:
+            return candidate
+    return None
+
+
 def is_llm_endpoint_path(path: str) -> bool:
     if not LLM_ENDPOINT_ENABLED:
         return False
-    return path.lower() in LLM_ENDPOINT_PATHS
+    return llm_endpoint_route(path) is not None
 
 
 def is_litellm_admin_path(path: str) -> bool:
@@ -8717,6 +8786,31 @@ def render_openai_models() -> bytes:
         ],
     }
     return json.dumps(payload).encode("utf-8")
+
+
+def render_gemini_models() -> bytes:
+    # Google Generative Language API /v1beta/models shape: a "models" array
+    # whose entries are namespaced (`models/<id>`) and carry token limits plus
+    # the generation methods each model supports. Structurally unlike the
+    # OpenAI list, so returning the OpenAI shape on this route would tell a
+    # client probing for Gemini that it is not talking to Gemini.
+    gemini_ids = ("gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash")
+    models = [
+        {
+            "name": f"models/{mid}",
+            "version": "001",
+            "displayName": mid.replace("-", " ").title(),
+            "description": f"Google {mid}",
+            "inputTokenLimit": 1_048_576,
+            "outputTokenLimit": 8192,
+            "supportedGenerationMethods": ["generateContent", "countTokens"],
+            "temperature": 1.0,
+            "topP": 0.95,
+            "topK": 40,
+        }
+        for mid in gemini_ids
+    ]
+    return json.dumps({"models": models}).encode("utf-8")
 
 
 def render_anthropic_models() -> bytes:
@@ -34417,7 +34511,10 @@ async def _handle_llm_endpoint(
 
     Captures the bearer / x-api-key token (sha256 + safe preview) so the same
     stolen key replayed across IPs is linkable — the token itself is the intel."""
-    lpath = path.lower()
+    # Both dispatch tables below key on the canonical route rather than on
+    # the request path, so a gateway mount prefix reaches the same renderer
+    # as the bare route instead of falling through to the defensive 404.
+    route = llm_endpoint_route(path.lower()) or path.lower()
     method = request.method
     content_type_req = request.headers.get("Content-Type", "")
     auth_header = request.headers.get("Authorization", "")
@@ -34433,6 +34530,8 @@ async def _handle_llm_endpoint(
     _streamable = {
         "/v1/chat/completions",
         "/v1/completions",
+        "/chat/completions",
+        "/completions",
         "/v1/messages",
         "/anthropic/v1/messages",
         "/api/chat",
@@ -34441,56 +34540,61 @@ async def _handle_llm_endpoint(
 
     # Route to a renderer.
     body: bytes = b""
-    if lpath in {"/v1/models"}:
+    if route in {"/v1/models", "/models"}:
         result_tag = "llm-endpoint-models-list"
         body = render_openai_models()
         if not action:
             action = "models-list"
-    elif lpath == "/anthropic/v1/models":
+    elif route == "/anthropic/v1/models":
         result_tag = "llm-endpoint-anthropic-models-list"
         body = render_anthropic_models()
         if not action:
             action = "models-list"
-    elif lpath == "/api/tags":
+    elif route == "/v1beta/models":
+        result_tag = "llm-endpoint-gemini-models-list"
+        body = render_gemini_models()
+        if not action:
+            action = "models-list"
+    elif route == "/api/tags":
         result_tag = "llm-endpoint-ollama-tags"
         body = render_ollama_tags()
         if not action:
             action = "models-list"
-    elif lpath == "/api/version":
+    elif route == "/api/version":
         result_tag = "llm-endpoint-ollama-version"
         body = render_ollama_version()
         if not action:
             action = "version"
-    elif lpath == "/api/ps":
+    elif route == "/api/ps":
         result_tag = "llm-endpoint-ollama-ps"
         body = render_ollama_ps()
         if not action:
             action = "running-models"
-    elif lpath == "/api/show":
+    elif route == "/api/show":
         result_tag = "llm-endpoint-ollama-show"
         body = render_ollama_show(model)
         if not action:
             action = "show-model"
-    elif lpath == "/api/chat":
+    elif route == "/api/chat":
         result_tag = "llm-endpoint-ollama-chat"
         if not stream_requested:
             body = render_ollama_chat(model)
-    elif lpath == "/api/generate":
+    elif route == "/api/generate":
         result_tag = "llm-endpoint-ollama-generate"
         if not stream_requested:
             body = render_ollama_generate(model)
-    elif lpath == "/v1/chat/completions":
+    elif route in {"/v1/chat/completions", "/chat/completions"}:
         result_tag = "llm-endpoint-openai-chat"
         if not stream_requested:
             body = render_openai_chat(model)
-    elif lpath == "/v1/completions":
+    elif route in {"/v1/completions", "/completions"}:
         result_tag = "llm-endpoint-openai-completion"
         if not stream_requested:
             body = render_openai_completion(model)
-    elif lpath == "/v1/embeddings":
+    elif route in {"/v1/embeddings", "/embeddings"}:
         result_tag = "llm-endpoint-openai-embedding"
         body = render_openai_embedding(model)
-    elif lpath in {"/v1/messages", "/anthropic/v1/messages"}:
+    elif route in {"/v1/messages", "/anthropic/v1/messages"}:
         result_tag = "llm-endpoint-anthropic-message"
         if not stream_requested:
             body = render_anthropic_message(model)
@@ -34522,17 +34626,17 @@ async def _handle_llm_endpoint(
 
     # Streaming path — keeps SDK clients (which opened the socket expecting an
     # event-stream / NDJSON wire shape) from bailing on a malformed protocol.
-    if stream_requested and lpath in _streamable:
-        if lpath == "/v1/chat/completions":
+    if stream_requested and route in _streamable:
+        if route in {"/v1/chat/completions", "/chat/completions"}:
             chunks = render_openai_chat_sse_chunks(model)
             content_type = "text/event-stream; charset=utf-8"
-        elif lpath == "/v1/completions":
+        elif route in {"/v1/completions", "/completions"}:
             chunks = render_openai_completion_sse_chunks(model)
             content_type = "text/event-stream; charset=utf-8"
-        elif lpath in {"/v1/messages", "/anthropic/v1/messages"}:
+        elif route in {"/v1/messages", "/anthropic/v1/messages"}:
             chunks = render_anthropic_message_sse_chunks(model)
             content_type = "text/event-stream; charset=utf-8"
-        elif lpath == "/api/chat":
+        elif route == "/api/chat":
             chunks = render_ollama_chat_ndjson_chunks(model)
             content_type = "application/x-ndjson; charset=utf-8"
         else:  # /api/generate
