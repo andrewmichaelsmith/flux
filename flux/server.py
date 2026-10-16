@@ -1189,6 +1189,16 @@ _WP_PLUGIN_UPLOAD_VECTORS: tuple[dict[str, str], ...] = (
         "idiom": "ajax",
     },
     {
+        # Form-builder upload reached through the plugin's own nopriv AJAX
+        # action, with the nonce minted by the sibling action above. The
+        # landing directory is the plugin's own upload tree.
+        "id": "super-forms",
+        "path": "/wp-admin/admin-ajax.php",
+        "action": "submit_form",
+        "landing": "/wp-content/uploads/superforms/files",
+        "idiom": "ajax",
+    },
+    {
         "id": "ecsload",
         "path": "/wp-admin/admin-ajax.php",
         "action": "ecsload",
@@ -8736,6 +8746,251 @@ def extract_llm_prompt(body: bytes, content_type: str) -> tuple[str, str, str, b
         prompt = prompt[:LLM_BODY_DECODE_LIMIT]
     stream_requested = bool(payload.get("stream"))
     return model, prompt, action, stream_requested
+
+
+# --- WordPress plugin readme version probe -------------------------------
+# Sweeps ask for `/wp-content/plugins/<slug>/readme.txt` before they ask
+# for anything exploitable. The file is the plugin's own packaging
+# metadata and its `Stable tag:` line is the installed version, so one
+# unauthenticated GET tells a scanner whether the version-gated bug it
+# carries is worth firing. That is reconnaissance with a decision
+# attached, and a 404 answers the decision "no": the request behind it —
+# the one carrying the payload — never arrives.
+#
+# The surface is a family, not a path list. Observed probing walks dozens
+# of distinct plugin slugs in a month and the set turns over continually,
+# so an enumeration of slugs would be stale the week it shipped. The
+# matcher anchors on the readme position instead and derives everything
+# it serves from the slug.
+#
+# Public context: plugin readmes are a documented WordPress packaging
+# convention (`Stable tag`, `Requires at least`, `Tested up to`), and
+# version-gated plugin RCEs are routinely exploited at scale — e.g.
+# CVE-2026-14894, an unauthenticated arbitrary file upload in a form
+# builder affecting every version up to 6.3.313, fixed in 6.3.314.
+# Against any such bound a low version reads as vulnerable, which is why
+# the version served is drawn from a deliberately low range rather than
+# a current one.
+WP_PLUGIN_README_ENABLED = _env_bool("HONEYPOT_WP_PLUGIN_README_ENABLED")
+_WP_PLUGIN_README_RE = re.compile(
+    r"^/wp-content/plugins/([A-Za-z0-9][A-Za-z0-9._-]{0,63})/readme\.txt$",
+    re.IGNORECASE,
+)
+# A source may be told about this many distinct plugins before the rest go
+# back to 404. This is a cap, not a threshold, and the direction is the
+# point: the webshell gate withholds until a source has proved it is
+# sweeping, because one unclaimed `.php` name is ambiguous. Here the first
+# probe is the valuable one — a scanner carrying one plugin's exploit asks
+# about exactly one plugin — so answering is immediate. What has to be
+# bounded is the opposite end: a source that walks fifty slugs and is told
+# all fifty are installed has learned the host fabricates, which is worth
+# more to it than any single readme is to us.
+WP_PLUGIN_README_MAX_SLUGS_PER_SOURCE = max(
+    int((os.environ.get("HONEYPOT_WP_PLUGIN_README_MAX_SLUGS") or "6").strip() or "6"), 1,
+)
+WP_PLUGIN_README_TTL_SECONDS = max(
+    int((os.environ.get("HONEYPOT_WP_PLUGIN_README_TTL_SECONDS") or "3600").strip() or "3600"),
+    60,
+)
+WP_PLUGIN_README_MAX_SOURCES = max(
+    int((os.environ.get("HONEYPOT_WP_PLUGIN_README_MAX_SOURCES") or "4096").strip() or "4096"),
+    64,
+)
+# src_ip -> (expiry, {slug})
+_WP_PLUGIN_README_SEEN: dict[str, tuple[float, set[str]]] = {}
+# Per-process, for the same reason the upload trap's secret is: the version
+# a given plugin reports differs between hosts, so the fleet cannot be
+# identified by collecting one readme from each.
+_WP_PLUGIN_README_SECRET = secrets.token_bytes(16)
+# Slug tokens that are initialisms in the plugin's own name. Title-casing
+# them like words ("Wp Mail Smtp") is the kind of detail that reads wrong
+# to someone looking at the file.
+_WP_PLUGIN_README_INITIALISMS: dict[str, str] = {
+    "wp": "WP", "smtp": "SMTP", "seo": "SEO", "api": "API", "css": "CSS",
+    "db": "DB", "faq": "FAQ", "ftp": "FTP", "html": "HTML", "http": "HTTP",
+    "id": "ID", "io": "IO", "js": "JS", "pdf": "PDF", "php": "PHP",
+    "rss": "RSS", "seo2": "SEO", "sms": "SMS", "sql": "SQL", "ssl": "SSL",
+    "svg": "SVG", "ui": "UI", "url": "URL", "woocommerce": "WooCommerce",
+    "xml": "XML", "yoast": "Yoast",
+}
+
+
+def wp_plugin_readme_slug(path: str) -> str:
+    """Return the plugin slug a readme probe addresses, or ''."""
+    if not WP_PLUGIN_README_ENABLED or not path:
+        return ""
+    match = _WP_PLUGIN_README_RE.match(path.split("?", 1)[0])
+    if match is None:
+        return ""
+    return match.group(1).lower()
+
+
+def wp_plugin_readme_observe(
+    src_ip: str, slug: str, now: float | None = None,
+) -> tuple[int, bool]:
+    """Record one readme probe.
+
+    Returns `(distinct slugs seen for this source, answer this one)`.
+
+    A slug already answered stays answered for as long as the entry lives,
+    even once the source is at its cap. Deciding on the count alone would
+    mean a source that tripped the cap started getting 404s for readmes it
+    had already been handed, which contradicts the earlier answer inside
+    one burst — a sharper tell than never having answered at all.
+
+    Entries expire after `WP_PLUGIN_README_TTL_SECONDS`, so a source that
+    asks about one plugin an hour never accumulates its way into the cap.
+    """
+    # An unidentified source shares one bucket rather than bypassing the
+    # cap. Returning "first probe" for every anonymous request would make
+    # the cap vanish exactly when the source cannot be told apart, which
+    # is the case where an enumeration oracle is least affordable.
+    key = src_ip or "-"
+    moment = time.time() if now is None else now
+    entry = _WP_PLUGIN_README_SEEN.get(key)
+    if entry is None or entry[0] <= moment:
+        entry = (moment + WP_PLUGIN_README_TTL_SECONDS, set())
+        _WP_PLUGIN_README_SEEN[key] = entry
+    seen = entry[1]
+    # Re-asking about a slug already answered is not a new slug: a tool
+    # that retries, or follows a redirect, must not be able to walk itself
+    # into the cap on one plugin.
+    if slug in seen:
+        answer = True
+    elif len(seen) < WP_PLUGIN_README_MAX_SLUGS_PER_SOURCE:
+        seen.add(slug)
+        answer = True
+    else:
+        answer = False
+    if len(_WP_PLUGIN_README_SEEN) > WP_PLUGIN_README_MAX_SOURCES:
+        for key in [k for k, v in _WP_PLUGIN_README_SEEN.items() if v[0] <= moment]:
+            del _WP_PLUGIN_README_SEEN[key]
+        while len(_WP_PLUGIN_README_SEEN) > WP_PLUGIN_README_MAX_SOURCES:
+            oldest = min(_WP_PLUGIN_README_SEEN, key=lambda k: _WP_PLUGIN_README_SEEN[k][0])
+            del _WP_PLUGIN_README_SEEN[oldest]
+    return len(seen), answer
+
+
+def wp_plugin_readme_title(slug: str) -> str:
+    """`super-forms` -> `Super Forms`, with initialisms left uppercase."""
+    words = [w for w in re.split(r"[-_.]+", slug) if w]
+    if not words:
+        return "Plugin"
+    out: list[str] = []
+    for word in words:
+        mapped = _WP_PLUGIN_README_INITIALISMS.get(word.lower())
+        out.append(mapped if mapped else word[:1].upper() + word[1:])
+    return " ".join(out)
+
+
+def wp_plugin_readme_version(slug: str) -> str:
+    """A stable, deliberately-low `Stable tag` for this slug.
+
+    Deterministic per (slug, process): the same plugin reports the same
+    version for as long as the process lives, because a scanner that asks
+    twice and is told two versions has found the fabrication. Low on
+    purpose — a version-gated check compares against an upper bound, and
+    a low number reads as "vulnerable" against essentially any of them.
+    """
+    digest = hmac.new(
+        _WP_PLUGIN_README_SECRET, slug.encode("utf-8", "replace"), hashlib.sha256,
+    ).digest()
+    major = 1 + digest[0] % 3
+    minor = digest[1] % 10
+    patch = digest[2] % 20
+    return f"{major}.{minor}.{patch}"
+
+
+def render_wp_plugin_readme(slug: str, version: str) -> bytes:
+    """The plugin's packaging metadata, in the documented readme format.
+
+    Deliberately thin on prose: the fields a scanner parses are the header
+    block, and a long fabricated description is more surface to get wrong
+    than it is bait. `Tested up to` trails the current core release, which
+    is what an install worth exploiting looks like.
+    """
+    title = wp_plugin_readme_title(slug)
+    digest = hmac.new(
+        _WP_PLUGIN_README_SECRET, (slug + ":meta").encode("utf-8", "replace"), hashlib.sha256,
+    ).digest()
+    tested = f"5.{digest[0] % 6 + 2}"
+    requires = f"4.{digest[1] % 5 + 5}"
+    major = version.split(".", 1)[0]
+    lines = [
+        f"=== {title} ===",
+        "Contributors: " + slug.replace(".", "-"),
+        f"Tags: {', '.join(sorted(set((slug.replace('_', '-').split('-') + ['wordpress'])[:4])))}",
+        f"Requires at least: {requires}",
+        f"Tested up to: {tested}",
+        f"Stable tag: {version}",
+        "Requires PHP: 5.6",
+        "License: GPLv2 or later",
+        "License URI: https://www.gnu.org/licenses/gpl-2.0.html",
+        "",
+        "== Description ==",
+        "",
+        f"{title} for WordPress.",
+        "",
+        "== Installation ==",
+        "",
+        f"1. Upload the `{slug}` directory to `/wp-content/plugins/`.",
+        "2. Activate the plugin through the 'Plugins' menu in WordPress.",
+        "",
+        "== Changelog ==",
+        "",
+        f"= {version} =",
+        "* Maintenance release.",
+        "",
+        f"= {major}.0.0 =",
+        "* Initial release.",
+        "",
+    ]
+    return ("\n".join(lines)).encode("utf-8")
+
+
+# --- WordPress plugin nonce mint (upload precondition) --------------------
+# The form-builder upload vector below is nonce-protected, and the plugin
+# exposes the mint to unauthenticated callers at the same `admin-ajax.php`
+# address under its own action. A tool that follows the real chain
+# therefore sends two requests: mint first, upload second, and it only
+# sends the second if the first returned something it could parse.
+#
+# That makes the mint a precondition rather than a separate trap. Answering
+# the upload action while leaving the mint to fall through captures nothing
+# from a tool that implements the chain properly — it stops at step one,
+# and the payload we actually want never leaves the client. Both halves
+# live under the upload trap's switch because neither is useful alone.
+#
+# Public context: this two-request shape is how CVE-2026-14894 is described
+# — a nopriv mint action supplies the nonce that the nopriv upload action
+# checks, so the nonce is not a barrier to an unauthenticated caller.
+WP_PLUGIN_NONCE_ACTIONS: frozenset[str] = frozenset({"super_create_nonce"})
+
+
+def wp_plugin_nonce_action(path: str, query_string: str = "") -> str:
+    """Return the nonce-mint action a request addresses, or ''."""
+    if not WP_PLUGIN_UPLOAD_ENABLED or not path:
+        return ""
+    lp = path.lower().split("?", 1)[0].rstrip("/") or "/"
+    if lp != "/wp-admin/admin-ajax.php":
+        return ""
+    action = _wp_plugin_upload_action(query_string)
+    return action if action in WP_PLUGIN_NONCE_ACTIONS else ""
+
+
+def render_wp_plugin_nonce_response() -> tuple[bytes, str, str]:
+    """Mint a nonce and a session id, both fresh for every single request.
+
+    Nothing credential-shaped here is ever a literal. A fixed nonce would
+    be worthless on replay and, shared across every host, would make one
+    request enough to identify the whole fleet — so both values come from
+    the CSPRNG per hit. The nonce is ten hex characters because that is
+    the width WordPress nonces are.
+    """
+    nonce = secrets.token_hex(5)
+    session = secrets.token_hex(16)
+    payload = {"success": True, "data": {"nonce": nonce, "session": session}}
+    return (json.dumps(payload) + "\n").encode("utf-8"), nonce, session
 
 
 # --- LLM renderers --------------------------------------------------------
@@ -44065,6 +44320,72 @@ async def _handle_wp_plugin_upload_landing(
     )
 
 
+async def _handle_wp_plugin_readme(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    slug: str,
+    client_ip: str,
+) -> web.Response:
+    """Serve one plugin's packaging metadata, or 404 past the per-source cap."""
+    distinct, answer = wp_plugin_readme_observe(client_ip, slug)
+    if not answer:
+        append_log({
+            **log_context, "status": 404,
+            "result": "wp-plugin-readme-capped",
+            "wpPluginReadmeSlug": slug,
+            "wpPluginReadmeDistinct": distinct,
+        })
+        return web.Response(
+            status=404, body=b"not found\n",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+    version = wp_plugin_readme_version(slug)
+    body = render_wp_plugin_readme(slug, version)
+    append_log({
+        **log_context, "status": 200,
+        "result": "wp-plugin-readme-probe",
+        "wpPluginReadmeSlug": slug,
+        "wpPluginReadmeVersion": version,
+        "wpPluginReadmeDistinct": distinct,
+    })
+    return web.Response(
+        status=200,
+        body=b"" if request.method == "HEAD" else body,
+        headers={
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+async def _handle_wp_plugin_nonce(
+    request: web.Request,
+    log_context: dict[str, object],
+    action: str,
+    client_ip: str,
+) -> web.Response:
+    """Answer the nonce mint that the upload vector's check depends on."""
+    body, nonce, session = render_wp_plugin_nonce_response()
+    append_log({
+        **log_context, "status": 200,
+        "result": "wp-plugin-nonce-mint",
+        "wpPluginNonceAction": action,
+        "wpPluginNonceIssued": nonce,
+    })
+    return web.Response(
+        status=200,
+        body=b"" if request.method == "HEAD" else body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Set-Cookie": (
+                f"sf_session={session}; path=/; HttpOnly"
+            ),
+        },
+    )
+
+
 async def _handle_file_upload(
     request: web.Request,
     log_context: dict[str, object],
@@ -47530,6 +47851,15 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # sweep gate because a landing path whose vector this source was
     # refused has to stay 404 — the gate would otherwise answer it on
     # shape alone and contradict the refusal inside the same burst.
+    # The nonce mint the upload vector's check depends on. Ahead of the
+    # vector branch because both are `admin-ajax.php` and only the `action`
+    # tells them apart, and answered on GET as well as POST because the
+    # address accepts either and tools differ on which they use.
+    _wp_plugin_nonce = wp_plugin_nonce_action(path, query_string)
+    if _wp_plugin_nonce:
+        return await _handle_wp_plugin_nonce(
+            request, log_context, _wp_plugin_nonce, client_ip,
+        )
     _wp_plugin_vector = (
         wp_plugin_upload_vector(path, query_string)
         if request.method == "POST"
@@ -47809,6 +48139,18 @@ async def handle(request: web.Request) -> web.StreamResponse:
         return await _send_backup_archive(
             request, request_id, path, client_ip, host, user_agent, proto, log_context,
         )
+
+    # Plugin readme version probe. After the file-upload trap, which owns
+    # the one readme it serves under its own library directory, and after
+    # every exact-path trap — so what reaches here is a readme for a plugin
+    # nothing else claimed. Before the shell-jacking gate only for
+    # tidiness: that gate matches `.php` names and would never claim this.
+    if WP_PLUGIN_README_ENABLED and request.method in {"GET", "HEAD"}:
+        _wp_readme_slug = wp_plugin_readme_slug(path)
+        if _wp_readme_slug:
+            return await _handle_wp_plugin_readme(
+                request, log_context, path, _wp_readme_slug, client_ip,
+            )
 
     # Shell-jacking sweep gate. Runs last on purpose: everything above has
     # already claimed its own paths, so whatever reaches here is a root-level

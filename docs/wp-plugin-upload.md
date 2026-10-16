@@ -12,11 +12,39 @@ one names consistent with the answer it gave.
 | `/wp-admin/admin-ajax.php?action=uploadFontIcon` | POST | `/wp-content/uploads/kaswara/fonts/` |
 | `/wp-admin/admin-ajax.php?action=wpr_addons_upload_file` | POST | `/wp-content/uploads/wpr-addons/templates/` |
 | `/wp-admin/admin-ajax.php?action=ecsload` | POST | `/wp-content/uploads/` |
+| `/wp-admin/admin-ajax.php?action=submit_form` | POST | `/wp-content/uploads/superforms/files/` |
+| `/wp-admin/admin-ajax.php?action=super_create_nonce` | GET / POST | — mints the nonce the above checks |
 | a claimed landing path, `.php` leaf | GET / HEAD | the acceptance decides — see below |
 
 `admin-ajax.php` is claimed only when `action` names one of the upload
 handlers. Every other use of that address — which is nearly all of it —
 is left to the trap that already owns it.
+
+## The nonce is a precondition, not a second trap
+
+The form-builder vector's upload action is nonce-protected, and the plugin
+exposes the mint to unauthenticated callers at the same `admin-ajax.php`
+address under its own action. A tool that follows the real chain therefore
+sends two requests — mint first, upload second — and sends the second only
+if the first returned something it could parse.
+
+That is why the mint lives under the upload trap's switch rather than
+beside it as its own feature. Answering the upload action while leaving the
+mint to fall through captures nothing from a tool that implements the chain
+properly: it stops at step one and the payload never leaves the client.
+Neither half is useful alone.
+
+Both the nonce and the session id are minted per request from the CSPRNG.
+A fixed nonce would be worthless on replay and, identical across every
+host, would make one request enough to identify the whole fleet. The nonce
+is ten hex characters because that is the width WordPress nonces are.
+
+Public context: this two-request shape is how CVE-2026-14894 is described —
+a nopriv mint action supplies the nonce that the nopriv upload action
+checks, so the nonce is no barrier to an unauthenticated caller.
+
+The version check that precedes both is
+[wp-plugin-readme](./wp-plugin-readme.md).
 
 ## One vector is writable, not all of them
 

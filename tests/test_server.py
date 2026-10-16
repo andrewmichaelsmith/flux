@@ -654,6 +654,12 @@ def test_all_trap_families_default_on():
         "layout-vocabulary walk cannot cover."
     )
     assert tbenv.CLOUD_IMDS_ENABLED
+    assert tbenv.WP_PLUGIN_README_ENABLED, (
+        "HONEYPOT_WP_PLUGIN_README_ENABLED should default to True — the "
+        "plugin readme is the version check a version-gated exploit makes "
+        "before it fires, so a 404 there costs the request that carries "
+        "the payload"
+    )
     assert tbenv.AIPLATFORM_LOGIN_ENABLED, (
         "HONEYPOT_AIPLATFORM_LOGIN_ENABLED should default to True — the "
         "self-hosted AI/MLOps control planes are probed in one pass with "
