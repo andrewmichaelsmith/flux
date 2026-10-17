@@ -36,6 +36,9 @@ from .test_server import FAKE_TRACEBIT, _fake_canary, _log_entries, flux_client 
     ("/superset_config.py", "app-config-python"),
     # Per-service env split.
     ("/production.env", "env-production"),
+    # Exact since `env` joined the webroot-prefix list -- it used to
+    # reach `env-production` through the layout walk instead.
+    ("/env/production.env", "env-production"),
     ("/mysql.env", "env-production"),
     ("/mongodb.env", "env-production"),
     ("/postgres.env", "env-production"),
@@ -85,7 +88,6 @@ def test_new_leaves_route_to_the_expected_trap(path, trap_name):
     ("/config/secrets.py", "app-config-python"),
     ("/src/secrets.py", "app-config-python"),
     ("/instance/secrets.py", "app-config-python"),
-    ("/env/production.env", "env-production"),
     ("/envs/production.env", "env-production"),
     ("/includes/db.php", "app-config-php-database"),
     ("/includes/database.php", "app-config-php-database"),

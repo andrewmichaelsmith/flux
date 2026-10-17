@@ -6034,6 +6034,23 @@ def scan_headers(headers: object) -> dict[str, str]:
 
 _NO_SLASH_TRAVERSAL_RE = re.compile(r"([^/])\.\.(/)")
 
+# NTFS alternate-data-stream spellings. `file::$DATA` names the default
+# data stream of that same file and `dir::$INDEX_ALLOCATION` the
+# directory itself; IIS has historically served both past a handler
+# mapping that would otherwise execute or deny the plain name, which is
+# why source-disclosure dictionaries still walk the shape against every
+# config family they probe. The canonical destination is therefore the
+# path without the stream name. Matched case-insensitively, and only at
+# the end, which is the only position a stream name is legal in.
+#
+# Stripping here rather than per-trap is the point: every family in the
+# table gains the spelling at once. The evasion attempt itself is not
+# lost -- `rawPath` carries the request as it arrived, so the stream
+# suffix stays visible in the log while dispatch sees the real file.
+_NTFS_STREAM_SUFFIX_RE = re.compile(
+    r"::\$(?:DATA|INDEX_ALLOCATION)/*$", re.IGNORECASE,
+)
+
 
 # Path-generator leakage: the first segment is not a directory the sender
 # believes in, it is a fragment of the context the dictionary was expanded
@@ -6169,6 +6186,9 @@ def normalize_path(raw_path: str) -> str:
       2a. Strip an injected first segment that is not a directory -- `~`,
          `$(pwd)`, `localhost`, `:<port>`. See
          `strip_injected_path_prefix`.
+      2b. Strip an NTFS alternate-data-stream suffix -- `/.env::$DATA`,
+         `/config.php::$INDEX_ALLOCATION`. See
+         `_NTFS_STREAM_SUFFIX_RE`.
       3. Repair the no-slash traversal-bypass shape: `xxx../yyy` →
          `xxx/../yyy`. Scanners use this against parsers that treat
          `..` as a path-up token even without a leading slash; without
@@ -6198,6 +6218,11 @@ def normalize_path(raw_path: str) -> str:
     # (`/%24%28pwd%29/.env`); before the traversal repair, so a stripped
     # path still gets `..` resolved normally.
     _, collapsed = strip_injected_path_prefix(collapsed)
+    # Drop an NTFS stream suffix (`/.env::$DATA`) before anything keys on
+    # the leaf name. Before the traversal repair for the same reason the
+    # injected-prefix strip is: a stripped path still gets `..` resolved
+    # normally afterwards.
+    collapsed = _NTFS_STREAM_SUFFIX_RE.sub("", collapsed) or "/"
     repaired = _NO_SLASH_TRAVERSAL_RE.sub(r"\1/..\2", collapsed)
     while repaired != collapsed:
         collapsed = repaired
@@ -21944,6 +21969,28 @@ _ENV_FILE_SUFFIXES: tuple[str, ...] = (
     # Underscore-separated tier variants beyond the existing
     # `_bak` / `_old` / `_orig` / `_copy` / `_priv` / `_example` set.
     "_prod", "_dev", "_backup", "_prev", "_default",
+    # Underscore spellings of the sample/numbered forms. `_example` and
+    # the dotted `.1` / `.2` were covered while `_sample` / `_1` / `_2`
+    # -- the same three files under the other separator -- were not, so
+    # one dictionary split across two outcomes.
+    "_sample", "_1", "_2",
+    # Tier and extension spellings observed being walked beside the
+    # covered ones: `.testing` beside `.test`, `.www` for a vhost-scoped
+    # copy, `.config` / `.ini` / `.php` for the shipped-shim shapes, and
+    # `.secret` / `.secrets` for the "split the secrets out" convention.
+    ".testing", ".www", ".config", ".ini", ".php",
+    ".secret", ".secrets",
+    # `.dev.local` completes the `.local` override tier -- `.development.local`
+    # and `.prod.local` were both present, the short spelling of the same
+    # file was not.
+    ".dev.local",
+    # Cloud-provider-scoped fragments. Splitting one provider's block out
+    # of a shared `.env` is ordinary practice, and a credential dictionary
+    # that walks provider names gets the generic renderer's cloud keys --
+    # which is exactly what these spellings are being asked for. The
+    # AI/LLM provider names are owned by `ai-provider-dotenv` below, which
+    # answers them with provider-shaped keys instead.
+    ".aws", ".azure", ".gcp",
 )
 
 # Webroot-prefix variants. Off-the-shelf env-harvester dictionaries walk a
@@ -21995,6 +22042,22 @@ _ENV_WEBROOT_PREFIXES: tuple[str, ...] = (
     "web", "wordpress", "worker", "wp", "www",
     "yii",
     "zend",
+    # Prefixes a declined-path pass found being walked with the same
+    # `<prefix>/.env*` matrix as the list above, but which were missing
+    # here -- so the walk got the generic variant chain instead of a
+    # canary. Plain application-layout names first:
+    "data", "env", "infra", "packages", "pkg", "root",
+    "services", "settings", "static", "utils", "var", "workspace",
+    # Then an AI/ML-themed cohort, which arrived as one contiguous block
+    # of the same walk. The deployment shape these assume is a service
+    # directory per model or agent, each with its own provider keys --
+    # which is why a dotenv under them is worth answering with a canary
+    # rather than a redirect. Listed together because they are one
+    # dictionary family, not independent observations:
+    "agent", "agents", "ai", "bot", "chatbot", "embeddings",
+    "inference", "langchain", "llm", "llms", "ml", "mlflow",
+    "model", "models", "notebooks", "pipeline", "prompts", "rag",
+    "training", "vectordb",
 )
 
 _ENV_DEEP_PREFIXES: tuple[str, ...] = (
@@ -22029,6 +22092,12 @@ _ENV_DOTDIR_PREFIXES: tuple[str, ...] = (
     # and a pipeline that keeps its environment beside its workflows
     # leaves the credential file inside it.
     ".github",
+    # Framework build output served as the webroot. A `.env` copied into
+    # the build directory is a packaging mistake common enough that the
+    # dictionaries walk it; the plain `next` / `nuxt` spellings were
+    # already prefixes, the dot-directory the frameworks actually write
+    # was not.
+    ".next", ".nuxt",
 )
 
 
@@ -25556,6 +25625,202 @@ def render_openai_dotenv(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+_AI_DOTENV_SELF_HOST_FALLBACK = "gateway.internal"
+
+# Prefix on the per-hit deployment username in `.idea/webServers.xml`.
+# Fixed on purpose while the suffix is random: the prefix is what makes
+# a login attempt on the SSH plane recognisable as "somebody acted on a
+# deployment config served from here", and the suffix is what makes each
+# one trace to a single read. A deployment account called `deploy` is
+# also the ordinary name for the thing, so the prefix costs no
+# plausibility.
+_IDE_DEPLOY_USER_PREFIX = "deploy_"
+_IDE_DEPLOY_HOST_FALLBACK = "staging.internal"
+
+
+def _ide_deploy_host(r: dict[str, object]) -> str:
+    """The hostname to name as the deployment target.
+
+    The host the scanner just fetched the file from, for the reason the
+    `_requestHost` enrichment in `_serve_canary_trap` gives: a checked-in
+    deploy config names the box it deploys to, and a config naming some
+    unreachable `deploy.internal` is bait anyone can spot. Naming this
+    host also makes the follow-through observable, since an SSH login
+    attempt against it is recorded on the sensor's own SSH surface.
+
+    Same plausibility test and fallback order as `_mcp_self_endpoint`.
+    """
+    host = str(r.get("_requestHost") or "").strip().lower().split(":", 1)[0]
+    if _host_is_externally_plausible(host):
+        return host
+    return (
+        SITE_HOST
+        if _host_is_externally_plausible(SITE_HOST)
+        else _IDE_DEPLOY_HOST_FALLBACK
+    )
+
+
+def render_ide_web_servers_xml(r: dict[str, object]) -> bytes:
+    """`.idea/webServers.xml` -- a JetBrains IDE deployment config.
+
+    The file an IDE writes when a project has a "Remote Host" deployment
+    target: one `<webServer>` per target, each with a `<fileTransfer>`
+    element carrying the protocol, host, and the account to connect as.
+    A project directory committed or rsynced into the webroot brings the
+    whole `.idea/` with it, which is why credential dictionaries walk
+    this name.
+
+    What makes it worth answering rather than 404ing is that the file
+    names a *next step* instead of a secret to grep. Everything else in
+    the credential table ends at the read -- a key is taken and we learn
+    nothing more unless it is replayed against the issuer. A deployment
+    entry says "there is an SFTP account at this host, here is the
+    username and password", and acting on it means opening a connection
+    to the host named in the file, which is this one. So the measurement
+    this trap is built for is not issuance, it is the login attempt that
+    follows on the SSH surface, carrying a username of a shape nothing
+    else emits.
+
+    No Tracebit canary: both credential-shaped fields are per-hit
+    synthetics (`_IDE_DEPLOY_USER_PREFIX` plus random, and
+    `_fake_db_password()`), so the trap spends no issuance quota and has
+    no upstream dependency. The join is the username, which is logged
+    here and arrives verbatim on any connection attempt.
+
+    The second entry is a plain unauthenticated FTP target, which is
+    what makes the first one look like a choice rather than the only
+    thing in the file.
+    """
+    # `html.escape` for XML attribute context. The host reaches here
+    # from a request header, and while `_host_is_externally_plausible`
+    # already rejects the quote and angle brackets, it permits `&` --
+    # which is enough on its own to make the document malformed, and a
+    # deploy config that does not parse is a trap that reads as one. The
+    # configured fallback goes through the same escape, since an
+    # operator-set value is no more guaranteed to be XML-clean.
+    host = html.escape(_ide_deploy_host(r), quote=True)
+    username = f"{_IDE_DEPLOY_USER_PREFIX}{secrets.token_hex(4)}"
+    password = _fake_db_password()
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<project version="4">\n'
+        '  <component name="WebServers">\n'
+        '    <option name="servers">\n'
+        f'      <webServer id="8f3c1d20-5a7e-4b19-9c04-2e6d8a1f7b53" name="{host} (prod)"'
+        f' url="https://{host}">\n'
+        f'        <fileTransfer host="{host}" port="22" privateKey="$USER_HOME$/.ssh/id_rsa"'
+        f' accessType="SFTP" keyPair="false" authAgent="false" username="{username}"'
+        f' password="{password}">\n'
+        '          <advancedOptions>\n'
+        '            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0"'
+        ' passiveMode="true" shareSSLContext="true" />\n'
+        '          </advancedOptions>\n'
+        '        </fileTransfer>\n'
+        '      </webServer>\n'
+        '      <webServer id="1b9e47aa-3c62-4d85-8f10-7a5b2c9d4e6f" name="assets-cdn"'
+        ' url="http://assets.internal.lan">\n'
+        '        <fileTransfer host="assets.internal.lan" port="21" accessType="FTP"'
+        ' anonymous="true">\n'
+        '          <advancedOptions>\n'
+        '            <advancedOptions dataProtectionLevel="Private" passiveMode="true" />\n'
+        '          </advancedOptions>\n'
+        '        </fileTransfer>\n'
+        '      </webServer>\n'
+        '    </option>\n'
+        '  </component>\n'
+        '</project>\n'
+    ).encode("utf-8")
+
+
+def _llm_self_base_url(r: dict[str, object]) -> str:
+    """This server's own OpenAI-compatible base URL.
+
+    The provider-scoped fragments below carry a key *and* a base URL,
+    because a deployment that splits one provider per file is usually
+    doing so to point some of them at a self-hosted gateway. Naming our
+    own inference routes there is what makes the file actionable: the
+    `/v1` prefix is already answered, so a reader that configures a
+    client from this fragment and makes one call arrives on that trap
+    carrying the key from this file -- and the canary-echo fields join
+    the call back to the read. Without it the fragment is a dead end
+    whose only measurement is "a file was fetched".
+
+    Same host test and fallback order as `_mcp_self_endpoint`: behind a
+    proxy that rewrites `Host` the requested name arrives as a loopback
+    literal, and publishing that would both advertise the reader's own
+    machine and, being identical everywhere this runs, fingerprint the
+    deployment.
+    """
+    host = str(r.get("_requestHost") or "").strip().lower().split(":", 1)[0]
+    if not _host_is_externally_plausible(host):
+        host = (
+            SITE_HOST
+            if _host_is_externally_plausible(SITE_HOST)
+            else _AI_DOTENV_SELF_HOST_FALLBACK
+        )
+    return f"https://{host}/v1"
+
+
+def render_ai_provider_dotenv(r: dict[str, object]) -> bytes:
+    """The AI/LLM-provider-scoped dotenv fragments other than the two
+    with their own renderers (`.env.anthropic`, `.env.openai`).
+
+    One renderer for the whole set rather than one per vendor: the file
+    a deployment actually writes when it splits inference config out of
+    `.env` carries whichever providers that deployment uses, so a
+    fragment holding several provider keys is the ordinary shape and a
+    single-key file reads as bait. The filename the request asked for is
+    already in the log, so per-vendor bodies would add nothing the
+    `path` field does not already say.
+
+    Three of the keys are the per-hit canary. `OPENAI_BASE_URL` points
+    at our own inference routes -- see `_llm_self_base_url` for why that
+    is the part that makes the read measurable.
+    """
+    aws = _aws(r)
+    base = _llm_self_base_url(r)
+    return (
+        f"OPENAI_API_KEY={aws.get('awsAccessKeyId', '')}\n"
+        f"OPENAI_BASE_URL={base}\n"
+        f"ANTHROPIC_API_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        "ANTHROPIC_BASE_URL=https://api.anthropic.com\n"
+        f"LLM_GATEWAY_TOKEN={aws.get('awsSessionToken', '')}\n"
+        f"LLM_GATEWAY_URL={base}\n"
+        "OLLAMA_HOST=http://127.0.0.1:11434\n"
+        "DEFAULT_MODEL=gpt-4o-mini\n"
+        "EMBEDDING_MODEL=text-embedding-3-small\n"
+        "REQUEST_TIMEOUT=600\n"
+        "MAX_RETRIES=3\n"
+    ).encode("utf-8")
+
+
+def render_legacy_dockercfg(r: dict[str, object]) -> bytes:
+    """`/.dockercfg` -- the pre-1.7 Docker registry auth file.
+
+    Not the same format as `.docker/config.json`: the legacy file is a
+    flat map of registry URL to credential, with no `auths` wrapper, and
+    it carries an `email` field the modern format dropped. Serving the
+    modern body at this name would be a tell to anyone who knows the
+    difference, and harvesters grep the base64 `auth` value out of
+    either shape, so the cost of getting it right is one function.
+    """
+    import base64
+    aws = _aws(r)
+    auth = base64.b64encode(
+        f"AWS:{aws.get('awsSecretAccessKey', '')}".encode("utf-8"),
+    ).decode("ascii")
+    return json.dumps({
+        "https://index.docker.io/v1/": {
+            "auth": auth,
+            "email": "ops@internal.lan",
+        },
+        "123456789012.dkr.ecr.us-east-1.amazonaws.com": {
+            "auth": auth,
+            "email": "ops@internal.lan",
+        },
+    }, indent=2).encode("utf-8")
+
+
 def render_cursor_mcp_json(r: dict[str, object]) -> bytes:
     # Cursor's Model Context Protocol config — can contain API keys and
     # tokens passed as env vars to spawned MCP servers. We embed the canary
@@ -28884,7 +29149,6 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
             "/wp-config.php.orig",
             "/wp-config.php.txt",
             "/wp-config.php~",
-            "/wp-config.php::$DATA",  # NTFS alternate-stream syntax
             "/wp-config.bak",
             "/wp-config.old",
             "/wp-config.txt",
@@ -29213,6 +29477,38 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ),
         ("aws",),
         render_firebase_json,
+        "application/json; charset=utf-8",
+    ),
+    # JetBrains IDE deployment config. Current IDEs write
+    # `webServers.xml` and older ones wrote `WebServers.xml`; the
+    # dictionaries ask for both, and one entry covers both because
+    # lookup is case-folded. `deployment.xml` is the separate file
+    # holding the per-server path mappings, walked beside it.
+    CanaryTrap(
+        "ide-web-servers",
+        (
+            "/.idea/webServers.xml",
+            "/.idea/deployment.xml",
+            "/idea/webServers.xml",
+            *_home_dir_variants(".idea/webServers.xml"),
+        ),
+        (),
+        render_ide_web_servers_xml,
+        "text/xml; charset=utf-8",
+    ),
+    # The pre-1.7 filename, which the dictionaries still walk beside the
+    # modern one. Separate trap rather than another path on `docker-config`
+    # because the legacy file is a different JSON shape -- see
+    # `render_legacy_dockercfg`.
+    CanaryTrap(
+        "legacy-dockercfg",
+        (
+            "/.dockercfg",
+            "/dockercfg",
+            *_home_dir_variants(".dockercfg"),
+        ),
+        ("aws",),
+        render_legacy_dockercfg,
         "application/json; charset=utf-8",
     ),
     CanaryTrap(
@@ -30767,6 +31063,34 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         render_openai_dotenv,
         "text/plain; charset=utf-8",
     ),
+    # The rest of the provider-scoped dotenv set. A credential dictionary
+    # that walks provider names does not stop at the two vendors above,
+    # and every other spelling it tried was reaching the generic variant
+    # chain instead of minting a canary -- the same shadowing the comment
+    # above describes, for the same reason. Registering them here is what
+    # exempts them from `is_tarpit_path`.
+    #
+    # `.local` siblings of the two dedicated spellings live here rather
+    # than on those traps: the override file is where a deployment puts
+    # the key it did not want committed, so it is worth answering, but it
+    # does not need a vendor-specific body.
+    CanaryTrap(
+        "ai-provider-dotenv",
+        (
+            "/.env.ai", "/.env.llm", "/.env.llms",
+            "/.env.gpt", "/.env.claude", "/.env.gemini",
+            "/.env.ollama", "/.env.groq", "/.env.mistral",
+            "/.env.huggingface", "/.env.hf", "/.env.cohere",
+            "/.env.langchain", "/.env.litellm", "/.env.vllm",
+            "/.env.openrouter", "/.env.deepseek", "/.env.perplexity",
+            "/.env.bedrock", "/.env.vertex", "/.env.replicate",
+            "/.env.together", "/.env.inference",
+            "/.env.openai.local", "/.env.anthropic.local",
+        ),
+        ("aws",),
+        render_ai_provider_dotenv,
+        "text/plain; charset=utf-8",
+    ),
     CanaryTrap(
         "claude-credentials",
         (
@@ -31201,7 +31525,24 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
     ),
     CanaryTrap(
         "cloudflare-dev-vars",
-        ("/.dev.vars",),
+        (
+            "/.dev.vars",
+            # `wrangler` reads `.dev.vars.<environment>` when `--env` is
+            # passed, so a Workers project with more than one environment
+            # has the per-environment files and not the bare one. The
+            # bare spelling was the only one answered, which split one
+            # dictionary pass across two outcomes.
+            "/.dev.vars.production",
+            "/.dev.vars.staging",
+            "/.dev.vars.preview",
+            "/.dev.vars.development",
+            "/.dev.vars.dev",
+            "/.dev.vars.test",
+            "/.dev.vars.local",
+            # Editor/backup leftovers of the same file.
+            "/.dev.vars.bak",
+            "/.dev.vars.old",
+        ),
         ("aws",),
         render_cloudflare_dev_vars,
         "text/plain; charset=utf-8",
@@ -48037,19 +48378,25 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 client_ip, host, user_agent, proto, log_context,
             )
 
-    if API_KEY:
-        trap, trap_walk_depth = resolve_canary_trap(path)
-        if trap is not None:
-            return await _send_canary_trap(
-                request, trap, request_id, path, client_ip, host, user_agent, proto, log_context,
-                # Only stamped when the walk actually moved, so the field's
-                # presence is exactly the "this arrived nested under an
-                # app-layout directory" signal and unnested traffic keeps
-                # its existing log shape.
-                extra_log=(
-                    {"trapWalkDepth": trap_walk_depth} if trap_walk_depth else None
-                ),
-            )
+    trap, trap_walk_depth = resolve_canary_trap(path)
+    # The key gates the table because almost every entry mints a canary at
+    # hit time and a keyless deployment should 404 rather than serve a
+    # credential-shaped file with an empty credential in it. An entry whose
+    # renderer mints its own per-hit synthetic has no upstream dependency,
+    # so gating it on the key would disable a trap for a reason that does
+    # not apply to it -- `CONFIG.md` already says only the canary-backed
+    # traps need a key.
+    if trap is not None and (API_KEY or not trap.canary_types):
+        return await _send_canary_trap(
+            request, trap, request_id, path, client_ip, host, user_agent, proto, log_context,
+            # Only stamped when the walk actually moved, so the field's
+            # presence is exactly the "this arrived nested under an
+            # app-layout directory" signal and unnested traffic keeps
+            # its existing log shape.
+            extra_log=(
+                {"trapWalkDepth": trap_walk_depth} if trap_walk_depth else None
+            ),
+        )
 
     # Last, deliberately: the descriptor families below are registered in
     # the shared trap table, so every spelling the normal dispatch can

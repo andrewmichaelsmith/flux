@@ -1083,7 +1083,6 @@ FAKE_TRACEBIT = {
     # WP-shipped sample template + distribution-template siblings.
     ("/wp-config-sample.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/wp-config.php.dist", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
-    ("/wp-config.php::$data", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     ("/wp-config-backup.php", b"define('AWS_ACCESS_KEY_ID', 'AKIAFAKEEXAMPLE01');"),
     # Magento 2 env.php — AWS canary lands in the `system.default.aws_s3`
     # slot alongside the S3 bucket name. Grep-based scanners keying on
