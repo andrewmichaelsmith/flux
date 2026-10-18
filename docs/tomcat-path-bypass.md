@@ -68,3 +68,13 @@ filename — is the signature of a scanner population that already
 knows about both surfaces and is composing them. Logging the family
 separately surfaces evasion-aware actors above the noise of regular
 env-file harvesters.
+
+## Matching, since the path-parameter traversal fold
+
+`normalize_path` folds `..;` onto `..` and resolves it, so the normalised
+path no longer carries the bypass segment. This handler therefore reads
+the path parameters from the raw path and the `env*.js` filename from the
+normalised one. The point of keeping it as its own surface is the result
+tag: a bypass-shaped env-file harvest stays separable from a plain one
+instead of collapsing into the generic env route once the spelling
+resolves. See [path-param-traversal.md](./path-param-traversal.md).

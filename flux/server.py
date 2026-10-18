@@ -2540,6 +2540,28 @@ _SSRF_RELAY_ENTRY_PATHS: frozenset[str] = frozenset({
     # convention the rest of this set already follows.
     "/load", "/api/load",
     "/request", "/api/request",
+    # Product-specific read primitives, as distinct from the generic verbs
+    # above. These three were silent misses while the generic spelling of
+    # the same capability was answered, and they pass a sharper test than
+    # the source-overlap one the entries above were admitted on: the
+    # request *names its own target*, and the names asked for are
+    # `/app/.env`, `../../.env` and `/proc/self/environ` — files already in
+    # the table. The source test agrees where it can be read: ~70-80% of
+    # the sources sending these also send a metadata address or a `file://`
+    # read somewhere, against ~0% for a same-volume endpoint whose
+    # parameter carries an application resource id rather than a path, and
+    # ~4% for the DNS-over-HTTPS resolver spellings — which is the
+    # discriminator that keeps this from becoming an open proxy for every
+    # endpoint that happens to take a `path=`.
+    #
+    # `/userfiles` is the upload directory a file-manager component serves;
+    # the read is spelled as traversal out of it (`?path=../../.env`).
+    "/userfiles", "/userfiles/x",
+    # The image optimiser's real address. `/image` and `/api/image` were
+    # already here, which covered the generic guess but not the framework
+    # spelling that is the actual documented SSRF surface — and that is the
+    # one arriving with the link-local metadata address in `url=`.
+    "/_next/image",
 })
 # Hosts whose metadata tree uses the EC2 `/latest/meta-data/...` layout.
 # Alibaba Cloud mirrors that layout at its own link-local address, so it
@@ -3229,6 +3251,13 @@ _F5_BIGIP_DEFAULT_PATHS = ",".join([
     "/my.policy",
     "/tmui/login.jsp",
     "/tmui/login.jsp/..;/tmui/locallb/workspace/fileread.jsp",
+    # What that CVE-2020-5902 payload resolves to now that `..;` is folded
+    # and walked in normalisation: the `..` cancels `login.jsp`, and the
+    # payload names `/tmui/` twice, so the canonical destination keeps both
+    # segments. The unresolved spelling above is retained so an
+    # operator-supplied `HONEYPOT_F5_BIGIP_PATHS_CSV` carrying it still
+    # matches, and because it is the form the probe arrives in.
+    "/tmui/tmui/locallb/workspace/fileread.jsp",
     "/sslvpnclient",
 ])
 F5_BIGIP_PATHS = {
@@ -6051,6 +6080,64 @@ _NTFS_STREAM_SUFFIX_RE = re.compile(
     r"::\$(?:DATA|INDEX_ALLOCATION)/*$", re.IGNORECASE,
 )
 
+# Path-parameter traversal: a `..` segment carrying an RFC 3986 path
+# parameter (`/..;/`, `/..;jsessionid=x/`). Servlet containers strip the
+# `;name=value` part before resolving the segment, so `..;` is a path-up
+# token there -- which is the whole basis of the bypass: a fronting proxy
+# that gates on a URL prefix sees an ordinary directory name and forwards,
+# and the container then walks up out of the gated prefix.
+#
+# Flux resolved `..` but not `..;`, so every traversal spelled this way
+# stayed unresolved and 404ed even where the file it named had a renderer
+# -- `/static/..;/..;/..;/..;/proc/self/environ` and
+# `/assets/..;/../var/www/html/wp-config.php` both name families already
+# in the table. Two hand-written literals had been added to cover the
+# shape for single destinations (an `env*.js` matcher and one appliance
+# file-read path); folding it in normalisation instead gives the whole
+# table the spelling at once, which is the same reasoning the NTFS strip
+# above is built on.
+#
+# Only a segment that is *exactly* `..` plus parameters is folded. A
+# parameter on an ordinary segment (`/admin;jsessionid=x/`) is left alone:
+# it is not a traversal token, and the session id in it is worth keeping
+# in the path the handler sees.
+#
+# The evasion attempt is not lost. `rawPath` carries the request as it
+# arrived, and `pathParamTraversal` counts the folded segments, so the
+# bypass-shape signal stays in the log while dispatch sees the real file.
+_PATH_PARAM_TRAVERSAL_RE = re.compile(r"/\.\.;[^/]*(?=/|$)")
+
+
+def _decoded_collapsed_path(raw_path: str) -> str:
+    """Percent-decode to a fixed point and collapse `/` runs.
+
+    Factored out of `normalize_path` so the one predicate that still needs
+    to see path parameters -- the servlet-container bypass matcher -- reads
+    the same intermediate form dispatch does, rather than re-deriving it
+    from a raw path that may be double-encoded.
+    """
+    decoded = raw_path
+    for _ in range(4):
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+    collapsed = re.sub(r"/+", "/", decoded)
+    if not collapsed.startswith("/"):
+        collapsed = "/" + collapsed
+    return collapsed
+
+
+def _path_param_traversal_of(raw_path: str) -> int:
+    """How many `..`-with-path-parameter segments the request carried.
+
+    Zero for every ordinary request, so the caller stamps the log field
+    only on the shapes that used the bypass.
+    """
+    if not raw_path:
+        return 0
+    return len(_PATH_PARAM_TRAVERSAL_RE.findall(_decoded_collapsed_path(raw_path)))
+
 
 # Path-generator leakage: the first segment is not a directory the sender
 # believes in, it is a fragment of the context the dictionary was expanded
@@ -6189,6 +6276,10 @@ def normalize_path(raw_path: str) -> str:
       2b. Strip an NTFS alternate-data-stream suffix -- `/.env::$DATA`,
          `/config.php::$INDEX_ALLOCATION`. See
          `_NTFS_STREAM_SUFFIX_RE`.
+      2c. Fold a `..` segment carrying a path parameter onto plain `..`
+         -- `/static/..;/.env`, `/x/..;jsessionid=1/.env`. Servlet
+         containers treat `..;` as a path-up token; step 4 then resolves
+         it like any other. See `_PATH_PARAM_TRAVERSAL_RE`.
       3. Repair the no-slash traversal-bypass shape: `xxx../yyy` →
          `xxx/../yyy`. Scanners use this against parsers that treat
          `..` as a path-up token even without a leading slash; without
@@ -6202,15 +6293,7 @@ def normalize_path(raw_path: str) -> str:
     """
     if not raw_path:
         return "/"
-    decoded = raw_path
-    for _ in range(4):
-        next_decoded = unquote(decoded)
-        if next_decoded == decoded:
-            break
-        decoded = next_decoded
-    collapsed = re.sub(r"/+", "/", decoded)
-    if not collapsed.startswith("/"):
-        collapsed = "/" + collapsed
+    collapsed = _decoded_collapsed_path(raw_path)
     # Drop path-generator leakage (`/~/`, `/$(pwd)/`, `/localhost/`,
     # `/:443/`) before dispatch, so the credential-file families already
     # in the table answer these spellings instead of 404ing. After the
@@ -6223,6 +6306,11 @@ def normalize_path(raw_path: str) -> str:
     # injected-prefix strip is: a stripped path still gets `..` resolved
     # normally afterwards.
     collapsed = _NTFS_STREAM_SUFFIX_RE.sub("", collapsed) or "/"
+    # Fold `..;<params>` onto `..` so the resolver below walks it. Before
+    # the traversal repair and the normpath, which are what actually
+    # resolve it; after the strips above, for the same reason they run in
+    # that order -- a stripped path still gets `..` resolved normally.
+    collapsed = _PATH_PARAM_TRAVERSAL_RE.sub("/..", collapsed)
     repaired = _NO_SLASH_TRAVERSAL_RE.sub(r"\1/..\2", collapsed)
     while repaired != collapsed:
         collapsed = repaired
@@ -8399,7 +8487,7 @@ def is_joomla4_config_path(path: str) -> bool:
     )
 
 
-def is_tomcat_path_bypass_path(path: str) -> bool:
+def is_tomcat_path_bypass_path(path: str, raw_path: str | None = None) -> bool:
     """Match Tomcat-style path-normalization-bypass requests (`/..;/`
     segment) targeting frontend-bundle env files.
 
@@ -8411,17 +8499,26 @@ def is_tomcat_path_bypass_path(path: str) -> bool:
     segment plus the `env*.js` filename family. The F5 BIG-IP TMUI
     `/..;/` handler already owns `/tmui/login.jsp/..;/...` — keep that
     routing intact by gating on the `env*.js` filename specifically.
+
+    `normalize_path` now folds `..;` onto `..` and resolves it, so the
+    normalized path no longer carries the bypass segment. `raw_path` is
+    where the shape is still visible: pass it and the parameters are read
+    from there while the filename is read from the normalized path. Called
+    with `path` alone, both reads come from `path` — which is how the
+    unnormalized spelling still matches, and what the predicate's own
+    tests exercise.
     """
     if not TOMCAT_PATH_BYPASS_ENABLED:
         return False
     p = path.lower()
-    if "/..;/" not in p:
+    probe = _decoded_collapsed_path(raw_path).lower() if raw_path is not None else p
+    if "/..;" not in probe:
         return False
     tail = p.rsplit("/", 1)[-1]
     if not tail.startswith("env") or not tail.endswith(".js"):
         return False
     # F5 TMUI bypass shapes carry `/tmui/` — leave them with the F5 handler.
-    if "/tmui/" in p:
+    if "/tmui/" in probe or "/tmui/" in p:
         return False
     return True
 
@@ -34948,6 +35045,18 @@ def _log_context_from_request(request: web.Request, request_id: str, body_bytes_
             if (_injected_prefix := _injected_prefix_of(raw_path))
             else {}
         ),
+        # Present only when a `..` segment arrived carrying a path
+        # parameter, so the field's presence is exactly the
+        # servlet-container bypass signal and every other request keeps
+        # its existing log shape. The value is how many such segments the
+        # request carried: dispatch resolves them away, and this is what
+        # records that the read was spelled as a prefix-gate bypass rather
+        # than asked for by name.
+        **(
+            {"pathParamTraversal": _path_param_traversal}
+            if (_path_param_traversal := _path_param_traversal_of(raw_path))
+            else {}
+        ),
         "rawTarget": raw_target,
         "query": query_string,
         "clientIp": client_ip,
@@ -38849,7 +38958,16 @@ async def _handle_f5_bigip(
     if request_body:
         body_preview = request_body[:WEBSHELL_BODY_DECODE_LIMIT].decode("utf-8", errors="replace")
 
-    has_path_traversal = "/.." in path or "%2e%2e" in path.lower()
+    # `path` is normalized, so a traversal that resolved cleanly has
+    # already been walked out of it. `pathParamTraversal` (stamped ahead
+    # of dispatch from the raw path) is what still records the `..;`
+    # spelling this appliance's own CVE payload is written in, so the flag
+    # reads both rather than only the residue of an unresolved one.
+    has_path_traversal = (
+        "/.." in path
+        or "%2e%2e" in path.lower()
+        or bool(log_context.get("pathParamTraversal"))
+    )
 
     set_cookie_value: str | None = None
 
@@ -47971,7 +48089,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # BIG-IP so the bypass-shape env-file harvest goes to the dedicated
     # handler; `is_tomcat_path_bypass_path` already excludes `/tmui/`
     # paths (which the F5 handler owns).
-    if API_KEY and is_tomcat_path_bypass_path(path):
+    if API_KEY and is_tomcat_path_bypass_path(
+        path, raw_path=str(log_context.get("rawPath") or path),
+    ):
         return await _handle_tomcat_path_bypass(
             request, log_context, path, query_string,
         )

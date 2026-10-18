@@ -219,3 +219,29 @@ address; `HONEYPOT_SSRF_AZURE_CLIENT_ID`,
 `HONEYPOT_SSRF_AZURE_SUBSCRIPTION_ID` override the equivalent Azure
 identifiers. None of the four is a secret — they name a principal, they
 do not authenticate as one.
+
+## Product-specific read primitives
+
+The entry table started as generic verbs — `/fetch`, `/proxy`, `/read`,
+`/image` — admitted on a source-overlap test: every source sending the
+candidate also sent `/fetch` and `/proxy` in the same sweep. Three
+entries are admitted on a sharper test instead, because they are real
+addresses rather than guesses and the source-overlap figure for them is
+near zero:
+
+| Entry | What it is |
+| --- | --- |
+| `/userfiles`, `/userfiles/x` | The upload directory a file-manager component serves. The read is spelled as traversal out of it (`?path=../../.env`, `?path=../../../../proc/self/environ`) |
+| `/_next/image` | The framework image optimiser's documented SSRF surface. `/image` and `/api/image` already covered the generic guess but not the real address — and the real address is the one arriving with the link-local metadata URL in `url=` |
+
+The test they pass is that **the request names its own target**, and the
+names asked for are files already in the table. Where the source
+behaviour can be read it agrees: roughly 70–80% of the sources sending
+these also send a metadata address or a `file://` read somewhere, against
+roughly 0% for a same-volume endpoint whose parameter carries an
+application resource id rather than a path, and roughly 4% for the
+DNS-over-HTTPS resolver spellings. That gap is the discriminator that
+keeps this from becoming an open proxy for every endpoint that happens to
+take a `path=` parameter — and admission changes nothing about the
+refusal rule: a parameter naming neither a metadata host nor a local file
+is still not claimed.
