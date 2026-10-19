@@ -28246,6 +28246,179 @@ def render_python_settings(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+# --- Django / Flask entry-point modules --------------------------------
+# `settings.py` and `config.py` are already answered as credential files.
+# The modules that *name* them were not: `manage.py`, `wsgi.py` and
+# `asgi.py` each carry an
+# `os.environ.setdefault("DJANGO_SETTINGS_MODULE", "<project>.settings")`
+# line, and that line is the only place a deployment's project package
+# name is written down. A dredge that reads it learns where the
+# credential file actually lives.
+#
+# That makes the pair a chain rather than two files. The entry point
+# holds no credential, so it mints nothing and costs no quota; what it
+# carries is a package name derived from the calling address under a
+# per-process secret. The settings module that name points at is not in
+# any wordlist, is not shared between deployments and cannot be reached
+# by enumeration — so a request for it is evidence the caller parsed the
+# module it was given rather than replaying a path list, which is the one
+# thing the fixed-prefix table below it cannot show. A name from the
+# vocabulary that this process never issued to this caller is tagged
+# separately: that is the shape a cross-deployment replay takes.
+DJANGO_ENTRYPOINT_ENABLED = _env_bool("HONEYPOT_DJANGO_ENTRYPOINT_ENABLED")
+
+# Realistic `django-admin startproject` package names. Deliberately
+# disjoint from the layout prefixes the app-config table already owns
+# (`app`, `core`, `backend`, `src`, `project`, `config`, `instance`), so
+# this chain can only ever add a route and never move an existing one.
+_DJANGO_PROJECT_NAMES: tuple[str, ...] = (
+    "mysite", "website", "webapp", "portal", "intranet", "dashboard",
+    "platform", "mainsite", "storefront", "shopfront", "billing",
+    "accounts", "crm", "erp", "helpdesk", "ticketing", "inventory",
+    "analytics", "reporting", "scheduler", "bookings", "payments",
+    "invoicing", "payroll", "logistics", "dispatch", "fleet", "assets",
+    "catalog", "marketplace", "subscriptions", "onboarding", "identity",
+    "directory", "workspace", "collab", "knowledgebase", "support",
+    "gateway", "apiserver", "backoffice", "adminsite", "console",
+    "controlpanel", "provisioning", "telemetry", "auditlog", "compliance",
+)
+
+_DJANGO_PROJECT_SECRET = secrets.token_bytes(32)
+
+
+def _django_project_for_client(client_ip: str) -> str:
+    """The project package name this deployment shows `client_ip`.
+
+    Keyed on the address exactly as the build-manifest chunk hash is, so
+    a caller that reads the entry point over one connection and asks for
+    the settings module over another still agrees with itself, and the
+    server holds no per-client state a fan-out could grow without bound.
+    """
+    digest = hmac.new(
+        _DJANGO_PROJECT_SECRET,
+        (client_ip or "-").encode("utf-8", "replace"),
+        hashlib.sha256,
+    ).digest()
+    return _DJANGO_PROJECT_NAMES[digest[0] % len(_DJANGO_PROJECT_NAMES)]
+
+
+def _django_settings_module_target(path: str) -> str | None:
+    """The project package named by `/<project>/settings.py`, or None.
+
+    Exact two-segment shape only. A deeper spelling is the layout walk's
+    business, and a project name is not a layout directory.
+    """
+    segments = [seg for seg in path.lower().split("/") if seg]
+    if len(segments) != 2 or segments[1] != "settings.py":
+        return None
+    return segments[0] if segments[0] in _DJANGO_PROJECT_NAMES else None
+
+
+def render_django_entrypoint(r: dict[str, object]) -> bytes:
+    """`manage.py` / `wsgi.py` / `asgi.py` / `app.py` / `environment.py`.
+
+    No credential: the body's whole value is the settings module it
+    names. Which of the five shapes is served is chosen from the leaf
+    actually asked for, because a `wsgi.py` whose body is a `manage.py`
+    is a tell to anything that reads past the first line.
+    """
+    project = _django_project_for_client(str(r.get("_clientIp") or ""))
+    leaf = str(r.get("_requestPath") or "").lower().rsplit("/", 1)[-1]
+
+    if leaf == "wsgi.py":
+        return (
+            '"""WSGI config -- exposes the WSGI callable as ``application``."""\n'
+            "import os\n"
+            "\n"
+            "from django.core.wsgi import get_wsgi_application\n"
+            "\n"
+            f"os.environ.setdefault('DJANGO_SETTINGS_MODULE', '{project}.settings')\n"
+            "\n"
+            "application = get_wsgi_application()\n"
+        ).encode("utf-8")
+
+    if leaf == "asgi.py":
+        return (
+            '"""ASGI config -- exposes the ASGI callable as ``application``."""\n'
+            "import os\n"
+            "\n"
+            "from django.core.asgi import get_asgi_application\n"
+            "\n"
+            f"os.environ.setdefault('DJANGO_SETTINGS_MODULE', '{project}.settings')\n"
+            "\n"
+            "application = get_asgi_application()\n"
+        ).encode("utf-8")
+
+    if leaf == "app.py":
+        # Flask's application factory. The Django pair above names its
+        # settings in an environment default; Flask names it in a
+        # `from_object` call, and a dredge reading this file is after
+        # the same thing by a different spelling.
+        return (
+            '"""Application factory."""\n'
+            "import os\n"
+            "\n"
+            "from flask import Flask\n"
+            "\n"
+            "\n"
+            "def create_app(config_object=None):\n"
+            "    app = Flask(__name__, instance_relative_config=True)\n"
+            f"    app.config.from_object(config_object or '{project}.settings')\n"
+            f"    app.config.from_pyfile('{project}/settings.py', silent=True)\n"
+            "    return app\n"
+            "\n"
+            "\n"
+            "app = create_app()\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))\n"
+        ).encode("utf-8")
+
+    if leaf == "environment.py":
+        # The hand-rolled "which settings module am I" shim a project
+        # grows when it has more than two environments.
+        return (
+            '"""Environment selection for the deployed settings module."""\n'
+            "import os\n"
+            "\n"
+            "ENVIRONMENT = os.environ.get('APP_ENVIRONMENT', 'production')\n"
+            "\n"
+            "SETTINGS_MODULES = {\n"
+            f"    'production': '{project}.settings',\n"
+            f"    'staging': '{project}.settings',\n"
+            f"    'development': '{project}.settings',\n"
+            "}\n"
+            "\n"
+            "os.environ.setdefault(\n"
+            "    'DJANGO_SETTINGS_MODULE', SETTINGS_MODULES[ENVIRONMENT],\n"
+            ")\n"
+        ).encode("utf-8")
+
+    return (
+        "#!/usr/bin/env python\n"
+        '"""Django\'s command-line utility for administrative tasks."""\n'
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        f"    os.environ.setdefault('DJANGO_SETTINGS_MODULE', '{project}.settings')\n"
+        "    try:\n"
+        "        from django.core.management import execute_from_command_line\n"
+        "    except ImportError as exc:\n"
+        "        raise ImportError(\n"
+        "            \"Couldn't import Django. Are you sure it's installed and \"\n"
+        "            'available on your PYTHONPATH environment variable? Did you '\n"
+        "            'forget to activate a virtual environment?'\n"
+        "        ) from exc\n"
+        "    execute_from_command_line(sys.argv)\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    ).encode("utf-8")
+
+
 def render_generic_config_yaml(r: dict[str, object]) -> bytes:
     """Framework-agnostic `config.yaml` / `config.yml` / `secrets.yml` /
     `bootstrap.yml` — the shape Spring Boot, Micronaut, Helm values, and
@@ -32902,6 +33075,27 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         "text/plain; charset=utf-8",
     ),
     CanaryTrap(
+        # No canary types: the body holds no credential. Its value is the
+        # settings module it names, which is why this stays keyless and
+        # costs no issuance quota.
+        "django-entrypoint",
+        (
+            "/manage.py",
+            "/wsgi.py",
+            "/asgi.py",
+            "/app.py",
+            "/environment.py",
+            *_app_layout_variants("manage.py"),
+            *_app_layout_variants("wsgi.py"),
+            *_app_layout_variants("asgi.py"),
+            *_app_layout_variants("app.py"),
+            *_app_layout_variants("environment.py"),
+        ),
+        (),
+        render_django_entrypoint,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
         "app-config-python",
         (
             # Django `settings.py` / Flask `config.py`. A leaked
@@ -34008,10 +34202,63 @@ def resolve_canary_trap(path: str) -> "tuple[CanaryTrap | None, int]":
     return _nested_phpinfo_trap(path)
 
 
+# The settings module an entry point named. Both share the renderer and
+# the canary type the fixed-prefix table entry uses, so the body a caller
+# gets is byte-identical whichever route it arrived by; only the result
+# tag differs, and that tag is the measurement.
+DJANGO_SETTINGS_NAMED_TRAP = CanaryTrap(
+    "django-settings-named",
+    (),
+    ("aws",),
+    render_python_settings,
+    "text/plain; charset=utf-8",
+)
+DJANGO_SETTINGS_FOREIGN_TRAP = CanaryTrap(
+    "django-settings-foreign",
+    (),
+    ("aws",),
+    render_python_settings,
+    "text/plain; charset=utf-8",
+)
+
+
+def resolve_django_settings_module(
+    path: str, client_ip: str,
+) -> "tuple[CanaryTrap | None, str, str]":
+    """Resolve `/<project>/settings.py` against what this caller was told.
+
+    Returns `(trap, requested_project, issued_project)`. `trap` is None
+    when the path is not a project-settings spelling or the family is
+    off. A requested name that matches the one this process issued to
+    this address means the caller read the entry point; any other name
+    from the vocabulary means it did not get that name from us here.
+    """
+    if not (DJANGO_ENTRYPOINT_ENABLED and CANARY_TRAPS_ENABLED):
+        return None, "", ""
+    requested = _django_settings_module_target(path)
+    if requested is None:
+        return None, "", ""
+    issued = _django_project_for_client(client_ip)
+    trap = (
+        DJANGO_SETTINGS_NAMED_TRAP if requested == issued
+        else DJANGO_SETTINGS_FOREIGN_TRAP
+    )
+    return trap, requested, issued
+
+
 def find_canary_trap(path: str) -> "CanaryTrap | None":
     if not CANARY_TRAPS_ENABLED:
         return None
-    return _TRAP_BY_PATH.get(path.lower())
+    found = _TRAP_BY_PATH.get(path.lower())
+    if (
+        found is not None
+        and found.name == "django-entrypoint"
+        and not DJANGO_ENTRYPOINT_ENABLED
+    ):
+        # Gated at the single lookup seam so the switch covers the layout
+        # walk and every other caller, not just the exact-match route.
+        return None
+    return found
 
 
 def find_system_file(path: str) -> "tuple[str, Callable[[], bytes], str] | None":
@@ -48517,6 +48764,24 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 {"trapWalkDepth": trap_walk_depth} if trap_walk_depth else None
             ),
         )
+
+    # The settings module an entry point named. After the table lookup so
+    # a project name that also happens to be a table route keeps its own
+    # renderer, and before the 404 so the second half of the chain is
+    # reachable at all. Gated on the key like every canary-bearing read.
+    if API_KEY:
+        ds_trap, ds_requested, ds_issued = resolve_django_settings_module(
+            path, client_ip,
+        )
+        if ds_trap is not None:
+            return await _send_canary_trap(
+                request, ds_trap, request_id, path,
+                client_ip, host, user_agent, proto, log_context,
+                extra_log={
+                    "djangoProjectRequested": ds_requested,
+                    "djangoProjectIssued": ds_issued,
+                },
+            )
 
     # Last, deliberately: the descriptor families below are registered in
     # the shared trap table, so every spelling the normal dispatch can

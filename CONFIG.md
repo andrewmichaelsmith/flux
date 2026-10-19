@@ -94,6 +94,7 @@ burning quota.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `HONEYPOT_DJANGO_ENTRYPOINT_ENABLED` | **on** | Serve the Python entry-point modules (`manage.py`, `wsgi.py`, `asgi.py`, `app.py`, `environment.py`, plus app-layout prefixes) and the per-client `/<project>/settings.py` they name. The entry points carry no credential and mint nothing, so they run keyless; only the settings module issues a canary. See [docs/django-entrypoint.md](./docs/django-entrypoint.md). |
 | `HONEYPOT_LARAVEL_DEBUGBAR_ENABLED` | **on** | Serve the Debugbar stored-request browser at `/_debugbar/*`. Only the `op=get` payload step mints a canary; the listing and asset steps are free. See [docs/laravel-debugbar.md](./docs/laravel-debugbar.md). |
 
 Requires a Tracebit key: the dispatch is gated on `TRACEBIT_API_KEY`, so

@@ -654,6 +654,12 @@ def test_all_trap_families_default_on():
         "layout-vocabulary walk cannot cover."
     )
     assert tbenv.CLOUD_IMDS_ENABLED
+    assert tbenv.DJANGO_ENTRYPOINT_ENABLED, (
+        "HONEYPOT_DJANGO_ENTRYPOINT_ENABLED should default to True — the "
+        "entry-point module is the only place a deployment's project "
+        "package name is written down, and it mints no canary, so there "
+        "is no per-request cost to opt out of."
+    )
     assert tbenv.WP_PLUGIN_README_ENABLED, (
         "HONEYPOT_WP_PLUGIN_README_ENABLED should default to True — the "
         "plugin readme is the version check a version-gated exploit makes "
