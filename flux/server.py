@@ -21771,6 +21771,174 @@ def render_proc_environ(r: dict[str, object]) -> bytes:
     return ("\x00".join(fields) + "\x00").encode("utf-8")
 
 
+def _log_base_epoch() -> int:
+    """A believable recent timestamp base, randomised per render so the
+    ordering looks live and the body never acts as a fleet fingerprint."""
+    return 1_762_000_000 + secrets.randbelow(6_000_000)
+
+
+def render_php_error_log(r: dict[str, object]) -> bytes:
+    """`error_log` / `error.log` / `debug.log` — the PHP error log.
+
+    What PHP actually writes is one `[DD-Mon-YYYY HH:MM:SS UTC] PHP
+    <level>:  <message>` line per record, with a `Stack trace:` block
+    indented under a fatal. The credential comes from the thing real
+    fatals do: a `var_dump($_ENV)` or `print_r` left in an error handler
+    dumps the whole environment into the log, which is why `grep AKIA`
+    over a leaked `error_log` is a standard dredging step.
+
+    Shape is deliberately PHP's and not Monolog's — serving a Monolog
+    line for a path named `error_log` would tell a reader this host
+    answers by path pattern rather than by what the file is.
+    """
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    db_password = _fake_db_password()
+    base = _log_base_epoch()
+
+    def ts(offset: int) -> str:
+        return time.strftime(
+            "%d-%b-%Y %H:%M:%S UTC", time.gmtime(base + offset)
+        )
+
+    return (
+        f"[{ts(0)}] PHP Notice:  Undefined index: remember_token in "
+        "/var/www/html/includes/session.php on line 48\n"
+        f"[{ts(37)}] PHP Warning:  file_get_contents(/tmp/cache/catalog.ser): "
+        "failed to open stream: No such file or directory in "
+        "/var/www/html/lib/Cache.php on line 112\n"
+        f"[{ts(204)}] PHP Warning:  mysqli_real_connect(): (HY000/2002): "
+        "Connection refused in /var/www/html/includes/db.php on line 17\n"
+        f"[{ts(206)}] PHP Fatal error:  Uncaught PDOException: SQLSTATE[08006] "
+        "[7] could not connect to server: Connection refused\n"
+        "\tis the server running on host \"db.internal\" and accepting\n"
+        "\tTCP/IP connections on port 5432? in "
+        "/var/www/html/includes/db.php:24\n"
+        "Stack trace:\n"
+        "#0 /var/www/html/includes/db.php(24): PDO->__construct()\n"
+        "#1 /var/www/html/lib/Bootstrap.php(61): Database->connect()\n"
+        "#2 /var/www/html/index.php(9): Bootstrap->run()\n"
+        "#3 {main}\n"
+        "  thrown in /var/www/html/includes/db.php on line 24\n"
+        f"[{ts(207)}] PHP Notice:  environment dump follows "
+        "(APP_DEBUG=1) in /var/www/html/lib/ErrorHandler.php on line 90\n"
+        "array(11) {\n"
+        '  ["APP_ENV"]=>\n  string(10) "production"\n'
+        '  ["DB_HOST"]=>\n  string(11) "db.internal"\n'
+        '  ["DB_DATABASE"]=>\n  string(7) "appprod"\n'
+        '  ["DB_USERNAME"]=>\n  string(7) "appuser"\n'
+        f'  ["DB_PASSWORD"]=>\n  string({len(db_password)}) "{db_password}"\n'
+        '  ["CACHE_DRIVER"]=>\n  string(5) "redis"\n'
+        '  ["AWS_DEFAULT_REGION"]=>\n  string(9) "us-east-1"\n'
+        f'  ["AWS_ACCESS_KEY_ID"]=>\n  string({len(ak)}) "{ak}"\n'
+        f'  ["AWS_SECRET_ACCESS_KEY"]=>\n  string({len(sk)}) "{sk}"\n'
+        f'  ["AWS_SESSION_TOKEN"]=>\n  string({len(st)}) "{st}"\n'
+        '  ["AWS_BUCKET"]=>\n  string(14) "appprod-assets"\n'
+        "}\n"
+    ).encode("utf-8")
+
+
+def render_rails_log(r: dict[str, object]) -> bytes:
+    """`log/production.log` — the Rails logger.
+
+    Rails writes a request block per action: `Started`, the
+    `Processing by` line, SQL at debug level, then `Completed`. An
+    unrescued exception prints the class, the message and a backtrace.
+    The credential arrives the way it does in a real Rails log — the
+    logger's filter_parameters list covers `password` but almost never
+    the AWS keys, so an `Aws::S3` error logs the client options inline.
+    """
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    st = aws.get("awsSessionToken", "")
+    secret_key_base = secrets.token_hex(64)
+    base = _log_base_epoch()
+
+    def ts(offset: int) -> str:
+        return time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.gmtime(base + offset)
+        ) + f" +0000"
+
+    return (
+        f"I, [{ts(0)}]  INFO -- : Started GET \"/health\" for 10.0.0.4 "
+        f"at {ts(0)}\n"
+        f"I, [{ts(0)}]  INFO -- : Processing by HealthController#show as */*\n"
+        f"I, [{ts(0)}]  INFO -- : Completed 200 OK in 3ms "
+        "(Views: 0.4ms | ActiveRecord: 1.1ms)\n"
+        f"I, [{ts(118)}]  INFO -- : Started POST \"/uploads\" for 10.0.0.9 "
+        f"at {ts(118)}\n"
+        f"I, [{ts(118)}]  INFO -- : Processing by UploadsController#create "
+        "as JSON\n"
+        f"D, [{ts(118)}] DEBUG -- :   User Load (0.6ms)  SELECT \"users\".* "
+        "FROM \"users\" WHERE \"users\".\"id\" = $1 LIMIT $2\n"
+        f"F, [{ts(119)}] FATAL -- : \n"
+        "Aws::S3::Errors::InvalidAccessKeyId (The AWS Access Key Id you "
+        "provided does not exist in our records.):\n"
+        "\n"
+        "app/services/asset_uploader.rb:34:in `store!'\n"
+        "app/controllers/uploads_controller.rb:12:in `create'\n"
+        f"E, [{ts(119)}] ERROR -- : client options: "
+        f"{{:region=>\"us-east-1\", :access_key_id=>\"{ak}\", "
+        f":secret_access_key=>\"{sk}\", :session_token=>\"{st}\", "
+        ":bucket=>\"appprod-assets\"}}\n"
+        f"E, [{ts(120)}] ERROR -- : secret_key_base "
+        f"{secret_key_base[:16]}... in use; credentials not re-read\n"
+        f"I, [{ts(121)}]  INFO -- : Completed 500 Internal Server Error "
+        "in 812ms (ActiveRecord: 2.4ms)\n"
+    ).encode("utf-8")
+
+
+def render_web_access_log(r: dict[str, object]) -> bytes:
+    """`access.log` — the nginx/Apache combined access log.
+
+    An access log holds no config, so it would be a weak answer if the
+    body were only request lines. What makes it worth serving is the
+    thing that makes real access logs a credential source: anything a
+    client put in a query string is logged verbatim, so a leaked
+    `access.log` routinely carries tokens and keys from callers that
+    signed a URL or passed a key as a parameter. The canary rides one
+    such line.
+    """
+    aws = _aws(r)
+    ak = aws.get("awsAccessKeyId", "")
+    sk = aws.get("awsSecretAccessKey", "")
+    base = _log_base_epoch()
+
+    def ts(offset: int) -> str:
+        return time.strftime(
+            "%d/%b/%Y:%H:%M:%S +0000", time.gmtime(base + offset)
+        )
+
+    ua_browser = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+    return (
+        f'10.0.0.4 - - [{ts(0)}] "GET /health HTTP/1.1" 200 2 "-" '
+        '"kube-probe/1.29"\n'
+        f'203.0.113.18 - - [{ts(12)}] "GET / HTTP/1.1" 200 15043 "-" '
+        f'"{ua_browser}"\n'
+        f'203.0.113.18 - - [{ts(13)}] "GET /static/app.4f1c2b.js HTTP/1.1" '
+        f'200 184322 "https://app.internal/" "{ua_browser}"\n'
+        f'10.0.0.9 - - [{ts(96)}] "POST /api/v1/sessions HTTP/1.1" 201 312 '
+        '"-" "python-requests/2.31.0"\n'
+        # The leak: a sync job that passes its credentials as query
+        # parameters, logged verbatim by the web server.
+        f'10.0.0.9 - - [{ts(97)}] "GET /api/v1/assets/sync?'
+        f'aws_access_key_id={ak}&aws_secret_access_key={sk}'
+        '&region=us-east-1&bucket=appprod-assets HTTP/1.1" 200 1142 "-" '
+        '"appsync/1.4 (+internal)"\n'
+        f'10.0.0.9 - - [{ts(98)}] "GET /api/v1/assets/manifest HTTP/1.1" '
+        '200 884 "-" "appsync/1.4 (+internal)"\n'
+        f'198.51.100.23 - - [{ts(240)}] "GET /.env HTTP/1.1" 404 162 "-" '
+        '"Mozilla/5.0 (compatible)"\n'
+        f'198.51.100.23 - - [{ts(241)}] "GET /wp-login.php HTTP/1.1" 404 162 '
+        '"-" "Mozilla/5.0 (compatible)"\n'
+    ).encode("utf-8")
+
 def render_laravel_log(r: dict[str, object]) -> bytes:
     """`storage/logs/laravel.log` — the Monolog daily-file Laravel writes
     when `LOG_CHANNEL=single` (or `daily` at the un-suffixed `laravel.log`
@@ -28267,6 +28435,33 @@ def render_python_settings(r: dict[str, object]) -> bytes:
 # separately: that is the shape a cross-deployment replay takes.
 DJANGO_ENTRYPOINT_ENABLED = _env_bool("HONEYPOT_DJANGO_ENTRYPOINT_ENABLED")
 
+# Application log files asked for by their generic names rather than at
+# their framework-canonical location. The table already renders the
+# Monolog `storage/logs/laravel.log` and the WordPress
+# `wp-content/debug.log`, but a credential-dredging sweep does not start
+# from the framework's layout — it asks for `error_log`, `debug.log`,
+# `access.log` and `production.log` at the webroot and under `log/` and
+# `logs/`, because that is where a misconfigured static-file route
+# actually leaves them. Those spellings answered 404 while the canonical
+# ones answered, which is the same first-request-misses shape the entry
+# point module pair above was built to close.
+#
+# A log is worth answering because of what a real one leaks: a stack
+# trace carries the env block, a PHP fatal carries the var_dump, and an
+# access line carries whatever the client put in a query string. Each
+# shape gets its own renderer — a `php error_log` whose body is Monolog
+# is a tell to anything that reads past the first line, exactly as a
+# `wsgi.py` whose body is a `manage.py` would be.
+APP_LOG_ENABLED = _env_bool("HONEYPOT_APP_LOG_ENABLED")
+
+# The families the flag above governs. Scoped to the generic-name
+# expansion only, so turning it off restores the pre-expansion surface
+# rather than taking the canonical `laravel-log` / `wp-debug-log` routes
+# down with it.
+_APP_LOG_TRAP_NAMES: frozenset[str] = frozenset(
+    {"php-error-log", "rails-env-log", "web-access-log"}
+)
+
 # Realistic `django-admin startproject` package names. Deliberately
 # disjoint from the layout prefixes the app-config table already owns
 # (`app`, `core`, `backend`, `src`, `project`, `config`, `instance`), so
@@ -30385,6 +30580,14 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         "laravel-log",
         (
             "/storage/logs/laravel.log",
+            # The bare leaf. A dredging sweep asks for `laravel.log`
+            # without the framework's `storage/logs/` layout, and the
+            # layout walk then covers the `logs/`, `log/`, `public/`,
+            # `admin/` and `var/` spellings of the same leaf from this
+            # one registration.
+            "/laravel.log",
+            "/laravel.log.bak",
+            "/laravel.log.old",
             # Editor backup / log-rotate sibling names harvesters walk
             # alongside the bare path.
             "/storage/logs/laravel.log.bak",
@@ -30402,6 +30605,60 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ),
         ("aws",),
         render_laravel_log,
+        "text/plain; charset=utf-8",
+    ),
+    # The generic application log names, answered by shape. Each of
+    # these is asked for at the webroot and under `log/` / `logs/` by
+    # the same credential-dredging dictionaries that walk `.env`, and
+    # all of them answered 404 while the framework-canonical spellings
+    # above answered — so a sweep's first request missed and only a
+    # later, more specific one hit. Registering the bare leaf is enough:
+    # the layout walk covers the directory spellings from here.
+    CanaryTrap(
+        "php-error-log",
+        (
+            "/error_log",
+            "/error.log",
+            "/errors.log",
+            "/debug.log",
+            "/php_errors.log",
+            # Generic server/application log names. The PHP shape is the
+            # right default for these on a host that otherwise presents
+            # a PHP stack (wp-config, phpinfo, the webshell surface):
+            # answering with a Rails or Monolog body here would be the
+            # mismatch, not this.
+            "/server.log",
+            "/app.log",
+            "/application.log",
+        ),
+        ("aws",),
+        render_php_error_log,
+        "text/plain; charset=utf-8",
+    ),
+    # Rails writes its logs to `log/<env>.log` — the singular directory,
+    # which is why `log` had to join the walk vocabulary for this family
+    # to resolve at all.
+    CanaryTrap(
+        "rails-env-log",
+        (
+            "/production.log",
+            "/development.log",
+            "/staging.log",
+            "/dev.log",
+            "/test.log",
+        ),
+        ("aws",),
+        render_rails_log,
+        "text/plain; charset=utf-8",
+    ),
+    CanaryTrap(
+        "web-access-log",
+        (
+            "/access.log",
+            "/access_log",
+        ),
+        ("aws",),
+        render_web_access_log,
         "text/plain; charset=utf-8",
     ),
     # `wp-content/debug.log` — the file WordPress writes with
@@ -33955,6 +34212,18 @@ _TRAP_WALK_EXTRA_PREFIXES: tuple[str, ...] = (
     # A CMS installed into a subdirectory rather than at the root, and
     # the directories that sit beside it.
     "apache", "blog", "console", "credentials", "ssl", "workflows",
+    # The singular log directory. `logs` was already here but `log` was
+    # not, which split the log family in half: the same dictionary walks
+    # both spellings, so `logs/error.log` resolved while `log/error.log`
+    # — and the whole Rails tree, whose directory is `log/` by
+    # convention, never `logs/` — answered 404. It is as plausible a
+    # deployment directory as its plural.
+    #
+    # `apache2` and `nginx` come with it: the system log tree a sweep
+    # walks is `/var/log/<server>/error.log`, and only the unsuffixed
+    # `apache` was here, so the spelling Debian and Ubuntu actually
+    # install (`apache2`) missed while `apache` hit.
+    "log", "apache2", "nginx",
 )
 
 
@@ -34257,6 +34526,16 @@ def find_canary_trap(path: str) -> "CanaryTrap | None":
     ):
         # Gated at the single lookup seam so the switch covers the layout
         # walk and every other caller, not just the exact-match route.
+        return None
+    if (
+        found is not None
+        and found.name in _APP_LOG_TRAP_NAMES
+        and not APP_LOG_ENABLED
+    ):
+        # Same seam, same reason. `laravel-log` and `wp-debug-log` are
+        # deliberately NOT in this set: they predate the switch and are
+        # the framework-canonical locations, not the generic-name
+        # expansion this flag governs.
         return None
     return found
 

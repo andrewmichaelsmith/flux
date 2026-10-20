@@ -660,6 +660,14 @@ def test_all_trap_families_default_on():
         "package name is written down, and it mints no canary, so there "
         "is no per-request cost to opt out of."
     )
+    assert tbenv.APP_LOG_ENABLED, (
+        "HONEYPOT_APP_LOG_ENABLED should default to True — a credential "
+        "dredge asks for error_log / debug.log / access.log / "
+        "production.log at the webroot rather than at the framework's "
+        "canonical location, and the renderers mint no canary until a "
+        "read actually lands, so there is no per-request cost to opt "
+        "out of."
+    )
     assert tbenv.WP_PLUGIN_README_ENABLED, (
         "HONEYPOT_WP_PLUGIN_README_ENABLED should default to True — the "
         "plugin readme is the version check a version-gated exploit makes "

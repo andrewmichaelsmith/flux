@@ -95,6 +95,7 @@ burning quota.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HONEYPOT_DJANGO_ENTRYPOINT_ENABLED` | **on** | Serve the Python entry-point modules (`manage.py`, `wsgi.py`, `asgi.py`, `app.py`, `environment.py`, plus app-layout prefixes) and the per-client `/<project>/settings.py` they name. The entry points carry no credential and mint nothing, so they run keyless; only the settings module issues a canary. See [docs/django-entrypoint.md](./docs/django-entrypoint.md). |
+| `HONEYPOT_APP_LOG_ENABLED` | **on** | Serve the generic application-log names (`error_log`, `error.log`, `debug.log`, `access.log`, `production.log` and siblings) at the webroot and, via the layout walk, under `log/` / `logs/` / `var/log/<server>/`. Each name is rendered in the shape its real writer produces — PHP error log, Rails logger, combined access log — and carries the AWS canary where that shape really leaks it. Scoped to the generic-name expansion: the canonical `laravel-log` / `wp-debug-log` routes stay up when this is off. See [docs/app-log-locations.md](./docs/app-log-locations.md). |
 | `HONEYPOT_LARAVEL_DEBUGBAR_ENABLED` | **on** | Serve the Debugbar stored-request browser at `/_debugbar/*`. Only the `op=get` payload step mints a canary; the listing and asset steps are free. See [docs/laravel-debugbar.md](./docs/laravel-debugbar.md). |
 
 Requires a Tracebit key: the dispatch is gated on `TRACEBIT_API_KEY`, so
