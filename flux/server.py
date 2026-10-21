@@ -4147,6 +4147,59 @@ _SAP_METADATAUPLOADER_XXE_INDICATORS = (
 )
 
 
+# --- Fake Telerik UI RadAsyncUpload handler (CVE-2019-18935 bait) ---
+# `Telerik.Web.UI.WebResource.axd?type=rau` is the handler registration
+# check for Telerik UI for ASP.NET AJAX's RadAsyncUpload. It is the
+# fingerprint step of CVE-2019-18935: a real build answers the bare
+# `type=rau` GET with a fixed JSON notice, and only then does the exploit
+# POST its AES-encrypted `rauPostData` descriptor plus the mixed-mode DLL
+# it wants deserialized. Answering the GET is therefore what decides
+# whether the request carrying the gadget chain is ever sent, and the POST
+# is the only place that chain can be captured -- it never appears in a
+# path dictionary.
+#
+# The `type` parameter is the discriminator, not the path. Bare
+# `WebResource.axd` is ASP.NET's own static web-resource handler and 404s
+# without a valid `d`/`t` pair, so a path hit with no `type=rau` is
+# answered as a 404 on purpose (`telerik-webresource-miss`) -- that is
+# correct upstream behaviour, NOT a renderer gap to be closed later.
+# Keeping it a 404 also separates senders doing the real fingerprint check
+# from ones replaying a path list.
+TELERIK_RAU_ENABLED = _env_bool("HONEYPOT_TELERIK_RAU_ENABLED")
+# Body decode cap mirrors the SAP uploader -- keeps log rows compact while
+# still surfacing enough of the descriptor for the gadget-indicator flags.
+TELERIK_RAU_BODY_DECODE_LIMIT = max(
+    int((os.environ.get("HONEYPOT_TELERIK_RAU_BODY_DECODE_LIMIT") or "8192").strip() or "8192"),
+    512,
+)
+# How much of the `rauPostData` descriptor to retain. It is base64 of an
+# AES-encrypted blob, so it is opaque here, but its length and prefix
+# identify the toolchain that produced it.
+TELERIK_RAU_POSTDATA_PREVIEW_LIMIT = 512
+# Gadget / payload indicators matched case-insensitively on the raw body.
+# The public CVE-2019-18935 chains serialize one of these type names, and
+# the upload half carries a DLL; either flips
+# `telerikHasGadgetIndicator` for fast triage.
+_TELERIK_RAU_GADGET_INDICATORS = (
+    b"objectdataprovider",             # the canonical ysoserial.net gadget
+    b"windowsidentity",                # WindowsIdentity chain
+    b"resourcedictionary",             # XAML-loading chain
+    b"system.configuration.install",   # InstallUtil / AssemblyInstaller
+    b"activitysurrogateselector",      # ActivitySurrogateSelector chain
+    b"typeconfuseddelegate",           # TypeConfuseDelegate
+    b"system.workflow",                # workflow-assembly chains
+    b"4d5a9000",                       # hex-encoded PE header ("MZ")
+    b"targetfolder",                   # the descriptor's own field name
+    b"tempTargetFolder".lower(),
+)
+# Extensions the upload half asks to drop. Recorded separately because a
+# `.dll` is the deserialization chain while an `.aspx` is a plain webshell
+# -- different operators, same CVE.
+_TELERIK_RAU_PAYLOAD_EXTENSIONS = (
+    ".dll", ".aspx", ".asmx", ".ashx", ".config", ".exe", ".txt",
+)
+
+
 # --- Fake Drupal user-registration / settings.php trap (Drupalgeddon2) ---
 # Two probe families against the Drupal 8/9 attack surface:
 #
@@ -8430,6 +8483,26 @@ def is_sap_metadatauploader_path(path: str) -> bool:
         "/nwa/developmentserver/metadatauploader",
         "/sap/developmentserver/metadatauploader",
     }
+
+
+
+def is_telerik_rau_path(path: str) -> bool:
+    """Match the Telerik UI for ASP.NET AJAX web-resource handler.
+
+    IIS resolves paths case-insensitively, and the handler is registered
+    at the application root, so `/Telerik.Web.UI.WebResource.axd` and
+    `/telerik.web.ui.webresource.axd` are the same endpoint on a real
+    deployment. Matched at the webroot only: the observed probes spell it
+    bare, and an unbounded prefix walk on a `.axd` suffix would take
+    traffic belonging to the other ASP.NET traps.
+
+    Note this matches the path regardless of query string -- the
+    `type=rau` check lives in the handler, which answers the registration
+    probe and 404s everything else, mirroring the real handler.
+    """
+    if not TELERIK_RAU_ENABLED:
+        return False
+    return path.lower().rstrip("/") == "/telerik.web.ui.webresource.axd"
 
 
 def is_drupal_path(path: str) -> bool:
@@ -43869,6 +43942,236 @@ async def _handle_sap_metadatauploader(
     )
 
 
+
+def render_telerik_rau_registered() -> bytes:
+    """The RadAsyncUpload handler-registration notice.
+
+    This is the literal body a real Telerik build returns for
+    `?type=rau`, misspelling included -- the misspelling is in the
+    shipped product, and a scanner that string-matches the notice would
+    notice a corrected one. No per-hit variation here on purpose: this
+    response carries no secret, and the whole point is to be
+    byte-identical to the real fingerprint.
+    """
+    body = (
+        '{ "message" : "RadAsyncUpload handler is registered succesfully, '
+        'however, it may not be accessed directly." }'
+    )
+    return body.encode("utf-8")
+
+
+def render_telerik_rau_upload_receipt(filename: str) -> bytes:
+    """Plausible RadAsyncUpload success envelope.
+
+    A real successful upload returns the file's metadata alongside an
+    encrypted `metaData` blob that the client echoes back on the next
+    request. Every opaque field here is per-hit random -- a fixed
+    `metaData` would ship one identical string from every sensor and let
+    a replay recognise the trap. Nothing is written to disk; the receipt
+    exists so the operator believes the drop landed and goes on to
+    request it, which is the step that tells us the chain completed.
+    """
+    temp_name = f"{uuid.uuid4().hex[:8]}-{uuid.uuid4().hex[:4]}"
+    meta_data = base64.b64encode(secrets.token_bytes(48)).decode("ascii")
+    payload = {
+        "fileInfo": {
+            "FileName": filename,
+            "ContentType": "application/octet-stream",
+            "ContentLength": secrets.randbelow(65536) + 1024,
+            "DateJson": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "Index": 0,
+        },
+        "metaData": meta_data,
+        "tempFileName": f"{temp_name}.tmp",
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def _telerik_rau_query_type(query_string: str) -> str:
+    """Read the `type` parameter the handler dispatches on. Returns ""
+    when absent so the caller can treat it as a plain web-resource
+    request."""
+    if not query_string:
+        return ""
+    try:
+        for key, value in parse_qsl(query_string, keep_blank_values=True):
+            if key.lower() == "type":
+                return value.strip().lower()[:32]
+    except Exception:
+        return ""
+    return ""
+
+
+def _telerik_rau_extract_postdata(request_body: bytes) -> str:
+    """Pull the `rauPostData` descriptor out of the POST body.
+
+    The exploit sends it as an ordinary form field, so it arrives in one
+    of three spellings: a multipart part, a JSON member, or a urlencoded
+    pair. Scan for the field name rather than parsing a format, so a
+    hand-rolled or truncated body still yields the value.
+
+    Only the urlencoded spelling is `+`-decoded. The descriptor is
+    base64, so `+` is a payload byte in the multipart and JSON spellings
+    — running `unquote_plus` over those turns every `+` into a space and
+    the captured descriptor stops being decodable, which defeats the
+    point of capturing it.
+    """
+    if not request_body:
+        return ""
+    text = request_body[:TELERIK_RAU_BODY_DECODE_LIMIT].decode(
+        "utf-8", errors="replace",
+    )
+    # Multipart part: `name="rauPostData"` then a blank line, then the value.
+    match = re.search(
+        r'name="rauPostData"[^\r\n]*\r?\n\r?\n([^\r\n]+)',
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).strip()[:TELERIK_RAU_POSTDATA_PREVIEW_LIMIT]
+    # JSON member.
+    match = re.search(r'"rauPostData"\s*:\s*"([^"]+)"', text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()[:TELERIK_RAU_POSTDATA_PREVIEW_LIMIT]
+    # Urlencoded pair — here `+` really is an encoded space.
+    match = re.search(r'rauPostData=([^&\r\n]+)', text, re.IGNORECASE)
+    if match:
+        return unquote_plus(match.group(1)).strip()[:TELERIK_RAU_POSTDATA_PREVIEW_LIMIT]
+    return ""
+
+
+
+async def _handle_telerik_rau(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake Telerik UI for ASP.NET AJAX RadAsyncUpload handler
+    (CVE-2019-18935 / CVE-2017-11317 bait).
+
+    GET `?type=rau`  -> the handler-registration notice, which is the
+    fingerprint a version-gated exploit checks before it fires.
+    POST `?type=rau` -> capture the `rauPostData` descriptor and any
+    uploaded part, flag the known gadget chains, and return a success
+    receipt so the operator proceeds to request what it thinks it just
+    dropped. Nothing is written anywhere.
+    Anything without `type=rau` -> 404, which is what ASP.NET's own
+    web-resource handler does without a valid resource reference.
+    """
+    method = request.method
+    rau_type = _telerik_rau_query_type(query_string)
+
+    if rau_type != "rau":
+        # Deliberate 404 -- see the config block. Logged so the senders
+        # that replay the path without the registration parameter stay
+        # separable from the ones doing the real fingerprint check.
+        append_log({
+            **log_context,
+            "status": 404,
+            "result": "telerik-webresource-miss",
+            "telerikPath": path,
+            "telerikMethod": method,
+            "telerikType": rau_type,
+        })
+        return web.Response(
+            status=404, body=b"",
+            headers={"Content-Type": "text/html; charset=utf-8"},
+        )
+
+    content_type = request.headers.get("Content-Type", "")
+    names: list[str] = []
+    filenames: list[str] = []
+    part_content_types: list[str] = []
+    has_script_part = False
+    if method not in {"GET", "HEAD"}:
+        names, filenames, part_content_types, has_script_part = extract_multipart_parts(
+            request_body, content_type, FILE_UPLOAD_MAX_PARTS,
+        )
+
+    lower_body = (
+        request_body[:TELERIK_RAU_BODY_DECODE_LIMIT].lower() if request_body else b""
+    )
+    gadgets = sorted(
+        {
+            ind.decode("ascii", errors="replace")
+            for ind in _TELERIK_RAU_GADGET_INDICATORS
+            if ind in lower_body
+        }
+    )
+    payload_exts = sorted(
+        {
+            ext
+            for ext in _TELERIK_RAU_PAYLOAD_EXTENSIONS
+            for name in filenames
+            if name.lower().endswith(ext)
+        }
+    )
+    post_data = _telerik_rau_extract_postdata(request_body)
+
+    if method in {"GET", "HEAD"}:
+        result_tag = "telerik-rau-probe"
+    elif post_data or filenames:
+        result_tag = "telerik-rau-upload"
+    else:
+        # POST on the registered handler with neither a descriptor nor a
+        # file -- a truncated or hand-rolled attempt. Kept distinct so it
+        # does not inflate the upload count.
+        result_tag = "telerik-rau-noupload"
+
+    log_entry: dict[str, object] = {
+        **log_context,
+        "status": 200,
+        "result": result_tag,
+        "telerikPath": path,
+        "telerikMethod": method,
+        "telerikType": rau_type,
+        "telerikHasRauPostData": bool(post_data),
+        "telerikRauPostDataLen": len(post_data),
+        "telerikPartCount": len(names),
+        "telerikFieldNames": sorted(set(names))[:32],
+        "telerikFilenames": filenames[:32],
+        "telerikPartContentTypes": sorted(set(part_content_types))[:32],
+        "telerikPayloadExtensions": payload_exts,
+        "telerikHasGadgetIndicator": bool(gadgets) or has_script_part,
+        "telerikGadgetIndicators": gadgets,
+        "contentType": content_type[:120],
+    }
+    if post_data:
+        log_entry["telerikRauPostData"] = post_data
+    if request_body:
+        log_entry["bodyPreview"] = request_body[:TELERIK_RAU_BODY_DECODE_LIMIT].decode(
+            "utf-8", errors="replace",
+        )[:400]
+    append_log(log_entry)
+
+    headers = {
+        # Telerik ships as a library inside an ASP.NET app, so the
+        # server banner is IIS's. Pinned to a build still carrying the
+        # vulnerable handler, so a version-gated exploit does not bail.
+        "Server": "Microsoft-IIS/10.0",
+        "X-AspNet-Version": "4.0.30319",
+        "Cache-Control": "private, max-age=0",
+    }
+
+    if method in {"GET", "HEAD"}:
+        return web.Response(
+            status=200,
+            body=render_telerik_rau_registered(),
+            headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+        )
+
+    receipt = render_telerik_rau_upload_receipt(
+        filenames[0] if filenames else "RadUpload.tmp",
+    )
+    return web.Response(
+        status=200,
+        body=receipt,
+        headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+    )
+
+
 async def _handle_drupal(
     request: web.Request,
     log_context: dict[str, object],
@@ -48749,6 +49052,11 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_sap_metadatauploader_path(path):
         return await _handle_sap_metadatauploader(request, log_context, path, request_body)
 
+    if is_telerik_rau_path(path):
+        return await _handle_telerik_rau(
+            request, log_context, path, query_string, request_body,
+        )
+
     if is_drupal_path(path):
         return await _handle_drupal(request, log_context, path, query_string, request_body)
 
@@ -49303,6 +49611,8 @@ def main() -> int:
         active.append("confluence")
     if SAP_METADATAUPLOADER_ENABLED:
         active.append("sap-metadatauploader")
+    if TELERIK_RAU_ENABLED:
+        active.append("telerik-rau")
     if DRUPAL_ENABLED:
         active.append("drupal")
     if JOOMLA4_CONFIG_ENABLED:

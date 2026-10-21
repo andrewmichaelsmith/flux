@@ -451,6 +451,8 @@ No Tracebit key required.
 | --- | --- | --- |
 | `HONEYPOT_SAP_METADATAUPLOADER_ENABLED` | on | Master switch. Covers `/developmentserver/metadatauploader` (CVE-2025-31324 unauth file-upload + CVE-2017-9844 XXE) under the bare, `/irj/`, `/nwa/`, and `/sap/` webroot prefixes. |
 | `HONEYPOT_SAP_METADATAUPLOADER_BODY_DECODE_LIMIT` | `8192` | Max bytes of the request body decoded into `bodyPreview` and scanned for the JSP / XXE / cmd-injection indicator flags. The full body is still hashed via `bodySha256`. |
+| `HONEYPOT_TELERIK_RAU_ENABLED` | on | Master switch. Covers `/Telerik.Web.UI.WebResource.axd?type=rau` — the RadAsyncUpload handler-registration fingerprint (CVE-2019-18935 / CVE-2017-11317 bait) — plus the upload `POST` that follows it. A path hit without `type=rau` is a deliberate 404. |
+| `HONEYPOT_TELERIK_RAU_BODY_DECODE_LIMIT` | `8192` | Max bytes of the request body decoded into `bodyPreview` and scanned for the gadget-chain indicator flags. The full body is still hashed via `bodySha256`. |
 
 The handler always advertises `Server: SAP NetWeaver Application Server / ABAP (7.50)`
 on responses — pinned to a build in the CVE-2025-31324 public-disclosure

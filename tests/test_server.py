@@ -674,6 +674,13 @@ def test_all_trap_families_default_on():
         "before it fires, so a 404 there costs the request that carries "
         "the payload"
     )
+    assert tbenv.TELERIK_RAU_ENABLED, (
+        "HONEYPOT_TELERIK_RAU_ENABLED should default to True — the "
+        "RadAsyncUpload registration notice is the fingerprint that "
+        "decides whether the exploit POSTs its gadget chain at all, and "
+        "that POST is the only place the chain can be captured, so an "
+        "off-by-default switch forfeits the payload rather than a 404"
+    )
     assert tbenv.AIPLATFORM_LOGIN_ENABLED, (
         "HONEYPOT_AIPLATFORM_LOGIN_ENABLED should default to True — the "
         "self-hosted AI/MLOps control planes are probed in one pass with "
