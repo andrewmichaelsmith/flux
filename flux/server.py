@@ -17680,7 +17680,36 @@ def _build_fake_repo(
     files["/.git/refs/wip/wtree/refs/heads/"] = _autoindex(
         "/.git/refs/wip/wtree/refs/heads", _branch_entries,
     )
-    files["/.git/objects/"] = _autoindex("/.git/objects", ("info/", "pack/"))
+    # Loose-object fan-out directories. A real repo's `objects/` holds one
+    # two-hex directory per object it stores, and nginx `autoindex on` lists
+    # them alongside `info/` and `pack/`. Listing only the latter two was
+    # internally inconsistent: the tree served
+    # `/.git/objects/<2-hex>/<38-hex>` at 200 while the parent index denied
+    # that `<2-hex>/` existed and the directory itself 404'd. A dumper that
+    # LISTS before it fetches — rather than guessing object names out of
+    # `HEAD` and the refs — therefore saw an empty object store and stopped
+    # walking, which is the opposite of the "keep them walking the tree"
+    # rationale behind every other autoindex here.
+    #
+    # Derived from the object paths actually registered above rather than
+    # from a hardcoded list, so adding a blob to the synthesized repo keeps
+    # the index and the directories consistent for free. Prefixes with no
+    # object stay 404 — that is what a real repo does, and inventing
+    # directories for all 256 would be the tell.
+    _obj_re = re.compile(r"^/\.git/objects/([0-9a-f]{2})/([0-9a-f]{38})$")
+    _fanout: dict[str, list[str]] = {}
+    for _key in tuple(files):
+        _m = _obj_re.match(_key)
+        if _m:
+            _fanout.setdefault(_m.group(1), []).append(_m.group(2))
+    files["/.git/objects/"] = _autoindex(
+        "/.git/objects",
+        (*(f"{_pfx}/" for _pfx in sorted(_fanout)), "info/", "pack/"),
+    )
+    for _pfx, _objs in _fanout.items():
+        files[f"/.git/objects/{_pfx}/"] = _autoindex(
+            f"/.git/objects/{_pfx}", tuple(sorted(_objs)),
+        )
     files["/.git/objects/info/"] = _autoindex("/.git/objects/info", ("packs",))
     # Empty `pack/` — no pack files in the synthesized loose-only repo, but
     # scanners walk the directory anyway. An autoindex with just the

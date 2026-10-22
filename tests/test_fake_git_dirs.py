@@ -167,3 +167,143 @@ async def test_a_real_object_path_still_resolves(flux_client, monkeypatch):
         headers=caller, allow_redirects=False,
     )
     assert resp.status == 200
+
+
+# --- loose-object fan-out directories ----------------------------------
+#
+# `objects/` holds one two-hex directory per object a repo stores, and an
+# autoindex lists them. Listing only `info/` and `pack/` was internally
+# inconsistent: the tree served `objects/<2-hex>/<38-hex>` while denying
+# that `<2-hex>/` existed, so a dumper that lists before it fetches saw an
+# empty object store and stopped walking.
+
+def _fanout_prefixes(repo):
+    """The two-hex prefixes of every loose object the tree registers."""
+    return {
+        key.split("/")[3]
+        for key in repo
+        if key.startswith("/.git/objects/")
+        and len(key.split("/")) == 5
+        and len(key.split("/")[3]) == 2
+        and len(key.split("/")[4]) == 38
+    }
+
+
+def test_tree_actually_stores_loose_objects(repo):
+    """Guard the premise: if this is empty the rest proves nothing."""
+    assert _fanout_prefixes(repo)
+
+
+def test_every_fanout_directory_has_an_autoindex(repo):
+    for prefix in _fanout_prefixes(repo):
+        assert f"/.git/objects/{prefix}/" in repo, prefix
+
+
+def test_objects_index_lists_every_fanout_directory(repo):
+    body = repo["/.git/objects/"].decode()
+    for prefix in _fanout_prefixes(repo):
+        assert f'href="{prefix}/"' in body, prefix
+
+
+def test_objects_index_still_lists_info_and_pack(repo):
+    body = repo["/.git/objects/"].decode()
+    assert 'href="info/"' in body
+    assert 'href="pack/"' in body
+
+
+def test_fanout_autoindex_lists_the_object_it_holds(repo):
+    for prefix in _fanout_prefixes(repo):
+        listing = repo[f"/.git/objects/{prefix}/"].decode()
+        suffixes = [
+            key.split("/")[4] for key in repo
+            if key.startswith(f"/.git/objects/{prefix}/")
+            and len(key.split("/")) == 5 and len(key.split("/")[4]) == 38
+        ]
+        assert suffixes, prefix
+        for suffix in suffixes:
+            assert f'href="{suffix}"' in listing, (prefix, suffix)
+
+
+def test_unused_prefixes_are_not_invented(repo):
+    """A real repo has no directory for a prefix it stores nothing under.
+    Fabricating all 256 would be the tell."""
+    present = _fanout_prefixes(repo)
+    absent = [f"{n:02x}" for n in range(256) if f"{n:02x}" not in present]
+    assert absent, "tree cannot plausibly occupy all 256 prefixes"
+    for prefix in absent[:12]:
+        assert f"/.git/objects/{prefix}/" not in repo, prefix
+
+
+async def _served_prefixes(flux_client, ip):
+    """Two-hex prefixes as the LIVE tree lists them. Rebuilding the repo
+    locally yields different shas (the commit timestamp moves), so the
+    prefixes must come from the server's own index, not a second build."""
+    import re as _re
+    resp = await flux_client.get(
+        "/.git/objects/", headers={"X-Forwarded-For": ip},
+    )
+    assert resp.status == 200
+    return sorted(set(_re.findall(r'href="([0-9a-f]{2})/"', await resp.text())))
+
+
+def _enable(monkeypatch):
+    monkeypatch.setattr(tbenv, "API_KEY", "fake-key")
+    monkeypatch.setattr(tbenv, "FAKE_GIT_ENABLED", True)
+    monkeypatch.setattr(tbenv, "issue_credentials", _fake_canary)
+    tbenv._FAKE_GIT_CACHE.clear()
+
+
+async def test_served_objects_index_lists_fanout_dirs(flux_client, monkeypatch):
+    _enable(monkeypatch)
+    assert await _served_prefixes(flux_client, "203.0.113.38")
+
+
+async def test_bare_fanout_directory_redirects(flux_client, monkeypatch):
+    """The spelling actually observed is bare (`/.git/objects/9d`), so it
+    must reach the existing directory redirect rather than a miss."""
+    _enable(monkeypatch)
+    prefix = (await _served_prefixes(flux_client, "203.0.113.35"))[0]
+
+    resp = await flux_client.get(
+        f"/.git/objects/{prefix}",
+        headers={"X-Forwarded-For": "203.0.113.35"}, allow_redirects=False,
+    )
+    assert resp.status == 301
+    assert resp.headers["Location"] == f"/.git/objects/{prefix}/"
+    entry = _log_entries(flux_client.log_path)[-1]
+    assert entry["result"] == "fake-git-redirect"
+
+
+async def test_fanout_directory_serves_an_html_autoindex(flux_client, monkeypatch):
+    _enable(monkeypatch)
+    prefix = (await _served_prefixes(flux_client, "203.0.113.36"))[0]
+
+    resp = await flux_client.get(
+        f"/.git/objects/{prefix}/",
+        headers={"X-Forwarded-For": "203.0.113.36"},
+    )
+    assert resp.status == 200
+    assert "text/html" in resp.headers["Content-Type"]
+    assert f"Index of /.git/objects/{prefix}" in await resp.text()
+
+
+async def test_listed_object_is_fetchable_so_the_walk_completes(
+    flux_client, monkeypatch,
+):
+    """The point of the fix: a lister must be able to go index -> object."""
+    import re as _re
+    _enable(monkeypatch)
+    prefix = (await _served_prefixes(flux_client, "203.0.113.37"))[0]
+
+    index = await (await flux_client.get(
+        f"/.git/objects/{prefix}/", headers={"X-Forwarded-For": "203.0.113.37"},
+    )).text()
+    suffix = _re.search(r'href="([0-9a-f]{38})"', index).group(1)
+
+    resp = await flux_client.get(
+        f"/.git/objects/{prefix}/{suffix}",
+        headers={"X-Forwarded-For": "203.0.113.37"},
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"] == "application/x-git-loose-object"
+    assert (await resp.read()).startswith(b"\x78")  # zlib deflate
