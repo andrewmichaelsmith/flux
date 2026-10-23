@@ -658,6 +658,26 @@ FAKE_GIT_COMMIT_MESSAGE = (os.environ.get("FAKE_GIT_COMMIT_MESSAGE") or "Initial
 FAKE_GIT_REMOTE_URL = (os.environ.get("FAKE_GIT_REMOTE_URL") or "").strip()
 FAKE_GIT_REMOTE_HOST = (os.environ.get("FAKE_GIT_REMOTE_HOST") or "github.com").strip()
 FAKE_GIT_REMOTE_PATH = (os.environ.get("FAKE_GIT_REMOTE_PATH") or "internal/tools.git").strip().lstrip("/")
+# Non-secret filler for the installed `post-receive` deploy hook: the
+# checkout target and the asset bucket it syncs to. Both are ordinary
+# infrastructure names rather than credentials, so a fixed value is
+# correct here — what must never be fixed is the key material, which
+# comes from the per-request canary.
+FAKE_GIT_DEPLOY_WORK_TREE = (
+    os.environ.get("FAKE_GIT_DEPLOY_WORK_TREE") or "/var/www/internal-tools"
+).strip().rstrip("/")
+FAKE_GIT_DEPLOY_BUCKET = (
+    os.environ.get("FAKE_GIT_DEPLOY_BUCKET") or "internal-tools-assets-prod"
+).strip().strip("/")
+# Second remote declared in `config.worktree`. Naming an upstream is what
+# makes the worktree config worth reading: it points at a *different*
+# repository than `config` does.
+FAKE_GIT_UPSTREAM_HOST = (
+    os.environ.get("FAKE_GIT_UPSTREAM_HOST") or "gitlab.internal-tools.lan"
+).strip()
+FAKE_GIT_UPSTREAM_PATH = (
+    os.environ.get("FAKE_GIT_UPSTREAM_PATH") or "platform/internal-tools.git"
+).strip().lstrip("/")
 
 # --- Fake /.svn/ working-copy configuration ---
 # The Subversion sibling of the /.git/ tree above. Scanner dictionaries walk
@@ -1538,6 +1558,13 @@ GIT_DOTFILE_PATHS: set[str] = {
     "/.gitignore",
     "/root/.gitignore",
     "/home/.gitignore",
+    # `.gitattributes` is swept in the same pass as `.gitignore` and was
+    # the only member of that pass still 404ing, which is a free tell:
+    # a webroot that serves one worktree dotfile and not its neighbour
+    # is not a checkout. It carries no credential, and does not need to.
+    "/.gitattributes",
+    "/root/.gitattributes",
+    "/home/.gitattributes",
 }
 
 # --- Fake WordPress user-enumeration trap ---------------------------------
@@ -7532,7 +7559,7 @@ def is_git_dotfile_path(path: str) -> bool:
     if lower in GIT_DOTFILE_PATHS:
         return True
     leaf = lower.rsplit("/", 1)[-1]
-    return leaf == ".gitignore"
+    return leaf in (".gitignore", ".gitattributes")
 
 
 def is_sonicwall_path(path: str) -> bool:
@@ -15593,6 +15620,34 @@ def render_gitconfig() -> bytes:
     ).encode("utf-8")
 
 
+def render_gitattributes() -> bytes:
+    """Project `.gitattributes`. No credential — like `.gitignore` this is
+    pure corroboration that the webroot is a checkout, and it is read by
+    the same sweep. The `filter=lfs` and `linguist-generated` lines name
+    real tooling, and the `*.env diff=nodiff` line is the idiom a repo
+    that tracks environment files uses, which is a quiet pointer at the
+    files the rest of the trap surface answers."""
+    return (
+        "* text=auto eol=lf\n"
+        "\n"
+        "*.png binary\n"
+        "*.jpg binary\n"
+        "*.woff2 binary\n"
+        "*.pdf binary\n"
+        "\n"
+        "# large build artifacts are tracked out-of-band\n"
+        "dist/**/*.map filter=lfs diff=lfs merge=lfs -text\n"
+        "\n"
+        "# generated - keep out of diffs and language stats\n"
+        "package-lock.json linguist-generated=true -diff\n"
+        "*.min.js linguist-generated=true -diff\n"
+        "\n"
+        "# never render these in a diff\n"
+        "*.env diff=nodiff\n"
+        "config/secrets.yml diff=nodiff\n"
+    ).encode("utf-8")
+
+
 def render_gitignore() -> bytes:
     """Project `.gitignore`. Pure deception — listing typical Node +
     Python + Terraform + secret-file patterns convinces a scanner that
@@ -17249,6 +17304,26 @@ _FAKE_GIT_HOOK_NAMES: tuple[str, ...] = (
     "update",
 )
 
+# The subset of the names above that this repository has *installed* —
+# served without the `.sample` suffix, listed in the `hooks/` autoindex,
+# and carrying real script bodies.
+#
+# Why only three. A stock `git init` leaves every hook as a `.sample`, so
+# the non-suffixed names are the second half of the same dictionary and
+# were answering 404 — which is the correct answer for a stock repo, and
+# the reason this was not simply "a missed route". The interesting repo is
+# the one that has hooks installed, because an installed hook is a script
+# the deployment actually runs, and a deploy script is where a credential
+# attached to the *release pipeline* lives rather than to the application.
+# Fabricating all nineteen would be the tell this avoids: a repository
+# with every hook active does not exist. Three is what a deployed app
+# looks like — a commit-time gate, a push-time gate, and the deploy hook.
+_FAKE_GIT_INSTALLED_HOOK_NAMES: tuple[str, ...] = (
+    "pre-commit",
+    "pre-push",
+    "post-receive",
+)
+
 # Extra branch names that enumeration scanners hit alongside
 # `main` / `master`. These are the high-signal repeats from the
 # fake-git-miss logs: each shows up at single-digit-to-low-double-digit
@@ -17257,6 +17332,9 @@ _FAKE_GIT_HOOK_NAMES: tuple[str, ...] = (
 # with the synthesized tree.
 _FAKE_GIT_EXTRA_BRANCHES: tuple[str, ...] = (
     "develop",
+    # `trunk` is the Subversion-convention default name; dictionaries that
+    # cover both VCS layouts walk it alongside `main` / `master`.
+    "trunk",
     "development",
     "dev",
     "staging",
@@ -17312,6 +17390,87 @@ def _fake_git_hook_body(name: str) -> bytes:
     ).encode("utf-8")
 
 
+def _fake_git_installed_hook_body(
+    name: str,
+    tracebit_response: dict[str, object] | None = None,
+) -> bytes:
+    """Body for an *installed* (non-`.sample`) hook.
+
+    Unlike `_fake_git_hook_body`, which renders git's "rename me to
+    enable" stub, these are scripts a deployment would really have put
+    here. Only `post-receive` carries a secret: it is the deploy step, so
+    it is the one that needs credentials, and one secret among three files
+    reads as a real repository rather than a bait pile. The other two name
+    a next step instead (the ignore list the secret-scan reads, the CI
+    config the test run uses), which is the cheaper and more durable lure.
+    """
+    aws = _aws(tracebit_response or {})
+    if name == "pre-commit":
+        return (
+            "#!/bin/sh\n"
+            "# installed by scripts/bootstrap-dev.sh - do not edit by hand\n"
+            "set -e\n"
+            "\n"
+            "# block accidental commits of credential files\n"
+            "if git diff --cached --name-only | grep -Eq '(^|/)\\.env$|secrets\\.ya?ml$'; then\n"
+            "  echo 'pre-commit: refusing to commit a credential file' >&2\n"
+            "  echo 'pre-commit: see .gitignore, or --no-verify to override' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            "\n"
+            "exec npm run --silent lint\n"
+        ).encode("utf-8")
+    if name == "pre-push":
+        return (
+            "#!/bin/sh\n"
+            "# installed by scripts/bootstrap-dev.sh - do not edit by hand\n"
+            "set -e\n"
+            "\n"
+            "# run the same suite CI will run, so a red push is caught locally\n"
+            "if [ -f .gitlab-ci.yml ]; then\n"
+            "  npm run --silent test:unit\n"
+            "fi\n"
+            "\n"
+            "exit 0\n"
+        ).encode("utf-8")
+    if name == "post-receive":
+        access_key = str(aws.get("awsAccessKeyId") or "").strip()
+        secret = str(aws.get("awsSecretAccessKey") or "").strip()
+        # Fall back to a credential-free body rather than emitting empty
+        # `export` lines, which would read as a stripped file.
+        if not access_key or not secret:
+            return (
+                "#!/bin/sh\n"
+                "# deploy-on-push: check the pushed tree out over the live webroot\n"
+                "set -e\n"
+                f"GIT_WORK_TREE={FAKE_GIT_DEPLOY_WORK_TREE} git checkout -f main\n"
+                f"{FAKE_GIT_DEPLOY_WORK_TREE}/scripts/reload.sh\n"
+            ).encode("utf-8")
+        return (
+            "#!/bin/sh\n"
+            "# deploy-on-push: check the pushed tree out over the live webroot,\n"
+            "# then sync build artifacts to the asset bucket.\n"
+            "set -e\n"
+            "\n"
+            f"GIT_WORK_TREE={FAKE_GIT_DEPLOY_WORK_TREE} git checkout -f main\n"
+            f"cd {FAKE_GIT_DEPLOY_WORK_TREE}\n"
+            "\n"
+            "npm ci --omit=dev\n"
+            "npm run --silent build\n"
+            "\n"
+            "# deploy role - rotated with the bucket policy, not with user keys\n"
+            f"export AWS_ACCESS_KEY_ID={access_key}\n"
+            f"export AWS_SECRET_ACCESS_KEY={secret}\n"
+            "export AWS_DEFAULT_REGION=us-east-1\n"
+            "\n"
+            f"aws s3 sync ./dist \"s3://{FAKE_GIT_DEPLOY_BUCKET}/\" --delete\n"
+            "\n"
+            "./scripts/reload.sh\n"
+        ).encode("utf-8")
+    # Not an installed name — should be unreachable; keep the stub shape.
+    return _fake_git_hook_body(name)
+
+
 def _format_secrets_yaml(tracebit_response: dict[str, object]) -> str:
     aws = tracebit_response.get("aws") if isinstance(tracebit_response, dict) else None
     if not isinstance(aws, dict):
@@ -17357,6 +17516,33 @@ def _build_fake_git_remote_url(tracebit_response: dict[str, object]) -> str:
     # RFC 3986 userinfo-safe.
     encoded_secret = quote(secret, safe="")
     return f"https://{access_key}:{encoded_secret}@{FAKE_GIT_REMOTE_HOST}/{FAKE_GIT_REMOTE_PATH}"
+
+
+def _build_fake_git_upstream_url(tracebit_response: dict[str, object]) -> str:
+    """Build the `url = …` line for `config.worktree`'s `[remote "upstream"]`.
+
+    Deliberately a *different* canary type than the origin URL in
+    `config`: origin carries the AWS pair, upstream carries the GitLab
+    username/password pair. Both files are read by the same dictionary,
+    so using one canary for both would make a replay untraceable to a
+    file. With two types, which canary comes back says which file the
+    client actually parsed — the worktree-scoped config being the one
+    only a reader that understands `extensions.worktreeConfig` bothers
+    with.
+    """
+    creds = _gitlab_creds(tracebit_response or {}, "gitlab-username-password").get("credentials")
+    if not isinstance(creds, dict):
+        creds = {}
+    username = str(creds.get("username") or "").strip()
+    password = str(creds.get("password") or "").strip()
+    if not username or not password:
+        # Canary mint failed or was incomplete; fall back to an SSH URL
+        # carrying no secret rather than emitting half a credential.
+        return f"git@{FAKE_GIT_UPSTREAM_HOST}:{FAKE_GIT_UPSTREAM_PATH}"
+    return (
+        f"https://{quote(username, safe='')}:{quote(password, safe='')}"
+        f"@{FAKE_GIT_UPSTREAM_HOST}/{FAKE_GIT_UPSTREAM_PATH}"
+    )
 
 
 def _build_fake_repo(
@@ -17417,18 +17603,41 @@ def _build_fake_repo(
         return f"/.git/objects/{sha[:2]}/{sha[2:]}"
 
     remote_url = _build_fake_git_remote_url(tracebit_response or {})
+    upstream_url = _build_fake_git_upstream_url(tracebit_response or {})
+    # `extensions.worktreeConfig` is what makes `config.worktree` a file
+    # git reads at all. Serving the worktree config without declaring the
+    # extension here would be the incoherence a careful reader spots:
+    # the file would exist on disk and be ignored by every git command.
     config_text = (
         "[core]\n"
         "\trepositoryformatversion = 0\n"
         "\tfilemode = true\n"
         "\tbare = false\n"
         "\tlogallrefupdates = true\n"
+        "[extensions]\n"
+        "\tworktreeConfig = true\n"
         "[remote \"origin\"]\n"
         f"\turl = {remote_url}\n"
         "\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
         "[branch \"main\"]\n"
         "\tremote = origin\n"
         "\tmerge = refs/heads/main\n"
+    )
+    # The worktree-scoped half. Real `config.worktree` holds exactly the
+    # settings that must not be shared between linked worktrees — `core.
+    # worktree` and per-worktree remotes — so that is what it holds here,
+    # rather than being a byte-copy of `config` (which is what the
+    # `config.bak` / `config.old` aliases are, correctly, since those are
+    # editor leftovers of the same file).
+    config_worktree_text = (
+        "[core]\n"
+        f"\tworktree = {FAKE_GIT_DEPLOY_WORK_TREE}\n"
+        "\tsparseCheckout = false\n"
+        "[remote \"upstream\"]\n"
+        f"\turl = {upstream_url}\n"
+        "\tfetch = +refs/heads/*:refs/remotes/upstream/*\n"
+        "[branch \"main\"]\n"
+        "\tdescription = release branch; deploys via post-receive\n"
     )
 
     reflog_line = (
@@ -17492,6 +17701,7 @@ def _build_fake_repo(
         (
             "HEAD",
             "config",
+            "config.worktree",
             "description",
             "FETCH_HEAD",
             "ORIG_HEAD",
@@ -17510,6 +17720,7 @@ def _build_fake_repo(
         "/.git/": git_root_index,
         "/.git/head": b"ref: refs/heads/main\n",
         "/.git/config": config_text.encode("utf-8"),
+        "/.git/config.worktree": config_worktree_text.encode("utf-8"),
         # Some scanners ask for a credential-store file inside the exposed
         # repo metadata rather than the conventional home-directory
         # `/.git-credentials` path. Keep it in the fake repo so dispatch
@@ -17590,6 +17801,20 @@ def _build_fake_repo(
     }
     for hook_name in _FAKE_GIT_HOOK_NAMES:
         files[f"/.git/hooks/{hook_name}.sample"] = _fake_git_hook_body(hook_name)
+    # The installed subset, served at the bare name. The other sixteen
+    # names stay 404 — a repo with three hooks installed is what this is,
+    # and answering all nineteen is the shape no real repository has.
+    for hook_name in _FAKE_GIT_INSTALLED_HOOK_NAMES:
+        files[f"/.git/hooks/{hook_name}"] = _fake_git_installed_hook_body(
+            hook_name, tracebit_response or {},
+        )
+
+    # Remote-tracking refs for the upstream `config.worktree` declares.
+    # Declaring a remote whose refs do not exist is the same class of
+    # incoherence as listing a directory whose contents 404.
+    files["/.git/refs/remotes/upstream/head"] = b"ref: refs/remotes/upstream/main\n"
+    files["/.git/refs/remotes/upstream/main"] = f"{commit_sha}\n".encode("utf-8")
+    files["/.git/logs/refs/remotes/upstream/main"] = reflog_line.encode("utf-8")
 
     # Extra branch refs (`refs/heads/<branch>`, `refs/remotes/origin/<branch>`,
     # and the matching reflog entries). Same commit_sha across all branches —
@@ -17646,7 +17871,14 @@ def _build_fake_repo(
     # subdirectory even though the leaf files under it (e.g.
     # `/.git/refs/heads/main`, `/.git/hooks/pre-commit.sample`) render fine.
     # Same "keep them walking the tree" rationale as the /.git/ root index.
-    _hook_entries = tuple(sorted(f"{name}.sample" for name in _FAKE_GIT_HOOK_NAMES))
+    # Listing is what a real `autoindex` shows: the `.sample` stubs plus
+    # whatever is actually installed. Every entry here resolves, and every
+    # installed hook is listed — the two sets are derived from the same
+    # constants so they cannot drift apart.
+    _hook_entries = tuple(sorted(
+        [f"{name}.sample" for name in _FAKE_GIT_HOOK_NAMES]
+        + list(_FAKE_GIT_INSTALLED_HOOK_NAMES)
+    ))
     _branch_entries = tuple(sorted({"main", "master", *_FAKE_GIT_EXTRA_BRANCHES}))
     _tag_entries = tuple(sorted(_FAKE_GIT_TAG_REFS))
     files["/.git/hooks/"] = _autoindex("/.git/hooks", _hook_entries)
@@ -17660,10 +17892,18 @@ def _build_fake_repo(
     )
     files["/.git/refs/heads/"] = _autoindex("/.git/refs/heads", _branch_entries)
     files["/.git/refs/tags/"] = _autoindex("/.git/refs/tags", _tag_entries)
-    files["/.git/refs/remotes/"] = _autoindex("/.git/refs/remotes", ("origin/",))
+    files["/.git/refs/remotes/"] = _autoindex(
+        "/.git/refs/remotes", ("origin/", "upstream/"),
+    )
     files["/.git/refs/remotes/origin/"] = _autoindex(
         "/.git/refs/remotes/origin",
         ("HEAD", *_branch_entries),
+    )
+    # The upstream remote has only been fetched on `main` — which is what
+    # a repository that tracks a platform upstream for releases looks
+    # like, and keeps the listing honest about which refs resolve.
+    files["/.git/refs/remotes/upstream/"] = _autoindex(
+        "/.git/refs/remotes/upstream", ("HEAD", "main"),
     )
     files["/.git/refs/wip/"] = _autoindex("/.git/refs/wip", ("index/", "wtree/"))
     files["/.git/refs/wip/index/"] = _autoindex("/.git/refs/wip/index", ("refs/",))
@@ -17726,7 +17966,10 @@ def _build_fake_repo(
         "/.git/logs/refs/tags", _tag_entries,
     )
     files["/.git/logs/refs/remotes/"] = _autoindex(
-        "/.git/logs/refs/remotes", ("origin/",),
+        "/.git/logs/refs/remotes", ("origin/", "upstream/"),
+    )
+    files["/.git/logs/refs/remotes/upstream/"] = _autoindex(
+        "/.git/logs/refs/remotes/upstream", ("main",),
     )
     files["/.git/logs/refs/remotes/origin/"] = _autoindex(
         "/.git/logs/refs/remotes/origin", ("HEAD", *_branch_entries),
@@ -25403,6 +25646,78 @@ def render_git_credentials(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_gitmodules(r: dict[str, object]) -> bytes:
+    """Project `.gitmodules` — the submodule map at the worktree root.
+
+    This is the one worktree dotfile that names *other repositories*, and
+    it names them as URLs, which is where a credential ends up when a
+    submodule is added over HTTPS with a helper that writes userinfo into
+    the file. That makes it both a credential placement and the only part
+    of the git surface that offers a next target rather than another file
+    of the same repo: a collector that follows a submodule URL is doing
+    something more than dumping one webroot.
+
+    The private submodule carries the GitLab username/password canary;
+    the public one deliberately does not, because a `.gitmodules` where
+    every entry has inline credentials is not a shape that occurs.
+    """
+    creds = _gitlab_creds(r, "gitlab-username-password").get("credentials")
+    if not isinstance(creds, dict):
+        creds = {}
+    username = str(creds.get("username") or "").strip()
+    password = str(creds.get("password") or "").strip()
+    host_names = _gitlab_creds(r, "gitlab-username-password").get("hostNames") or []
+    host = str(host_names[0]) if host_names else FAKE_GIT_UPSTREAM_HOST
+    if username and password:
+        private_url = (
+            f"https://{quote(username, safe='')}:{quote(password, safe='')}"
+            f"@{host}/platform/deploy-keys.git"
+        )
+    else:
+        # Canary mint failed; an SSH URL carries no secret and still names
+        # the second repository, which is most of the value here.
+        private_url = f"git@{host}:platform/deploy-keys.git"
+    return (
+        "[submodule \"vendor/ui-kit\"]\n"
+        "\tpath = vendor/ui-kit\n"
+        "\turl = https://github.com/twbs/bootstrap.git\n"
+        "\tbranch = main\n"
+        "[submodule \"infra/deploy-keys\"]\n"
+        "\tpath = infra/deploy-keys\n"
+        f"\turl = {private_url}\n"
+        "\tbranch = main\n"
+        "\tupdate = checkout\n"
+    ).encode("utf-8")
+
+
+def render_aws_config_json(r: dict[str, object]) -> bytes:
+    """`/awsconfig.json` — the flat SDK-config shape, not the Amplify one.
+
+    Distinct from `awsconfiguration.json` (the Amplify CLI artifact, which
+    nests everything under `CredentialsProvider` / `CognitoIdentity`) and
+    from `/aws.json` (the `aws sts` session envelope). This is the
+    hand-written config a backend drops beside its entry point: region,
+    bucket, and the key pair inline. A collector greping for
+    `accessKeyId` finds the Amplify file useless and this one not, so the
+    shape has to be the flat one or the answer is wasted.
+    """
+    aws = _aws(r)
+    body = {
+        "region": "us-east-1",
+        "accessKeyId": aws.get("awsAccessKeyId", ""),
+        "secretAccessKey": aws.get("awsSecretAccessKey", ""),
+        "sessionToken": aws.get("awsSessionToken", ""),
+        "s3": {
+            "bucket": FAKE_GIT_DEPLOY_BUCKET,
+            "signatureVersion": "v4",
+            "useAccelerateEndpoint": False,
+        },
+        "sqs": {"queueUrl": "https://sqs.us-east-1.amazonaws.com/418372019283/ingest-prod"},
+        "maxRetries": 3,
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
 def render_npmrc(r: dict[str, object]) -> bytes:
     creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
     if not isinstance(creds, dict):
@@ -29931,6 +30246,43 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_amplify_config_json,
         "application/json; charset=utf-8",
+    ),
+    # The flat SDK-config spelling, which is a different file from the
+    # Amplify artifact above and was 404ing beside it — the single
+    # highest-source unserved path in the dispatch log, swept by a wide
+    # population rather than one dictionary, and still current. Lookup is
+    # case-insensitive, so the `AwsConfig.json` camel spelling (the .NET
+    # and Xamarin convention, and the second-highest on its own) resolves
+    # through the same row.
+    CanaryTrap(
+        "aws-config-json",
+        (
+            "/awsconfig.json",
+            "/aws-config.json",
+            "/aws_config.json",
+            "/config/awsconfig.json",
+            "/config/aws_config.json",
+            "/src/awsconfig.json",
+            "/assets/awsconfig.json",
+        ),
+        ("aws",),
+        render_aws_config_json,
+        "application/json; charset=utf-8",
+    ),
+    # `.gitmodules` — worktree-root submodule map. Grouped with the git
+    # surface by behaviour, but it belongs in this table rather than the
+    # credential-free dotfile family because the private submodule URL
+    # carries a canary.
+    CanaryTrap(
+        "gitmodules",
+        (
+            "/.gitmodules",
+            "/root/.gitmodules",
+            "/home/.gitmodules",
+        ),
+        ("gitlab-username-password",),
+        render_gitmodules,
+        "text/plain; charset=utf-8",
     ),
     # PM2 process definition. Its `env_production` block is injected
     # into the process environment, which makes it the one file a Node
@@ -38580,6 +38932,10 @@ async def _handle_git_dotfile(
         body = render_gitconfig()
         result_tag = "gitconfig"
         content_type = "text/plain; charset=utf-8"
+    elif leaf == ".gitattributes":
+        body = render_gitattributes()
+        result_tag = "gitattributes"
+        content_type = "text/plain; charset=utf-8"
     else:
         body = render_gitignore()
         result_tag = "gitignore"
@@ -47127,6 +47483,18 @@ async def _send_fake_git(
             headers={"Content-Type": "text/plain; charset=utf-8"},
         )
 
+    # Which installed hook was fetched, when one was. The point of the
+    # field is the split it makes queryable: a client that read the
+    # `hooks/` autoindex asks for the three names the listing shows, a
+    # client replaying a dictionary asks for all nineteen and takes
+    # sixteen 404s. Without the field that distinction needs a path
+    # regex on every row.
+    installed_hook = ""
+    if git_key.startswith("/.git/hooks/") and not git_key.endswith(".sample"):
+        _leaf = git_key.rsplit("/", 1)[-1]
+        if _leaf in _FAKE_GIT_INSTALLED_HOOK_NAMES:
+            installed_hook = _leaf
+
     if git_key.endswith("/"):
         # Any trailing-slash /.git/... key is a directory autoindex — HTML,
         # matching Apache's mod_autoindex / nginx `autoindex on` fingerprint.
@@ -47177,6 +47545,7 @@ async def _send_fake_git(
         append_log({
             **log_context, "status": 200, "result": "fake-git-undripped",
             "fakeGitBytes": len(content),
+            "fakeGitInstalledHook": installed_hook,
         })
         return web.Response(
             status=200, body=content,
@@ -47208,6 +47577,7 @@ async def _send_fake_git(
                 "secretsBlobSha": meta.get("secretsBlobSha", ""),
                 "canaryTypes": meta.get("canaryTypes", []),
                 "fakeGitBytes": len(content),
+                "fakeGitInstalledHook": installed_hook,
                 "fakeGitDripBytes": FAKE_GIT_DRIP_BYTES,
                 "fakeGitDripIntervalMs": FAKE_GIT_DRIP_INTERVAL_MS,
             })

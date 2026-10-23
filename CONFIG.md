@@ -119,6 +119,10 @@ when `TRACEBIT_API_KEY` is unset — the dispatch requires both.
 | `FAKE_GIT_REMOTE_URL` | *unset* | Operator override for the `[remote "origin"] url` line. When unset (default), the URL is built per-request from the Tracebit canary so that scrapers who only fetch `.git/config` still leak a canary in the URL userinfo. Set this to a static string to suppress that embedding (e.g. in staging where you don't want canary burn on every hit). |
 | `FAKE_GIT_REMOTE_HOST` | `github.com` | Host portion of the generated canary URL. |
 | `FAKE_GIT_REMOTE_PATH` | `internal/tools.git` | Path portion of the generated canary URL. |
+| `FAKE_GIT_UPSTREAM_HOST` | `gitlab.internal-tools.lan` | Host portion of the `config.worktree` `[remote "upstream"]` URL, which carries a GitLab username/password canary — a different canary type than origin's, so a replay is attributable to the file it came from. |
+| `FAKE_GIT_UPSTREAM_PATH` | `platform/internal-tools.git` | Path portion of the same URL. |
+| `FAKE_GIT_DEPLOY_WORK_TREE` | `/var/www/internal-tools` | Checkout target named by `core.worktree` and by the installed `post-receive` deploy hook. Non-secret filler. |
+| `FAKE_GIT_DEPLOY_BUCKET` | `internal-tools-assets-prod` | Bucket the `post-receive` hook syncs build output to, and the `s3.bucket` value in the AWS SDK config file. Non-secret filler. |
 
 ## Fake `/.svn/*` working copy
 

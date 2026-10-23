@@ -90,13 +90,16 @@ failure fully diagnosable in the log.
 
 | `result` | `status` | Extras | Meaning |
 | --- | --- | --- | --- |
-| `fake-git` | 200 | `commitSha`, `rootTreeSha`, `secretsBlobSha`, `canaryTypes`, `fakeGitBytes`, `fakeGitDripBytes`, `fakeGitDripIntervalMs` | Object served from the synthetic repo. Includes `/.git/credentials`, which returns a Git credential-store line with a GitLab username/password canary. |
+| `fake-git` | 200 | `commitSha`, `rootTreeSha`, `secretsBlobSha`, `canaryTypes`, `fakeGitBytes`, `fakeGitInstalledHook`, `fakeGitDripBytes`, `fakeGitDripIntervalMs` | Object served from the synthetic repo. Includes `/.git/credentials`, which returns a Git credential-store line with a GitLab username/password canary. |
 | `fake-git-miss` | 404 | `commitSha`, `gitKey` | Path resolved to the repo but wasn't a file in it. `gitKey` is the canonical `/.git/...` lookup key (lowercased, prefix-stripped) — so `/login/.GiT/FOO` logs `path=/login/.GiT/FOO`, `gitKey=/.git/foo`. |
 | `fake-git-error` | 404 | — | Canary issuance failed. |
 | `fake-git-disconnect` | 200 | `fakeGitBytesSent`, `commitSha` | Scanner hung up mid-drip. |
 | `fake-git-redirect` | 301 | `commitSha`, `gitKey`, `location` | Directory asked for without its trailing slash (`/.git/refs/heads`, `/.git/hooks`, `/.git/objects/pack`, `/.git/branches`). Matches Apache `DirectorySlash On` and nginx. `location` is built from the request path, so a repo probed under a subpath is redirected inside its own prefix. Whether the client follows it separates protocol-implementing clients from raw dictionary sweepers. |
-| `fake-git-undripped` | 200 | `fakeGitBytes` | The drip cap was full, so a response that would have dripped was served in one shot instead. Takes no slot and holds nothing. Replaces the old `fake-git-capacity` refusal: `503 busy` is not something a really-exposed repository answers a file fetch with, and a source parallel enough to saturate the cap got a burst of them at once. |
+| `fake-git-undripped` | 200 | `fakeGitBytes`, `fakeGitInstalledHook` | The drip cap was full, so a response that would have dripped was served in one shot instead. Takes no slot and holds nothing. Replaces the old `fake-git-capacity` refusal: `503 busy` is not something a really-exposed repository answers a file fetch with, and a source parallel enough to saturate the cap got a burst of them at once. |
 | `fake-git-capacity` | 503 | — | **Retired.** Historic tag only; the drip cap now answers `fake-git-undripped` above. Kept documented so older log lines stay interpretable. |
+| `gitattributes` | 200 | `gitDotfilePath`, `bytes` | Worktree attributes file, matched on basename under any parent — the `.gitignore` sibling, and swept in the same pass. No credential. |
+| `gitmodules` | 200 | canary-trap fields | Submodule map. The private submodule's URL carries a GitLab username/password canary; the public one carries none. |
+| `aws-config-json` | 200 | canary-trap fields | Flat AWS SDK config file — distinct from `aws-amplify-config-json`, which is the Amplify artifact. |
 
 ### Fake `/.svn/*` working copy
 
@@ -110,6 +113,14 @@ failure fully diagnosable in the log.
 A path carrying both segments (`/.git/config/.svn/entries` — a scanner
 appending the svn dictionary to every git path it tried) is dispatched to
 fake-git and logs `fake-git-miss`, not `fake-svn`.
+
+`fakeGitInstalledHook` carries the hook leaf name when the fetched path was
+one of the *installed* (non-`.sample`) hooks, and is empty on every other
+fake-git row. It exists to make one split a column rather than a path regex:
+the `hooks/` autoindex names exactly the installed hooks, so a client that
+read the listing asks for those names and nothing else, while a client
+replaying a hook-name dictionary asks for all nineteen and takes a 404 on
+the sixteen that are not installed.
 
 ### Tarpit + fingerprint modules
 
