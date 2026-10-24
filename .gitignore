@@ -14,3 +14,6 @@ build/
 dist/
 *.egg-info/
 .DS_Store
+
+# Runtime output captured during local runs — never belongs in the repo.
+*.out
