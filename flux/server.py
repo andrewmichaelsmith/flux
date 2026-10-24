@@ -2779,6 +2779,81 @@ SONICWALL_PATHS = {
     if value.strip()
 }
 
+# --- Fake Cisco IOS XE WebUI + WSMA (CVE-2023-20198 / CVE-2023-20273) ----
+# The IOS XE web management UI is the entry point of the implant chain CISA
+# added to its Known Exploited Vulnerabilities catalog in October 2023:
+# CVE-2023-20198 takes an unauthenticated session on `/webui/`, then
+# CVE-2023-20273 escalates by POSTing a Web Services Management Agent
+# (WSMA) XML envelope to `/webui_wsma_Http`, whose `<exec>` element runs
+# privileged IOS commands -- in the field an account creation followed by a
+# Lua implant drop.
+#
+# The whole family 404s today, so the walk ends at the fingerprint GET and
+# we never see the one request that carries attacker-authored content. The
+# WSMA leg is the point of this trap: the `<exec>` text names the account
+# the operator wants and the implant it installs.
+#
+# Matching is EXACT, never a `/webui/` prefix. `/webui/.env`,
+# `/open-webui/.env` and the `stable-diffusion-webui` / `text-generation-webui`
+# spellings are a different population -- LLM-frontend credential dredging --
+# already answered by the env-canary and tarpit modules. A prefix match here
+# would steal that traffic and silently retag it as appliance exploitation.
+CISCO_IOSXE_ENABLED = _env_bool("HONEYPOT_CISCO_IOSXE_ENABLED")
+
+# The login shell, plus the WebUI internals observed walks ask for beside it.
+_CISCO_IOSXE_PAGE_PATHS = frozenset({
+    "/webui",
+    "/webui/",
+    "/webui/index.html",
+})
+_CISCO_IOSXE_LOGOUT_PATHS = frozenset({
+    "/webui/logoutconfirm.html",
+})
+_CISCO_IOSXE_STATE_PATHS = frozenset({
+    "/webui/gui_states/index.json",
+    "/webui/application/get_saml_request",
+})
+_CISCO_IOSXE_LOGIN_PATHS = frozenset({
+    "/webui/login",
+})
+# WSMA transport spellings. IOS XE registers the HTTP and HTTPS listeners
+# under their own path and the casing varies by release, so match the exact
+# set case-insensitively rather than binding to one spelling.
+_CISCO_IOSXE_WSMA_PATHS = frozenset({
+    "/webui_wsma_http",
+    "/webui_wsma_https",
+})
+
+# `<exec>` indicators worth flagging separately on the log row. Account
+# creation is the CVE-2023-20273 escalation step; the rest are the
+# persistence and read-back idioms that follow it.
+_CISCO_IOSXE_ACCOUNT_INDICATORS = (
+    "username",
+    "privilege 15",
+    "secret",
+    "aaa authentication",
+    "ip http server",
+    "ip http secure-server",
+)
+_CISCO_IOSXE_IMPLANT_INDICATORS = (
+    "tclsh",
+    "lua",
+    "cisco_service.conf",
+    "cisco_tap",
+    "copy ",
+    "archive download-sw",
+    "write memory",
+    "show running-config",
+    "nvram:",
+    "flash:",
+)
+# Keeps the log row compact while retaining enough of the envelope to
+# identify the toolchain that produced it.
+CISCO_IOSXE_WSMA_PREVIEW_LIMIT = max(
+    int((os.environ.get("HONEYPOT_CISCO_IOSXE_WSMA_PREVIEW_LIMIT") or "512").strip() or "512"),
+    128,
+)
+
 # --- Fake Cisco WebVPN + Secure Client launcher (CVE bait) ---------------
 # Common scanner sequence seen in fleet telemetry:
 #   /+CSCOE+/logon.html (landing page)
@@ -7572,6 +7647,90 @@ def is_cisco_webvpn_path(path: str) -> bool:
     if not CISCO_WEBVPN_ENABLED:
         return False
     return path.lower() in CISCO_WEBVPN_PATHS
+
+
+def _cisco_iosxe_family(path: str) -> str:
+    """Classify an IOS XE WebUI path into its response family, or "".
+
+    Exact match on the lower-cased path with at most one trailing slash
+    removed for the WSMA and state spellings. Deliberately NOT a `/webui/`
+    prefix test -- see the config block for why the LLM-frontend
+    `/webui/.env` family must keep falling through to the canary traps.
+    """
+    lp = path.lower()
+    if lp in _CISCO_IOSXE_WSMA_PATHS or lp.rstrip("/") in _CISCO_IOSXE_WSMA_PATHS:
+        return "wsma"
+    if lp in _CISCO_IOSXE_LOGIN_PATHS or lp.rstrip("/") in _CISCO_IOSXE_LOGIN_PATHS:
+        return "login"
+    if lp in _CISCO_IOSXE_STATE_PATHS or lp.rstrip("/") in _CISCO_IOSXE_STATE_PATHS:
+        return "state"
+    if lp in _CISCO_IOSXE_LOGOUT_PATHS or lp.rstrip("/") in _CISCO_IOSXE_LOGOUT_PATHS:
+        return "logout"
+    if lp in _CISCO_IOSXE_PAGE_PATHS:
+        return "page"
+    return ""
+
+
+def is_cisco_iosxe_path(path: str) -> bool:
+    if not CISCO_IOSXE_ENABLED:
+        return False
+    return bool(_cisco_iosxe_family(path))
+
+
+_CISCO_IOSXE_EXEC_RE = re.compile(
+    rb"<\s*(?:\w+:)?(exec|execCmd|cmd)\b[^>]*>(.*?)<\s*/\s*(?:\w+:)?\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_CISCO_IOSXE_CDATA_RE = re.compile(rb"<!\[CDATA\[(.*?)\]\]>", re.DOTALL)
+_CISCO_IOSXE_TAG_RE = re.compile(rb"<[^>]*>", re.DOTALL)
+_CISCO_IOSXE_CORRELATOR_RE = re.compile(
+    rb"""correlator\s*=\s*["']([^"'<>]{1,64})["']""", re.IGNORECASE,
+)
+
+
+def cisco_iosxe_wsma_commands(body: bytes) -> list[str]:
+    """Pull the IOS command text out of a WSMA request envelope.
+
+    A WSMA `exec` request wraps the command in an `<exec>` element (some
+    releases and most exploit tooling spell it `<execCmd>` or `<cmd>`),
+    usually but not always inside CDATA, inside a SOAP-ish `<request>`
+    envelope that may be namespace-prefixed. Take the union of those
+    spellings rather than binding to one, strip CDATA and any residual
+    markup, and return de-duplicated command text in first-seen order.
+    """
+    if not body:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _CISCO_IOSXE_EXEC_RE.finditer(body):
+        inner = match.group(2)
+        cdata = _CISCO_IOSXE_CDATA_RE.findall(inner)
+        chunks = cdata if cdata else [_CISCO_IOSXE_TAG_RE.sub(b" ", inner)]
+        for chunk in chunks:
+            for line in chunk.splitlines():
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                out.append(text[:200])
+                if len(out) >= 32:
+                    return out
+    return out
+
+
+def cisco_iosxe_wsma_correlator(body: bytes) -> str:
+    """Echo the request's own correlator back, as the real agent does.
+
+    A WSMA client matches the response to its request on this value, so a
+    response that invents one reads as a different conversation and can end
+    the exchange before the next `exec`.
+    """
+    if not body:
+        return ""
+    match = _CISCO_IOSXE_CORRELATOR_RE.search(body[:4096])
+    if not match:
+        return ""
+    return match.group(1).decode("utf-8", errors="replace")[:64]
 
 
 def is_ivanti_vpn_path(path: str) -> bool:
@@ -39793,6 +39952,222 @@ def extract_checkpoint_login_form(body: bytes) -> tuple[str, bool, str]:
     return username, has_password, realm
 
 
+_CISCO_IOSXE_LOGIN_HTML = (
+    b"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+    b"<meta charset=\"utf-8\">\n"
+    b"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    b"<title>Cisco</title>\n"
+    b"<link rel=\"icon\" href=\"/webui/favicon.ico\">\n"
+    b"<link rel=\"stylesheet\" href=\"/webui/css/webui.css\">\n"
+    b"</head>\n<body class=\"cui\">\n"
+    b"<div id=\"login-container\" class=\"cui-login\">\n"
+    b"  <div class=\"cui-login--brand\">\n"
+    b"    <img src=\"/webui/img/cisco-logo.svg\" alt=\"Cisco\">\n"
+    b"  </div>\n"
+    b"  <form id=\"login-form\" method=\"post\" action=\"/webui/login\">\n"
+    b"    <input type=\"text\" id=\"uname\" name=\"user\" autocomplete=\"username\""
+    b" placeholder=\"Username\" required>\n"
+    b"    <input type=\"password\" id=\"pwd\" name=\"password\""
+    b" autocomplete=\"current-password\" placeholder=\"Password\" required>\n"
+    b"    <button type=\"submit\" class=\"btn btn--primary\">Log In</button>\n"
+    b"  </form>\n"
+    b"</div>\n"
+    b"<script src=\"/webui/js/webui.js\"></script>\n"
+    b"</body>\n</html>\n"
+)
+
+_CISCO_IOSXE_LOGOUT_HTML = (
+    b"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+    b"<meta charset=\"utf-8\">\n<title>Cisco</title>\n"
+    b"<link rel=\"stylesheet\" href=\"/webui/css/webui.css\">\n"
+    b"</head>\n<body class=\"cui\">\n"
+    b"<div class=\"cui-login\">\n"
+    b"  <p>You have been logged out.</p>\n"
+    b"  <a href=\"/webui/\" class=\"btn btn--primary\">Log In Again</a>\n"
+    b"</div>\n</body>\n</html>\n"
+)
+
+
+def _cisco_iosxe_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Response headers an IOS XE WebUI front end sets.
+
+    The WebUI is fronted by the box's own embedded HTTP server, which does
+    not advertise a product version, so no version string is invented here.
+    """
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+        "X-Frame-Options": "SAMEORIGIN",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _cisco_iosxe_wsma_response(correlator: str, commands: list[str]) -> bytes:
+    """A WSMA `exec` success envelope, echoing the request's correlator.
+
+    Returning success is the point: the documented chain sends the account
+    creation first and the implant drop second, so a failure envelope on
+    the first `exec` costs the request that names the implant.
+    """
+    received = "".join(
+        "<received><text>{}</text></received>".format(html.escape(cmd, quote=False))
+        for cmd in commands[:8]
+    )
+    correlator_attr = (
+        ' correlator="{}"'.format(html.escape(correlator, quote=True))
+        if correlator else ""
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<response xmlns="urn:cisco:wsma-exec"{} success="1">'
+        "<execLog><dialogueLog>{}</dialogueLog>"
+        "<sessionLog><status>0</status></sessionLog></execLog>"
+        "</response>"
+    ).format(correlator_attr, received).encode("utf-8")
+
+
+async def _handle_cisco_iosxe(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake Cisco IOS XE WebUI + WSMA agent
+    (CVE-2023-20198 / CVE-2023-20273 bait).
+
+    GET `/webui[/]`               -> the WebUI login shell, which is the
+                                     fingerprint the walk starts with.
+    GET the WebUI internals       -> the state document and the SSO probe
+                                     the same walks ask for beside it.
+    POST `/webui/login`           -> capture the submitted username and
+                                     whether a password came with it.
+    POST `/webui_wsma_Http[s]`    -> parse the `<exec>` command text, flag
+                                     the account-creation and implant
+                                     idioms, and return a success envelope
+                                     so the operator sends the next `exec`.
+
+    The WSMA leg deliberately does NOT require a prior successful login:
+    CVE-2023-20198 is an authentication bypass, so a real vulnerable box
+    answers the agent without one. Gating it behind our own login form
+    would make the trap less realistic than the bug it imitates, and would
+    drop the only request carrying attacker-authored content.
+    Nothing is written anywhere and no credential-shaped value is emitted.
+    """
+    family = _cisco_iosxe_family(path)
+    method = request.method
+    base = {
+        **log_context,
+        "ciscoIosxePath": path,
+        "ciscoIosxeMethod": method,
+        "ciscoIosxeFamily": family,
+    }
+
+    if family == "wsma":
+        if method != "POST":
+            # The agent is a POST-only SOAP endpoint; a real box answers a
+            # GET with a 405. Kept distinct so path-list replays stay
+            # separable from senders that actually drive the agent.
+            append_log({**base, "status": 405, "result": "cisco-iosxe-wsma-method-not-allowed"})
+            return web.Response(
+                status=405, body=b"",
+                headers=_cisco_iosxe_headers({"Allow": "POST"}),
+            )
+        commands = cisco_iosxe_wsma_commands(request_body)
+        correlator = cisco_iosxe_wsma_correlator(request_body)
+        joined = " ; ".join(commands).lower()
+        has_account = any(ind in joined for ind in _CISCO_IOSXE_ACCOUNT_INDICATORS)
+        has_implant = any(ind in joined for ind in _CISCO_IOSXE_IMPLANT_INDICATORS)
+        append_log({
+            **base,
+            "status": 200,
+            "result": "cisco-iosxe-wsma-exec" if commands else "cisco-iosxe-wsma-probe",
+            "ciscoIosxeWsmaCommands": commands,
+            "ciscoIosxeWsmaCommandCount": len(commands),
+            "ciscoIosxeWsmaCorrelator": correlator,
+            "ciscoIosxeWsmaHasAccountCreation": has_account,
+            "ciscoIosxeWsmaHasImplantIndicator": has_implant,
+            "ciscoIosxeWsmaBodyLen": len(request_body),
+            "ciscoIosxeWsmaBodySha256": hashlib.sha256(request_body).hexdigest(),
+            "ciscoIosxeWsmaBodyPreview": request_body[
+                :CISCO_IOSXE_WSMA_PREVIEW_LIMIT
+            ].decode("utf-8", errors="replace"),
+        })
+        return web.Response(
+            status=200,
+            body=_cisco_iosxe_wsma_response(correlator, commands),
+            headers=_cisco_iosxe_headers({"Content-Type": "text/xml; charset=utf-8"}),
+        )
+
+    if family == "login":
+        if method != "POST":
+            append_log({**base, "status": 200, "result": "cisco-iosxe-webui-probe"})
+            return web.Response(
+                status=200, body=_CISCO_IOSXE_LOGIN_HTML,
+                headers=_cisco_iosxe_headers({"Content-Type": "text/html; charset=utf-8"}),
+            )
+        fields = parse_form_body(request_body, request.headers.get("Content-Type", ""))
+        username = ""
+        for key in ("user", "username", "uname", "login"):
+            values = fields.get(key) or []
+            if values and values[0]:
+                username = values[0][:120]
+                break
+        has_password = any(
+            (fields.get(key) or [""])[0]
+            for key in ("password", "pwd", "passwd")
+        )
+        append_log({
+            **base,
+            "status": 401,
+            "result": "cisco-iosxe-webui-login",
+            "ciscoIosxeUsername": username,
+            "ciscoIosxeHasPassword": has_password,
+            "ciscoIosxeBodySha256": hashlib.sha256(request_body).hexdigest(),
+        })
+        # The documented chain bypasses this form rather than guessing it,
+        # so a failure here does not end the walk -- the WSMA leg above is
+        # reachable regardless, which is the asymmetry the bug creates.
+        return web.Response(
+            status=401,
+            body=b'{"status":"error","message":"Authentication failed"}',
+            headers=_cisco_iosxe_headers({"Content-Type": "application/json; charset=utf-8"}),
+        )
+
+    if family == "state":
+        lp = path.lower().rstrip("/")
+        if lp.endswith("get_saml_request"):
+            # A box without SSO configured answers the probe with an error
+            # rather than a redirect. The route confirming it exists is the
+            # fingerprint value; inventing a SAML document would not help.
+            body = b'{"error":"sso-not-configured"}'
+        else:
+            body = (
+                b'{"gui_state":{"initialized":true,"day0":false},'
+                b'"features":{"netconf":true,"restconf":true,"wsma":true}}'
+            )
+        append_log({**base, "status": 200, "result": "cisco-iosxe-webui-state"})
+        return web.Response(
+            status=200, body=body,
+            headers=_cisco_iosxe_headers({"Content-Type": "application/json; charset=utf-8"}),
+        )
+
+    if family == "logout":
+        append_log({**base, "status": 200, "result": "cisco-iosxe-webui-logout"})
+        return web.Response(
+            status=200, body=_CISCO_IOSXE_LOGOUT_HTML,
+            headers=_cisco_iosxe_headers({"Content-Type": "text/html; charset=utf-8"}),
+        )
+
+    append_log({**base, "status": 200, "result": "cisco-iosxe-webui-probe"})
+    return web.Response(
+        status=200, body=_CISCO_IOSXE_LOGIN_HTML,
+        headers=_cisco_iosxe_headers({"Content-Type": "text/html; charset=utf-8"}),
+    )
+
+
 async def _handle_checkpoint(
     request: web.Request,
     log_context: dict[str, object],
@@ -49281,6 +49656,11 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if is_sonicwall_path(path):
         return await _handle_sonicwall(request, log_context, path, request_body)
 
+    if is_cisco_iosxe_path(path):
+        return await _handle_cisco_iosxe(
+            request, log_context, path, query_string, request_body,
+        )
+
     if is_cisco_webvpn_path(path) or is_cisco_anyconnect_config_auth(path, request_body):
         return await _handle_cisco_webvpn(request, log_context, path, request_body)
 
@@ -49968,6 +50348,8 @@ def main() -> int:
         active.append("sonicwall-ssl-vpn")
     if CISCO_WEBVPN_ENABLED:
         active.append("cisco-webvpn")
+    if CISCO_IOSXE_ENABLED:
+        active.append("cisco-iosxe-webui")
     if IVANTI_VPN_ENABLED:
         active.append("ivanti-vpn")
     if ASPERA_FASPEX_ENABLED:

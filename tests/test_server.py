@@ -654,6 +654,12 @@ def test_all_trap_families_default_on():
         "layout-vocabulary walk cannot cover."
     )
     assert tbenv.CLOUD_IMDS_ENABLED
+    assert tbenv.CISCO_IOSXE_ENABLED, (
+        "HONEYPOT_CISCO_IOSXE_ENABLED should default to True — the IOS XE "
+        "WebUI is the fingerprint GET that precedes the WSMA exec, and the "
+        "exec is the only request in the chain carrying attacker-authored "
+        "content"
+    )
     assert tbenv.DJANGO_ENTRYPOINT_ENABLED, (
         "HONEYPOT_DJANGO_ENTRYPOINT_ENABLED should default to True — the "
         "entry-point module is the only place a deployment's project "
