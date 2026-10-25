@@ -13,17 +13,16 @@ from __future__ import annotations
 import json
 
 import pytest
-import pytest_asyncio
 
 from flux import server as tbenv
 
-
-@pytest_asyncio.fixture
-async def flux_client(aiohttp_client, monkeypatch, tmp_path):
-    monkeypatch.setattr(tbenv, "LOG_PATH", tmp_path / "env-canary.jsonl")
-    client = await aiohttp_client(tbenv.create_app())
-    client.log_path = tmp_path / "env-canary.jsonl"
-    return client
+# The shared fixture, not a local one: every trap below is canary-bearing,
+# and the dispatch gate only serves those when an API key is set. A
+# hand-rolled client that sets up the log path alone leaves the key unset,
+# so the whole lane 404s and the end-to-end checks here measure the
+# fixture rather than the table. It also stubs the outbound issuance call,
+# which keeps these tests offline.
+from .test_server import flux_client  # noqa: F401
 
 
 NEW_PATHS = [
@@ -146,7 +145,7 @@ def test_renderers_embed_no_fixed_credential_literal():
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("path", NEW_PATHS)
-async def test_path_is_served_rather_than_404(flux_client, path, monkeypatch):
+async def test_path_is_served_rather_than_404(flux_client, path):
     response = await flux_client.get(path)
     assert response.status != 404, path
 
