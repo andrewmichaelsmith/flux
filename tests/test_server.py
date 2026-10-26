@@ -660,6 +660,12 @@ def test_all_trap_families_default_on():
         "exec is the only request in the chain carrying attacker-authored "
         "content"
     )
+    assert tbenv.JENKINS_SCRIPT_ENABLED, (
+        "HONEYPOT_JENKINS_SCRIPT_ENABLED should default to True — the Groovy "
+        "script console is the unauthenticated-RCE surface scanners POST to, "
+        "and the POST body is the only request carrying attacker-authored "
+        "content"
+    )
     assert tbenv.DJANGO_ENTRYPOINT_ENABLED, (
         "HONEYPOT_DJANGO_ENTRYPOINT_ENABLED should default to True — the "
         "entry-point module is the only place a deployment's project "

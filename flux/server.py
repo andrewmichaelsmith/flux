@@ -7690,6 +7690,130 @@ def is_cisco_iosxe_path(path: str) -> bool:
     return bool(_cisco_iosxe_family(path))
 
 
+# --- Fake Jenkins Groovy script console ----------------------------------
+# The script console is Jenkins' built-in Groovy REPL. On an instance whose
+# authorization is misconfigured (anonymous Overall/RunScripts, or an older
+# release predating the CSRF/permission hardening) it is a straight
+# unauthenticated remote-code-execution surface, which is why scanners walk
+# it constantly: a GET on the console path is the fingerprint, and a
+# `POST script=<groovy>` is the execution. The whole family 404s today, so
+# the walk ends at the fingerprint and the one request carrying
+# attacker-authored content -- the Groovy itself -- is lost.
+#
+# This completes a chain the server already half-answers: the Jenkins
+# `config.xml`, `credentials.xml` and `secrets/master.key` canary files are
+# served by the canary-file table, so a sweep that reads those and then
+# posts to the console currently gets a convincing config read followed by a
+# dead 404 at the step that matters.
+#
+# The console deliberately answers without a prior login -- that is the
+# vulnerability being imitated, exactly as the Cisco WSMA leg above. Nothing
+# is written and no credential-shaped value is emitted: the CSRF crumb in
+# the page is minted per request, never a fixed literal.
+JENKINS_SCRIPT_ENABLED = _env_bool("HONEYPOT_JENKINS_SCRIPT_ENABLED")
+
+# Console path spellings. The HTML console is `/script`; the API variant
+# that returns a plain-text result is `/scriptText`; the per-node console is
+# `/computer/<node>/script`. Each is also walked under the `/jenkins/` and
+# `/.jenkins/` webroot prefixes the canary-file table already recognises.
+_JENKINS_SCRIPT_WEBROOTS = ("", "/jenkins", "/.jenkins")
+_JENKINS_SCRIPT_LEAVES = ("/script", "/scripttext")
+_JENKINS_SCRIPT_CONSOLE_PATHS = frozenset(
+    f"{root}{leaf}"
+    for root in _JENKINS_SCRIPT_WEBROOTS
+    for leaf in _JENKINS_SCRIPT_LEAVES
+)
+# The per-node console: `/computer/(master)/script`,
+# `/computer/(built-in)/script`, `/computer/<agent>/script`. Matched by a
+# regex because the node label is attacker-chosen.
+_JENKINS_NODE_SCRIPT_RE = re.compile(
+    r"^(?:/jenkins|/\.jenkins)?/computer/[^/]+/(?:script|scripttext)$",
+    re.IGNORECASE,
+)
+
+
+def _jenkins_script_family(path: str) -> str:
+    """Classify a Jenkins console path into its response family, or "".
+
+    Returns "text" for the `scriptText` plain-text API variant and "html"
+    for the browser console (including the per-node console). Exact match on
+    the lower-cased path with at most one trailing slash removed -- never a
+    prefix test, so `/scripts/.env` and the `/script/<asset>` static tree
+    stay out of this trap and keep falling through to the canary/tarpit
+    modules.
+    """
+    lp = path.lower().rstrip("/") or "/"
+    node = _JENKINS_NODE_SCRIPT_RE.match(lp)
+    if lp in _JENKINS_SCRIPT_CONSOLE_PATHS or node:
+        return "text" if lp.endswith("scripttext") else "html"
+    return ""
+
+
+def is_jenkins_script_path(path: str) -> bool:
+    if not JENKINS_SCRIPT_ENABLED:
+        return False
+    return bool(_jenkins_script_family(path))
+
+
+# Groovy idioms worth splitting out on the log row so the recon, RCE,
+# credential-theft and persistence steps separate in triage. Substrings,
+# matched case-insensitively against the extracted script.
+_JENKINS_SCRIPT_EXEC_INDICATORS = (
+    ".execute()",
+    "runtime.getruntime",
+    "processbuilder",
+    "/bin/sh",
+    "/bin/bash",
+    "bash -c",
+    "cmd.exe",
+    "powershell",
+)
+_JENKINS_SCRIPT_CRED_INDICATORS = (
+    "credentials",
+    "usernamepasswordcredentials",
+    "secret.decrypt",
+    "getpassword",
+    "getstore",
+    "com.cloudbees.plugins.credentials",
+    "basicsshuserprivatekey",
+    "hudson.util.secret",
+)
+_JENKINS_SCRIPT_DOWNLOAD_INDICATORS = (
+    "new url(",
+    ".gettext()",
+    ".getbytes()",
+    "wget ",
+    "curl ",
+    "invoke-webrequest",
+    "thread.start",
+    "newinstance",
+)
+
+# Keeps the log row bounded while retaining enough of the Groovy to
+# identify the toolchain. Floor mirrors the Cisco WSMA preview.
+JENKINS_SCRIPT_PREVIEW_LIMIT = max(
+    int((os.environ.get("HONEYPOT_JENKINS_SCRIPT_PREVIEW_LIMIT") or "512").strip() or "512"),
+    128,
+)
+
+
+def jenkins_script_source(body: bytes, content_type: str) -> str:
+    """Pull the Groovy source out of a console `POST`.
+
+    The console and the `scriptText` API both take the program in the
+    `script` form field (`script=<urlencoded groovy>`). `parse_form_body`
+    url-decodes it, which is correct here -- the body is genuinely
+    form-urlencoded, so `+` is a space and `%2B` is a literal plus. Returns
+    the decoded source, or "" when no `script` field is present (a bare
+    fingerprint POST with an empty or JSON body).
+    """
+    if not body:
+        return ""
+    fields = parse_form_body(body, content_type)
+    values = fields.get("script") or []
+    return values[0] if values else ""
+
+
 _CISCO_IOSXE_EXEC_RE = re.compile(
     rb"<\s*(?:\w+:)?(exec|execCmd|cmd)\b[^>]*>(.*?)<\s*/\s*(?:\w+:)?\1\s*>",
     re.IGNORECASE | re.DOTALL,
@@ -40181,6 +40305,156 @@ async def _handle_cisco_iosxe(
     )
 
 
+# Jenkins reports its own version in this header on every response; the
+# script-console and credential-store probes assume a version inside the
+# window where the console is reachable, so this matches the number the
+# already-served `config.xml` canary claims (2.426.3).
+_JENKINS_SCRIPT_VERSION = "2.426.3"
+
+
+def _jenkins_script_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Response headers a Jenkins front end sets on the script console."""
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "X-Hudson": "1.395",
+        "X-Jenkins": _JENKINS_SCRIPT_VERSION,
+        "X-Jenkins-Session": secrets.token_hex(16),
+        "Cache-Control": "no-cache,no-store,must-revalidate",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _jenkins_script_console_html() -> bytes:
+    """The Groovy script console page.
+
+    The load-bearing element is `<textarea name="script">` inside a form
+    that posts back to the same path -- that is the field a console client
+    fills and the shape a scanner fingerprints. The CSRF crumb is minted
+    per request (`secrets.token_hex`), so no fixed credential-shaped literal
+    ships across hosts.
+    """
+    crumb = secrets.token_hex(16)
+    return (
+        "<!DOCTYPE html>\n<html><head>"
+        "<title>Jenkins</title>"
+        '<meta name="ROBOTS" content="NOFOLLOW">'
+        '<link rel="stylesheet" href="/static/jenkins/css/style.css" type="text/css">'
+        "</head><body>\n"
+        '<div id="main-panel">\n'
+        "<h1>Script Console</h1>\n"
+        "<p>Type in an arbitrary <a href=\"https://www.groovy-lang.org/\">Groovy"
+        "</a> script and execute it on the server. Use this feature to"
+        " administer Jenkins.</p>\n"
+        '<form method="post" action="script" name="script">\n'
+        '<input type="hidden" name="Jenkins-Crumb" value="{crumb}">\n'
+        '<textarea name="script" rows="10" cols="80"></textarea>\n'
+        '<button type="submit">Run</button>\n'
+        "</form>\n"
+        "</div>\n"
+        "</body></html>\n"
+    ).format(crumb=crumb).encode("utf-8")
+
+
+async def _handle_jenkins_script(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake Jenkins Groovy script console (unauthenticated-RCE bait).
+
+    GET  `/script` (+ node / webroot spellings) -> the console page, which
+                                                    is the fingerprint the
+                                                    walk starts with.
+    POST `/script`      -> parse the `script` Groovy field, flag the exec /
+                           credential-theft / download idioms, and return
+                           the console page with an (empty) result block so
+                           the operator reads the run as successful and
+                           sends the next script.
+    POST `/scriptText`  -> same capture, but the plain-text result body the
+                           API variant returns.
+
+    The console deliberately answers without a prior login: an instance
+    whose authorization is misconfigured serves it to anonymous, which is
+    the vulnerability this imitates. Gating it behind a login we invent
+    would make the trap less realistic than the bug, and would drop the one
+    request carrying attacker-authored content -- the Groovy. Nothing is
+    written and no credential-shaped value is emitted (the page crumb is
+    per-request random).
+    """
+    family = _jenkins_script_family(path)
+    method = request.method
+    base = {
+        **log_context,
+        "jenkinsScriptPath": path,
+        "jenkinsScriptMethod": method,
+        "jenkinsScriptFamily": family,
+    }
+
+    if method != "POST":
+        # The console GET is the fingerprint. `scriptText` has no GET view
+        # on a real box, but answering it with the console page rather than
+        # a 405 keeps a GET-first probe engaged without a separate shape.
+        append_log({**base, "status": 200, "result": "jenkins-script-console-probe"})
+        return web.Response(
+            status=200, body=_jenkins_script_console_html(),
+            headers=_jenkins_script_headers({"Content-Type": "text/html; charset=utf-8"}),
+        )
+
+    source = jenkins_script_source(
+        request_body, request.headers.get("Content-Type", ""),
+    )
+    low = source.lower()
+    has_exec = any(ind in low for ind in _JENKINS_SCRIPT_EXEC_INDICATORS)
+    has_cred = any(ind in low for ind in _JENKINS_SCRIPT_CRED_INDICATORS)
+    has_download = any(ind in low for ind in _JENKINS_SCRIPT_DOWNLOAD_INDICATORS)
+    append_log({
+        **base,
+        "status": 200,
+        "result": "jenkins-script-exec" if source else "jenkins-script-probe",
+        "jenkinsScriptSource": source[:JENKINS_SCRIPT_PREVIEW_LIMIT],
+        "jenkinsScriptLen": len(source),
+        "jenkinsScriptHasExec": has_exec,
+        "jenkinsScriptHasCredentialAccess": has_cred,
+        "jenkinsScriptHasDownload": has_download,
+        "jenkinsScriptBodyLen": len(request_body),
+        "jenkinsScriptBodySha256": hashlib.sha256(request_body).hexdigest(),
+    })
+
+    if family == "text":
+        # `/scriptText` returns the script's stdout as plain text, nothing
+        # more. An empty body reads as a program that printed nothing --
+        # plausible for a recon one-liner that assigns without printing, and
+        # it volunteers no host data.
+        return web.Response(
+            status=200, body=b"",
+            headers=_jenkins_script_headers({"Content-Type": "text/plain; charset=utf-8"}),
+        )
+
+    # The HTML console echoes the submitted script back in the textarea and
+    # renders the result under a `Result` heading. An empty result keeps the
+    # operator moving to the next script without handing back host state.
+    page = (
+        "<!DOCTYPE html>\n<html><head><title>Jenkins</title></head><body>\n"
+        '<div id="main-panel">\n'
+        "<h1>Script Console</h1>\n"
+        '<form method="post" action="script" name="script">\n'
+        '<textarea name="script" rows="10" cols="80">{script}</textarea>\n'
+        '<button type="submit">Run</button>\n'
+        "</form>\n"
+        "<h2>Result</h2>\n"
+        "<pre></pre>\n"
+        "</div>\n"
+        "</body></html>\n"
+    ).format(script=html.escape(source, quote=False)).encode("utf-8")
+    return web.Response(
+        status=200, body=page,
+        headers=_jenkins_script_headers({"Content-Type": "text/html; charset=utf-8"}),
+    )
+
+
 async def _handle_checkpoint(
     request: web.Request,
     log_context: dict[str, object],
@@ -49679,6 +49953,15 @@ async def handle(request: web.Request) -> web.StreamResponse:
             request, log_context, path, query_string, request_body,
         )
 
+    # Jenkins Groovy script console. Exact-matched on a disjoint path set,
+    # placed before the generic web-app form responder so a POST to
+    # `/script` is captured as a Groovy exec rather than a login form. No
+    # canary is minted, so no API_KEY gate.
+    if is_jenkins_script_path(path):
+        return await _handle_jenkins_script(
+            request, log_context, path, request_body,
+        )
+
     if is_cisco_webvpn_path(path) or is_cisco_anyconnect_config_auth(path, request_body):
         return await _handle_cisco_webvpn(request, log_context, path, request_body)
 
@@ -50368,6 +50651,8 @@ def main() -> int:
         active.append("cisco-webvpn")
     if CISCO_IOSXE_ENABLED:
         active.append("cisco-iosxe-webui")
+    if JENKINS_SCRIPT_ENABLED:
+        active.append("jenkins-script-console")
     if IVANTI_VPN_ENABLED:
         active.append("ivanti-vpn")
     if ASPERA_FASPEX_ENABLED:
