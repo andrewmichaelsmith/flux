@@ -26014,6 +26014,160 @@ def render_aws_config_json(r: dict[str, object]) -> bytes:
     return (json.dumps(body, indent=2) + "\n").encode("utf-8")
 
 
+# --- Kubernetes API Secret / ConfigMap list (anonymous-read cluster) ---
+# The API-server spelling of the same prize the kubeconfig trap answers
+# as a file: `GET /api/v1/namespaces/<ns>/secrets` against a cluster that
+# binds `system:anonymous` to a read role. That misconfiguration is the
+# documented entry point of cloud-native cryptojacking campaigns, and
+# dictionary sweepers ask for the listing in the same pass as the
+# `.env` / workflow / dump files. A real server with anonymous auth off
+# answers 403; answering the list is the vulnerability imitated.
+#
+# The two lists carry the canary differently on purpose. A Secret's
+# `data` is base64, exactly as the API serves it, so the key only exists
+# for a reader that decodes it; a ConfigMap's `data` is plaintext, which
+# is the mistake (credentials in a ConfigMap) a grep for `AKIA` finds.
+# A replay therefore says which kind of reader took it.
+_K8S_NAMESPACE_IN_PATH_RE = re.compile(r"/namespaces/([a-z0-9][a-z0-9-]{0,62})/")
+
+
+def _k8s_list_namespace(r: dict[str, object]) -> str:
+    """The namespace the request named, `default` when it named none
+    (`/api/v1/secrets`) — a list echoing a different namespace than the
+    one asked for is a tell."""
+    path = str(r.get("_requestPath") or "").lower()
+    match = _K8S_NAMESPACE_IN_PATH_RE.search(path)
+    if match:
+        return match.group(1)
+    if "kube-system" in path:
+        return "kube-system"
+    return "default"
+
+
+def _k8s_b64(value: str) -> str:
+    return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def _k8s_object_meta(name: str, namespace: str, created: str) -> dict[str, object]:
+    return {
+        "name": name,
+        "namespace": namespace,
+        "uid": str(uuid.uuid4()),
+        "resourceVersion": str(1_000_000 + secrets.randbelow(9_000_000)),
+        "creationTimestamp": created,
+    }
+
+
+def _k8s_created(days_ago_max: int = 400) -> str:
+    stamp = datetime.now(UTC) - timedelta(
+        days=1 + secrets.randbelow(days_ago_max), seconds=secrets.randbelow(86400),
+    )
+    return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def render_k8s_secret_list(r: dict[str, object]) -> bytes:
+    """`GET /api/v1/namespaces/<ns>/secrets` — a `SecretList`.
+
+    Three items, the shape a small production namespace has: an Opaque
+    cloud-credential secret holding the AWS canary, a database secret
+    with a per-hit synthetic password, and the namespace's default
+    service-account token. Every `data` value is base64 as the API
+    serves it; every UID, resourceVersion and token is per hit.
+    """
+    aws = _aws(r)
+    ns = _k8s_list_namespace(r)
+    sa_token = render_fake_k8s_sa_token().decode("ascii")
+    items = [
+        {
+            "metadata": _k8s_object_meta("aws-credentials", ns, _k8s_created()),
+            "type": "Opaque",
+            "data": {
+                "AWS_ACCESS_KEY_ID": _k8s_b64(aws.get("awsAccessKeyId", "")),
+                "AWS_SECRET_ACCESS_KEY": _k8s_b64(aws.get("awsSecretAccessKey", "")),
+                "AWS_SESSION_TOKEN": _k8s_b64(aws.get("awsSessionToken", "")),
+                "AWS_DEFAULT_REGION": _k8s_b64("us-east-1"),
+            },
+        },
+        {
+            "metadata": _k8s_object_meta("postgres-credentials", ns, _k8s_created()),
+            "type": "Opaque",
+            "data": {
+                "POSTGRES_HOST": _k8s_b64("postgres.%s.svc.cluster.local" % ns),
+                "POSTGRES_USER": _k8s_b64("app_prod"),
+                "POSTGRES_PASSWORD": _k8s_b64(_fake_db_password()),
+                "POSTGRES_DB": _k8s_b64("app"),
+            },
+        },
+        {
+            "metadata": {
+                **_k8s_object_meta("default-token-" + secrets.token_hex(3)[:5], ns, _k8s_created()),
+                "annotations": {
+                    "kubernetes.io/service-account.name": "default",
+                    "kubernetes.io/service-account.uid": str(uuid.uuid4()),
+                },
+            },
+            "type": "kubernetes.io/service-account-token",
+            "data": {
+                "ca.crt": _k8s_b64(
+                    "-----BEGIN CERTIFICATE-----\n"
+                    + base64.b64encode(secrets.token_bytes(720)).decode("ascii")
+                    + "\n-----END CERTIFICATE-----\n"
+                ),
+                "namespace": _k8s_b64(ns),
+                "token": _k8s_b64(sa_token),
+            },
+        },
+    ]
+    body = {
+        "kind": "SecretList",
+        "apiVersion": "v1",
+        "metadata": {"resourceVersion": str(10_000_000 + secrets.randbelow(90_000_000))},
+        "items": items,
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
+def render_k8s_configmap_list(r: dict[str, object]) -> bytes:
+    """`GET /api/v1/namespaces/<ns>/configmaps` — a `ConfigMapList`.
+
+    ConfigMap `data` is plaintext, so the canary sits in the clear in an
+    app-config map — the "credentials in a ConfigMap" mistake — beside
+    the cluster's `kube-root-ca.crt` map that every namespace carries.
+    """
+    aws = _aws(r)
+    ns = _k8s_list_namespace(r)
+    app_env = (
+        "APP_ENV=production\n"
+        "AWS_REGION=us-east-1\n"
+        f"AWS_ACCESS_KEY_ID={aws.get('awsAccessKeyId', '')}\n"
+        f"AWS_SECRET_ACCESS_KEY={aws.get('awsSecretAccessKey', '')}\n"
+        f"AWS_SESSION_TOKEN={aws.get('awsSessionToken', '')}\n"
+        f"S3_BUCKET={FAKE_GIT_DEPLOY_BUCKET}\n"
+        "LOG_LEVEL=info\n"
+    )
+    items = [
+        {
+            "metadata": _k8s_object_meta("kube-root-ca.crt", ns, _k8s_created()),
+            "data": {
+                "ca.crt": "-----BEGIN CERTIFICATE-----\n"
+                + base64.b64encode(secrets.token_bytes(720)).decode("ascii")
+                + "\n-----END CERTIFICATE-----\n",
+            },
+        },
+        {
+            "metadata": _k8s_object_meta("app-config", ns, _k8s_created()),
+            "data": {"app.env": app_env, "FEATURE_FLAGS": "billing_v2,new_checkout"},
+        },
+    ]
+    body = {
+        "kind": "ConfigMapList",
+        "apiVersion": "v1",
+        "metadata": {"resourceVersion": str(10_000_000 + secrets.randbelow(90_000_000))},
+        "items": items,
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
 def render_npmrc(r: dict[str, object]) -> bytes:
     creds = _gitlab_creds(r, "gitlab-username-password").get("credentials") or {}
     if not isinstance(creds, dict):
@@ -31516,6 +31670,32 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ("aws",),
         render_kubeconfig_yaml,
         "text/plain; charset=utf-8",
+    ),
+    # Kubernetes API Secret / ConfigMap listings on an anonymous-read
+    # cluster — the API-server spelling of the kubeconfig prize above.
+    # The bare `/kube-system/secrets` is not a real API path but is the
+    # spelling the sweeping dictionaries emit beside the real ones.
+    CanaryTrap(
+        "k8s-secret-list",
+        tuple(
+            p
+            for ns in ("default", "kube-system")
+            for p in (f"/api/v1/namespaces/{ns}/secrets", f"/api/v1/namespaces/{ns}/secrets/")
+        ) + ("/api/v1/secrets", "/api/v1/secrets/", "/kube-system/secrets"),
+        ("aws",),
+        render_k8s_secret_list,
+        "application/json",
+    ),
+    CanaryTrap(
+        "k8s-configmap-list",
+        tuple(
+            p
+            for ns in ("default", "kube-system")
+            for p in (f"/api/v1/namespaces/{ns}/configmaps", f"/api/v1/namespaces/{ns}/configmaps/")
+        ) + ("/api/v1/configmaps", "/api/v1/configmaps/", "/kube-system/configmaps"),
+        ("aws",),
+        render_k8s_configmap_list,
+        "application/json",
     ),
     *(
         CanaryTrap(
