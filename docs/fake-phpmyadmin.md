@@ -30,7 +30,9 @@ The handler logs:
 - `phpMyAdminUsername` and `phpMyAdminHasPwd` for any POST to a
   matched path. Password value is never stored — only presence and
   length (`phpMyAdminPwdLen`) so common-dictionary vs random-blob
-  brute strategies are separable.
+  brute strategies are separable. `pwdFp` / `pwdReplayOf` attribute a
+  replayed flux per-hit password to the leak that issued it (see
+  [framework-debug](./framework-debug.md#replay-attribution-for-per-hit-db-passwords)).
 - `phpMyAdminServer` — the `server` form selector (real PMA assigns
   one integer per configured server; the trap accepts any value).
 - `phpMyAdminTokenSubmitted` — the hidden `token` returned with the

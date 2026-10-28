@@ -34,6 +34,10 @@ The handler logs:
 - `adminerHasPwd` and `adminerPwdLen` — password value is never
   stored, only presence and length, so common-dictionary vs
   random-blob brute strategies are separable
+- `pwdFp` / `pwdReplayOf` — when the submitted password has the shape
+  of a flux per-hit synthetic, its fingerprint and (if this process
+  issued it) the leak it came from. See
+  [framework-debug](./framework-debug.md#replay-attribution-for-per-hit-db-passwords)
 - `adminerTokenSubmitted` — the hidden `token` returned with the
   POST; truncated to 48 chars
 - `adminerSessionCookiePresent` — whether the request carried a prior

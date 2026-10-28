@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import bz2
+import contextvars
 import gzip
 import hashlib
 import hmac
@@ -24,6 +25,7 @@ import time
 import uuid
 import zipfile
 import zlib
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12569,7 +12571,9 @@ def extract_phpmyadmin_creds(body: bytes, content_type: str) -> dict[str, str]:
     """Pull the four PMA login fields off a `application/x-www-form-urlencoded`
     or `multipart/form-data` POST body. Mirrors `extract_wp_login_creds`:
     we record the username, server, token, and whether a password was
-    present, but never store the password itself."""
+    present. The password itself is returned (as `synthPwd`) only when
+    it has the shape of a flux per-hit synthetic, so the caller can
+    fingerprint it; it is never logged."""
     parsed = parse_form_body(body, content_type)
     result: dict[str, str] = {}
     for key in ("pma_username", "pma_password", "server", "token", "target", "set_session"):
@@ -12578,6 +12582,8 @@ def extract_phpmyadmin_creds(body: bytes, content_type: str) -> dict[str, str]:
             if key == "pma_password":
                 result["hasPwd"] = "true"
                 result["pwdLen"] = str(len(values[0]))[:6]
+                if _SYNTHETIC_SECRET_RE.fullmatch(values[0]):
+                    result["synthPwd"] = values[0]
             else:
                 result[key] = values[0][:200]
     return result
@@ -12715,8 +12721,10 @@ def extract_adminer_creds(body: bytes, content_type: str) -> dict[str, str]:
     `application/x-www-form-urlencoded` or `multipart/form-data` POST
     body. Real Adminer uses `auth[<field>]` PHP-array field names, so
     we match those exactly. Records username, server, DB name, driver,
-    submitted token, and whether a password was present — the
-    password bytes themselves are never stored."""
+    submitted token, and whether a password was present. The password
+    is returned (as `synthPwd`) only when it has the shape of a flux
+    per-hit synthetic, so the caller can fingerprint it; it is never
+    logged."""
     parsed = parse_form_body(body, content_type)
     result: dict[str, str] = {}
     for suffix, out_key in (
@@ -12736,6 +12744,8 @@ def extract_adminer_creds(body: bytes, content_type: str) -> dict[str, str]:
         if values and values[0]:
             result["hasPwd"] = "true"
             result["pwdLen"] = str(len(values[0]))[:6]
+            if _SYNTHETIC_SECRET_RE.fullmatch(values[0]):
+                result["synthPwd"] = values[0]
             break
     tok = parsed.get("token")
     if tok and tok[0]:
@@ -19276,7 +19286,74 @@ def _fake_db_password() -> str:
     # URL, which wouldn't be where a wp-config-style probe replays this).
     # The point is to avoid shipping a *fixed literal* across every sensor,
     # which turns into a farm-wide fingerprint.
-    return secrets.token_urlsafe(16)
+    value = secrets.token_urlsafe(16)
+    issued = _ISSUED_SECRETS.get()
+    if issued is not None:
+        issued.append(value)
+    return value
+
+
+# --- Synthetic-secret replay attribution ----------------------------------
+# A DB password minted by `_fake_db_password` is not a Tracebit canary, so
+# when a client submits it to the Adminer / phpMyAdmin login traps there is
+# no upstream alert. The leak and the login are both ours, though: the
+# canary-trap dispatcher collects every password a renderer minted for one
+# response (via this context variable), logs a short fingerprint of each,
+# and remembers which hit issued it. The login handlers fingerprint a
+# submitted password of the same shape, so a leak -> login replay can be
+# joined exactly in the logs (across sensors, by fingerprint) and is
+# tagged inline when the same process served both.
+_ISSUED_SECRETS: "contextvars.ContextVar[list[str] | None]" = contextvars.ContextVar(
+    "flux_issued_secrets", default=None,
+)
+_ISSUED_SECRET_INDEX: "OrderedDict[str, dict[str, object]]" = OrderedDict()
+_ISSUED_SECRET_INDEX_MAX = 8192
+# `secrets.token_urlsafe(16)` is always 22 characters of this alphabet.
+_SYNTHETIC_SECRET_RE = re.compile(r"[A-Za-z0-9_-]{22}")
+
+
+def _secret_fp(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _register_issued_secrets(
+    values: "list[str]", trap: str, request_id: str, client_ip: str,
+) -> list[str]:
+    fps: list[str] = []
+    now = time.time()
+    for value in values:
+        fp = _secret_fp(value)
+        if fp in fps:
+            continue
+        fps.append(fp)
+        _ISSUED_SECRET_INDEX[fp] = {
+            "trap": trap, "requestId": request_id, "clientIp": client_ip, "ts": now,
+        }
+        _ISSUED_SECRET_INDEX.move_to_end(fp)
+    while len(_ISSUED_SECRET_INDEX) > _ISSUED_SECRET_INDEX_MAX:
+        _ISSUED_SECRET_INDEX.popitem(last=False)
+    return fps
+
+
+def synthetic_secret_replay_fields(password: str, client_ip: str) -> dict[str, object]:
+    """Log fields for a submitted password that has the synthetic shape.
+
+    Only a password that could be one of ours is fingerprinted, so an
+    ordinary brute-force dictionary word is never hashed into the log.
+    """
+    if not password or not _SYNTHETIC_SECRET_RE.fullmatch(password):
+        return {}
+    fp = _secret_fp(password)
+    fields: dict[str, object] = {"pwdFp": fp}
+    issued = _ISSUED_SECRET_INDEX.get(fp)
+    if issued is not None:
+        fields["pwdReplayOf"] = {
+            "trap": issued["trap"],
+            "requestId": issued["requestId"],
+            "sameClient": issued["clientIp"] == client_ip,
+            "ageSeconds": int(time.time() - float(issued["ts"])),
+        }
+    return fields
 
 
 def _gitlab_creds(r: dict[str, object], canary_type: str) -> dict[str, object]:
@@ -28100,6 +28177,131 @@ def render_symfony_profiler_phpinfo(r: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def render_symfony1_dev_exception(r: dict[str, object]) -> bytes:
+    """symfony 1.4 dev front controller exception page.
+
+    `frontend_dev.php` runs the app with `sf_debug` on, so an unroutable
+    URL renders the full `sfError404Exception` page rather than a 404:
+    stack trace, then the Settings and Global vars dumps the page lets
+    you expand. Those dumps are where a sf1 app's secrets live in
+    practice: `app.yml` keys (cloud storage, mailer) surface as `app_*`
+    settings, and the DSN usually arrives through vhost `SetEnv` and so
+    shows up in `$_SERVER`. The module name in the message is echoed
+    from the request, as the routing layer would."""
+    aws = _aws(r)
+    ak = html.escape(str(aws.get("awsAccessKeyId", "")))
+    sk = html.escape(str(aws.get("awsSecretAccessKey", "")))
+    st = html.escape(str(aws.get("awsSessionToken", "")))
+    host = html.escape(str(r.get("_requestHost") or "localhost"))
+    req_path = str(r.get("_requestPath") or "/frontend_dev.php/")
+    script = "/" + req_path.lstrip("/").split("/", 1)[0]
+    app = "frontend"
+    info = req_path[len(script):] or "/"
+    module = info.strip("/").split("/", 1)[0]
+    if module:
+        message = f'Action "{module}/index" does not exist.'
+    else:
+        message = "Empty module and/or action after parsing the URL \"/\" (/)."
+    message = html.escape(message)
+    db_password = _fake_db_password()
+    mailer_password = _fake_db_password()
+    csrf_secret = secrets.token_hex(12)
+    remote = html.escape(str(r.get("_clientIp") or "127.0.0.1"))
+    trace = (
+        ("sfController", "forward", "lib/vendor/symfony/lib/controller/sfController.class.php", 160),
+        ("sfFrontWebController", "dispatch", "lib/vendor/symfony/lib/controller/sfFrontWebController.class.php", 48),
+        ("sfContext", "dispatch", "lib/vendor/symfony/lib/util/sfContext.class.php", 170),
+        ("sfContext", "dispatch", f"web/{app}_dev.php", 13),
+    )
+    trace_html = "".join(
+        f"<li>at <strong>{cls}->{fn}()</strong><br />\n"
+        f"in <em>SF_ROOT_DIR/{fpath}</em> line {line} ...</li>\n"
+        for cls, fn, fpath, line in trace
+    )
+    settings = (
+        "app:\n"
+        "  amazon_s3:\n"
+        f"    access_key: {ak}\n"
+        f"    secret_key: {sk}\n"
+        f"    session_token: {st}\n"
+        "    bucket: media-prod\n"
+        "    region: us-east-1\n"
+        "  mailer:\n"
+        "    transport: smtp\n"
+        "    host: smtp.mailgun.org\n"
+        "    port: 587\n"
+        "    username: postmaster@mg.internal\n"
+        f"    password: {mailer_password}\n"
+        "sf:\n"
+        f"  app: {app}\n"
+        "  environment: dev\n"
+        "  debug: true\n"
+        "  logging_enabled: true\n"
+        "  web_debug: true\n"
+        f"  csrf_secret: {csrf_secret}\n"
+        "  orm: doctrine\n"
+        "  charset: utf-8\n"
+        "  root_dir: /var/www/app\n"
+        "  symfony_lib_dir: /var/www/app/lib/vendor/symfony/lib\n"
+    )
+    server = (
+        "server:\n"
+        "  DOCUMENT_ROOT: /var/www/app/web\n"
+        f"  HTTP_HOST: {host}\n"
+        f"  REMOTE_ADDR: {remote}\n"
+        f"  SCRIPT_NAME: {script}\n"
+        f"  PATH_INFO: {html.escape(info)}\n"
+        "  SERVER_SOFTWARE: Apache/2.2.22 (Debian)\n"
+        "  SF_ENVIRONMENT: dev\n"
+        "  DB_DSN: 'mysql:host=db.internal;dbname=sfapp_prod'\n"
+        "  DB_USER: sfapp\n"
+        f"  DB_PASSWORD: {db_password}\n"
+        "  APPLICATION_ENV: development\n"
+    )
+    return (
+        '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" '
+        '"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">\n'
+        "<head>\n"
+        '<meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>\n'
+        f"<title>{message}</title>\n"
+        '<style type="text/css">\n'
+        "body { margin: 0; padding: 20px; margin-top: 20px; background-color: #eee }\n"
+        "body, td, th { font: 11px Verdana, Arial, sans-serif; color: #333 }\n"
+        "a { color: #333 }\n"
+        "h1 { margin: 0 0 0 10px; padding: 10px 0 10px 0; font-weight: bold; font-size: 120% }\n"
+        "h2 { margin: 0; padding: 5px 0; font-size: 110% }\n"
+        "ul { padding-left: 20px; list-style: decimal }\n"
+        "#main { padding: 30px 40px; border: 1px solid #ddd; background-color: #fff; text-align:left; "
+        "-moz-border-radius: 10px; -webkit-border-radius: 10px; min-width: 770px; max-width: 770px }\n"
+        "#message { padding: 10px; margin-bottom: 10px; background-color: #eee; -moz-border-radius: 10px; "
+        "-webkit-border-radius: 10px }\n"
+        "</style>\n"
+        '<script type="text/javascript">\n'
+        "function toggle(id) { el = document.getElementById(id); "
+        "el.style.display = el.style.display == 'none' ? 'block' : 'none'; }\n"
+        "</script>\n"
+        "</head>\n<body>\n<center><div id=\"main\">\n"
+        "<h1>[sfError404Exception]</h1>\n"
+        f'<h2 id="message">{message}</h2>\n'
+        "<h2>stack trace</h2>\n<ul>\n" + trace_html + "</ul>\n"
+        "<h2>symfony v.1.4.20 - php 5.4.45-0+deb7u14</h2>\n"
+        "<h2>for help resolving this issue, please visit "
+        '<a href="http://www.symfony-project.org/">http://www.symfony-project.org/</a>.</h2>\n'
+        '<h2>Request <a href="#" onclick="toggle(\'sfexceptionrequest\'); return false;">...</a></h2>\n'
+        '<div id="sfexceptionrequest" style="display: none"><pre>parameterHolder:\n'
+        f"  action: index\n  module: '{html.escape(module)}'\n"
+        "options:\n  path_info_key: PATH_INFO\n  path_info_array: SERVER\n"
+        "  http_port: null\n  https_port: null\n  default_format: null\n"
+        "  logging: '1'\n  relative_url_root: null\n</pre></div>\n"
+        '<h2>Settings <a href="#" onclick="toggle(\'sfexceptionsettings\'); return false;">...</a></h2>\n'
+        f'<div id="sfexceptionsettings" style="display: none"><pre>{settings}</pre></div>\n'
+        '<h2>Global vars <a href="#" onclick="toggle(\'sfexceptionglobals\'); return false;">...</a></h2>\n'
+        f'<div id="sfexceptionglobals" style="display: none"><pre>{server}</pre></div>\n'
+        "</div></center>\n</body>\n</html>\n"
+    ).encode("utf-8")
+
+
 def render_symfony_parameters_yml(r: dict[str, object]) -> bytes:
     """Symfony legacy `app/config/parameters.yml` shape — DB / mailer /
     AWS creds in YAML form. Also returned as the body of
@@ -33110,6 +33312,21 @@ CANARY_TRAPS: tuple[CanaryTrap, ...] = (
         ),
         ("aws",),
         render_symfony_profiler_phpinfo,
+        "text/html; charset=utf-8",
+    ),
+    CanaryTrap(
+        "symfony1-dev-exception",
+        (
+            # symfony 1.x dev front controller. A scanner sends a module
+            # name no app routes (`$`) so that a debug-mode install answers
+            # with the full exception page instead of a 404 -- that page is
+            # the leak. The bare `/frontend_dev.php` stays with the webshell
+            # probe, which already answers it.
+            "/frontend_dev.php/$",
+            "/frontend_dev.php/",
+        ),
+        ("aws",),
+        render_symfony1_dev_exception,
         "text/html; charset=utf-8",
     ),
     # --- Rails secrets bundle -------------------------------------------
@@ -43973,6 +44190,7 @@ async def _handle_adminer(
             "adminerSessionCookiePresent": bool(submitted_session),
             "canaryTypes": canary_types,
             "contentType": content_type_req[:120],
+            **synthetic_secret_replay_fields(creds.get("synthPwd", ""), client_ip),
         }
         if body_preview:
             log_entry["bodyPreview"] = body_preview
@@ -44404,6 +44622,9 @@ async def _handle_phpmyadmin(
             "phpMyAdminTokenSubmitted": creds.get("token", "")[:48],
             "phpMyAdminSessionCookiePresent": bool(submitted_session),
             "contentType": content_type_req[:120],
+            **synthetic_secret_replay_fields(
+                creds.get("synthPwd", ""), str(log_context.get("clientIp", "")),
+            ),
         }
         if body_preview:
             log_entry["bodyPreview"] = body_preview
@@ -47155,6 +47376,7 @@ async def _send_canary_trap(
         # trap that has no upstream dependency.
         tracebit_response = {}
 
+    issued_token = _ISSUED_SECRETS.set([])
     try:
         # Renderers that need to stay self-consistent with the host the
         # client actually asked for read `_requestHost`. A deploy config
@@ -47185,6 +47407,10 @@ async def _send_canary_trap(
             "error": _exc_detail(exc)[:400],
         })
         return _credential_failure_response()
+    finally:
+        issued_secrets = _ISSUED_SECRETS.get() or []
+        _ISSUED_SECRETS.reset(issued_token)
+    secret_fps = _register_issued_secrets(issued_secrets, tag, request_id, client_ip)
 
     response = web.Response(status=200, body=body)
     response.headers["Content-Type"] = trap.content_type
@@ -47198,6 +47424,7 @@ async def _send_canary_trap(
         "result": tag,
         "canaryTypes": [k for k, v in tracebit_response.items() if v],
         "bytes": len(body),
+        **({"syntheticSecretFps": secret_fps} if secret_fps else {}),
     })
     return response
 
