@@ -660,6 +660,12 @@ def test_all_trap_families_default_on():
         "exec is the only request in the chain carrying attacker-authored "
         "content"
     )
+    assert tbenv.SOLR_ENABLED, (
+        "HONEYPOT_SOLR_ENABLED should default to True — the Solr admin API\n"
+        "is the recon fingerprint that precedes the CVE-2019-17558 Velocity\n"
+        "RCE, and the `config` POST and `select?wt=velocity` requests are\n"
+        "the only ones in the chain carrying attacker-authored content"
+    )
     assert tbenv.JENKINS_SCRIPT_ENABLED, (
         "HONEYPOT_JENKINS_SCRIPT_ENABLED should default to True — the Groovy "
         "script console is the unauthenticated-RCE surface scanners POST to, "

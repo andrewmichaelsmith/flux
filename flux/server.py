@@ -40754,6 +40754,340 @@ def _jenkins_script_console_html() -> bytes:
     ).format(crumb=crumb).encode("utf-8")
 
 
+# --- Fake Apache Solr admin API + Velocity-template RCE (CVE-2019-17558) --
+# Solr's admin API answers unauthenticated on a default install, and the
+# recon vocabulary is one of the most constant on the wire: a `Go-http`
+# scanner walks `/solr/admin/info/system?wt=json` for the version and JVM,
+# then `/solr/admin/cores?action=STATUS&wt=json` for the core list. The
+# family 404s today, so the walk ends at the fingerprint and we never see
+# the one request that carries attacker-authored code.
+#
+# That request is the Velocity-template leg. CVE-2019-17558 turns the
+# VelocityResponseWriter into unauthenticated RCE in two steps: a
+# `POST /solr/<core>/config` enables `params.resource.loader.enabled`, then
+# a `GET /solr/<core>/select?wt=velocity&v.template=custom&v.template.custom=<vtl>`
+# runs the attacker's template -- the `#set($x.class.forName('java.lang.Runtime'))`
+# idiom. The `v.template.custom` parameter (and the config POST body) is the
+# payload this trap exists to capture; everything else is the fingerprint
+# chain that gets a scanner to send it.
+#
+# Matching is exact on the admin leaves and regex on the attacker-named
+# core segment -- never a bare `/solr/` prefix, so `/solr/.env`,
+# `/solr/%2eenv` and `/var/www/html/solr/.env` stay with the env-canary
+# module instead of being retagged as Solr recon. Nothing credential-shaped
+# is emitted (the recon JSON is host facts, not secrets), so there is no
+# canary to mint and no API_KEY gate -- the payload capture works keyless.
+SOLR_ENABLED = _env_bool("HONEYPOT_SOLR_ENABLED")
+
+_SOLR_VERSION = "8.11.2"
+_SOLR_ADMIN_LEAVES = frozenset({
+    "/solr",
+    "/solr/",
+    "/solr/index.html",
+    "/solr/admin",
+    "/solr/admin/",
+    "/solr/admin/info/system",
+    "/solr/admin/info/properties",
+    "/solr/admin/cores",
+})
+# `/solr/<core>/<leaf>` where the core name is attacker-chosen (test,
+# collection1, gettingstarted, techproducts, core1, ...). Matched by regex
+# because the label is not a fixed set.
+_SOLR_CORE_LEAF_RE = re.compile(
+    r"^/solr/(?P<core>[A-Za-z0-9][A-Za-z0-9._-]{0,63})/"
+    r"(?P<leaf>select|config|dataimport|admin/ping|replication|stream|update)/?$",
+    re.IGNORECASE,
+)
+# Velocity-template RCE idioms worth splitting out on the log row so the
+# recon templates separate from the ones reaching for a shell. Substrings,
+# matched case-insensitively against the decoded `v.template.custom`.
+_SOLR_VELOCITY_RCE_INDICATORS = (
+    "runtime",
+    "processbuilder",
+    "getruntime",
+    ".exec(",
+    "java.lang",
+    "forname",
+    "/bin/sh",
+    "/bin/bash",
+    "cmd.exe",
+    "powershell",
+    "bufferedreader",
+    "inputstream",
+)
+
+# Keeps the log row bounded while retaining enough of the template to
+# identify the toolchain. Floor mirrors the Jenkins/WSMA previews.
+SOLR_PREVIEW_LIMIT = max(
+    int((os.environ.get("HONEYPOT_SOLR_PREVIEW_LIMIT") or "1024").strip() or "1024"),
+    256,
+)
+
+
+def _solr_core_leaf(path: str) -> tuple[str, str] | None:
+    """Return (core, leaf) for a `/solr/<core>/<leaf>` request, else None."""
+    match = _SOLR_CORE_LEAF_RE.match(path.rstrip("/") or path)
+    if not match:
+        return None
+    return match.group("core"), match.group("leaf").lower().replace("admin/ping", "ping")
+
+
+def _solr_family(path: str) -> str:
+    """Classify a Solr path into its response family, or "".
+
+    Exact match on the admin leaves, regex on the attacker-named core
+    segment. Never a prefix test, so arbitrary files under `/solr/` keep
+    falling through to the env-canary / tarpit modules.
+    """
+    lp = path.lower()
+    norm = lp.rstrip("/") or "/"
+    if lp in _SOLR_ADMIN_LEAVES or norm in _SOLR_ADMIN_LEAVES:
+        if norm.endswith("/admin/info/system"):
+            return "system"
+        if norm.endswith("/admin/info/properties"):
+            return "properties"
+        if norm.endswith("/admin/cores"):
+            return "cores"
+        return "welcome"
+    core_leaf = _solr_core_leaf(path)
+    if core_leaf:
+        return "core:" + core_leaf[1]
+    return ""
+
+
+def is_solr_path(path: str) -> bool:
+    if not SOLR_ENABLED:
+        return False
+    return bool(_solr_family(path))
+
+
+def solr_velocity_template(query_string: str, body: bytes, content_type: str) -> str:
+    """Extract the Velocity template from a `select` request.
+
+    The CVE-2019-17558 payload carries the template in `v.template.custom`
+    (and names it with `v.template=custom`). It rides the query string on a
+    GET and the body on a POST. `parse_qs` url-decodes with form semantics,
+    which is correct: the template's spaces arrive as `+`, its `#`/`'` as
+    `%23`/`%27`, and a literal `+` inside Java as `%2B` -- exactly what
+    `unquote_plus` restores. Returns "" when no custom template is present.
+    """
+    for source in (query_string or "", body.decode("utf-8", errors="replace") if body else ""):
+        if not source:
+            continue
+        try:
+            params = parse_qs(source, keep_blank_values=True)
+        except Exception:  # pragma: no cover - parse_qs is permissive
+            continue
+        values = params.get("v.template.custom") or []
+        if values and values[0]:
+            return values[0]
+    return ""
+
+
+def _solr_core_status_item(core: str) -> dict[str, object]:
+    now = datetime.now(UTC)
+    started = now - timedelta(days=1 + secrets.randbelow(120), seconds=secrets.randbelow(86400))
+    return {
+        "name": core,
+        "instanceDir": f"/var/solr/data/{core}",
+        "dataDir": f"/var/solr/data/{core}/data/",
+        "config": "solrconfig.xml",
+        "schema": "managed-schema",
+        "startTime": started.strftime("%Y-%m-%dT%H:%M:%S.") + f"{secrets.randbelow(1000):03d}Z",
+        "uptime": secrets.randbelow(9_000_000),
+        "index": {
+            "numDocs": secrets.randbelow(500_000),
+            "maxDoc": secrets.randbelow(500_000),
+            "version": secrets.randbelow(5000),
+            "segmentCount": 1 + secrets.randbelow(30),
+            "current": True,
+            "sizeInBytes": secrets.randbelow(2_000_000_000),
+        },
+    }
+
+
+def render_solr_system_info() -> bytes:
+    """`/solr/admin/info/system?wt=json` — the recon fingerprint.
+
+    Solr version, Lucene version and the host JVM facts a scanner reads to
+    decide whether the Velocity path is worth trying. Host facts, not
+    secrets; nothing credential-shaped is emitted.
+    """
+    body = {
+        "responseHeader": {"status": 0, "QTime": secrets.randbelow(40)},
+        "mode": "std",
+        "solr_home": "/var/solr/data",
+        "lucene": {
+            "solr-spec-version": _SOLR_VERSION,
+            "solr-impl-version": _SOLR_VERSION,
+            "lucene-spec-version": _SOLR_VERSION,
+            "lucene-impl-version": _SOLR_VERSION,
+        },
+        "jvm": {
+            "version": "11.0.21 11.0.21+9-post-Ubuntu-0ubuntu1",
+            "name": "Eclipse Adoptium OpenJDK 64-Bit Server VM",
+            "spec": {"vendor": "Oracle Corporation", "name": "Java Platform API Specification", "version": "11"},
+            "jre": {"vendor": "Eclipse Adoptium", "version": "11.0.21"},
+            "processors": 4,
+            "memory": {"free": "412.3 MB", "total": "512 MB", "max": "512 MB", "used": "99.7 MB (%19.5)"},
+        },
+        "system": {
+            "name": "Linux",
+            "arch": "amd64",
+            "availableProcessors": 4,
+            "systemLoadAverage": round(secrets.randbelow(400) / 100, 2),
+            "version": "5.15.0-105-generic",
+            "committedVirtualMemorySize": secrets.randbelow(4_000_000_000),
+            "uname": "Linux solr01 5.15.0-105-generic #115-Ubuntu SMP x86_64 GNU/Linux\n",
+        },
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
+def render_solr_cores_status() -> bytes:
+    """`/solr/admin/cores?action=STATUS&wt=json` — a `CoreStatus`.
+
+    Two cores, the shape a small install carries. All facts are host
+    telemetry (doc counts, uptimes); no secret-shaped value is emitted.
+    """
+    cores = {name: _solr_core_status_item(name) for name in ("collection1", "techproducts")}
+    body = {
+        "responseHeader": {"status": 0, "QTime": secrets.randbelow(60)},
+        "initFailures": {},
+        "status": cores,
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
+def render_solr_core_action(action: str, core: str) -> bytes:
+    body = {"responseHeader": {"status": 0, "QTime": 20 + secrets.randbelow(2000)}}
+    if action == "create" and core:
+        body["core"] = core
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
+def render_solr_ping() -> bytes:
+    body = {
+        "responseHeader": {"status": 0, "QTime": secrets.randbelow(30), "zkConnected": None, "params": {"q": "{!lucene}*:*", "echoParams": "all"}},
+        "status": "OK",
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
+def render_solr_select_empty() -> bytes:
+    body = {
+        "responseHeader": {"status": 0, "QTime": secrets.randbelow(30)},
+        "response": {"numFound": 0, "start": 0, "docs": []},
+    }
+    return (json.dumps(body, indent=2) + "\n").encode("utf-8")
+
+
+async def _handle_solr(
+    request: web.Request,
+    log_context: dict[str, object],
+    path: str,
+    query_string: str,
+    request_body: bytes,
+) -> web.Response:
+    """Fake Apache Solr admin API + Velocity-template RCE bait.
+
+    The admin leaves answer the recon fingerprint (version, JVM, core
+    list) that precedes exploitation. The `config` POST and the
+    `select?wt=velocity` request are the two legs of CVE-2019-17558 that
+    carry attacker-authored content: the config body enables the params
+    resource loader, and `v.template.custom` is the Velocity template that
+    runs. Both are captured; the recon responses emit no secret-shaped
+    value, so nothing is gated on an issuing key.
+    """
+    family = _solr_family(path)
+    method = request.method
+    headers = {"Content-Type": "application/json; charset=UTF-8"}
+    base = {
+        **log_context,
+        "solrPath": path,
+        "solrMethod": method,
+        "solrFamily": family,
+    }
+
+    if family == "system":
+        append_log({**base, "status": 200, "result": "solr-system-info"})
+        return web.Response(status=200, body=render_solr_system_info(), headers=headers)
+
+    if family in ("welcome", "properties"):
+        # The admin UI root and the properties listing are both just the
+        # fingerprint that the install exists; answer 200 with the system
+        # facts shape so a GET-first probe stays engaged.
+        append_log({**base, "status": 200, "result": "solr-admin-probe"})
+        return web.Response(status=200, body=render_solr_system_info(), headers=headers)
+
+    if family == "cores":
+        params = parse_qs(query_string or "", keep_blank_values=True)
+        action = (params.get("action") or [""])[0].lower()
+        core = (params.get("name") or params.get("core") or [""])[0]
+        if action in ("create", "reload", "unload", "rename", "swap", "merge"):
+            append_log({
+                **base, "status": 200, "result": "solr-core-action",
+                "solrCoreAction": action, "solrCoreName": core[:128],
+            })
+            return web.Response(status=200, body=render_solr_core_action(action, core), headers=headers)
+        append_log({**base, "status": 200, "result": "solr-cores-status"})
+        return web.Response(status=200, body=render_solr_cores_status(), headers=headers)
+
+    core_leaf = _solr_core_leaf(path)
+    core, leaf = core_leaf if core_leaf else ("", "")
+    base["solrCore"] = core[:128]
+
+    if leaf == "ping":
+        append_log({**base, "status": 200, "result": "solr-ping"})
+        return web.Response(status=200, body=render_solr_ping(), headers=headers)
+
+    if leaf == "config":
+        # The CVE-2019-17558 enablement step: a POST that flips
+        # `params.resource.loader.enabled` on the VelocityResponseWriter.
+        # The body is attacker-authored config JSON -- capture it.
+        if method == "POST" and request_body:
+            append_log({
+                **base, "status": 200, "result": "solr-config-post",
+                "solrConfigBodyLen": len(request_body),
+                "solrConfigBodySha256": hashlib.sha256(request_body).hexdigest(),
+                "solrConfigBodyPreview": request_body.decode("utf-8", errors="replace")[:SOLR_PREVIEW_LIMIT],
+            })
+        else:
+            append_log({**base, "status": 200, "result": "solr-config-probe"})
+        return web.Response(
+            status=200,
+            body=(json.dumps({"responseHeader": {"status": 0, "QTime": 10 + secrets.randbelow(200)}}, indent=2) + "\n").encode("utf-8"),
+            headers=headers,
+        )
+
+    if leaf == "select":
+        template = solr_velocity_template(query_string, request_body, request.headers.get("Content-Type", ""))
+        if template:
+            low = template.lower()
+            append_log({
+                **base, "status": 200, "result": "solr-velocity-exec",
+                "solrVelocityTemplate": template[:SOLR_PREVIEW_LIMIT],
+                "solrVelocityLen": len(template),
+                "solrVelocityHasRce": any(ind in low for ind in _SOLR_VELOCITY_RCE_INDICATORS),
+                "solrBodySha256": hashlib.sha256(request_body).hexdigest() if request_body else "",
+            })
+            # Echo an empty template render: the operator reads it as a
+            # template that ran and printed nothing, and sends the next one.
+            return web.Response(status=200, body=b"", headers={"Content-Type": "text/html; charset=UTF-8"})
+        append_log({**base, "status": 200, "result": "solr-select-probe"})
+        return web.Response(status=200, body=render_solr_select_empty(), headers=headers)
+
+    # dataimport / replication / stream / update: fingerprint-only, answer
+    # the empty-success shape so the probe keeps the install "alive".
+    append_log({**base, "status": 200, "result": "solr-endpoint-probe"})
+    return web.Response(
+        status=200,
+        body=(json.dumps({"responseHeader": {"status": 0, "QTime": secrets.randbelow(40)}}, indent=2) + "\n").encode("utf-8"),
+        headers=headers,
+    )
+
+
+
 async def _handle_jenkins_script(
     request: web.Request,
     log_context: dict[str, object],
@@ -50357,6 +50691,16 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     if is_cisco_iosxe_path(path):
         return await _handle_cisco_iosxe(
+            request, log_context, path, query_string, request_body,
+        )
+
+    # Apache Solr admin API + Velocity-template RCE. Exact on the admin
+    # leaves, regex on the attacker-named core segment; placed before the
+    # generic form responder so a `config` POST / `select?wt=velocity`
+    # request is captured as an exploit leg, not a login form. No canary
+    # minted, so no API_KEY gate.
+    if is_solr_path(path):
+        return await _handle_solr(
             request, log_context, path, query_string, request_body,
         )
 
