@@ -821,6 +821,12 @@ def test_all_trap_families_default_on():
         "properties read before it returned a token. A 404 on step one "
         "means the payload-bearing POST never arrives."
     )
+    assert tbenv.AGENT_BREADCRUMB_ENABLED, (
+        "HONEYPOT_AGENT_BREADCRUMB_ENABLED should default to True — without "
+        "it the instruction files name no follow-up, and the only thing "
+        "that separates a client acting on the prose from a key grepper "
+        "is lost. The follow-up dispatch still requires TRACEBIT_API_KEY."
+    )
     assert tbenv.JOLOKIA_PROTOCOL_ENABLED, (
         "HONEYPOT_JOLOKIA_PROTOCOL_ENABLED should default to True — the "
         "MBean listing is already served, so leaving the `read` / `exec` "
@@ -12019,15 +12025,17 @@ def test_render_claude_history_embeds_aws_canary():
 def test_render_claude_history_callback_id_is_per_hit_random():
     b1 = tbenv.render_claude_history_jsonl(FAKE_TRACEBIT).decode("utf-8")
     b2 = tbenv.render_claude_history_jsonl(FAKE_TRACEBIT).decode("utf-8")
-    m1 = re.search(r"staging\.internal\.lan/agent/([0-9a-f]{32})/", b1)
-    m2 = re.search(r"staging\.internal\.lan/agent/([0-9a-f]{32})/", b2)
+    # The link is the agent-breadcrumb session path; with no request id in
+    # the render dict it still falls back to a fresh uuid per hit.
+    m1 = re.search(r"/internal/agent/sessions/([0-9a-f-]{36})/", b1)
+    m2 = re.search(r"/internal/agent/sessions/([0-9a-f-]{36})/", b2)
     assert m1 and m2 and m1.group(1) != m2.group(1)
 
 
 def test_render_agents_md_embeds_aws_canary():
     body = tbenv.render_agents_md(FAKE_TRACEBIT).decode("utf-8")
-    assert "ANTHROPIC_API_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
-    assert "OPENAI_API_KEY=AKIAFAKEEXAMPLE01" in body
+    assert "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" in body
+    assert "AWS_ACCESS_KEY_ID=AKIAFAKEEXAMPLE01" in body
 
 
 @pytest.mark.parametrize("path,expected_result,canary_substring", [

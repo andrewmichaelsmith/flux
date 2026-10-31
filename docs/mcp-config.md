@@ -5,7 +5,7 @@ dotenv fragments that travel in the same scanner dictionaries.
 
 | Method | Path | Response |
 | --- | --- | --- |
-| `GET` | `/.mcp.json`, `/mcp.json`, `/.mcp/mcp.json`, `/.mcp/config.json`, `/.mcp/settings.json`, `/mcp_settings.json`, `/.cline/mcp_settings.json`, `/.cursor/mcp.json`, `/.cursor/mcp_config.json`, `/claude_desktop_config.json` | `200 application/json` — an `mcpServers` document |
+| `GET` | `/.mcp.json`, `/mcp.json`, `/.mcp/mcp.json`, `/.mcp/config.json`, `/.mcp/settings.json`, `/mcp_settings.json`, `/.cline/mcp_settings.json`, `/.cursor/mcp.json`, `/.cursor/mcp_config.json`, `/claude_desktop_config.json`, and `mcp.json` under the per-project editor dirs (`/.vscode/`, `/.claude/`, `/.windsurf/`, `/.junie/`, `/.amazonq/`) via the layout walk | `200 application/json` — an `mcpServers` document |
 | `GET` | `/.env.anthropic` | `200 text/plain` — dotenv fragment, canary in `ANTHROPIC_API_KEY` |
 | `GET` | `/.env.openai` | `200 text/plain` — dotenv fragment, canary in `OPENAI_API_KEY` |
 
